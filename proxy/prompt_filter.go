@@ -17,11 +17,11 @@ import (
 const promptFilterFullTextMaxRunes = 32000
 const codexAmbientSuggestionClassifierPrefix = "Classify Codex ambient suggestion candidates for policy safety."
 const codex55UnrestrictedInstructionsPatternName = "codex55_unrestricted_instructions"
-const promptCyberPolicyMessage = "This content was flagged for possible cybersecurity risk. If this seems wrong, start a new session or rephrase the request."
+const promptCyberPolicyMessage = "This request was blocked by the content policy. Please rephrase and try again."
 
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
-		api.ErrorCode("cyber_policy"),
+		api.ErrorCode("content_policy_violation"),
 		promptCyberPolicyMessage,
 		api.ErrorTypeInvalidRequest,
 	)
