@@ -38,6 +38,7 @@ import type {
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
   SemanticReviewConnectionTestResponse,
+  SemanticReviewProvider,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
@@ -555,7 +556,7 @@ export const api = {
   },
   testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
-  testSemanticReviewConnection: (data: { text?: string; endpoint?: string; request_model?: string } = {}) =>
+  testSemanticReviewConnection: (data: { provider_id?: string; provider?: SemanticReviewProvider; text?: string; endpoint?: string; request_model?: string } = {}) =>
     request<SemanticReviewConnectionTestResponse>('/prompt-filter/semantic-review/test', { method: 'POST', body: JSON.stringify(data) }),
   testPromptFilterRulePattern: (data: { pattern: string; text: string }) =>
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),

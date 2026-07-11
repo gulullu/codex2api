@@ -12,7 +12,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
-import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, SemanticReviewConnectionTestResponse, SystemSettings } from '../types'
+import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, SemanticReviewConnectionTestResponse, SemanticReviewProvider, SemanticReviewStrategy, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -69,6 +69,8 @@ type PromptFilterForm = Pick<
   | 'prompt_filter_semantic_review_model'
   | 'prompt_filter_semantic_review_timeout_ms'
   | 'prompt_filter_semantic_review_max_concurrency'
+  | 'prompt_filter_semantic_review_strategy'
+  | 'prompt_filter_semantic_review_providers'
   | 'prompt_filter_semantic_review_failure_policy'
   | 'prompt_filter_semantic_review_log_retention_days'
 >
@@ -95,6 +97,51 @@ type CustomRuleDraft = {
   weight: string
   category: string
   strict: boolean
+}
+
+function createSemanticReviewProvider(index = 0): SemanticReviewProvider {
+  return {
+    id: `provider-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
+    name: '',
+    enabled: true,
+    base_url: 'https://api.openai.com/v1',
+    model: 'gpt-5.4-mini',
+    api_key: '',
+    api_key_configured: false,
+    timeout_ms: 2500,
+    max_concurrency: 4,
+  }
+}
+
+function normalizeSemanticReviewProvider(provider: SemanticReviewProvider, index: number): SemanticReviewProvider {
+  return {
+    id: provider.id?.trim() || `provider-${index + 1}`,
+    name: provider.name?.trim() || '',
+    enabled: provider.enabled ?? true,
+    base_url: provider.base_url?.trim() || 'https://api.openai.com/v1',
+    model: provider.model?.trim() || 'gpt-5.4-mini',
+    api_key: '',
+    api_key_configured: Boolean(provider.api_key_configured || provider.api_key),
+    timeout_ms: Math.max(100, Math.min(30000, provider.timeout_ms || 2500)),
+    max_concurrency: Math.max(1, Math.min(100, provider.max_concurrency || 4)),
+  }
+}
+
+function semanticReviewProvidersFromSettings(settings?: SystemSettings | null): SemanticReviewProvider[] {
+  if (Array.isArray(settings?.prompt_filter_semantic_review_providers)) {
+    return settings.prompt_filter_semantic_review_providers.map(normalizeSemanticReviewProvider)
+  }
+  return [{
+    id: 'legacy',
+    name: 'Legacy',
+    enabled: true,
+    base_url: settings?.prompt_filter_semantic_review_base_url || 'https://api.openai.com/v1',
+    model: settings?.prompt_filter_semantic_review_model || 'gpt-5.4-mini',
+    api_key: '',
+    api_key_configured: Boolean(settings?.prompt_filter_semantic_review_api_key_configured),
+    timeout_ms: settings?.prompt_filter_semantic_review_timeout_ms || 2500,
+    max_concurrency: settings?.prompt_filter_semantic_review_max_concurrency || 4,
+  }]
 }
 
 const defaultForm: PromptFilterForm = {
@@ -124,6 +171,18 @@ const defaultForm: PromptFilterForm = {
   prompt_filter_semantic_review_model: 'gpt-5.4-mini',
   prompt_filter_semantic_review_timeout_ms: 2500,
   prompt_filter_semantic_review_max_concurrency: 4,
+  prompt_filter_semantic_review_strategy: 'round_robin',
+  prompt_filter_semantic_review_providers: [{
+    id: 'legacy',
+    name: 'Legacy',
+    enabled: true,
+    base_url: 'https://api.openai.com/v1',
+    model: 'gpt-5.4-mini',
+    api_key: '',
+    api_key_configured: false,
+    timeout_ms: 2500,
+    max_concurrency: 4,
+  }],
   prompt_filter_semantic_review_failure_policy: 'block',
   prompt_filter_semantic_review_log_retention_days: 0,
 }
@@ -197,6 +256,8 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_semantic_review_model: settings?.prompt_filter_semantic_review_model || 'gpt-5.4-mini',
   prompt_filter_semantic_review_timeout_ms: settings?.prompt_filter_semantic_review_timeout_ms || 2500,
   prompt_filter_semantic_review_max_concurrency: settings?.prompt_filter_semantic_review_max_concurrency || 4,
+  prompt_filter_semantic_review_strategy: settings?.prompt_filter_semantic_review_strategy || 'round_robin',
+  prompt_filter_semantic_review_providers: semanticReviewProvidersFromSettings(settings),
   prompt_filter_semantic_review_failure_policy: settings?.prompt_filter_semantic_review_failure_policy || 'block',
   prompt_filter_semantic_review_log_retention_days: settings?.prompt_filter_semantic_review_log_retention_days ?? 0,
 })
@@ -227,6 +288,23 @@ function promptFilterSavePayload(form: PromptFilterForm): Partial<SystemSettings
   if (!payload.prompt_filter_semantic_review_api_key?.trim()) {
     delete payload.prompt_filter_semantic_review_api_key
   }
+  payload.prompt_filter_semantic_review_strategy = payload.prompt_filter_semantic_review_strategy || 'round_robin'
+  payload.prompt_filter_semantic_review_providers = (payload.prompt_filter_semantic_review_providers || []).map((provider) => {
+    const apiKey = provider.api_key?.trim()
+    const normalized: SemanticReviewProvider = {
+      id: provider.id.trim(),
+      name: provider.name.trim(),
+      enabled: provider.enabled,
+      api_key_configured: Boolean(provider.api_key_configured || apiKey),
+      base_url: provider.base_url.trim(),
+      model: provider.model.trim(),
+      timeout_ms: Math.max(100, Math.min(30000, provider.timeout_ms || 2500)),
+      max_concurrency: Math.max(1, Math.min(100, provider.max_concurrency || 4)),
+    }
+    if (apiKey) normalized.api_key = apiKey
+    else delete normalized.api_key
+    return normalized
+  })
   return payload
 }
 
@@ -522,6 +600,7 @@ function OverviewView({
 }) {
   const { t } = useTranslation()
   const [semanticTesting, setSemanticTesting] = useState(false)
+  const [semanticTestProviderID, setSemanticTestProviderID] = useState<string | null>(null)
   const [semanticTestResult, setSemanticTestResult] = useState<SemanticReviewConnectionTestResponse | null>(null)
   const [semanticTestError, setSemanticTestError] = useState<string | null>(null)
   const stats = useMemo(() => ({
@@ -530,11 +609,47 @@ function OverviewView({
     latest: recentLogs[0]?.created_at,
   }), [recentLogs])
 
-  const runSemanticReviewTest = async () => {
+  const semanticProviders = form.prompt_filter_semantic_review_providers || []
+
+  const updateSemanticProvider = (providerID: string, patch: Partial<SemanticReviewProvider>) => {
+    setForm((current) => ({
+      ...current,
+      prompt_filter_semantic_review_providers: (current.prompt_filter_semantic_review_providers || []).map((provider) => (
+        provider.id === providerID ? { ...provider, ...patch } : provider
+      )),
+    }))
+  }
+
+  const addSemanticProvider = () => {
+    setForm((current) => ({
+      ...current,
+      prompt_filter_semantic_review_providers: [
+        ...(current.prompt_filter_semantic_review_providers || []),
+        createSemanticReviewProvider((current.prompt_filter_semantic_review_providers || []).length),
+      ],
+    }))
+  }
+
+  const removeSemanticProvider = (providerID: string) => {
+    setForm((current) => ({
+      ...current,
+      prompt_filter_semantic_review_providers: (current.prompt_filter_semantic_review_providers || []).filter((provider) => provider.id !== providerID),
+    }))
+    if (semanticTestProviderID === providerID) {
+      setSemanticTestProviderID(null)
+      setSemanticTestResult(null)
+      setSemanticTestError(null)
+    }
+  }
+
+  const runSemanticReviewTest = async (provider: SemanticReviewProvider) => {
     setSemanticTesting(true)
+    setSemanticTestProviderID(provider.id)
     setSemanticTestError(null)
     try {
       const result = await api.testSemanticReviewConnection({
+        provider_id: provider.id,
+        provider,
         endpoint: testEndpoint,
         request_model: testModel,
       })
@@ -663,9 +778,15 @@ function OverviewView({
             </div>
 
             <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
-              <div>
-                <SectionTitle title={t('promptFilter.semanticReviewTitle')} />
-                <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.semanticReviewDesc')}</p>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <SectionTitle title={t('promptFilter.semanticReviewTitle')} />
+                  <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.semanticReviewDesc')}</p>
+                </div>
+                <Button type="button" variant="outline" onClick={addSemanticProvider}>
+                  <Plus className="size-3.5" />
+                  {t('promptFilter.semanticReviewAddProvider')}
+                </Button>
               </div>
               <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
                 <Field label={t('promptFilter.semanticReviewEnabled')}>
@@ -675,22 +796,14 @@ function OverviewView({
                     options={booleanOptions}
                   />
                 </Field>
-                <Field label={t('promptFilter.semanticReviewTimeout')}>
-                  <Input
-                    type="number"
-                    min={100}
-                    max={30000}
-                    value={form.prompt_filter_semantic_review_timeout_ms}
-                    onChange={(event) => setForm((current) => ({ ...current, prompt_filter_semantic_review_timeout_ms: parseInt(event.target.value, 10) || 2500 }))}
-                  />
-                </Field>
-                <Field label={t('promptFilter.semanticReviewMaxConcurrency')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={form.prompt_filter_semantic_review_max_concurrency}
-                    onChange={(event) => setForm((current) => ({ ...current, prompt_filter_semantic_review_max_concurrency: parseInt(event.target.value, 10) || 4 }))}
+                <Field label={t('promptFilter.semanticReviewStrategy')}>
+                  <Select
+                    value={form.prompt_filter_semantic_review_strategy || 'round_robin'}
+                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_semantic_review_strategy: value as SemanticReviewStrategy }))}
+                    options={[
+                      { label: t('promptFilter.semanticReviewStrategyRoundRobin'), value: 'round_robin' },
+                      { label: t('promptFilter.semanticReviewStrategyRandom'), value: 'random' },
+                    ]}
                   />
                 </Field>
                 <Field label={t('promptFilter.semanticReviewFailurePolicy')}>
@@ -711,66 +824,119 @@ function OverviewView({
                   <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.semanticReviewLogRetentionHint')}</span>
                 </Field>
               </div>
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(180px,0.8fr)]">
-                <Field label={t('promptFilter.semanticReviewBaseUrl')}>
-                  <Input
-                    value={form.prompt_filter_semantic_review_base_url}
-                    placeholder="https://api.openai.com/v1"
-                    onChange={(event) => setForm((current) => ({ ...current, prompt_filter_semantic_review_base_url: event.target.value }))}
-                  />
-                </Field>
-                <Field label={t('promptFilter.semanticReviewModel')}>
-                  <Input
-                    value={form.prompt_filter_semantic_review_model}
-                    placeholder="gpt-5.4-mini"
-                    onChange={(event) => setForm((current) => ({ ...current, prompt_filter_semantic_review_model: event.target.value }))}
-                  />
-                </Field>
-              </div>
-              <Field label={t('promptFilter.semanticReviewApiKey')}>
-                <Input
-                  className="font-mono"
-                  value={form.prompt_filter_semantic_review_api_key ?? ''}
-                  placeholder={
-                    form.prompt_filter_semantic_review_api_key_configured
-                      ? t('promptFilter.semanticReviewApiKeyConfigured', { n: form.prompt_filter_semantic_review_api_key_count })
-                      : t('promptFilter.semanticReviewApiKeyPlaceholder')
-                  }
-                  onChange={(event) => setForm((current) => ({ ...current, prompt_filter_semantic_review_api_key: event.target.value }))}
-                />
-                <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.semanticReviewApiKeyHint')}</span>
-              </Field>
-              <div className="rounded-lg border border-border bg-background/60 p-3">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold text-foreground">{t('promptFilter.semanticReviewConnectivity')}</div>
-                    <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.semanticReviewConnectivityDesc')}</p>
-                  </div>
-                  <Button type="button" variant="outline" onClick={() => void runSemanticReviewTest()} disabled={semanticTesting}>
-                    <RefreshCw className={cn('size-3.5', semanticTesting && 'animate-spin')} />
-                    {semanticTesting ? t('promptFilter.semanticReviewTesting') : t('promptFilter.semanticReviewTest')}
-                  </Button>
+              {semanticProviders.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-border bg-background/40 p-6 text-center text-sm text-muted-foreground">
+                  {t('promptFilter.semanticReviewNoProviders')}
                 </div>
-                {semanticTestResult || semanticTestError ? (
-                  <div className={cn(
-                    'mt-3 rounded-md border p-3 text-xs leading-5',
-                    semanticTestResult?.ok
-                      ? 'border-emerald-500/20 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300'
-                      : 'border-destructive/20 bg-destructive/8 text-destructive'
-                  )}>
-                    {semanticTestResult ? (
-                      <div className="grid gap-1 sm:grid-cols-2">
-                        <span>{t('promptFilter.semanticReviewTestStatus')}: {semanticTestResult.ok ? t('common.success') : t('promptFilter.semanticReviewTestFailed')}</span>
-                        <span>{t('promptFilter.semanticReviewTestLatency')}: {semanticTestResult.latency_ms || 0} ms</span>
-                        <span>{t('promptFilter.semanticReviewTestModel')}: {semanticTestResult.response_model || semanticTestResult.model || '-'}</span>
-                        <span>{t('promptFilter.semanticReviewTestDecision')}: {semanticTestResult.block ? 'block' : 'allow'} / {Math.round((semanticTestResult.confidence || 0) * 100)}%</span>
-                        <span className="sm:col-span-2">{t('promptFilter.semanticReviewTestReason')}: {semanticTestResult.error || semanticTestResult.reason || '-'}</span>
+              ) : null}
+              <div className="space-y-4">
+                {semanticProviders.map((provider, index) => {
+                  const showingTest = semanticTestProviderID === provider.id
+                  return (
+                    <div key={provider.id} className="space-y-4 rounded-lg border border-border bg-background/60 p-4">
+                      <div className="flex flex-wrap items-end gap-3">
+                        <div className="min-w-[220px] flex-1">
+                          <Field label={t('promptFilter.semanticReviewProviderName')}>
+                            <Input
+                              value={provider.name}
+                              placeholder={t('promptFilter.semanticReviewProviderNamePlaceholder', { n: index + 1 })}
+                              onChange={(event) => updateSemanticProvider(provider.id, { name: event.target.value })}
+                            />
+                          </Field>
+                        </div>
+                        <div className="w-full sm:w-44">
+                          <Field label={t('promptFilter.semanticReviewProviderStatus')}>
+                            <Select
+                              value={provider.enabled ? 'true' : 'false'}
+                              onValueChange={(value) => updateSemanticProvider(provider.id, { enabled: value === 'true' })}
+                              options={booleanOptions}
+                            />
+                          </Field>
+                        </div>
+                        <Button type="button" variant="outline" onClick={() => removeSemanticProvider(provider.id)} aria-label={t('promptFilter.semanticReviewDeleteProvider')}>
+                          <Trash2 className="size-3.5" />
+                          {t('promptFilter.semanticReviewDeleteProvider')}
+                        </Button>
                       </div>
-                    ) : (
-                      <span>{semanticTestError}</span>
-                    )}
-                  </div>
-                ) : null}
+                      <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(180px,0.8fr)]">
+                        <Field label={t('promptFilter.semanticReviewBaseUrl')}>
+                          <Input
+                            value={provider.base_url}
+                            placeholder="https://api.openai.com/v1"
+                            onChange={(event) => updateSemanticProvider(provider.id, { base_url: event.target.value })}
+                          />
+                        </Field>
+                        <Field label={t('promptFilter.semanticReviewModel')}>
+                          <Input
+                            value={provider.model}
+                            placeholder="gpt-5.4-mini"
+                            onChange={(event) => updateSemanticProvider(provider.id, { model: event.target.value })}
+                          />
+                        </Field>
+                      </div>
+                      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_180px_180px]">
+                        <Field label={t('promptFilter.semanticReviewApiKey')}>
+                          <Input
+                            className="font-mono"
+                            type="password"
+                            autoComplete="new-password"
+                            value={provider.api_key || ''}
+                            placeholder={provider.api_key_configured ? t('promptFilter.semanticReviewApiKeyKeep') : t('promptFilter.semanticReviewApiKeyPlaceholder')}
+                            onChange={(event) => updateSemanticProvider(provider.id, { api_key: event.target.value })}
+                          />
+                          <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.semanticReviewProviderApiKeyHint')}</span>
+                        </Field>
+                        <Field label={t('promptFilter.semanticReviewTimeout')}>
+                          <Input
+                            type="number"
+                            min={100}
+                            max={30000}
+                            value={provider.timeout_ms}
+                            onChange={(event) => updateSemanticProvider(provider.id, { timeout_ms: parseInt(event.target.value, 10) || 2500 })}
+                          />
+                        </Field>
+                        <Field label={t('promptFilter.semanticReviewMaxConcurrency')}>
+                          <Input
+                            type="number"
+                            min={1}
+                            max={100}
+                            value={provider.max_concurrency}
+                            onChange={(event) => updateSemanticProvider(provider.id, { max_concurrency: parseInt(event.target.value, 10) || 4 })}
+                          />
+                        </Field>
+                      </div>
+                      <div className="rounded-lg border border-border bg-muted/20 p-3">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <p className="text-xs leading-5 text-muted-foreground">{t('promptFilter.semanticReviewConnectivityDesc')}</p>
+                          <Button type="button" variant="outline" onClick={() => void runSemanticReviewTest(provider)} disabled={semanticTesting}>
+                            <RefreshCw className={cn('size-3.5', semanticTesting && showingTest && 'animate-spin')} />
+                            {semanticTesting && showingTest ? t('promptFilter.semanticReviewTesting') : t('promptFilter.semanticReviewTest')}
+                          </Button>
+                        </div>
+                        {showingTest && (semanticTestResult || semanticTestError) ? (
+                          <div className={cn(
+                            'mt-3 rounded-md border p-3 text-xs leading-5',
+                            semanticTestResult?.ok
+                              ? 'border-emerald-500/20 bg-emerald-500/8 text-emerald-700 dark:text-emerald-300'
+                              : 'border-destructive/20 bg-destructive/8 text-destructive'
+                          )}>
+                            {semanticTestResult ? (
+                              <div className="grid gap-1 sm:grid-cols-2">
+                                <span>{t('promptFilter.semanticReviewTestStatus')}: {semanticTestResult.ok ? t('common.success') : t('promptFilter.semanticReviewTestFailed')}</span>
+                                <span>{t('promptFilter.semanticReviewTestLatency')}: {semanticTestResult.latency_ms || 0} ms</span>
+                                <span>{t('promptFilter.semanticReviewTestModel')}: {semanticTestResult.response_model || semanticTestResult.model || '-'}</span>
+                                <span>{t('promptFilter.semanticReviewTestDecision')}: {semanticTestResult.block ? 'block' : 'allow'} / {Math.round((semanticTestResult.confidence || 0) * 100)}%</span>
+                                <span className="sm:col-span-2">{t('promptFilter.semanticReviewTestReason')}: {semanticTestResult.error || semanticTestResult.reason || '-'}</span>
+                              </div>
+                            ) : (
+                              <span>{semanticTestError}</span>
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
             </div>
             <Button onClick={onSave} disabled={saving}>

@@ -6043,6 +6043,8 @@ type settingsResponse struct {
 	PromptFilterSemanticReviewMaxConcurrency   int     `json:"prompt_filter_semantic_review_max_concurrency"`
 	PromptFilterSemanticReviewFailurePolicy    string  `json:"prompt_filter_semantic_review_failure_policy"`
 	PromptFilterSemanticReviewLogRetentionDays int     `json:"prompt_filter_semantic_review_log_retention_days"`
+	PromptFilterSemanticReviewStrategy         string  `json:"prompt_filter_semantic_review_strategy"`
+	PromptFilterSemanticReviewProviders        []proxy.SemanticReviewProvider `json:"prompt_filter_semantic_review_providers"`
 	ClientCompatMode                           string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                         string  `json:"codex_min_cli_version"`
 	CodexUserAgentConfig                       string  `json:"codex_user_agent_config"`
@@ -6150,6 +6152,8 @@ type updateSettingsReq struct {
 	PromptFilterSemanticReviewMaxConcurrency   *int     `json:"prompt_filter_semantic_review_max_concurrency"`
 	PromptFilterSemanticReviewFailurePolicy    *string  `json:"prompt_filter_semantic_review_failure_policy"`
 	PromptFilterSemanticReviewLogRetentionDays *int     `json:"prompt_filter_semantic_review_log_retention_days"`
+	PromptFilterSemanticReviewStrategy         *string  `json:"prompt_filter_semantic_review_strategy"`
+	PromptFilterSemanticReviewProviders        *[]proxy.SemanticReviewProvider `json:"prompt_filter_semantic_review_providers"`
 	ClientCompatMode                           *string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                         *string  `json:"codex_min_cli_version"`
 	CodexUserAgentConfig                       *string  `json:"codex_user_agent_config"`
@@ -6192,6 +6196,9 @@ type promptFilterSemanticReviewResolved struct {
 	MaxConcurrency   int
 	FailurePolicy    string
 	LogRetentionDays int
+	Strategy         string
+	Providers        []proxy.SemanticReviewProvider
+	ProviderPoolConfigured bool
 }
 
 func adminEnvBool(name string, fallback bool) bool {
@@ -6231,6 +6238,128 @@ func clampAdminInt(value, min, max int) int {
 	return value
 }
 
+const (
+	semanticReviewLegacyProviderID = "legacy"
+	semanticReviewProviderLimit    = 32
+)
+
+func semanticReviewProviderID() string {
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err == nil {
+		return "provider-" + hex.EncodeToString(raw[:])
+	}
+	return fmt.Sprintf("provider-%d", time.Now().UnixNano())
+}
+
+func validateAdminSemanticReviewProvider(provider proxy.SemanticReviewProvider, fallbackTimeoutMS, fallbackMaxConcurrency int) (proxy.SemanticReviewProvider, error) {
+	provider.ID = strings.TrimSpace(provider.ID)
+	if provider.ID == "" {
+		provider.ID = semanticReviewProviderID()
+	}
+	provider.Name = strings.TrimSpace(provider.Name)
+	if provider.Name == "" {
+		provider.Name = provider.ID
+	}
+	provider.BaseURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+	provider.Model = strings.TrimSpace(provider.Model)
+	provider.APIKey = strings.TrimSpace(provider.APIKey)
+	if provider.TimeoutMS <= 0 {
+		provider.TimeoutMS = fallbackTimeoutMS
+	}
+	provider.TimeoutMS = clampAdminInt(provider.TimeoutMS, 100, 30000)
+	if provider.MaxConcurrency <= 0 {
+		provider.MaxConcurrency = fallbackMaxConcurrency
+	}
+	provider.MaxConcurrency = clampAdminInt(provider.MaxConcurrency, 1, 100)
+	provider.APIKeyConfigured = provider.APIKey != ""
+
+	if provider.BaseURL != "" {
+		parsed, err := url.Parse(provider.BaseURL)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return provider, fmt.Errorf("semantic review provider %q base_url must be a valid http(s) URL", provider.ID)
+		}
+	}
+	if provider.Enabled {
+		if provider.BaseURL == "" {
+			return provider, fmt.Errorf("semantic review provider %q base_url is required", provider.ID)
+		}
+		if provider.Model == "" {
+			return provider, fmt.Errorf("semantic review provider %q model is required", provider.ID)
+		}
+		if provider.APIKey == "" {
+			return provider, fmt.Errorf("semantic review provider %q api_key is required", provider.ID)
+		}
+	}
+	return provider, nil
+}
+
+func mergeAdminSemanticReviewProviders(existing, incoming []proxy.SemanticReviewProvider, fallbackTimeoutMS, fallbackMaxConcurrency int) ([]proxy.SemanticReviewProvider, error) {
+	if len(incoming) > semanticReviewProviderLimit {
+		return nil, fmt.Errorf("semantic review provider count cannot exceed %d", semanticReviewProviderLimit)
+	}
+	existingByID := make(map[string]proxy.SemanticReviewProvider, len(existing))
+	for _, provider := range existing {
+		if id := strings.TrimSpace(provider.ID); id != "" {
+			existingByID[id] = provider
+		}
+	}
+	providers := make([]proxy.SemanticReviewProvider, 0, len(incoming))
+	seen := make(map[string]struct{}, len(incoming))
+	for _, provider := range incoming {
+		provider.ID = strings.TrimSpace(provider.ID)
+		if provider.ID == "" {
+			provider.ID = semanticReviewProviderID()
+		}
+		old, hadOld := existingByID[provider.ID]
+		if strings.TrimSpace(provider.APIKey) == "" && hadOld {
+			provider.APIKey = old.APIKey
+		}
+		if provider.ID == semanticReviewLegacyProviderID && !hadOld && strings.TrimSpace(provider.APIKey) == "" && provider.APIKeyConfigured {
+			continue
+		}
+		var err error
+		provider, err = validateAdminSemanticReviewProvider(provider, fallbackTimeoutMS, fallbackMaxConcurrency)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[provider.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate semantic review provider id %q", provider.ID)
+		}
+		seen[provider.ID] = struct{}{}
+		providers = append(providers, provider)
+	}
+	return providers, nil
+}
+
+func firstEffectiveSemanticReviewProvider(providers []proxy.SemanticReviewProvider) (proxy.SemanticReviewProvider, bool) {
+	for _, provider := range providers {
+		if provider.Enabled && strings.TrimSpace(provider.APIKey) != "" && strings.TrimSpace(provider.BaseURL) != "" && strings.TrimSpace(provider.Model) != "" {
+			return provider, true
+		}
+	}
+	return proxy.SemanticReviewProvider{}, false
+}
+
+func semanticReviewProviderResponses(providers []proxy.SemanticReviewProvider) []proxy.SemanticReviewProvider {
+	responses := make([]proxy.SemanticReviewProvider, 0, len(providers))
+	for _, provider := range providers {
+		provider.APIKeyConfigured = strings.TrimSpace(provider.APIKey) != ""
+		provider.APIKey = ""
+		responses = append(responses, provider)
+	}
+	return responses
+}
+
+func semanticReviewProviderKeyCount(providers []proxy.SemanticReviewProvider) int {
+	count := 0
+	for _, provider := range providers {
+		if strings.TrimSpace(provider.APIKey) != "" {
+			count++
+		}
+	}
+	return count
+}
+
 func resolvePromptFilterSemanticReview(settings *database.SystemSettings) promptFilterSemanticReviewResolved {
 	resolved := promptFilterSemanticReviewResolved{
 		Enabled:        adminEnvBool("CODEX_SEMANTIC_REVIEW_DISAGREEMENT_ENABLED", true),
@@ -6240,6 +6369,7 @@ func resolvePromptFilterSemanticReview(settings *database.SystemSettings) prompt
 		TimeoutMS:      adminEnvInt("CODEX_SEMANTIC_REVIEW_TIMEOUT_MS", 2500, 100, 30000),
 		MaxConcurrency: adminEnvInt("CODEX_SEMANTIC_REVIEW_MAX_CONCURRENCY", 4, 1, 100),
 		FailurePolicy:  proxy.NormalizeSemanticReviewFailurePolicy(os.Getenv("CODEX_SEMANTIC_REVIEW_FAILURE_POLICY")),
+		Strategy:       proxy.NormalizeSemanticReviewSelectionStrategy(""),
 	}
 	if resolved.BaseURL == "" {
 		resolved.BaseURL = "https://api.openai.com/v1"
@@ -6247,27 +6377,75 @@ func resolvePromptFilterSemanticReview(settings *database.SystemSettings) prompt
 	if resolved.Model == "" {
 		resolved.Model = "gpt-5.4-mini"
 	}
-	if settings == nil {
-		return resolved
+	if rawPool := strings.TrimSpace(os.Getenv("CODEX_SEMANTIC_REVIEW_PROVIDER_POOL")); settings == nil && rawPool != "" {
+		pool, err := proxy.ParseSemanticReviewProviderPool(rawPool)
+		if err != nil {
+			log.Printf("semantic review environment provider pool parse failed: %v", err)
+		} else {
+			pool = proxy.NormalizeSemanticReviewProviderPool(pool)
+			resolved.ProviderPoolConfigured = true
+			resolved.Strategy = pool.Strategy
+			resolved.Providers = pool.Providers
+			if provider, ok := firstEffectiveSemanticReviewProvider(pool.Providers); ok {
+				resolved.APIKey = provider.APIKey
+				resolved.BaseURL = provider.BaseURL
+				resolved.Model = provider.Model
+				resolved.TimeoutMS = provider.TimeoutMS
+				resolved.MaxConcurrency = provider.MaxConcurrency
+			}
+		}
 	}
-	resolved.Enabled = settings.PromptFilterSemanticReviewEnabled
-	if key := strings.TrimSpace(settings.PromptFilterSemanticReviewAPIKey); key != "" {
-		resolved.APIKey = key
+	if settings != nil {
+		// Database-backed settings are authoritative over the environment pool.
+		// When the DB pool column is empty, synthesize the legacy provider from
+		// the resolved flat DB/env values below.
+		resolved.ProviderPoolConfigured = false
+		resolved.Providers = nil
+		resolved.Strategy = proxy.NormalizeSemanticReviewSelectionStrategy("")
+		resolved.Enabled = settings.PromptFilterSemanticReviewEnabled
+		if key := strings.TrimSpace(settings.PromptFilterSemanticReviewAPIKey); key != "" {
+			resolved.APIKey = key
+		}
+		if baseURL := strings.TrimRight(strings.TrimSpace(settings.PromptFilterSemanticReviewBaseURL), "/"); baseURL != "" {
+			resolved.BaseURL = baseURL
+		}
+		if model := strings.TrimSpace(settings.PromptFilterSemanticReviewModel); model != "" {
+			resolved.Model = model
+		}
+		if settings.PromptFilterSemanticReviewTimeoutMS > 0 {
+			resolved.TimeoutMS = clampAdminInt(settings.PromptFilterSemanticReviewTimeoutMS, 100, 30000)
+		}
+		if settings.PromptFilterSemanticReviewMaxConcurrency > 0 {
+			resolved.MaxConcurrency = clampAdminInt(settings.PromptFilterSemanticReviewMaxConcurrency, 1, 100)
+		}
+		resolved.FailurePolicy = proxy.NormalizeSemanticReviewFailurePolicy(settings.PromptFilterSemanticReviewFailurePolicy)
+		resolved.LogRetentionDays = clampAdminInt(settings.PromptFilterSemanticReviewLogRetentionDays, 0, 3650)
+		if rawPool := strings.TrimSpace(settings.PromptFilterSemanticReviewProviderPool); rawPool != "" {
+			pool, err := proxy.ParseSemanticReviewProviderPool(rawPool)
+			if err != nil {
+				log.Printf("semantic review provider pool parse failed: %v", err)
+			} else {
+				pool = proxy.NormalizeSemanticReviewProviderPool(pool)
+				resolved.ProviderPoolConfigured = true
+				resolved.Strategy = pool.Strategy
+				resolved.Providers = pool.Providers
+				if provider, ok := firstEffectiveSemanticReviewProvider(pool.Providers); ok {
+					resolved.APIKey = provider.APIKey
+					resolved.BaseURL = provider.BaseURL
+					resolved.Model = provider.Model
+					resolved.TimeoutMS = provider.TimeoutMS
+					resolved.MaxConcurrency = provider.MaxConcurrency
+				}
+			}
+		}
 	}
-	if baseURL := strings.TrimRight(strings.TrimSpace(settings.PromptFilterSemanticReviewBaseURL), "/"); baseURL != "" {
-		resolved.BaseURL = baseURL
+	if len(resolved.Providers) == 0 && !resolved.ProviderPoolConfigured {
+		resolved.Providers = []proxy.SemanticReviewProvider{{
+			ID: semanticReviewLegacyProviderID, Name: "Legacy provider", Enabled: true,
+			BaseURL: resolved.BaseURL, Model: resolved.Model, APIKey: resolved.APIKey,
+			APIKeyConfigured: resolved.APIKey != "", TimeoutMS: resolved.TimeoutMS, MaxConcurrency: resolved.MaxConcurrency,
+		}}
 	}
-	if model := strings.TrimSpace(settings.PromptFilterSemanticReviewModel); model != "" {
-		resolved.Model = model
-	}
-	if settings.PromptFilterSemanticReviewTimeoutMS > 0 {
-		resolved.TimeoutMS = clampAdminInt(settings.PromptFilterSemanticReviewTimeoutMS, 100, 30000)
-	}
-	if settings.PromptFilterSemanticReviewMaxConcurrency > 0 {
-		resolved.MaxConcurrency = clampAdminInt(settings.PromptFilterSemanticReviewMaxConcurrency, 1, 100)
-	}
-	resolved.FailurePolicy = proxy.NormalizeSemanticReviewFailurePolicy(settings.PromptFilterSemanticReviewFailurePolicy)
-	resolved.LogRetentionDays = clampAdminInt(settings.PromptFilterSemanticReviewLogRetentionDays, 0, 3650)
 	return resolved
 }
 
@@ -6844,19 +7022,16 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterReviewTimeoutSeconds:           promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:               promptFilterCfg.Review.FailClosed,
 		PromptFilterSemanticReviewEnabled:          semanticReviewCfg.Enabled,
-		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewCfg.APIKey != "",
-		PromptFilterSemanticReviewAPIKeyCount: func() int {
-			if semanticReviewCfg.APIKey == "" {
-				return 0
-			}
-			return 1
-		}(),
+		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewProviderKeyCount(semanticReviewCfg.Providers) > 0,
+		PromptFilterSemanticReviewAPIKeyCount:      semanticReviewProviderKeyCount(semanticReviewCfg.Providers),
 		PromptFilterSemanticReviewBaseURL:          semanticReviewCfg.BaseURL,
 		PromptFilterSemanticReviewModel:            semanticReviewCfg.Model,
 		PromptFilterSemanticReviewTimeoutMS:        semanticReviewCfg.TimeoutMS,
 		PromptFilterSemanticReviewMaxConcurrency:   semanticReviewCfg.MaxConcurrency,
 		PromptFilterSemanticReviewFailurePolicy:    semanticReviewCfg.FailurePolicy,
 		PromptFilterSemanticReviewLogRetentionDays: semanticReviewCfg.LogRetentionDays,
+		PromptFilterSemanticReviewStrategy:         semanticReviewCfg.Strategy,
+		PromptFilterSemanticReviewProviders:        semanticReviewProviderResponses(semanticReviewCfg.Providers),
 		ClientCompatMode:                           runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                         runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                       runtimeCfg.CodexUserAgentConfig,
@@ -7450,6 +7625,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	semanticReviewMaxConcurrency := 0
 	semanticReviewFailurePolicy := proxy.SemanticReviewFailurePolicyBlock
 	semanticReviewLogRetentionDays := 0
+	semanticReviewProviderPoolRaw := ""
 	if existingSettings != nil {
 		semanticReviewEnabled = existingSettings.PromptFilterSemanticReviewEnabled
 		semanticReviewAPIKey = existingSettings.PromptFilterSemanticReviewAPIKey
@@ -7459,6 +7635,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		semanticReviewMaxConcurrency = existingSettings.PromptFilterSemanticReviewMaxConcurrency
 		semanticReviewFailurePolicy = proxy.NormalizeSemanticReviewFailurePolicy(existingSettings.PromptFilterSemanticReviewFailurePolicy)
 		semanticReviewLogRetentionDays = clampAdminInt(existingSettings.PromptFilterSemanticReviewLogRetentionDays, 0, 3650)
+		semanticReviewProviderPoolRaw = strings.TrimSpace(existingSettings.PromptFilterSemanticReviewProviderPool)
 	}
 	if req.PromptFilterSemanticReviewEnabled != nil {
 		semanticReviewEnabled = *req.PromptFilterSemanticReviewEnabled
@@ -7485,6 +7662,105 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	if req.PromptFilterSemanticReviewLogRetentionDays != nil {
 		semanticReviewLogRetentionDays = clampAdminInt(*req.PromptFilterSemanticReviewLogRetentionDays, 0, 3650)
+	}
+	pool := proxy.SemanticReviewProviderPool{Strategy: proxy.NormalizeSemanticReviewSelectionStrategy("")}
+	poolParseOK := true
+	if semanticReviewProviderPoolRaw != "" {
+		parsed, err := proxy.ParseSemanticReviewProviderPool(semanticReviewProviderPoolRaw)
+		if err != nil {
+			poolParseOK = false
+			log.Printf("semantic review provider pool parse failed during settings update: %v", err)
+		} else {
+			pool = proxy.NormalizeSemanticReviewProviderPool(parsed)
+		}
+	}
+	poolFieldsChanged := req.PromptFilterSemanticReviewStrategy != nil || req.PromptFilterSemanticReviewProviders != nil
+	legacyProviderFieldsChanged := req.PromptFilterSemanticReviewAPIKey != nil || req.PromptFilterSemanticReviewBaseURL != nil || req.PromptFilterSemanticReviewModel != nil || req.PromptFilterSemanticReviewTimeoutMS != nil || req.PromptFilterSemanticReviewMaxConcurrency != nil
+	if poolFieldsChanged {
+		if !poolParseOK {
+			pool = proxy.SemanticReviewProviderPool{Strategy: proxy.NormalizeSemanticReviewSelectionStrategy("")}
+		}
+		if req.PromptFilterSemanticReviewStrategy != nil {
+			rawStrategy := strings.ToLower(strings.TrimSpace(*req.PromptFilterSemanticReviewStrategy))
+			if rawStrategy != "" && rawStrategy != "round_robin" && rawStrategy != "random" {
+				writeError(c, http.StatusBadRequest, "语义复核服务商调度策略无效")
+				return
+			}
+			pool.Strategy = proxy.NormalizeSemanticReviewSelectionStrategy(rawStrategy)
+		}
+		if req.PromptFilterSemanticReviewProviders != nil {
+			existingProviders := pool.Providers
+			if len(existingProviders) == 0 && existingSettings != nil && strings.TrimSpace(existingSettings.PromptFilterSemanticReviewAPIKey) != "" {
+				existingProviders = []proxy.SemanticReviewProvider{{
+					ID: semanticReviewLegacyProviderID, Name: "Legacy provider", Enabled: true,
+					BaseURL: strings.TrimRight(strings.TrimSpace(existingSettings.PromptFilterSemanticReviewBaseURL), "/"), Model: strings.TrimSpace(existingSettings.PromptFilterSemanticReviewModel), APIKey: strings.TrimSpace(existingSettings.PromptFilterSemanticReviewAPIKey),
+					TimeoutMS: existingSettings.PromptFilterSemanticReviewTimeoutMS, MaxConcurrency: existingSettings.PromptFilterSemanticReviewMaxConcurrency,
+				}}
+			}
+			fallback := resolvePromptFilterSemanticReview(existingSettings)
+			providers, err := mergeAdminSemanticReviewProviders(existingProviders, *req.PromptFilterSemanticReviewProviders, fallback.TimeoutMS, fallback.MaxConcurrency)
+			if err != nil {
+				writeError(c, http.StatusBadRequest, "语义复核服务商配置无效: "+err.Error())
+				return
+			}
+			pool.Providers = providers
+		}
+	} else if poolParseOK && legacyProviderFieldsChanged && len(pool.Providers) > 0 {
+		providerIndex := -1
+		for i, provider := range pool.Providers {
+			if provider.Enabled {
+				providerIndex = i
+				break
+			}
+		}
+		if providerIndex < 0 {
+			providerIndex = 0
+		}
+		provider := pool.Providers[providerIndex]
+		if req.PromptFilterSemanticReviewAPIKey != nil && strings.TrimSpace(*req.PromptFilterSemanticReviewAPIKey) != "" {
+			provider.APIKey = strings.TrimSpace(*req.PromptFilterSemanticReviewAPIKey)
+		}
+		if req.PromptFilterSemanticReviewBaseURL != nil && strings.TrimSpace(*req.PromptFilterSemanticReviewBaseURL) != "" {
+			provider.BaseURL = strings.TrimRight(strings.TrimSpace(*req.PromptFilterSemanticReviewBaseURL), "/")
+		}
+		if req.PromptFilterSemanticReviewModel != nil && strings.TrimSpace(*req.PromptFilterSemanticReviewModel) != "" {
+			provider.Model = strings.TrimSpace(*req.PromptFilterSemanticReviewModel)
+		}
+		if req.PromptFilterSemanticReviewTimeoutMS != nil {
+			provider.TimeoutMS = semanticReviewTimeoutMS
+		}
+		if req.PromptFilterSemanticReviewMaxConcurrency != nil {
+			provider.MaxConcurrency = semanticReviewMaxConcurrency
+		}
+		var err error
+		provider, err = validateAdminSemanticReviewProvider(provider, semanticReviewTimeoutMS, semanticReviewMaxConcurrency)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "语义复核服务商配置无效: "+err.Error())
+			return
+		}
+		pool.Providers[providerIndex] = provider
+		poolFieldsChanged = true
+	}
+	if poolFieldsChanged {
+		pool = proxy.NormalizeSemanticReviewProviderPool(pool)
+		encoded, err := proxy.MarshalSemanticReviewProviderPool(pool)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "语义复核服务商配置无效: "+err.Error())
+			return
+		}
+		semanticReviewProviderPoolRaw = encoded
+		if provider, ok := firstEffectiveSemanticReviewProvider(pool.Providers); ok {
+			semanticReviewAPIKey = provider.APIKey
+			semanticReviewBaseURL = provider.BaseURL
+			semanticReviewModel = provider.Model
+			semanticReviewTimeoutMS = provider.TimeoutMS
+			semanticReviewMaxConcurrency = provider.MaxConcurrency
+		} else if len(pool.Providers) == 0 {
+			// Deleting the final provider is an explicit credential deletion, not
+			// merely a routing change. Clear the legacy key as well so older builds
+			// and rollback paths cannot silently reactivate the removed provider.
+			semanticReviewAPIKey = ""
+		}
 	}
 
 	promptFilterCfg := h.store.GetPromptFilterConfig()
@@ -7734,6 +8010,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterSemanticReviewMaxConcurrency:   semanticReviewMaxConcurrency,
 		PromptFilterSemanticReviewFailurePolicy:    semanticReviewFailurePolicy,
 		PromptFilterSemanticReviewLogRetentionDays: semanticReviewLogRetentionDays,
+		PromptFilterSemanticReviewProviderPool:     semanticReviewProviderPoolRaw,
 		ClientCompatMode:                           runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                         runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                       runtimeCfg.CodexUserAgentConfig,
@@ -7785,6 +8062,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterSemanticReviewMaxConcurrency:   semanticReviewMaxConcurrency,
 		PromptFilterSemanticReviewFailurePolicy:    semanticReviewFailurePolicy,
 		PromptFilterSemanticReviewLogRetentionDays: semanticReviewLogRetentionDays,
+		PromptFilterSemanticReviewProviderPool:     semanticReviewProviderPoolRaw,
 	})
 
 	c.JSON(http.StatusOK, settingsResponse{
@@ -7862,19 +8140,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterReviewTimeoutSeconds:           promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:               promptFilterCfg.Review.FailClosed,
 		PromptFilterSemanticReviewEnabled:          semanticReviewResponse.Enabled,
-		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewResponse.APIKey != "",
-		PromptFilterSemanticReviewAPIKeyCount: func() int {
-			if semanticReviewResponse.APIKey == "" {
-				return 0
-			}
-			return 1
-		}(),
+		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewProviderKeyCount(semanticReviewResponse.Providers) > 0,
+		PromptFilterSemanticReviewAPIKeyCount:      semanticReviewProviderKeyCount(semanticReviewResponse.Providers),
 		PromptFilterSemanticReviewBaseURL:          semanticReviewResponse.BaseURL,
 		PromptFilterSemanticReviewModel:            semanticReviewResponse.Model,
 		PromptFilterSemanticReviewTimeoutMS:        semanticReviewResponse.TimeoutMS,
 		PromptFilterSemanticReviewMaxConcurrency:   semanticReviewResponse.MaxConcurrency,
 		PromptFilterSemanticReviewFailurePolicy:    semanticReviewResponse.FailurePolicy,
 		PromptFilterSemanticReviewLogRetentionDays: semanticReviewResponse.LogRetentionDays,
+		PromptFilterSemanticReviewStrategy:         semanticReviewResponse.Strategy,
+		PromptFilterSemanticReviewProviders:        semanticReviewProviderResponses(semanticReviewResponse.Providers),
 		ClientCompatMode:                           runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                         runtimeCfg.CodexMinCLIVersion,
 		CodexUserAgentConfig:                       runtimeCfg.CodexUserAgentConfig,

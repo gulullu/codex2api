@@ -3,8 +3,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,7 +36,6 @@ const (
 
 var (
 	semanticReviewHTTPClient      = http.DefaultClient
-	semanticReviewInFlight        int64
 	semanticReviewCleanupLastUnix int64
 	semanticReviewCacheState      = &semanticReviewCache{
 		items: map[string]semanticReviewCacheEntry{},
@@ -46,32 +43,38 @@ var (
 )
 
 type semanticReviewConfig struct {
-	Enabled             bool
-	DisagreementEnabled bool
-	Mode                string
-	APIKey              string
-	BaseURL             string
-	Model               string
-	Timeout             time.Duration
-	MaxChars            int
-	CacheTTL            time.Duration
-	MaxConcurrency      int64
-	LogAllows           bool
-	FailOpen            bool
-	FailurePolicy       string
-	Endpoints           map[string]bool
+	Enabled                bool
+	DisagreementEnabled    bool
+	Mode                   string
+	APIKey                 string
+	BaseURL                string
+	Model                  string
+	Timeout                time.Duration
+	MaxChars               int
+	CacheTTL               time.Duration
+	MaxConcurrency         int64
+	LogAllows              bool
+	FailOpen               bool
+	FailurePolicy          string
+	Endpoints              map[string]bool
+	ProviderPool           SemanticReviewProviderPool
+	ProviderPoolConfigured bool
 }
 
 type semanticReviewResult struct {
-	Block      bool    `json:"block"`
-	Confidence float64 `json:"confidence"`
-	Category   string  `json:"category"`
-	Reason     string  `json:"reason"`
-	Model      string  `json:"-"`
-	Cached     bool    `json:"-"`
+	Block        bool    `json:"block"`
+	Confidence   float64 `json:"confidence"`
+	Category     string  `json:"category"`
+	Reason       string  `json:"reason"`
+	Model        string  `json:"-"`
+	Cached       bool    `json:"-"`
+	ProviderID   string  `json:"-"`
+	ProviderName string  `json:"-"`
 }
 
 type SemanticReviewConnectionTestConfig struct {
+	ProviderID   string
+	ProviderName string
 	APIKey       string
 	BaseURL      string
 	Model        string
@@ -95,6 +98,8 @@ type SemanticReviewConnectionTestResult struct {
 	Category      string  `json:"category"`
 	Reason        string  `json:"reason"`
 	Error         string  `json:"error,omitempty"`
+	ProviderID    string  `json:"provider_id"`
+	ProviderName  string  `json:"provider_name"`
 }
 
 type semanticReviewRequest struct {
@@ -154,6 +159,12 @@ func loadSemanticReviewConfig() semanticReviewConfig {
 	if cfg.Model == "" {
 		cfg.Model = semanticReviewDefaultModel
 	}
+	if raw := strings.TrimSpace(os.Getenv("CODEX_SEMANTIC_REVIEW_PROVIDER_POOL")); raw != "" {
+		if pool, err := ParseSemanticReviewProviderPool(raw); err == nil {
+			cfg.ProviderPool = pool
+			cfg.ProviderPoolConfigured = true
+		}
+	}
 	return cfg
 }
 
@@ -187,28 +198,32 @@ func TestSemanticReviewConnection(ctx context.Context, in SemanticReviewConnecti
 	if timeout <= 0 {
 		timeout = time.Duration(semanticReviewDefaultTimeoutMS) * time.Millisecond
 	}
-	cfg := semanticReviewConfig{
-		Enabled:        true,
-		APIKey:         strings.TrimSpace(in.APIKey),
-		BaseURL:        baseURL,
-		Model:          model,
-		Timeout:        timeout,
-		MaxChars:       semanticReviewDefaultMaxChars,
-		MaxConcurrency: 1,
-	}
+	provider := NormalizeSemanticReviewProviderPool(SemanticReviewProviderPool{Providers: []SemanticReviewProvider{{
+		ID:               strings.TrimSpace(in.ProviderID),
+		Name:             strings.TrimSpace(in.ProviderName),
+		Enabled:          true,
+		APIKey:           strings.TrimSpace(in.APIKey),
+		APIKeyConfigured: strings.TrimSpace(in.APIKey) != "",
+		BaseURL:          baseURL,
+		Model:            model,
+		TimeoutMS:        int(timeout / time.Millisecond),
+		MaxConcurrency:   1,
+	}}}).Providers[0]
 	result := SemanticReviewConnectionTestResult{
-		Configured:   cfg.APIKey != "" && cfg.BaseURL != "" && cfg.Model != "",
-		BaseURL:      cfg.BaseURL,
-		Model:        cfg.Model,
+		Configured:   semanticReviewProviderReady(provider),
+		BaseURL:      provider.BaseURL,
+		Model:        provider.Model,
 		Endpoint:     endpoint,
 		RequestModel: requestModel,
+		ProviderID:   provider.ID,
+		ProviderName: provider.Name,
 	}
 	if !result.Configured {
 		result.Error = "semantic review base_url, model, or api key is not configured"
 		return result
 	}
 	start := time.Now()
-	review, err := callSemanticReviewModel(ctx, cfg, endpoint, requestModel, text)
+	review, err := callSemanticReviewProvider(ctx, provider, endpoint, requestModel, text)
 	result.LatencyMS = time.Since(start).Milliseconds()
 	if err != nil {
 		result.Error = err.Error()
@@ -321,19 +336,31 @@ func (h *Handler) loadSemanticReviewDisagreementConfig(ctx context.Context) sema
 	if settings.PromptFilterSemanticReviewMaxConcurrency > 0 {
 		cfg.MaxConcurrency = int64(clampSemanticReviewInt(settings.PromptFilterSemanticReviewMaxConcurrency, 1, 100))
 	}
+	// Once database-backed settings are available they remain authoritative over
+	// the environment, matching the legacy single-provider precedence. An empty
+	// or invalid DB pool therefore falls back to the resolved DB legacy fields,
+	// rather than silently retaining an environment provider pool.
+	cfg.ProviderPool = SemanticReviewProviderPool{}
+	cfg.ProviderPoolConfigured = false
+	if raw := strings.TrimSpace(settings.PromptFilterSemanticReviewProviderPool); raw != "" {
+		if pool, parseErr := ParseSemanticReviewProviderPool(raw); parseErr == nil {
+			cfg.ProviderPool = pool
+			cfg.ProviderPoolConfigured = true
+		}
+	}
 	cfg.FailurePolicy = NormalizeSemanticReviewFailurePolicy(settings.PromptFilterSemanticReviewFailurePolicy)
 	return cfg
 }
 
 func (cfg semanticReviewConfig) readyFor(endpoint string) bool {
-	if !cfg.Enabled || cfg.APIKey == "" || cfg.BaseURL == "" || cfg.Model == "" {
+	if !cfg.Enabled || !semanticReviewPoolReady(cfg) {
 		return false
 	}
 	return cfg.Endpoints[endpoint]
 }
 
 func (cfg semanticReviewConfig) readyForDisagreement(endpoint string) bool {
-	if !cfg.DisagreementEnabled || cfg.APIKey == "" || cfg.BaseURL == "" || cfg.Model == "" {
+	if !cfg.DisagreementEnabled || !semanticReviewPoolReady(cfg) {
 		return false
 	}
 	return cfg.Endpoints[endpoint]
@@ -439,12 +466,10 @@ func (h *Handler) inspectSemanticReviewDisagreementText(c *gin.Context, text str
 
 	if !cfg.readyForDisagreement(endpoint) {
 		reviewErr = fmt.Errorf("semantic review is not configured for high-risk prompt review disagreement")
-		action = promptfilter.ActionBlock
-		reason = "high-risk prompt review disagreement could not be reviewed: " + reviewErr.Error()
+		action, reason = semanticReviewFailureAction(cfg.FailurePolicy, reviewErr)
 	} else if strings.TrimSpace(text) == "" {
 		reviewErr = fmt.Errorf("semantic review text empty for high-risk prompt review disagreement")
-		action = promptfilter.ActionBlock
-		reason = "high-risk prompt review disagreement could not be reviewed: " + reviewErr.Error()
+		action, reason = semanticReviewFailureAction(cfg.FailurePolicy, reviewErr)
 	} else {
 		result, reviewErr = runSemanticReview(c.Request.Context(), cfg, endpoint, model, text)
 		if reviewErr != nil {
@@ -492,40 +517,27 @@ func semanticReviewFailureAction(policy string, reviewErr error) (string, string
 }
 
 func runSemanticReview(ctx context.Context, cfg semanticReviewConfig, endpoint string, model string, text string) (semanticReviewResult, error) {
-	cacheKey := semanticReviewCacheKey(cfg, endpoint, model, text)
-	if cached, ok := semanticReviewCacheState.get(cacheKey); ok {
-		cached.Cached = true
-		return cached, nil
-	}
-
-	current := atomic.AddInt64(&semanticReviewInFlight, 1)
-	if current > cfg.MaxConcurrency {
-		atomic.AddInt64(&semanticReviewInFlight, -1)
-		return semanticReviewResult{Model: cfg.Model}, fmt.Errorf("semantic review concurrency limit reached")
-	}
-	defer atomic.AddInt64(&semanticReviewInFlight, -1)
-
-	result, err := callSemanticReviewModel(ctx, cfg, endpoint, model, text)
-	if err != nil {
-		return semanticReviewResult{Model: cfg.Model}, err
-	}
-	result.Model = cfg.Model
-	if cfg.CacheTTL > 0 {
-		semanticReviewCacheState.set(cacheKey, result, cfg.CacheTTL)
-	}
-	return result, nil
+	return runSemanticReviewPool(ctx, cfg, endpoint, model, text)
 }
 
 func callSemanticReviewModel(ctx context.Context, cfg semanticReviewConfig, endpoint string, model string, text string) (semanticReviewResult, error) {
-	target, err := semanticReviewChatCompletionsEndpoint(cfg.BaseURL)
+	return callSemanticReviewProvider(ctx, semanticReviewLegacyProvider(cfg), endpoint, model, text)
+}
+
+func callSemanticReviewProvider(ctx context.Context, provider SemanticReviewProvider, endpoint string, model string, text string) (semanticReviewResult, error) {
+	target, err := semanticReviewChatCompletionsEndpoint(provider.BaseURL)
 	if err != nil {
 		return semanticReviewResult{}, err
 	}
-	timeoutCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	timeout := time.Duration(provider.TimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = time.Duration(semanticReviewDefaultTimeoutMS) * time.Millisecond
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	payload, err := json.Marshal(semanticReviewRequest{
-		Model: cfg.Model,
+		Model: provider.Model,
 		Messages: []semanticReviewMessage{
 			{Role: "system", Content: semanticReviewSystemPrompt()},
 			{Role: "user", Content: semanticReviewUserPrompt(endpoint, model, text)},
@@ -540,7 +552,7 @@ func callSemanticReviewModel(ctx context.Context, cfg semanticReviewConfig, endp
 	if err != nil {
 		return semanticReviewResult{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	client := semanticReviewHTTPClient
@@ -554,7 +566,10 @@ func callSemanticReviewModel(ctx context.Context, cfg semanticReviewConfig, endp
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return semanticReviewResult{}, fmt.Errorf("semantic review request failed with status %d", resp.StatusCode)
+		return semanticReviewResult{}, &semanticReviewProviderHTTPError{
+			StatusCode: resp.StatusCode,
+			RetryAfter: semanticReviewRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 
 	var decoded semanticReviewResponse
@@ -671,8 +686,7 @@ func prepareSemanticReviewText(text string, maxChars int) string {
 }
 
 func semanticReviewCacheKey(cfg semanticReviewConfig, endpoint string, model string, text string) string {
-	sum := sha256.Sum256([]byte(cfg.Model + "\n" + endpoint + "\n" + model + "\n" + text))
-	return hex.EncodeToString(sum[:])
+	return semanticReviewCacheKeyForPool(semanticReviewPoolForConfig(cfg), endpoint, model, text)
 }
 
 func (c *semanticReviewCache) get(key string) (semanticReviewResult, bool) {

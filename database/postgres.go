@@ -806,6 +806,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_max_concurrency INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_failure_policy TEXT DEFAULT 'block';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_log_retention_days INT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_provider_pool TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
@@ -1473,6 +1474,7 @@ type SystemSettings struct {
 	PromptFilterSemanticReviewMaxConcurrency   int
 	PromptFilterSemanticReviewFailurePolicy    string
 	PromptFilterSemanticReviewLogRetentionDays int
+	PromptFilterSemanticReviewProviderPool     string
 	SmartPacingEnabled                         bool   // issue #312 智能配速总开关
 	SmartPacingMinConcurrency                  int    // 配速并发下限
 	SmartPacingWindows                         string // "5h,7d" / "5h" / "7d"
@@ -1652,7 +1654,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(codex_cli_version_sync_interval_hours, 12),
 		       COALESCE(model_pricing_overrides, '{}'),
 		       COALESCE(model_pricing_sync_url, ''),
-		       COALESCE(ignore_usage_limit_status, false)
+		       COALESCE(ignore_usage_limit_status, false),
+		       COALESCE(prompt_filter_semantic_review_provider_pool, '')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1711,6 +1714,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ModelPricingOverrides,
 		&s.ModelPricingSyncURL,
 		&s.IgnoreUsageLimitStatus,
+		&s.PromptFilterSemanticReviewProviderPool,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1734,6 +1738,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.PromptFilterSemanticReviewFailurePolicy = normalizeSemanticReviewFailurePolicy(s.PromptFilterSemanticReviewFailurePolicy)
 	s.PromptFilterSemanticReviewLogRetentionDays = normalizeSemanticReviewLogRetentionDays(s.PromptFilterSemanticReviewLogRetentionDays)
+	s.PromptFilterSemanticReviewProviderPool = strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool)
 	return s, err
 }
 
@@ -1810,9 +1815,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_cli_version_sync_interval_hours,
 					model_pricing_overrides,
 					model_pricing_sync_url,
-					ignore_usage_limit_status
+					ignore_usage_limit_status,
+					prompt_filter_semantic_review_provider_pool
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1909,7 +1915,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours,
 					model_pricing_overrides = EXCLUDED.model_pricing_overrides,
 					model_pricing_sync_url = EXCLUDED.model_pricing_sync_url,
-					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status
+					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status,
+					prompt_filter_semantic_review_provider_pool = EXCLUDED.prompt_filter_semantic_review_provider_pool
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1936,7 +1943,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		strings.TrimSpace(s.CodexSyncedCLIVersion),
 		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
 		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
-		s.IgnoreUsageLimitStatus)
+		s.IgnoreUsageLimitStatus, strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool))
 	return err
 }
 

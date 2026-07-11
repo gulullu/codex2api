@@ -32,9 +32,11 @@ type promptFilterTestResponse struct {
 }
 
 type promptFilterSemanticReviewTestRequest struct {
-	Text         string `json:"text"`
-	Endpoint     string `json:"endpoint"`
-	RequestModel string `json:"request_model"`
+	Text         string                        `json:"text"`
+	Endpoint     string                        `json:"endpoint"`
+	RequestModel string                        `json:"request_model"`
+	ProviderID   string                        `json:"provider_id"`
+	Provider     *proxy.SemanticReviewProvider `json:"provider"`
 }
 
 type promptFilterRulePatternTestRequest struct {
@@ -246,14 +248,60 @@ func (h *Handler) TestPromptFilterSemanticReview(c *gin.Context) {
 		settings = &database.SystemSettings{PromptFilterSemanticReviewEnabled: true}
 	}
 	resolved := resolvePromptFilterSemanticReview(settings)
-	timeout := time.Duration(resolved.TimeoutMS) * time.Millisecond
+	requestedProviderID := strings.TrimSpace(req.ProviderID)
+	if req.Provider == nil && requestedProviderID == "" && resolved.ProviderPoolConfigured && len(resolved.Providers) == 0 {
+		writeError(c, http.StatusBadRequest, "尚未配置语义复核服务商")
+		return
+	}
+	provider := proxy.SemanticReviewProvider{
+		ID: semanticReviewLegacyProviderID, Name: "Legacy provider", Enabled: true,
+		APIKey: resolved.APIKey, BaseURL: resolved.BaseURL, Model: resolved.Model,
+		TimeoutMS: resolved.TimeoutMS, MaxConcurrency: resolved.MaxConcurrency,
+	}
+	if req.Provider != nil {
+		provider = *req.Provider
+		provider.ID = strings.TrimSpace(provider.ID)
+		if strings.TrimSpace(provider.APIKey) == "" && provider.ID != "" {
+			for _, stored := range resolved.Providers {
+				if stored.ID == provider.ID {
+					provider.APIKey = stored.APIKey
+					break
+				}
+			}
+		}
+		provider.Enabled = true
+		validated, validationErr := validateAdminSemanticReviewProvider(provider, resolved.TimeoutMS, resolved.MaxConcurrency)
+		if validationErr != nil {
+			writeError(c, http.StatusBadRequest, "语义复核服务商配置无效: "+validationErr.Error())
+			return
+		}
+		provider = validated
+	} else if requestedProviderID != "" {
+		found := false
+		for _, candidate := range resolved.Providers {
+			if candidate.ID == requestedProviderID {
+				provider = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeError(c, http.StatusBadRequest, "语义复核服务商不存在")
+			return
+		}
+	} else if candidate, ok := firstEffectiveSemanticReviewProvider(resolved.Providers); ok {
+		provider = candidate
+	}
+	timeout := time.Duration(provider.TimeoutMS) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 2500 * time.Millisecond
 	}
 	result := proxy.TestSemanticReviewConnection(ctx, proxy.SemanticReviewConnectionTestConfig{
-		APIKey:       resolved.APIKey,
-		BaseURL:      resolved.BaseURL,
-		Model:        resolved.Model,
+		ProviderID:   provider.ID,
+		ProviderName: provider.Name,
+		APIKey:       provider.APIKey,
+		BaseURL:      provider.BaseURL,
+		Model:        provider.Model,
 		Timeout:      timeout,
 		Endpoint:     req.Endpoint,
 		RequestModel: req.RequestModel,

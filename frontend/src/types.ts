@@ -659,6 +659,8 @@ export interface SystemSettings {
   prompt_filter_semantic_review_model: string
   prompt_filter_semantic_review_timeout_ms: number
   prompt_filter_semantic_review_max_concurrency: number
+  prompt_filter_semantic_review_strategy?: SemanticReviewStrategy
+  prompt_filter_semantic_review_providers?: SemanticReviewProvider[]
   prompt_filter_semantic_review_failure_policy: 'block' | 'allow' | 'warn' | string
   prompt_filter_semantic_review_log_retention_days: number
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
@@ -694,6 +696,20 @@ export interface SystemSettings {
   smart_pacing_min_concurrency: number
   smart_pacing_windows: string
   ignore_usage_limit_status: boolean
+}
+
+export type SemanticReviewStrategy = 'round_robin' | 'random'
+
+export interface SemanticReviewProvider {
+  id: string
+  name: string
+  enabled: boolean
+  base_url: string
+  model: string
+  api_key?: string
+  api_key_configured?: boolean
+  timeout_ms: number
+  max_concurrency: number
 }
 
 export interface SetupHintsResponse {
@@ -782,6 +798,8 @@ export interface PromptFilterTestResponse {
 export interface SemanticReviewConnectionTestResponse {
   ok: boolean
   configured: boolean
+  provider_id?: string
+  provider_name?: string
   base_url: string
   model: string
   response_model?: string

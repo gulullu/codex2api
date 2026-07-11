@@ -1183,6 +1183,8 @@ export default function Settings() {
     prompt_filter_semantic_review_model: 'gpt-5.4-mini',
     prompt_filter_semantic_review_timeout_ms: 2500,
     prompt_filter_semantic_review_max_concurrency: 4,
+    prompt_filter_semantic_review_strategy: 'round_robin',
+    prompt_filter_semantic_review_providers: [],
     prompt_filter_semantic_review_failure_policy: 'block',
     prompt_filter_semantic_review_log_retention_days: 0,
     client_compat_mode: 'preserve',

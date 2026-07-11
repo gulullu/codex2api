@@ -1103,6 +1103,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		PromptFilterSemanticReviewMaxConcurrency:   6,
 		PromptFilterSemanticReviewFailurePolicy:    "allow",
 		PromptFilterSemanticReviewLogRetentionDays: 14,
+		PromptFilterSemanticReviewProviderPool:     `{"strategy":"round_robin","providers":[{"id":"provider-a","name":"Provider A","enabled":true,"base_url":"https://semantic-a.example.com/v1","model":"semantic-model-a","api_key":"test-provider-key","timeout_ms":1200,"max_concurrency":3}]}`,
 		ClientCompatMode:                           "preserve",
 		CodexMinCLIVersion:                         "0.118.0",
 		CodexUserAgentConfig:                       `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
@@ -1209,6 +1210,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.PromptFilterSemanticReviewLogRetentionDays != 14 {
 		t.Fatalf("PromptFilterSemanticReviewLogRetentionDays = %d, want 14", settings.PromptFilterSemanticReviewLogRetentionDays)
+	}
+	if settings.PromptFilterSemanticReviewProviderPool != `{"strategy":"round_robin","providers":[{"id":"provider-a","name":"Provider A","enabled":true,"base_url":"https://semantic-a.example.com/v1","model":"semantic-model-a","api_key":"test-provider-key","timeout_ms":1200,"max_concurrency":3}]}` {
+		t.Fatalf("PromptFilterSemanticReviewProviderPool = %q, want provider pool JSON", settings.PromptFilterSemanticReviewProviderPool)
 	}
 	if !settings.CodexWSHideUpstreamErrors {
 		t.Fatal("CodexWSHideUpstreamErrors = false, want true")
