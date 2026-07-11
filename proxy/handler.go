@@ -627,6 +627,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateClientIPFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	populateCybUsageRouteMeta(h, c, input)
+	input.LogicalRequestID = logicalRequestID(c)
 	markCyberPolicyUsageKind(input)
 	h.logUsage(input)
 }
@@ -1811,6 +1812,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
 			if promptDecision.routesToCybRelay() {
+				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableOpenAI(c)
 				return
 			}
@@ -2874,6 +2876,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if promptDecision.routesToCybRelay() {
+					h.logCybRelayUnavailable(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt)
 					sendCybRelayUnavailableOpenAI(c)
 					return
 				}
@@ -3406,6 +3409,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
 			if promptDecision.routesToCybRelay() {
+				h.logCybRelayUnavailable(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableOpenAI(c)
 				return
 			}

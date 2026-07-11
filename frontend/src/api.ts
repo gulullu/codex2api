@@ -527,7 +527,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string } = 100) => {
+  getPromptFilterLogs: (params: number | { page?: number; pageSize?: number; limit?: number; source?: string; action?: string; endpoint?: string; model?: string; apiKeyId?: string; q?: string; cyberScope?: 'oauth' | 'relay' | 'unknown'; routeClass?: string; routeSource?: string; logicalRequestId?: string; upstreamAccountType?: string } = 100) => {
     const search = new URLSearchParams()
     if (typeof params === 'number') {
       search.set('limit', String(params))
@@ -541,6 +541,11 @@ export const api = {
       if (params.model) search.set('model', params.model)
       if (params.apiKeyId) search.set('api_key_id', params.apiKeyId)
       if (params.q) search.set('q', params.q)
+      if (params.cyberScope) search.set('cyber_scope', params.cyberScope)
+      if (params.routeClass) search.set('route_class', params.routeClass)
+      if (params.routeSource) search.set('route_source', params.routeSource)
+      if (params.logicalRequestId) search.set('logical_request_id', params.logicalRequestId)
+      if (params.upstreamAccountType) search.set('upstream_account_type', params.upstreamAccountType)
     }
     return request<PromptFilterLogsResponse>(`/prompt-filter/logs?${search.toString()}`)
   },

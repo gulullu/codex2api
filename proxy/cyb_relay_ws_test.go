@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -243,8 +244,20 @@ func TestCybRelayWebSocketEmptyPoolFailsClosed(t *testing.T) {
 	if eventType := gjson.GetBytes(message, "type").String(); eventType != "error" {
 		t.Fatalf("event type = %q, want error; body=%s", eventType, message)
 	}
-	if code := gjson.GetBytes(message, "error.code").String(); code != "content_policy_violation" {
-		t.Fatalf("error.code = %q, want content_policy_violation; body=%s", code, message)
+	if code := gjson.GetBytes(message, "error.code").String(); code != "relay_route_unavailable" {
+		t.Fatalf("error.code = %q, want relay_route_unavailable; body=%s", code, message)
+	}
+	if errorType := gjson.GetBytes(message, "error.type").String(); errorType != "server_error" {
+		t.Fatalf("error.type = %q, want server_error; body=%s", errorType, message)
+	}
+
+	_, _, err = conn.ReadMessage()
+	if err == nil {
+		t.Fatal("expected websocket close after relay unavailable error")
+	}
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseTryAgainLater {
+		t.Fatalf("websocket close = %v, want code %d", err, websocket.CloseTryAgainLater)
 	}
 	select {
 	case got := <-trapRequests:

@@ -175,6 +175,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
 			if promptDecision.routesToCybRelay() {
+				h.logCybRelayUnavailable(c, "/v1/messages", model, effectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableAnthropic(c)
 				return
 			}

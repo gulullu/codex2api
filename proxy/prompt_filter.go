@@ -31,64 +31,28 @@ func sendPromptCyberPolicyBlockedOpenAI(c *gin.Context) {
 	api.SendErrorWithStatus(c, promptCyberPolicyError(), http.StatusBadRequest)
 }
 
+func routingPromptFilterConfig(cfg promptfilter.Config) promptfilter.Config {
+	// codex2api only uses local rules as routing signals. Moderation and
+	// user-visible policy blocking are owned by the upstream sub2 layer.
+	cfg.Mode = promptfilter.ModeMonitor
+	cfg.Review.Enabled = false
+	cfg.Review.All = false
+	return cfg
+}
+
 func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	c.Set(contextPromptFilterText, text)
-	if h.cybRelayConfig().Enabled {
-		if nested, ok := takeNestedPromptRiskDecision(c); ok {
-			setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
-			return nested.blocks()
-		}
-		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-			decision := h.applyCybRoutePin(c, rawBody, defaultPromptRiskDecision())
-			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
-			return false
-		}
-		verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-		return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model, func() {
-			sendPromptCyberPolicyBlockedOpenAI(c)
-		})
-	}
-	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-		return h.inspectSemanticReviewOpenAI(c, rawBody, endpoint, model)
-	}
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg, endpoint)
-	}
-	var semanticHandled bool
-	var semanticBlocked bool
-	if handled, blocked := h.inspectHighRiskReviewDisagreement(c, verdict, text, endpoint, model, func() {
-		sendPromptCyberPolicyBlockedOpenAI(c)
-	}); handled {
-		semanticHandled = true
-		semanticBlocked = blocked
-		if !blocked && verdict.Action == promptfilter.ActionBlock {
-			verdict.Action = promptfilter.ActionAllow
-			verdict.Reason = "semantic review cleared local high-risk prompt filter block"
-		}
-	}
-	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
-	}
-	if semanticBlocked {
-		return true
-	}
-	if verdict.Action == promptfilter.ActionBlock {
-		sendPromptCyberPolicyBlockedOpenAI(c)
-		return true
-	}
-	if semanticHandled {
+	if nested, ok := takeNestedPromptRiskDecision(c); ok {
+		setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
 		return false
 	}
-	return h.inspectSemanticReviewOpenAI(c, rawBody, endpoint, model)
+	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model)
 }
 
 func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, endpoint string, model string) bool {
@@ -96,113 +60,23 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
-	if h.cybRelayConfig().Enabled {
-		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-			decision := h.applyCybRoutePin(c, nil, defaultPromptRiskDecision())
-			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
-			return false
-		}
-		verdict := promptfilter.InspectText(text, cfg)
-		return h.inspectCybRelayPrompt(c, nil, verdict, text, endpoint, model, func() {
-			sendPromptCyberPolicyBlockedOpenAI(c)
-		})
-	}
-	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-		return h.inspectSemanticReviewTextOpenAI(c, text, endpoint, model)
-	}
+	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	verdict := promptfilter.InspectText(text, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg, endpoint)
-	}
-	var semanticHandled bool
-	var semanticBlocked bool
-	if handled, blocked := h.inspectHighRiskReviewDisagreement(c, verdict, text, endpoint, model, func() {
-		sendPromptCyberPolicyBlockedOpenAI(c)
-	}); handled {
-		semanticHandled = true
-		semanticBlocked = blocked
-		if !blocked && verdict.Action == promptfilter.ActionBlock {
-			verdict.Action = promptfilter.ActionAllow
-			verdict.Reason = "semantic review cleared local high-risk prompt filter block"
-		}
-	}
-	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
-	}
-	if semanticBlocked {
-		return true
-	}
-	if verdict.Action == promptfilter.ActionBlock {
-		sendPromptCyberPolicyBlockedOpenAI(c)
-		return true
-	}
-	if semanticHandled {
-		return false
-	}
-	return h.inspectSemanticReviewTextOpenAI(c, text, endpoint, model)
+	return h.inspectCybRelayPrompt(c, nil, verdict, text, endpoint, model)
 }
 
 func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	c.Set(contextPromptFilterText, text)
-	if h.cybRelayConfig().Enabled {
-		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-			decision := h.applyCybRoutePin(c, rawBody, defaultPromptRiskDecision())
-			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
-			return false
-		}
-		verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-		return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model, func() {
-			sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", promptCyberPolicyMessage)
-		})
-	}
-	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-		return h.inspectSemanticReviewAnthropic(c, rawBody, endpoint, model)
-	}
 	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg, endpoint)
-	}
-	var semanticHandled bool
-	var semanticBlocked bool
-	if handled, blocked := h.inspectHighRiskReviewDisagreement(c, verdict, text, endpoint, model, func() {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", promptCyberPolicyMessage)
-	}); handled {
-		semanticHandled = true
-		semanticBlocked = blocked
-		if !blocked && verdict.Action == promptfilter.ActionBlock {
-			verdict.Action = promptfilter.ActionAllow
-			verdict.Reason = "semantic review cleared local high-risk prompt filter block"
-		}
-	}
-	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
-	}
-	if semanticBlocked {
-		return true
-	}
-	if verdict.Action == promptfilter.ActionBlock {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", promptCyberPolicyMessage)
-		return true
-	}
-	if semanticHandled {
-		return false
-	}
-	return h.inspectSemanticReviewAnthropic(c, rawBody, endpoint, model)
+	return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model)
 }
 
-var promptFilterHardBlockPatterns = map[string]struct{}{
+var promptFilterExplicitHighRiskPatterns = map[string]struct{}{
 	codex55UnrestrictedInstructionsPatternName: {},
 	"credential_theft":                         {},
 	"malware_authoring":                        {},
@@ -212,12 +86,9 @@ var promptFilterHardBlockPatterns = map[string]struct{}{
 	"fraud_carding":                            {},
 }
 
-func promptFilterHardBlockVerdict(verdict promptfilter.Verdict) bool {
-	if verdict.Action != promptfilter.ActionBlock {
-		return false
-	}
+func promptFilterExplicitHighRiskVerdict(verdict promptfilter.Verdict) bool {
 	for _, match := range verdict.Matched {
-		if _, ok := promptFilterHardBlockPatterns[match.Name]; ok {
+		if _, ok := promptFilterExplicitHighRiskPatterns[match.Name]; ok {
 			return true
 		}
 	}
@@ -241,17 +112,28 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	if threshold <= 0 {
 		threshold = promptfilter.DefaultThreshold
 	}
-	signals := make([]string, 0, 3)
+	signals := make([]string, 0, 4)
 	if verdict.Score >= threshold {
 		signals = append(signals, "local_threshold")
 	}
 	if promptfilter.IsHighRiskReviewVerdict(verdict) {
 		signals = append(signals, "local_high_risk")
 	}
+	if promptFilterExplicitHighRiskVerdict(verdict) {
+		signals = append(signals, "explicit_high_risk_rule")
+	}
 	if promptfilter.LooksLikeTechnicalCyberIntent(text) {
 		signals = append(signals, "technical_cyber_intent")
 	}
 	return len(signals) > 0, signals
+}
+
+// PromptFilterRouteSignal exposes the same monitor-only routing decision used
+// by the live proxy so the admin route tester cannot drift back to legacy
+// moderation or blocking semantics.
+func PromptFilterRouteSignal(verdict promptfilter.Verdict, text string, cfg promptfilter.Config, endpoint string) (bool, []string) {
+	cfg = routingPromptFilterConfig(cfg)
+	return promptFilterCYBSignal(verdict, text, cfg, endpoint)
 }
 
 func omniOutcomeRequiresPolicyBlock(outcome promptfilter.ReviewOutcome, cybSignal bool) bool {
@@ -295,59 +177,31 @@ func (h *Handler) reviewPromptFilterVerdictDetailed(ctx context.Context, text st
 	return verdict, outcome, reviewErr
 }
 
-func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, localVerdict promptfilter.Verdict, text string, endpoint string, model string, writeBlock func()) bool {
-	cfg := h.store.GetPromptFilterConfig()
+func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, localVerdict promptfilter.Verdict, text string, endpoint string, model string) bool {
+	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	cybSignal, signals := promptFilterCYBSignal(localVerdict, text, cfg, endpoint)
-	verdict := localVerdict
 	decision := defaultPromptRiskDecision()
-
-	if promptFilterHardBlockVerdict(localVerdict) {
+	if cybSignal {
 		decision = promptRiskDecision{
-			Disposition: promptRiskDispositionBlock,
-			Reason:      "matched explicit hard-block policy rule",
-			Signals:     []string{"explicit_hard_block"},
-		}
-	} else {
-		outcome := promptfilter.ReviewOutcome{}
-		var reviewErr error
-		if shouldReviewPromptFilterVerdict(verdict, cfg) {
-			verdict, outcome, reviewErr = h.reviewPromptFilterVerdictDetailed(c.Request.Context(), text, verdict, cfg, endpoint)
-		}
-
-		if strings.Contains(strings.ToLower(endpoint), "image") {
-			if verdict.Action == promptfilter.ActionBlock {
-				decision = promptRiskDecision{Disposition: promptRiskDispositionBlock, Reason: verdict.Reason, Signals: []string{"image_policy"}}
-			}
-		} else if reviewErr == nil && omniOutcomeRequiresPolicyBlock(outcome, cybSignal) {
-			verdict.Action = promptfilter.ActionBlock
-			verdict.Reason = "omni moderation matched non-CYB policy"
-			decision = promptRiskDecision{Disposition: promptRiskDispositionBlock, Reason: "omni moderation matched non-CYB policy", Signals: []string{"omni_non_cyb_policy"}}
-		} else if cybSignal {
-			if outcome.Flagged && outcome.Categories["illicit"] {
-				signals = append(signals, "omni_illicit")
-			}
-			if reviewErr != nil {
-				signals = append(signals, "omni_unavailable")
-			}
-			decision = promptRiskDecision{Disposition: promptRiskDispositionRelay, Reason: "CYB risk isolated to relay pool", Signals: signals}
-		} else if verdict.Action == promptfilter.ActionBlock {
-			decision = promptRiskDecision{Disposition: promptRiskDispositionBlock, Reason: verdict.Reason, Signals: []string{"prompt_policy"}}
+			Disposition: promptRiskDispositionRelay,
+			Reason:      "CYB risk isolated to relay pool",
+			Signals:     signals,
+			RouteSource: cybRelayRouteSourceDirect,
 		}
 	}
 
-	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
-	}
-	decision = h.applyCybRoutePin(c, rawBody, decision)
-	h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
-	if !decision.blocks() {
+	// Keep local rule matches for diagnostics, but never turn them into a
+	// user-visible moderation decision in codex2api.
+	localVerdict.Action = promptfilter.ActionAllow
+	if !cybRelayTextEndpoint(endpoint) {
+		setPromptRiskDecisionContext(c, defaultPromptRiskDecision(), h.cybRelayConfig().GroupID)
+		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", localVerdict)
 		return false
 	}
-	if writeBlock != nil {
-		writeBlock()
-	}
-	return true
+	decision = h.applyCybRoutePin(c, rawBody, decision)
+	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", localVerdict)
+	h.logCybRelayDecision(c, endpoint, model, text, localVerdict, decision)
+	return false
 }
 
 func (h *Handler) logCybRelayDecision(c *gin.Context, endpoint string, model string, text string, baseVerdict promptfilter.Verdict, decision promptRiskDecision) {
@@ -400,6 +254,7 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 	populatePromptFilterAPIKeyMeta(c, input)
 	populateCybPromptFilterRouteMeta(c, input)
 	input.ClientRequestID = strings.TrimSpace(c.GetHeader("X-Client-Request-Id"))
+	input.LogicalRequestID = logicalRequestID(c)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = h.db.InsertPromptFilterLog(ctx, input)

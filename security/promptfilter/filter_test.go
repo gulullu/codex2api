@@ -168,6 +168,62 @@ func TestExtractTextResponses(t *testing.T) {
 	}
 }
 
+func TestExtractTextResponsesIncludesFullRoutingPayload(t *testing.T) {
+	body := []byte(`{
+		"instructions":"SYSTEM_ROUTE_SIGNAL",
+		"input":[{"role":"user","content":[{"type":"input_text","text":"USER_ROUTE_SIGNAL"}]}],
+		"tools":[{"type":"function","name":"route_tool","description":"TOOL_ROUTE_SIGNAL","parameters":{"description":"SCHEMA_ROUTE_SIGNAL"}}],
+		"functions":[{"name":"legacy_route","description":"FUNCTION_ROUTE_SIGNAL"}],
+		"skills":[{"name":"route_skill","instructions":"SKILL_ROUTE_SIGNAL"}],
+		"tool_choice":{"type":"function","name":"CHOICE_ROUTE_SIGNAL"},
+		"b64_json":"BASE64_MUST_NOT_LEAK"
+	}`)
+	got := ExtractText(body, "/v1/responses", DefaultMaxTextLength)
+	for _, want := range []string{
+		"SYSTEM_ROUTE_SIGNAL", "USER_ROUTE_SIGNAL", "TOOL_ROUTE_SIGNAL",
+		"SCHEMA_ROUTE_SIGNAL", "FUNCTION_ROUTE_SIGNAL", "SKILL_ROUTE_SIGNAL",
+		"CHOICE_ROUTE_SIGNAL",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ExtractText = %q, want %q from full Responses payload", got, want)
+		}
+	}
+	if strings.Contains(got, "BASE64_MUST_NOT_LEAK") {
+		t.Fatalf("ExtractText leaked b64_json: %q", got)
+	}
+}
+
+func TestExtractTextChatIncludesToolsFunctionsAndSkills(t *testing.T) {
+	body := []byte(`{
+		"messages":[{"role":"system","content":"CHAT_SYSTEM_SIGNAL"},{"role":"user","content":"CHAT_USER_SIGNAL"}],
+		"tools":[{"function":{"name":"chat_tool","description":"CHAT_TOOL_SIGNAL"}}],
+		"functions":[{"name":"legacy_chat_tool","description":"CHAT_FUNCTION_SIGNAL"}],
+		"tool_choice":{"function":{"name":"CHAT_CHOICE_SIGNAL"}},
+		"skills":[{"instructions":"CHAT_SKILL_SIGNAL"}]
+	}`)
+	got := ExtractText(body, "/v1/chat/completions", DefaultMaxTextLength)
+	for _, want := range []string{"CHAT_SYSTEM_SIGNAL", "CHAT_USER_SIGNAL", "CHAT_TOOL_SIGNAL", "CHAT_FUNCTION_SIGNAL", "CHAT_CHOICE_SIGNAL", "CHAT_SKILL_SIGNAL"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ExtractText = %q, want %q from full Chat payload", got, want)
+		}
+	}
+}
+
+func TestExtractTextAnthropicIncludesSystemToolsAndSkills(t *testing.T) {
+	body := []byte(`{
+		"system":"ANTHROPIC_SYSTEM_SIGNAL",
+		"messages":[{"role":"user","content":"ANTHROPIC_USER_SIGNAL"}],
+		"tools":[{"name":"anthropic_tool","description":"ANTHROPIC_TOOL_SIGNAL","input_schema":{"description":"ANTHROPIC_SCHEMA_SIGNAL"}}],
+		"skills":[{"instructions":"ANTHROPIC_SKILL_SIGNAL"}]
+	}`)
+	got := ExtractText(body, "/v1/messages", DefaultMaxTextLength)
+	for _, want := range []string{"ANTHROPIC_SYSTEM_SIGNAL", "ANTHROPIC_USER_SIGNAL", "ANTHROPIC_TOOL_SIGNAL", "ANTHROPIC_SCHEMA_SIGNAL", "ANTHROPIC_SKILL_SIGNAL"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("ExtractText = %q, want %q from full Anthropic payload", got, want)
+		}
+	}
+}
+
 func TestExtractTextSkipsMultimodalNonTextFields(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Explain DDoS detection"},{"type":"image_url","image_url":{"url":"https://private.example/secret.png"}},{"type":"input_image","source":{"type":"base64","data":"BASE64SECRET"}}]}]}`)
 	got := ExtractText(body, "/v1/messages", DefaultMaxTextLength)

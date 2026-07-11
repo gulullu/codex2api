@@ -148,7 +148,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			route_reason TEXT DEFAULT '',
 			route_group_id INTEGER DEFAULT 0,
 			route_pinned INTEGER DEFAULT 0,
-			upstream_account_type TEXT DEFAULT ''
+			upstream_account_type TEXT DEFAULT '',
+			logical_request_id TEXT DEFAULT '',
+			route_source TEXT DEFAULT '',
+			route_signals TEXT DEFAULT '[]',
+			pin_kind TEXT DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,7 +254,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					prompt_filter_cyb_relay_enabled INTEGER DEFAULT 0,
 					prompt_filter_cyb_relay_group_id INTEGER DEFAULT 0,
 					prompt_filter_cyb_relay_session_pin_enabled INTEGER DEFAULT 1,
-					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 3600
+					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 600
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -359,7 +363,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			route_reason TEXT DEFAULT '',
 			route_group_id INTEGER DEFAULT 0,
 			route_pinned INTEGER DEFAULT 0,
-			upstream_account_type TEXT DEFAULT ''
+			upstream_account_type TEXT DEFAULT '',
+			logical_request_id TEXT DEFAULT '',
+			route_source TEXT DEFAULT '',
+			route_signals TEXT DEFAULT '[]',
+			pin_kind TEXT DEFAULT ''
 		);`,
 	}
 	for _, stmt := range statements {
@@ -416,6 +424,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "route_group_id", "INTEGER DEFAULT 0"},
 		{"usage_logs", "route_pinned", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_account_type", "TEXT DEFAULT ''"},
+		{"usage_logs", "logical_request_id", "TEXT DEFAULT ''"},
+		{"usage_logs", "route_source", "TEXT DEFAULT ''"},
+		{"usage_logs", "route_signals", "TEXT DEFAULT '[]'"},
+		{"usage_logs", "pin_kind", "TEXT DEFAULT ''"},
 		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
 		{"api_keys", "quota_used", "REAL DEFAULT 0"},
 		{"api_keys", "total_used", "REAL DEFAULT 0"},
@@ -489,7 +501,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_review_model", "TEXT DEFAULT 'omni-moderation-latest'"},
 		{"system_settings", "prompt_filter_review_timeout_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "prompt_filter_review_fail_closed", "INTEGER DEFAULT 1"},
-		{"system_settings", "prompt_filter_semantic_review_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "prompt_filter_semantic_review_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_semantic_review_api_key", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_semantic_review_base_url", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_semantic_review_model", "TEXT DEFAULT ''"},
@@ -501,7 +513,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_cyb_relay_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_cyb_relay_group_id", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_cyb_relay_session_pin_enabled", "INTEGER DEFAULT 1"},
-		{"system_settings", "prompt_filter_cyb_relay_session_pin_ttl_seconds", "INTEGER DEFAULT 3600"},
+		{"system_settings", "prompt_filter_cyb_relay_session_pin_ttl_seconds", "INTEGER DEFAULT 600"},
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "review_error", "TEXT DEFAULT ''"},
@@ -513,6 +525,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"prompt_filter_logs", "route_group_id", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "route_pinned", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "upstream_account_type", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "logical_request_id", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "route_source", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "route_signals", "TEXT DEFAULT '[]'"},
+		{"prompt_filter_logs", "pin_kind", "TEXT DEFAULT ''"},
 		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
 		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.118.0'"},
 		{"system_settings", "codex_user_agent_config", "TEXT DEFAULT '{}'"},

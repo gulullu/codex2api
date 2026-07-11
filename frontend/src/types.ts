@@ -786,9 +786,14 @@ export interface PromptFilterLog {
   review_model: string
   review_flagged: boolean
   review_error: string
+  client_request_id?: string
+  logical_request_id?: string
   account_id?: number
   route_class?: string
   route_reason?: string
+  route_source?: 'default' | 'direct' | 'pin' | string
+  route_signals?: string
+  pin_kind?: string
   route_group_id?: number
   route_pinned?: boolean
   upstream_account_type?: string
@@ -837,6 +842,7 @@ export interface CodexAuditPromptFilterRow {
 
 export interface CodexAuditUsageSummary {
   requests: number
+  upstream_attempts: number
   errors_4xx: number
   errors_5xx: number
   websocket_requests: number
@@ -862,6 +868,19 @@ export interface CodexAuditSummary {
   probe_observed: number
   probe_short_circuits: number
   probe_high_frequency: number
+  relay_requests: number
+  relay_direct: number
+  relay_pinned: number
+  relay_legacy_unknown: number
+  relay_route_failures: number
+  relay_fallback_prevented: number
+  oauth_cyber_miss_requests: number
+  oauth_cyber_miss_attempts: number
+  relay_cyber_requests: number
+  relay_cyber_attempts: number
+  legacy_cyber_unattributed: number
+  route_invariant_violations: number
+  legacy_usage_rows: number
 }
 
 export interface CodexAuditTimelinePoint {
@@ -873,6 +892,33 @@ export interface CodexAuditTimelinePoint {
   errors_4xx: number
   errors_5xx: number
   first_token_p95_ms: number
+  default_requests: number
+  relay_direct: number
+  relay_pinned: number
+  relay_legacy_unknown: number
+  relay_route_failures: number
+  oauth_cyber_attempts: number
+  relay_cyber_attempts: number
+  route_invariant_violations: number
+}
+
+export interface CodexAuditRelayRouteRow {
+  account_id: number
+  account_name: string
+  route_source: string
+  pin_kind: string
+  requests: number
+  attempts: number
+  successes: number
+  errors_4xx: number
+  errors_5xx: number
+  cyber_policy: number
+}
+
+export interface CodexAuditRouteSignalRow {
+  signal: string
+  requests: number
+  last_seen: string
 }
 
 export interface CodexAuditModelRow {
@@ -910,6 +956,11 @@ export interface CodexAuditReport {
   usage: CodexAuditUsageSummary
   timeline: CodexAuditTimelinePoint[]
   models: CodexAuditModelRow[]
+  relay_routes: CodexAuditRelayRouteRow[]
+  route_signals: CodexAuditRouteSignalRow[]
+  route_samples: PromptFilterLog[]
+  oauth_cyber_cases: PromptFilterLog[]
+  relay_cyber_cases: PromptFilterLog[]
   suspicious_samples: PromptFilterLog[]
   probe_observed: CodexAuditProbeRow[]
   probe_short_circuits: CodexAuditProbeRow[]
@@ -918,6 +969,8 @@ export interface CodexAuditReport {
   slow_requests: UsageLog[]
   notes: string[]
   last_cyber_policy_at?: string
+  last_oauth_cyber_policy_at?: string
+  last_relay_cyber_policy_at?: string
 }
 
 export interface PromptFilterRulePatternTestResponse {
@@ -1127,9 +1180,13 @@ export interface UsageLog {
   error_message: string
   route_class?: string
   route_reason?: string
+  route_source?: 'default' | 'direct' | 'pin' | string
+  route_signals?: string
+  pin_kind?: string
   route_group_id?: number
   route_pinned?: boolean
   upstream_account_type?: string
+  logical_request_id?: string
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>

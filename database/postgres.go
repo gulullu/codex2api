@@ -301,6 +301,10 @@ type usageLogEntry struct {
 	RouteGroupID         int64
 	RoutePinned          bool
 	UpstreamAccountType  string
+	LogicalRequestID     string
+	RouteSource          string
+	RouteSignals         string
+	PinKind              string
 }
 
 // New 创建数据库连接并自动建表。
@@ -707,8 +711,14 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_group_id BIGINT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_pinned BOOLEAN DEFAULT FALSE;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_account_type VARCHAR(50) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS logical_request_id VARCHAR(128) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_source VARCHAR(16) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_signals TEXT DEFAULT '[]';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS pin_kind VARCHAR(32) DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
+	CREATE INDEX IF NOT EXISTS idx_usage_logs_logical_request_created_at ON usage_logs(logical_request_id, created_at);
+	CREATE INDEX IF NOT EXISTS idx_usage_logs_route_created_at ON usage_logs(route_class, route_source, created_at);
 
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id         SERIAL PRIMARY KEY,
@@ -808,7 +818,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'omni-moderation-latest';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_timeout_seconds INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_api_key TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_base_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_model TEXT DEFAULT '';
@@ -820,7 +830,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_group_id BIGINT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_enabled BOOLEAN DEFAULT TRUE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_ttl_seconds INT DEFAULT 3600;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_ttl_seconds INT DEFAULT 600;
+	ALTER TABLE system_settings ALTER COLUMN prompt_filter_semantic_review_enabled SET DEFAULT FALSE;
+	ALTER TABLE system_settings ALTER COLUMN prompt_filter_cyb_relay_session_pin_ttl_seconds SET DEFAULT 600;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
@@ -888,7 +900,11 @@ func (db *DB) migrate(ctx context.Context) error {
 				route_reason     TEXT DEFAULT '',
 				route_group_id   BIGINT DEFAULT 0,
 				route_pinned     BOOLEAN DEFAULT FALSE,
-				upstream_account_type VARCHAR(50) DEFAULT ''
+				upstream_account_type VARCHAR(50) DEFAULT '',
+				logical_request_id VARCHAR(128) DEFAULT '',
+				route_source VARCHAR(16) DEFAULT '',
+				route_signals TEXT DEFAULT '[]',
+				pin_kind VARCHAR(32) DEFAULT ''
 			);
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
@@ -901,7 +917,13 @@ func (db *DB) migrate(ctx context.Context) error {
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_group_id BIGINT DEFAULT 0;
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_pinned BOOLEAN DEFAULT FALSE;
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS upstream_account_type VARCHAR(50) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS logical_request_id VARCHAR(128) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_source VARCHAR(16) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_signals TEXT DEFAULT '[]';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS pin_kind VARCHAR(32) DEFAULT '';
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);
+			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_logical_request_created_at ON prompt_filter_logs(logical_request_id, created_at);
+			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_route_created_at ON prompt_filter_logs(route_class, route_source, created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);
 
 			CREATE TABLE IF NOT EXISTS model_registry (
@@ -1554,7 +1576,7 @@ func normalizeSemanticReviewLogRetentionDays(days int) int {
 }
 
 const (
-	defaultCybRelaySessionPinTTLSeconds = 3600
+	defaultCybRelaySessionPinTTLSeconds = 600
 	minCybRelaySessionPinTTLSeconds     = 60
 	maxCybRelaySessionPinTTLSeconds     = 86400
 )
@@ -1685,7 +1707,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(auto_pause_5h_guard_band_percent, 5),
 		       COALESCE(auto_pause_5h_guard_concurrency, 1),
 		       COALESCE(prompt_filter_review_all, false),
-		       COALESCE(prompt_filter_semantic_review_enabled, true),
+		       COALESCE(prompt_filter_semantic_review_enabled, false),
 		       COALESCE(prompt_filter_semantic_review_api_key, ''),
 		       COALESCE(prompt_filter_semantic_review_base_url, ''),
 		       COALESCE(prompt_filter_semantic_review_model, ''),
@@ -1708,7 +1730,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_cyb_relay_enabled, false),
 		       COALESCE(prompt_filter_cyb_relay_group_id, 0),
 		       COALESCE(prompt_filter_cyb_relay_session_pin_enabled, true),
-		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 3600)
+		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 600)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2381,6 +2403,10 @@ type UsageLog struct {
 	RouteGroupID         int64     `json:"route_group_id"`
 	RoutePinned          bool      `json:"route_pinned"`
 	UpstreamAccountType  string    `json:"upstream_account_type"`
+	LogicalRequestID     string    `json:"logical_request_id"`
+	RouteSource          string    `json:"route_source"`
+	RouteSignals         string    `json:"route_signals"`
+	PinKind              string    `json:"pin_kind"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
@@ -2465,6 +2491,10 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		RouteGroupID:         log.RouteGroupID,
 		RoutePinned:          log.RoutePinned,
 		UpstreamAccountType:  log.UpstreamAccountType,
+		LogicalRequestID:     log.LogicalRequestID,
+		RouteSource:          log.RouteSource,
+		RouteSignals:         log.RouteSignals,
+		PinKind:              log.PinKind,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -2521,6 +2551,10 @@ type UsageLogInput struct {
 	RouteGroupID         int64
 	RoutePinned          bool
 	UpstreamAccountType  string
+	LogicalRequestID     string
+	RouteSource          string
+	RouteSignals         string
+	PinKind              string
 }
 
 func (l *UsageLog) populateBillingBreakdown() {
@@ -2663,8 +2697,9 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 			  requested_service_tier, actual_service_tier, billing_service_tier,
 			  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-			  route_class, route_reason, route_group_id, route_pinned, upstream_account_type)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45)`)
+			  route_class, route_reason, route_group_id, route_pinned, upstream_account_type,
+			  logical_request_id, route_source, route_signals, pin_kind)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49)`)
 	if err != nil {
 		return fmt.Errorf("准备语句: %w", err)
 	}
@@ -2676,7 +2711,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType); err != nil {
+			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType,
+			e.LogicalRequestID, e.RouteSource, e.RouteSignals, e.PinKind); err != nil {
 			return fmt.Errorf("执行插入: %w", err)
 		}
 	}
@@ -2691,7 +2727,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 45 个参数）。
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行 49 个参数）。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -2703,7 +2739,8 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	}
 	defer tx.Rollback()
 
-	const maxRowsPerBatch = 1400
+	// 49 * 1337 = 65513，保持在 PostgreSQL 65535 参数上限以内。
+	const maxRowsPerBatch = 1337
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -2734,7 +2771,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	const argsPerUsageLog = 45
+	const argsPerUsageLog = 49
 	valueArgs := make([]interface{}, 0, len(batch)*argsPerUsageLog)
 	argIdx := 1
 
@@ -2749,7 +2786,8 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
-			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType)
+			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType,
+			e.LogicalRequestID, e.RouteSource, e.RouteSignals, e.PinKind)
 		argIdx += argsPerUsageLog
 	}
 
@@ -2758,7 +2796,8 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
-		route_class, route_reason, route_group_id, route_pinned, upstream_account_type)
+		route_class, route_reason, route_group_id, route_pinned, upstream_account_type,
+		logical_request_id, route_source, route_signals, pin_kind)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := execer.ExecContext(ctx, query, valueArgs...)
@@ -3261,6 +3300,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 		            COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
+		            COALESCE(u.logical_request_id, ''), COALESCE(u.route_source, ''), COALESCE(u.route_signals, ''), COALESCE(u.pin_kind, ''),
 		            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -3283,6 +3323,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
 			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&l.LogicalRequestID, &l.RouteSource, &l.RouteSignals, &l.PinKind,
 			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
@@ -3722,6 +3763,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 		            COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
+		            COALESCE(u.logical_request_id, ''), COALESCE(u.route_source, ''), COALESCE(u.route_signals, ''), COALESCE(u.pin_kind, ''),
 		            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -3745,6 +3787,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
 			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&l.LogicalRequestID, &l.RouteSource, &l.RouteSignals, &l.PinKind,
 			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
@@ -3950,6 +3993,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 			            COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
+			            COALESCE(u.logical_request_id, ''), COALESCE(u.route_source, ''), COALESCE(u.route_signals, ''), COALESCE(u.pin_kind, ''),
 			            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
@@ -3972,6 +4016,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&l.LogicalRequestID, &l.RouteSource, &l.RouteSignals, &l.PinKind,
 			&credentialRaw, &l.AccountName, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
@@ -4005,6 +4050,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 			COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
 			COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
+			COALESCE(u.logical_request_id, ''), COALESCE(u.route_source, ''), COALESCE(u.route_signals, ''), COALESCE(u.pin_kind, ''),
 			COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 		FROM usage_logs u
 		LEFT JOIN accounts a ON u.account_id = a.id
@@ -4026,6 +4072,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
 			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
 			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&l.LogicalRequestID, &l.RouteSource, &l.RouteSignals, &l.PinKind,
 			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}

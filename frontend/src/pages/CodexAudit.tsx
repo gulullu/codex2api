@@ -42,9 +42,11 @@ type Tone = 'ok' | 'warn' | 'bad' | 'neutral'
 
 const chartColors = {
   request: '#2563eb',
-  block: '#ef4444',
-  cyber: '#f97316',
-  error: '#6366f1',
+  default: '#64748b',
+  relayDirect: '#16a34a',
+  relayPinned: '#0ea5e9',
+  oauthCyber: '#dc2626',
+  relayError: '#f97316',
 }
 
 const rangeOptions = [
@@ -69,32 +71,32 @@ const refreshOptions = [
 const verdictMeta: Record<string, { label: string; title: string; description: string; tone: Tone }> = {
   normal: {
     label: '正常',
-    title: '巡检态势稳定',
-    description: '当前窗口内未发现明确漏网、审查异常或运行故障。',
+    title: 'Relay 路由态势稳定',
+    description: '当前窗口内未发现 OAuth CYB、路由隔离失效或服务故障。',
     tone: 'ok',
   },
-  blocked_activity: {
-    label: '存在拦截',
-    title: '已拦截风险请求',
-    description: '当前窗口内存在命中的安全拦截记录，请关注样本是否符合预期。',
+  oauth_cyber_risk: {
+    label: 'OAuth CYB',
+    title: '发现 OAuth 漏放',
+    description: '实际由受保护 OAuth 账号发起的请求触发了上游 cyber_policy，请优先复盘路由信号。',
+    tone: 'bad',
+  },
+  route_invariant_violation: {
+    label: '路由越界',
+    title: 'Relay 隔离约束被破坏',
+    description: '存在 Relay 意图却落到错误账号类型、缺少分组或审计字段冲突的请求。',
+    tone: 'bad',
+  },
+  relay_quality_issue: {
+    label: 'Relay 质量',
+    title: 'Relay 服务商出现策略拦截',
+    description: '该信号不计入 OAuth 漏放，但说明 Relay 供应商本身需要关注。',
     tone: 'warn',
-  },
-  suspected_miss: {
-    label: '疑似漏网',
-    title: '发现疑似漏网信号',
-    description: '上游 policy/cyb 错误或高风险样本需要复核，建议优先查看可疑样本。',
-    tone: 'bad',
-  },
-  review_error_risk: {
-    label: '审查异常',
-    title: '审查链路存在异常',
-    description: '模型审核或语义复核出现错误，需检查配置、额度和网络状态。',
-    tone: 'bad',
   },
   operational_issue: {
     label: '运行异常',
-    title: '服务运行存在异常',
-    description: '请求错误率或运行健康状态异常，需优先排查服务与账号池。',
+    title: 'Relay 路由或服务运行存在异常',
+    description: '存在 Relay 不可用、上游 5xx 或其他运行故障。',
     tone: 'bad',
   },
 }
@@ -160,7 +162,9 @@ export default function CodexAudit() {
   })), [report?.timeline])
 
   const errorRate = report?.usage.requests ? (report.usage.errors_4xx + report.usage.errors_5xx) / report.usage.requests : 0
-  const blockRate = report?.usage.requests ? report.summary.prompt_blocks / report.usage.requests : 0
+  const relayRate = report?.usage.requests ? report.summary.relay_requests / report.usage.requests : 0
+  const relaySuccesses = (report?.relay_routes || []).reduce((sum, row) => sum + row.successes, 0)
+  const relaySuccessRate = report?.summary.relay_requests ? relaySuccesses / report.summary.relay_requests : 0
   const firstTokenTone: Tone = (report?.usage.first_token_p95_ms || 0) >= 3000 ? 'bad' : (report?.usage.first_token_p95_ms || 0) >= 1500 ? 'warn' : 'ok'
   const errorTone: Tone = errorRate >= 0.05 ? 'bad' : errorRate > 0 ? 'warn' : 'ok'
 
@@ -168,7 +172,7 @@ export default function CodexAudit() {
     <>
       <PageHeader
         title="审计"
-        description="集中查看误伤、漏网、cyb、探针、首字延迟和运行健康。"
+        description="查看本地规则分流、OAuth 保护效果、Relay 质量、上游 CYB 与运行健康。"
         actions={
           <div className="grid w-full min-w-0 gap-2 sm:w-auto sm:grid-cols-[164px_164px_auto] sm:items-end">
             <HeaderControl label="巡检范围">
@@ -210,36 +214,57 @@ export default function CodexAudit() {
                   </div>
 
                   <div className="grid min-w-0 grid-cols-1 gap-px bg-border/70 sm:grid-cols-2 xl:grid-cols-4">
-                    <SignalTile label="请求总量" value={formatNumber(report.usage.requests)} detail={`错误率 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
-                    <SignalTile label="拦截命中" value={formatNumber(report.summary.prompt_blocks)} detail={`拦截率 ${formatPercent(blockRate)}`} icon={<ShieldX />} tone={report.summary.prompt_blocks ? 'warn' : 'ok'} />
-                    <SignalTile label="疑似漏网" value={formatNumber(report.summary.upstream_cyber_policy)} detail={report.summary.upstream_cyber_policy ? '上游 cyb / policy 信号' : report.last_cyber_policy_at ? `最近一次 cyb ${formatBeijingTime(report.last_cyber_policy_at)}` : '上游 cyb / policy 信号'} icon={<AlertTriangle />} tone={report.summary.upstream_cyber_policy ? 'bad' : report.last_cyber_policy_at ? 'warn' : 'ok'} />
+                    <SignalTile label="逻辑请求" value={formatNumber(report.usage.requests)} detail={`${formatNumber(report.usage.upstream_attempts)} 次上游尝试 · 错误率 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
+                    <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · 成功 ${formatPercent(relaySuccessRate)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                    <SignalTile label="本轮规则直达" value={formatNumber(report.summary.relay_direct)} detail="当前完整 payload 直接命中" icon={<Gauge />} tone="ok" />
+                    <SignalTile label="历史 Pin 延续" value={formatNumber(report.summary.relay_pinned)} detail={`旧口径 ${formatNumber(report.summary.relay_legacy_unknown)}`} icon={<Zap />} tone={report.summary.relay_legacy_unknown ? 'neutral' : 'ok'} />
+                    <SignalTile label="OAuth CYB 漏放" value={formatNumber(report.summary.oauth_cyber_miss_attempts)} detail={`${formatNumber(report.summary.oauth_cyber_miss_requests)} 个逻辑请求`} icon={<AlertTriangle />} tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'} />
+                    <SignalTile label="Relay CYB" value={formatNumber(report.summary.relay_cyber_attempts)} detail={`${formatNumber(report.summary.relay_cyber_requests)} 个请求 · 不计漏放`} icon={<ShieldAlert />} tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'} />
+                    <SignalTile label="路由异常" value={formatNumber(report.summary.relay_route_failures)} detail={`越界 ${formatNumber(report.summary.route_invariant_violations)} · 阻止回退 ${formatNumber(report.summary.relay_fallback_prevented)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
                     <SignalTile label="会话串扰" value={formatNumber(report.summary.session_bleed)} detail={report.summary.session_bleed ? '⚠️ 立即排查！' : '被动监测中·真实流量'} icon={<ShieldAlert />} tone={report.summary.session_bleed ? 'bad' : 'ok'} />
-                    <SignalTile label="审查异常" value={formatNumber(report.summary.review_errors)} detail="审核/语义复核错误" icon={<ShieldAlert />} tone={report.summary.review_errors ? 'bad' : 'ok'} />
                     <SignalTile label="首字 P95" value={formatMS(report.usage.first_token_p95_ms)} detail={`${formatNumber(report.usage.first_token_samples)} 个样本`} icon={<Clock3 />} tone={firstTokenTone} />
                     <SignalTile label="WS 占比" value={formatPercent(report.usage.websocket_ratio || 0)} detail={`${formatNumber(report.usage.websocket_requests)} 个 WS 请求`} icon={<Zap />} tone={(report.usage.websocket_ratio || 0) >= 0.85 ? 'ok' : 'warn'} />
-                    <SignalTile label="语义分歧" value={formatNumber(report.summary.semantic_disagreements)} detail={`拦截 ${formatNumber(report.summary.semantic_disagreement_blocks)}`} icon={<Gauge />} tone={report.summary.semantic_disagreement_blocks ? 'warn' : 'neutral'} />
-                    <SignalTile label="高频探针" value={formatNumber(report.summary.probe_high_frequency || 0)} detail={`已短路 ${formatNumber(report.summary.probe_short_circuits)} / 观测 ${formatNumber(report.summary.probe_observed)}`} icon={<CheckCircle2 />} tone={report.summary.probe_high_frequency ? 'warn' : 'ok'} className="sm:col-span-2 xl:col-span-2" />
+                    <SignalTile label="高频探针" value={formatNumber(report.summary.probe_high_frequency || 0)} detail={`已短路 ${formatNumber(report.summary.probe_short_circuits)} / 观测 ${formatNumber(report.summary.probe_observed)}`} icon={<CheckCircle2 />} tone={report.summary.probe_high_frequency ? 'warn' : 'ok'} />
                     <AccountPoolTile accounts={accounts} />
                   </div>
                 </div>
               </CardContent>
             </Card>
 
-            <CyberMissPanel />
+            <div className="grid min-w-0 gap-4 xl:grid-cols-2">
+              <CyberPolicyPanel
+                title="OAuth 漏放案卷"
+                description="仅展示实际由受保护 OAuth 账号发起且返回 cyber_policy 的请求；Relay 账号事件不计入漏放。"
+                rows={report.oauth_cyber_cases || []}
+                total={report.summary.oauth_cyber_miss_attempts}
+                empty="当前窗口内没有 OAuth 漏放"
+                tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'}
+              />
+              <CyberPolicyPanel
+                title="Relay CYB 案卷"
+                description="展示 Relay 账号返回的 cyber_policy，用于供应商质量分析，不计入 OAuth 漏放。"
+                rows={report.relay_cyber_cases || []}
+                total={report.summary.relay_cyber_attempts}
+                empty="当前窗口内 Relay 未返回 cyber_policy"
+                tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'}
+              />
+            </div>
             <SessionBleedPanel />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.85fr)]">
-              <ChartPanel title="请求与风险趋势" description="按时间窗口聚合请求、拦截、上游 cyb 和 5xx。">
+              <ChartPanel title="请求与 Relay 路由趋势" description="按逻辑请求聚合默认路由、本轮规则直达、历史 Pin、OAuth CYB 和 Relay 路由失败。">
                 <ResponsiveContainer width="100%" height={286}>
                   <LineChart data={timeline} margin={{ top: 12, right: 18, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="4 4" stroke="hsl(var(--border))" vertical={false} />
                     <XAxis dataKey="label" tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" tickLine={false} axisLine={false} />
                     <YAxis tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" tickLine={false} axisLine={false} />
                     <RechartsTooltip contentStyle={chartTooltipStyle} />
-                    <Line type="monotone" dataKey="requests" name="请求" stroke={chartColors.request} strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
-                    <Line type="monotone" dataKey="prompt_blocks" name="拦截" stroke={chartColors.block} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                    <Line type="monotone" dataKey="upstream_cyber_policy" name="上游 cyb" stroke={chartColors.cyber} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                    <Line type="monotone" dataKey="errors_5xx" name="5xx" stroke={chartColors.error} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="requests" name="逻辑请求" stroke={chartColors.request} strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="default_requests" name="默认 OAuth" stroke={chartColors.default} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_direct" name="Relay 直达" stroke={chartColors.relayDirect} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_pinned" name="Relay Pin" stroke={chartColors.relayPinned} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="oauth_cyber_attempts" name="OAuth CYB" stroke={chartColors.oauthCyber} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_route_failures" name="Relay 路由失败" stroke={chartColors.relayError} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                   </LineChart>
                 </ResponsiveContainer>
               </ChartPanel>
@@ -258,32 +283,47 @@ export default function CodexAudit() {
             </div>
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-2">
-              <Panel title="Prompt Filter 聚合" description="按来源、动作、审查模型和分数区间聚合。">
+              <Panel title="Relay 路由信号" description="按当前完整 payload 的本地规则信号聚合；历史 Pin 不伪装成本轮命中。">
                 <SimpleTable
-                  columns={['来源', '动作', '审查模型', '数量', '分数', '异常']}
-                  rows={(report.prompt_filter || []).map((row) => [
-                    row.source || '-',
-                    row.action || '-',
-                    row.review_model || '-',
-                    formatNumber(row.count),
-                    `${row.min_score}-${row.max_score}`,
-                    formatNumber(row.review_errors),
+                  columns={['信号', '逻辑请求', '最近出现']}
+                  rows={(report.route_signals || []).map((row) => [
+                    row.signal || '-',
+                    formatNumber(row.requests),
+                    formatBeijingTime(row.last_seen),
                   ])}
-                  empty="暂无 Prompt Filter 日志"
+                  empty="当前窗口内暂无 Relay 路由信号"
                 />
               </Panel>
 
-              <ProbePanel report={report} />
+              <Panel title="Relay 账号与路由来源" description="按 Relay 账号、Direct/Pin 来源和 Pin 类型统计成功率与上游质量。">
+                <SimpleTable
+                  columns={['账号', '来源', 'Pin', '请求', '尝试', '成功', '4xx', '5xx', 'CYB']}
+                  rows={(report.relay_routes || []).map((row) => [
+                    row.account_name || `#${row.account_id}`,
+                    row.route_source || 'legacy',
+                    row.pin_kind || '-',
+                    formatNumber(row.requests),
+                    formatNumber(row.attempts),
+                    formatNumber(row.successes),
+                    formatNumber(row.errors_4xx),
+                    formatNumber(row.errors_5xx),
+                    formatNumber(row.cyber_policy),
+                  ])}
+                  empty="当前窗口内暂无 Relay 请求"
+                />
+              </Panel>
             </div>
 
-            <Panel title="可疑样本" description="高分放行、语义分歧、上游 cyb 等需要人工复核的样本。">
-              <PromptSampleTable rows={report.suspicious_samples || []} />
+            <Panel title="Relay 路由案卷" description="记录本轮规则直达与历史 Pin 的来源、信号、账号和完整脱敏请求，便于复盘分流原因。">
+              {(report.route_samples || []).length ? (
+                <div className="space-y-2">
+                  {(report.route_samples || []).map((log) => <AuditLogRow key={log.id} log={log} />)}
+                </div>
+              ) : <EmptyState>当前窗口内暂无 Relay 路由样本</EmptyState>}
             </Panel>
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-2">
-              <Panel title="Policy-like 错误" description="从请求日志中提取 policy、cyber、violat、safety 相关错误。">
-                <UsageSampleTable rows={report.policy_errors || []} empty="暂无 policy-like 错误" />
-              </Panel>
+              <ProbePanel report={report} />
               <Panel title="首字慢请求" description="按首字时间倒序列出最慢样本，用于观察 WS 和上游延迟。">
                 <UsageSampleTable rows={report.slow_requests || []} empty="暂无慢请求样本" showFirstToken />
               </Panel>
@@ -296,75 +336,41 @@ export default function CodexAudit() {
   )
 }
 
-function CyberMissPanel() {
-  const [logs, setLogs] = useState<PromptFilterLog[]>([])
-  const [total, setTotal] = useState(0)
-  const [page, setPage] = useState(1)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const res = await api.getPromptFilterLogs({ source: 'upstream_cyber_policy', page, pageSize: AUDIT_PAGE_SIZE })
-      setLogs(res.logs ?? [])
-      setTotal(res.total ?? 0)
-    } catch (err) {
-      setError(getErrorMessage(err))
-    } finally {
-      setLoading(false)
-    }
-  }, [page])
-
-  useEffect(() => {
-    void load()
-  }, [load])
-
-  const totalPages = Math.max(1, Math.ceil(total / AUDIT_PAGE_SIZE))
-
+function CyberPolicyPanel({ title, description, rows, total, empty, tone }: { title: string; description: string; rows: PromptFilterLog[]; total: number; empty: string; tone: Tone }) {
+  const { pageRows, page, totalPages, setPage, pageSize } = usePaged(rows)
+  const clean = total === 0
+  const cardClass = tone === 'bad'
+    ? 'border-red-500/40 bg-red-500/[0.06]'
+    : tone === 'warn'
+      ? 'border-amber-500/30 bg-amber-500/[0.05]'
+      : 'border-emerald-500/30 bg-emerald-500/[0.05]'
   return (
-    <Card className="w-full min-w-0 overflow-hidden border-amber-500/30 bg-amber-500/[0.05] shadow-sm">
+    <Card className={`w-full min-w-0 overflow-hidden shadow-sm ${cardClass}`}>
       <CardContent className="min-w-0 p-4 sm:p-5">
-        <div className="mb-4 flex items-start justify-between gap-3 max-sm:flex-col">
+        <div className="mb-4 flex items-start justify-between gap-3">
           <div className="flex items-start gap-3">
-            <div className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-400">
-              <ShieldAlert className="size-5" />
+            <div className={`mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-xl ${toneIconClass(tone)}`}>
+              {clean ? <ShieldCheck className="size-5" /> : <ShieldAlert className="size-5" />}
             </div>
             <div className="min-w-0">
-              <h3 className="text-sm font-semibold text-foreground">漏放案卷 · 放行却被上游拦下</h3>
-              <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-                本地过滤与语义判官都放行、却被上游 cyber_policy 拦截的请求。每一条都是账号池的一次违规风险，也是复盘检测盲区、积累知识库的素材。已记录脱敏原始请求与上游原因，点开看完整案卷。
-              </p>
+              <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-3 max-sm:w-full max-sm:justify-between">
-            <div className="text-right">
-              <div className="text-2xl font-bold tabular-nums text-amber-600 dark:text-amber-400">{total}</div>
-              <div className="text-[11px] leading-tight text-muted-foreground">累计漏放</div>
-            </div>
-            <Button variant="outline" onClick={() => void load()} disabled={loading}>
-              <RefreshCw className={loading ? 'size-3.5 animate-spin' : 'size-3.5'} />
-              刷新
-            </Button>
+          <div className="shrink-0 text-right">
+            <div className={`text-2xl font-bold tabular-nums ${toneTextClass(tone)}`}>{formatNumber(total)}</div>
+            <div className="text-[11px] leading-tight text-muted-foreground">上游尝试</div>
           </div>
         </div>
-
-        {error ? (
-          <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{error}</div>
-        ) : total === 0 ? (
-          <div className="rounded-lg border border-border/60 bg-background/60 p-6 text-center text-xs text-muted-foreground">
-            {loading ? '加载中…' : '暂无漏放记录 —— 本地过滤与语义判官拦住了全部触发上游 cyber 策略的请求'}
-          </div>
+        {clean ? (
+          <div className="rounded-lg border border-border/60 bg-background/60 p-6 text-center text-xs text-muted-foreground">{empty}</div>
         ) : (
           <>
             <div className="space-y-2">
-              {logs.map((log) => (
-                <CyberMissRow key={log.id} log={log} />
-              ))}
+              {pageRows.map((log) => <AuditLogRow key={log.id} log={log} />)}
             </div>
-            {total > AUDIT_PAGE_SIZE ? (
-              <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={total} pageSize={AUDIT_PAGE_SIZE} />
+            {rows.length > pageSize ? (
+              <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={rows.length} pageSize={pageSize} />
             ) : null}
           </>
         )}
@@ -441,7 +447,7 @@ function SessionBleedPanel() {
             </div>
             <div className="space-y-2">
               {logs.map((log) => (
-                <CyberMissRow key={log.id} log={log} />
+                <AuditLogRow key={log.id} log={log} />
               ))}
             </div>
             {total > AUDIT_PAGE_SIZE ? (
@@ -454,10 +460,15 @@ function SessionBleedPanel() {
   )
 }
 
-function CyberMissRow({ log }: { log: PromptFilterLog }) {
+function AuditLogRow({ log }: { log: PromptFilterLog }) {
   const [open, setOpen] = useState(false)
   const full = (log.full_text || '').trim()
   const preview = (log.text_preview || '').trim()
+  const badge = log.source === 'session_bleed'
+    ? 'session_bleed'
+    : log.source === 'cyb_relay_routed'
+      ? (log.route_source === 'pin' ? `pin · ${log.pin_kind || 'unknown'}` : 'direct')
+      : 'cyber_policy'
   return (
     <div className="min-w-0 rounded-lg border border-border/60 bg-background/70">
       <button
@@ -465,7 +476,7 @@ function CyberMissRow({ log }: { log: PromptFilterLog }) {
         onClick={() => setOpen((v) => !v)}
         className="flex w-full min-w-0 items-center gap-2 px-3 py-2.5 text-left sm:gap-3"
       >
-        <Badge className="shrink-0 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">cyber_policy</Badge>
+        <Badge className="shrink-0 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">{badge}</Badge>
         <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-muted-foreground sm:inline">{formatBeijingTime(log.created_at)}</span>
         <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-muted-foreground md:inline">{log.endpoint}</span>
         <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-muted-foreground md:inline">{log.model || '-'}</span>
@@ -478,6 +489,14 @@ function CyberMissRow({ log }: { log: PromptFilterLog }) {
             <span>{formatBeijingTime(log.created_at)}</span>
             <span>{log.endpoint}</span>
             <span>{log.model || '-'}</span>
+          </div>
+          <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+            <span>账号 #{log.account_id || '-'}</span>
+            <span>{log.upstream_account_type || 'unknown'}</span>
+            <span>路由 {log.route_source || log.route_class || '-'}</span>
+            <span>Pin {log.pin_kind || '-'}</span>
+            <span>分组 {log.route_group_id || '-'}</span>
+            {log.route_signals ? <span>信号 {log.route_signals}</span> : null}
           </div>
           <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 text-[12px] leading-5 text-foreground">{full || '（无详情）'}</pre>
         </div>
@@ -496,7 +515,7 @@ function HeaderControl({ label, children }: { label: string; children: ReactNode
 }
 
 function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
-  const active = accounts.filter((a) => a.status === 'active' && a.enabled !== false && !a.locked)
+  const active = accounts.filter((a) => a.status === 'active' && a.enabled !== false)
   const healthy = active.length > 0 && active.length === accounts.length
   return (
     <div className="min-w-0 bg-background/95 p-4 sm:col-span-2 xl:col-span-2">
@@ -515,7 +534,7 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
           const pct = Math.round(a.usage_percent_7d ?? 0)
           const busy = a.active_requests ?? 0
           const cap = a.base_concurrency_effective ?? 5
-          const isActive = a.status === 'active' && a.enabled !== false && !a.locked
+          const isActive = a.status === 'active' && a.enabled !== false
           const barColor = pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
           return (
             <div key={a.id} className="flex items-center gap-2 text-xs">
@@ -765,66 +784,6 @@ function ProbeMeta({ label, value, wide = false, wrap = false }: { label: string
   )
 }
 
-function PromptSampleTable({ rows }: { rows: PromptFilterLog[] }) {
-  const { pageRows, page, totalPages, setPage, total } = usePaged(rows)
-  if (!rows.length) {
-    return <EmptyState>暂无可疑样本</EmptyState>
-  }
-  return (
-    <>
-      <div className="grid gap-2 sm:hidden">
-        {pageRows.map((row) => (
-          <div key={row.id} className="min-w-0 rounded-lg border border-border/60 bg-muted/20 p-3">
-            <div className="flex items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="text-xs font-medium text-foreground">{formatBeijingTime(row.created_at)}</div>
-                <div className="mt-1 truncate text-xs text-muted-foreground">{row.source || '-'}</div>
-              </div>
-              <Badge className={`${actionClass(row.action)} shrink-0`}>{row.action || '-'}</Badge>
-            </div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <MobileField label="分数" value={String(row.score)} />
-              <MobileField label="审查" value={row.review_model ? `${row.review_model} / ${row.review_flagged ? 'flagged' : 'clear'}` : '-'} />
-              <MobileField label="预览" value={row.text_preview || row.review_error || '-'} wide wrap />
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="hidden w-full max-w-full overflow-x-auto rounded-lg border border-border/70 sm:block">
-        <Table className="min-w-[760px]">
-          <TableHeader className="bg-muted/40">
-            <TableRow>
-              <TableHead className="text-xs font-semibold text-muted-foreground">时间</TableHead>
-              <TableHead className="text-xs font-semibold text-muted-foreground">来源</TableHead>
-              <TableHead className="text-xs font-semibold text-muted-foreground">动作</TableHead>
-              <TableHead className="text-xs font-semibold text-muted-foreground">分数</TableHead>
-              <TableHead className="text-xs font-semibold text-muted-foreground">审查</TableHead>
-              <TableHead className="text-xs font-semibold text-muted-foreground">预览</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {pageRows.map((row) => (
-              <TableRow key={row.id} className="hover:bg-muted/30">
-                <TableCell className="whitespace-nowrap text-[12px]">{formatBeijingTime(row.created_at)}</TableCell>
-                <TableCell className="text-[12px]">{row.source || '-'}</TableCell>
-                <TableCell><Badge className={actionClass(row.action)}>{row.action || '-'}</Badge></TableCell>
-                <TableCell className="font-medium">{row.score}</TableCell>
-                <TableCell className="text-[12px]">{row.review_model ? `${row.review_model} / ${row.review_flagged ? 'flagged' : 'clear'}` : '-'}</TableCell>
-                <TableCell className="min-w-[360px] max-w-[640px] text-[12px] leading-5 text-muted-foreground">
-                  <span className="line-clamp-3">{row.text_preview || row.review_error || '-'}</span>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </div>
-      {total > AUDIT_PAGE_SIZE ? (
-        <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={total} pageSize={AUDIT_PAGE_SIZE} />
-      ) : null}
-    </>
-  )
-}
-
 function UsageSampleTable({ rows, empty, showFirstToken = false }: { rows: UsageLog[]; empty: string; showFirstToken?: boolean }) {
   const { pageRows, page, totalPages, setPage, total } = usePaged(rows)
   if (!rows.length) {
@@ -911,12 +870,6 @@ function toneTextClass(tone: Tone) {
   if (tone === 'bad') return 'text-destructive'
   if (tone === 'warn') return 'text-amber-700 dark:text-amber-300'
   return 'text-foreground'
-}
-
-function actionClass(action?: string) {
-  if (action === 'block') return 'border-destructive/20 bg-destructive/12 text-destructive hover:bg-destructive/12'
-  if (action === 'allow') return 'border-emerald-500/20 bg-emerald-500/12 text-emerald-700 hover:bg-emerald-500/12 dark:text-emerald-300'
-  return 'border-border bg-muted text-muted-foreground hover:bg-muted'
 }
 
 function formatNumber(value?: number) {

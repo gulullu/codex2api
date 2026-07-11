@@ -134,6 +134,7 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 }
 
 func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte) error {
+	beginLogicalRequest(c)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
 		_ = writeResponsesWSError(conn, apiErr)
@@ -257,8 +258,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
 			if promptDecision.routesToCybRelay() {
+				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt)
 				_ = writeCybRelayUnavailableWebSocket(conn)
-				return newResponsesWSCloseError(websocket.ClosePolicyViolation, "CYB relay unavailable", nil)
+				return newResponsesWSCloseError(websocket.CloseTryAgainLater, "CYB relay unavailable", nil)
 			}
 			if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
@@ -808,53 +810,11 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	if h == nil || h.store == nil {
 		return false
 	}
-	cfg := h.store.GetPromptFilterConfig()
+	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	c.Set(contextPromptFilterText, text)
-	if h.cybRelayConfig().Enabled {
-		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-			decision := h.applyCybRoutePin(c, rawBody, defaultPromptRiskDecision())
-			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
-			return false
-		}
-		verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-		return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model, func() {
-			_ = writeResponsesWSError(conn, promptCyberPolicyError())
-		})
-	}
-	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
-		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-		return h.inspectSemanticReviewOpenAIForWebSocket(c, conn, rawBody, endpoint, model)
-	}
 	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg, endpoint)
-	}
-	var semanticHandled bool
-	var semanticBlocked bool
-	if handled, blocked := h.inspectHighRiskReviewDisagreement(c, verdict, text, endpoint, model, func() {
-		_ = writeResponsesWSError(conn, promptCyberPolicyError())
-	}); handled {
-		semanticHandled = true
-		semanticBlocked = blocked
-		if !blocked && verdict.Action == promptfilter.ActionBlock {
-			verdict.Action = promptfilter.ActionAllow
-			verdict.Reason = "semantic review cleared local high-risk prompt filter block"
-		}
-	}
-	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
-	if semanticBlocked {
-		return true
-	}
-	if verdict.Action == promptfilter.ActionBlock {
-		_ = writeResponsesWSError(conn, promptCyberPolicyError())
-		return true
-	}
-	if semanticHandled {
-		return false
-	}
-	return h.inspectSemanticReviewOpenAIForWebSocket(c, conn, rawBody, endpoint, model)
+	return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model)
 }
 
 func isResponsesWebSocketUpgradeRequest(r *http.Request) bool {

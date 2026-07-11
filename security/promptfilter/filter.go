@@ -613,9 +613,15 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 	switch endpoint {
 	case "chat", "chat_completions", "/v1/chat/completions":
 		addResultText(gjson.GetBytes(body, "messages"))
+		addResultText(gjson.GetBytes(body, "tools"))
+		addResultText(gjson.GetBytes(body, "functions"))
+		addResultText(gjson.GetBytes(body, "tool_choice"))
+		addResultText(gjson.GetBytes(body, "skills"))
 	case "messages", "anthropic", "/v1/messages":
 		addResultText(gjson.GetBytes(body, "system"))
 		addResultText(gjson.GetBytes(body, "messages"))
+		addResultText(gjson.GetBytes(body, "tools"))
+		addResultText(gjson.GetBytes(body, "skills"))
 	case "image", "images", "images_generations", "images_edits", "/v1/images/generations", "/v1/images/edits":
 		addResultText(gjson.GetBytes(body, "prompt"))
 		addResultText(gjson.GetBytes(body, "style"))
@@ -624,6 +630,10 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 		addResultText(gjson.GetBytes(body, "input"))
 		addResultText(gjson.GetBytes(body, "prompt"))
 		addResultText(gjson.GetBytes(body, "messages"))
+		addResultText(gjson.GetBytes(body, "tools"))
+		addResultText(gjson.GetBytes(body, "functions"))
+		addResultText(gjson.GetBytes(body, "skills"))
+		addResultText(gjson.GetBytes(body, "tool_choice"))
 	}
 	return limitScanText(strings.Join(parts, "\n"), maxLen)
 }

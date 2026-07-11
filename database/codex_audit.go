@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -17,23 +18,30 @@ type CodexAuditQuery struct {
 }
 
 type CodexAuditReport struct {
-	WindowStart        time.Time                   `json:"window_start"`
-	WindowEnd          time.Time                   `json:"window_end"`
-	GeneratedAt        time.Time                   `json:"generated_at"`
-	Verdict            string                      `json:"verdict"`
-	Summary            CodexAuditSummary           `json:"summary"`
-	PromptFilter       []CodexAuditPromptFilterRow `json:"prompt_filter"`
-	Usage              CodexAuditUsageSummary      `json:"usage"`
-	Timeline           []CodexAuditTimelinePoint   `json:"timeline"`
-	Models             []CodexAuditModelRow        `json:"models"`
-	SuspiciousSamples  []*PromptFilterLog          `json:"suspicious_samples"`
-	ProbeObserved      []CodexAuditProbeRow        `json:"probe_observed"`
-	ProbeShortCircuits []CodexAuditProbeRow        `json:"probe_short_circuits"`
-	ProbeHighFrequency []CodexAuditProbeRow        `json:"probe_high_frequency"`
-	PolicyErrors       []*UsageLog                 `json:"policy_errors"`
-	SlowRequests       []*UsageLog                 `json:"slow_requests"`
-	Notes              []string                    `json:"notes"`
-	LastCyberPolicyAt  *time.Time                  `json:"last_cyber_policy_at,omitempty"`
+	WindowStart            time.Time                   `json:"window_start"`
+	WindowEnd              time.Time                   `json:"window_end"`
+	GeneratedAt            time.Time                   `json:"generated_at"`
+	Verdict                string                      `json:"verdict"`
+	Summary                CodexAuditSummary           `json:"summary"`
+	PromptFilter           []CodexAuditPromptFilterRow `json:"prompt_filter"`
+	Usage                  CodexAuditUsageSummary      `json:"usage"`
+	Timeline               []CodexAuditTimelinePoint   `json:"timeline"`
+	Models                 []CodexAuditModelRow        `json:"models"`
+	RelayRoutes            []CodexAuditRelayRouteRow   `json:"relay_routes"`
+	RouteSignals           []CodexAuditRouteSignalRow  `json:"route_signals"`
+	RouteSamples           []*PromptFilterLog          `json:"route_samples"`
+	OAuthCyberCases        []*PromptFilterLog          `json:"oauth_cyber_cases"`
+	RelayCyberCases        []*PromptFilterLog          `json:"relay_cyber_cases"`
+	SuspiciousSamples      []*PromptFilterLog          `json:"suspicious_samples"`
+	ProbeObserved          []CodexAuditProbeRow        `json:"probe_observed"`
+	ProbeShortCircuits     []CodexAuditProbeRow        `json:"probe_short_circuits"`
+	ProbeHighFrequency     []CodexAuditProbeRow        `json:"probe_high_frequency"`
+	PolicyErrors           []*UsageLog                 `json:"policy_errors"`
+	SlowRequests           []*UsageLog                 `json:"slow_requests"`
+	Notes                  []string                    `json:"notes"`
+	LastCyberPolicyAt      *time.Time                  `json:"last_cyber_policy_at,omitempty"`
+	LastOAuthCyberPolicyAt *time.Time                  `json:"last_oauth_cyber_policy_at,omitempty"`
+	LastRelayCyberPolicyAt *time.Time                  `json:"last_relay_cyber_policy_at,omitempty"`
 }
 
 type CodexAuditSummary struct {
@@ -49,6 +57,19 @@ type CodexAuditSummary struct {
 	ProbeObserved              int64 `json:"probe_observed"`
 	ProbeShortCircuits         int64 `json:"probe_short_circuits"`
 	ProbeHighFrequency         int64 `json:"probe_high_frequency"`
+	RelayRequests              int64 `json:"relay_requests"`
+	RelayDirect                int64 `json:"relay_direct"`
+	RelayPinned                int64 `json:"relay_pinned"`
+	RelayLegacyUnknown         int64 `json:"relay_legacy_unknown"`
+	RelayRouteFailures         int64 `json:"relay_route_failures"`
+	RelayFallbackPrevented     int64 `json:"relay_fallback_prevented"`
+	OAuthCyberMissRequests     int64 `json:"oauth_cyber_miss_requests"`
+	OAuthCyberMissAttempts     int64 `json:"oauth_cyber_miss_attempts"`
+	RelayCyberRequests         int64 `json:"relay_cyber_requests"`
+	RelayCyberAttempts         int64 `json:"relay_cyber_attempts"`
+	LegacyCyberUnattributed    int64 `json:"legacy_cyber_unattributed"`
+	RouteInvariantViolations   int64 `json:"route_invariant_violations"`
+	LegacyUsageRows            int64 `json:"legacy_usage_rows"`
 }
 
 type CodexAuditPromptFilterRow struct {
@@ -65,6 +86,7 @@ type CodexAuditPromptFilterRow struct {
 
 type CodexAuditUsageSummary struct {
 	Requests          int64   `json:"requests"`
+	UpstreamAttempts  int64   `json:"upstream_attempts"`
 	Errors4xx         int64   `json:"errors_4xx"`
 	Errors5xx         int64   `json:"errors_5xx"`
 	WebSocketRequests int64   `json:"websocket_requests"`
@@ -78,14 +100,41 @@ type CodexAuditUsageSummary struct {
 }
 
 type CodexAuditTimelinePoint struct {
-	Bucket              time.Time `json:"bucket"`
-	Requests            int64     `json:"requests"`
-	PromptBlocks        int64     `json:"prompt_blocks"`
-	ReviewFlagged       int64     `json:"review_flagged"`
-	UpstreamCyberPolicy int64     `json:"upstream_cyber_policy"`
-	Errors4xx           int64     `json:"errors_4xx"`
-	Errors5xx           int64     `json:"errors_5xx"`
-	FirstTokenP95MS     int       `json:"first_token_p95_ms"`
+	Bucket                   time.Time `json:"bucket"`
+	Requests                 int64     `json:"requests"`
+	PromptBlocks             int64     `json:"prompt_blocks"`
+	ReviewFlagged            int64     `json:"review_flagged"`
+	UpstreamCyberPolicy      int64     `json:"upstream_cyber_policy"`
+	Errors4xx                int64     `json:"errors_4xx"`
+	Errors5xx                int64     `json:"errors_5xx"`
+	FirstTokenP95MS          int       `json:"first_token_p95_ms"`
+	DefaultRequests          int64     `json:"default_requests"`
+	RelayDirect              int64     `json:"relay_direct"`
+	RelayPinned              int64     `json:"relay_pinned"`
+	RelayLegacyUnknown       int64     `json:"relay_legacy_unknown"`
+	RelayRouteFailures       int64     `json:"relay_route_failures"`
+	OAuthCyberAttempts       int64     `json:"oauth_cyber_attempts"`
+	RelayCyberAttempts       int64     `json:"relay_cyber_attempts"`
+	RouteInvariantViolations int64     `json:"route_invariant_violations"`
+}
+
+type CodexAuditRelayRouteRow struct {
+	AccountID   int64  `json:"account_id"`
+	AccountName string `json:"account_name"`
+	RouteSource string `json:"route_source"`
+	PinKind     string `json:"pin_kind"`
+	Requests    int64  `json:"requests"`
+	Attempts    int64  `json:"attempts"`
+	Successes   int64  `json:"successes"`
+	Errors4xx   int64  `json:"errors_4xx"`
+	Errors5xx   int64  `json:"errors_5xx"`
+	CyberPolicy int64  `json:"cyber_policy"`
+}
+
+type CodexAuditRouteSignalRow struct {
+	Signal   string    `json:"signal"`
+	Requests int64     `json:"requests"`
+	LastSeen time.Time `json:"last_seen"`
 }
 
 type CodexAuditModelRow struct {
@@ -160,6 +209,21 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 	if report.Models, err = db.codexAuditModels(ctx, start, end, query.Limit); err != nil {
 		return nil, err
 	}
+	if report.RelayRoutes, err = db.codexAuditRelayRouteRows(ctx, start, end); err != nil {
+		return nil, err
+	}
+	if report.RouteSignals, err = db.codexAuditRouteSignalRows(ctx, start, end); err != nil {
+		return nil, err
+	}
+	if report.RouteSamples, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "cyb_relay_routed", Start: start, End: end}); err != nil {
+		return nil, err
+	}
+	if report.OAuthCyberCases, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "upstream_cyber_policy", CyberScope: "oauth", Start: start, End: end}); err != nil {
+		return nil, err
+	}
+	if report.RelayCyberCases, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "upstream_cyber_policy", CyberScope: "relay", Start: start, End: end}); err != nil {
+		return nil, err
+	}
 	if report.SuspiciousSamples, err = db.codexAuditSuspiciousSamples(ctx, start, end, query.Limit); err != nil {
 		return nil, err
 	}
@@ -179,23 +243,40 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 		return nil, err
 	}
 	report.Summary = summarizeCodexAudit(report)
+	routeSummary, routeErr := db.codexAuditRouteSummary(ctx, start, end)
+	if routeErr != nil {
+		return nil, routeErr
+	}
+	mergeCodexAuditRouteSummary(&report.Summary, routeSummary)
 	report.Verdict = codexAuditVerdict(report)
-	if report.LastCyberPolicyAt, err = db.codexAuditLastCyberPolicyAt(ctx, end); err != nil {
+	if report.LastOAuthCyberPolicyAt, err = db.codexAuditLastCyberPolicyAt(ctx, end, "oauth"); err != nil {
+		return nil, err
+	}
+	report.LastCyberPolicyAt = report.LastOAuthCyberPolicyAt
+	if report.LastRelayCyberPolicyAt, err = db.codexAuditLastCyberPolicyAt(ctx, end, "relay"); err != nil {
 		return nil, err
 	}
 	return report, nil
 }
 
-// codexAuditLastCyberPolicyAt 查询窗口外最近一次 upstream_cyber_policy 事件（30 天回看），
-// 供前端在当前窗口 cyb=0 时提示「最近一次 cyb」，避免短窗口误判为一直无风险。
-func (db *DB) codexAuditLastCyberPolicyAt(ctx context.Context, end time.Time) (*time.Time, error) {
+// codexAuditLastCyberPolicyAt 查询窗口外最近一次精确 cyber_policy 使用事件（30 天回看）。
+// usage_logs 是上游账号归属与实际调用结果的权威来源；prompt_filter_logs 只用于案卷正文。
+func (db *DB) codexAuditLastCyberPolicyAt(ctx context.Context, end time.Time, scope string) (*time.Time, error) {
 	start := end.Add(-30 * 24 * time.Hour)
 	startArg, endArg := db.timeRangeArgs(start, end)
+	accountType := "oauth"
+	routeClause := ""
+	if scope == "relay" {
+		accountType = "openai_responses"
+		routeClause = " AND COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) > 0"
+	}
 	var raw any
 	if err := db.conn.QueryRowContext(ctx, `
-		SELECT MAX(created_at) FROM prompt_filter_logs
-		WHERE source = 'upstream_cyber_policy' AND created_at >= $1 AND created_at <= $2
-	`, startArg, endArg).Scan(&raw); err != nil {
+		SELECT MAX(created_at) FROM usage_logs
+		WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
+		  AND COALESCE(upstream_account_type, '') = $3
+		  AND created_at >= $1 AND created_at <= $2`+routeClause,
+		startArg, endArg, accountType).Scan(&raw); err != nil {
 		return nil, err
 	}
 	if raw == nil {
@@ -237,7 +318,7 @@ func (db *DB) codexAuditPromptFilterRows(ctx context.Context, start, end time.Ti
 func (db *DB) codexAuditUsageSummary(ctx context.Context, start, end time.Time) (CodexAuditUsageSummary, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
 	var summary CodexAuditUsageSummary
-	err := db.conn.QueryRowContext(ctx, `
+	err := db.conn.QueryRowContext(ctx, codexAuditCanonicalUsageCTE+`
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN status_code BETWEEN 400 AND 499 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0),
@@ -252,10 +333,10 @@ func (db *DB) codexAuditUsageSummary(ctx context.Context, start, end time.Time) 
 		                           OR lower(COALESCE(upstream_error_kind, '')) LIKE '%safety%'
 		                      THEN 1 ELSE 0 END), 0),
 		       COALESCE(MIN(CASE WHEN first_token_ms > 0 THEN first_token_ms END), 0),
-		       COALESCE(MAX(first_token_ms), 0)
-		FROM usage_logs
-		WHERE created_at >= $1 AND created_at <= $2
-	`, startArg, endArg).Scan(&summary.Requests, &summary.Errors4xx, &summary.Errors5xx, &summary.WebSocketRequests, &summary.PolicyLikeErrors, &summary.FirstTokenMinMS, &summary.FirstTokenMaxMS)
+		       COALESCE(MAX(first_token_ms), 0),
+		       (SELECT COUNT(*) FROM ranked_usage)
+		FROM final_usage
+	`, startArg, endArg).Scan(&summary.Requests, &summary.Errors4xx, &summary.Errors5xx, &summary.WebSocketRequests, &summary.PolicyLikeErrors, &summary.FirstTokenMinMS, &summary.FirstTokenMaxMS, &summary.UpstreamAttempts)
 	if err != nil {
 		return summary, err
 	}
@@ -275,12 +356,12 @@ func (db *DB) codexAuditUsageSummary(ctx context.Context, start, end time.Time) 
 func (db *DB) codexAuditFirstTokenValues(ctx context.Context, start, end time.Time, model string) ([]int, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
 	args := []any{startArg, endArg}
-	where := "created_at >= $1 AND created_at <= $2 AND first_token_ms > 0"
+	where := "first_token_ms > 0"
 	if strings.TrimSpace(model) != "" {
 		args = append(args, model)
 		where += fmt.Sprintf(" AND COALESCE(NULLIF(effective_model, ''), model, '') = $%d", len(args))
 	}
-	rows, err := db.conn.QueryContext(ctx, `SELECT first_token_ms FROM usage_logs WHERE `+where+` ORDER BY first_token_ms ASC LIMIT 20000`, args...)
+	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`SELECT first_token_ms FROM final_usage WHERE `+where+` ORDER BY first_token_ms ASC LIMIT 20000`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -305,11 +386,23 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 		}
 		return t.Unix() / sec * sec
 	}
+	pointFor := func(created time.Time) *CodexAuditTimelinePoint {
+		key := bucketOf(created)
+		point := buckets[key]
+		if point == nil {
+			point = &CodexAuditTimelinePoint{Bucket: time.Unix(key, 0)}
+			buckets[key] = point
+		}
+		return point
+	}
 	startArg, endArg := db.timeRangeArgs(start, end)
-	rows, err := db.conn.QueryContext(ctx, `
-		SELECT created_at, status_code, COALESCE(first_token_ms, 0)
-		FROM usage_logs
-		WHERE created_at >= $1 AND created_at <= $2
+	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`
+		SELECT created_at, status_code, COALESCE(first_token_ms, 0),
+		       COALESCE(route_class, ''), COALESCE(route_source, ''), COALESCE(route_group_id, 0),
+		       COALESCE(logical_request_id, ''), COALESCE(upstream_account_type, ''),
+		       COALESCE(upstream_error_kind, ''), COALESCE(account_id, 0),
+		       COALESCE(route_signals, '[]'), COALESCE(pin_kind, '')
+		FROM final_usage
 		ORDER BY created_at ASC
 		LIMIT 100000
 	`, startArg, endArg)
@@ -320,7 +413,9 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 	for rows.Next() {
 		var raw any
 		var status, ft int
-		if err := rows.Scan(&raw, &status, &ft); err != nil {
+		var routeClass, routeSource, logicalID, accountType, errorKind, routeSignals, pinKind string
+		var routeGroupID, accountID int64
+		if err := rows.Scan(&raw, &status, &ft, &routeClass, &routeSource, &routeGroupID, &logicalID, &accountType, &errorKind, &accountID, &routeSignals, &pinKind); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -329,20 +424,42 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 			rows.Close()
 			return nil, err
 		}
-		key := bucketOf(created)
-		point := buckets[key]
-		if point == nil {
-			point = &CodexAuditTimelinePoint{Bucket: time.Unix(key, 0)}
-			buckets[key] = point
-		}
+		point := pointFor(created)
 		point.Requests++
+		if routeClass == "cyb_relay" {
+			switch routeSource {
+			case "direct":
+				point.RelayDirect++
+			case "pin":
+				point.RelayPinned++
+			default:
+				point.RelayLegacyUnknown++
+			}
+			if status >= 500 || errorKind == "relay_route_unavailable" || errorKind == "no_available_relay_account" || errorKind == "relay_affinity_unavailable" || errorKind == "route_switch_requires_replay" {
+				point.RelayRouteFailures++
+			}
+		} else {
+			point.DefaultRequests++
+		}
+		if logicalID != "" {
+			invariant := (routeClass == "cyb_relay" && accountID > 0 && accountType != "openai_responses") ||
+				(routeClass == "cyb_relay" && routeGroupID <= 0) ||
+				(routeClass == "cyb_relay" && routeSource != "direct" && routeSource != "pin") ||
+				(routeSource == "pin" && pinKind == "") ||
+				(routeSource == "direct" && (routeSignals == "" || routeSignals == "[]" || routeSignals == "null")) ||
+				(routeSource == "pin" && routeSignals != "" && routeSignals != "[]" && routeSignals != "null") ||
+				((routeSource == "direct" || routeSource == "pin") && routeClass != "cyb_relay")
+			if invariant {
+				point.RouteInvariantViolations++
+			}
+		}
 		if status >= 500 {
 			point.Errors5xx++
 		} else if status >= 400 {
 			point.Errors4xx++
 		}
 		if ft > 0 {
-			firstTokens[key] = append(firstTokens[key], ft)
+			firstTokens[bucketOf(created)] = append(firstTokens[bucketOf(created)], ft)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -351,47 +468,44 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 	}
 	rows.Close()
 
-	pRows, err := db.conn.QueryContext(ctx, `
-		SELECT created_at, COALESCE(action, ''), COALESCE(review_flagged, false), COALESCE(source, '')
-		FROM prompt_filter_logs
+	cyberRows, err := db.conn.QueryContext(ctx, `
+		SELECT created_at, COALESCE(upstream_account_type, ''),
+		       COALESCE(route_class, ''), COALESCE(route_group_id, 0)
+		FROM usage_logs
 		WHERE created_at >= $1 AND created_at <= $2
+		  AND LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
 		ORDER BY created_at ASC
 		LIMIT 100000
 	`, startArg, endArg)
 	if err != nil {
 		return nil, err
 	}
-	defer pRows.Close()
-	for pRows.Next() {
+	for cyberRows.Next() {
 		var raw any
-		var action, source string
-		var reviewFlagged bool
-		if err := pRows.Scan(&raw, &action, &reviewFlagged, &source); err != nil {
+		var accountType, routeClass string
+		var routeGroupID int64
+		if err := cyberRows.Scan(&raw, &accountType, &routeClass, &routeGroupID); err != nil {
+			cyberRows.Close()
 			return nil, err
 		}
 		created, err := parseDBTimeValue(raw)
 		if err != nil {
+			cyberRows.Close()
 			return nil, err
 		}
-		key := bucketOf(created)
-		point := buckets[key]
-		if point == nil {
-			point = &CodexAuditTimelinePoint{Bucket: time.Unix(key, 0)}
-			buckets[key] = point
-		}
-		if action == "block" {
-			point.PromptBlocks++
-		}
-		if reviewFlagged {
-			point.ReviewFlagged++
-		}
-		if source == "upstream_cyber_policy" {
+		point := pointFor(created)
+		if accountType == "oauth" {
+			point.OAuthCyberAttempts++
 			point.UpstreamCyberPolicy++
+		} else if accountType == "openai_responses" && routeClass == "cyb_relay" && routeGroupID > 0 {
+			point.RelayCyberAttempts++
 		}
 	}
-	if err := pRows.Err(); err != nil {
+	if err := cyberRows.Err(); err != nil {
+		cyberRows.Close()
 		return nil, err
 	}
+	cyberRows.Close()
 
 	keys := make([]int64, 0, len(buckets))
 	for key := range buckets {
@@ -409,14 +523,13 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 
 func (db *DB) codexAuditModels(ctx context.Context, start, end time.Time, limit int) ([]CodexAuditModelRow, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
-	rows, err := db.conn.QueryContext(ctx, `
+	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`
 		SELECT COALESCE(NULLIF(effective_model, ''), model, '') AS m,
 		       COUNT(*),
 		       COALESCE(SUM(CASE WHEN status_code BETWEEN 400 AND 499 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(via_websocket, false) THEN 1 ELSE 0 END), 0)
-		FROM usage_logs
-		WHERE created_at >= $1 AND created_at <= $2
+		FROM final_usage
 		GROUP BY 1
 		ORDER BY COUNT(*) DESC, 1
 		LIMIT $3
@@ -742,6 +855,206 @@ func scanPromptFilterLogs(rows scannerRows) ([]*PromptFilterLog, error) {
 	return result, rows.Err()
 }
 
+const codexAuditCanonicalUsageCTE = `
+WITH ranked_usage AS (
+	SELECT u.*,
+	       COALESCE(NULLIF(u.logical_request_id, ''), 'legacy:' || CAST(u.id AS TEXT)) AS audit_request_id,
+	       ROW_NUMBER() OVER (
+		   PARTITION BY COALESCE(NULLIF(u.logical_request_id, ''), 'legacy:' || CAST(u.id AS TEXT))
+		   -- Retry failures carry attempt_index, while the terminal success row is
+		   -- currently written with the default zero value. The final append is the
+		   -- authoritative logical-request outcome, so rank by write order only.
+		   ORDER BY u.id DESC
+	       ) AS audit_rn
+	FROM usage_logs u
+	WHERE u.created_at >= $1 AND u.created_at <= $2
+), final_usage AS (
+	SELECT * FROM ranked_usage WHERE audit_rn = 1
+)
+`
+
+func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) (CodexAuditSummary, error) {
+	startArg, endArg := db.timeRangeArgs(start, end)
+	var summary CodexAuditSummary
+	err := db.conn.QueryRowContext(ctx, codexAuditCanonicalUsageCTE+`
+		SELECT
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'direct' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'pin' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin') THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND (status_code >= 500 OR COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay')) THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay') THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') = '' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') <> '' AND (
+		      (COALESCE(route_class, '') = 'cyb_relay' AND account_id > 0 AND COALESCE(upstream_account_type, '') <> 'openai_responses') OR
+		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) <= 0) OR
+		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin')) OR
+		      (COALESCE(route_source, '') = 'pin' AND COALESCE(pin_kind, '') = '') OR
+		      (COALESCE(route_source, '') = 'direct' AND COALESCE(route_signals, '[]') IN ('', '[]', 'null')) OR
+		      (COALESCE(route_source, '') = 'pin' AND COALESCE(route_signals, '[]') NOT IN ('', '[]', 'null')) OR
+		      (COALESCE(route_source, '') IN ('direct', 'pin') AND COALESCE(route_class, '') <> 'cyb_relay')
+		  ) THEN 1 ELSE 0 END), 0),
+		  (SELECT COUNT(DISTINCT audit_request_id) FROM ranked_usage WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy' AND COALESCE(upstream_account_type, '') = 'oauth'),
+		  (SELECT COUNT(*) FROM ranked_usage WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy' AND COALESCE(upstream_account_type, '') = 'oauth'),
+		  (SELECT COUNT(DISTINCT audit_request_id) FROM ranked_usage
+		   WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
+		     AND COALESCE(upstream_account_type, '') = 'openai_responses'
+		     AND COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) > 0),
+		  (SELECT COUNT(*) FROM ranked_usage
+		   WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
+		     AND COALESCE(upstream_account_type, '') = 'openai_responses'
+		     AND COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) > 0),
+		  (SELECT COUNT(*) FROM ranked_usage
+		   WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
+		     AND NOT (
+		       COALESCE(upstream_account_type, '') = 'oauth' OR
+		       (COALESCE(upstream_account_type, '') = 'openai_responses'
+		        AND COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) > 0)
+		     ))
+		FROM final_usage
+	`, startArg, endArg).Scan(
+		&summary.RelayRequests,
+		&summary.RelayDirect,
+		&summary.RelayPinned,
+		&summary.RelayLegacyUnknown,
+		&summary.RelayRouteFailures,
+		&summary.RelayFallbackPrevented,
+		&summary.LegacyUsageRows,
+		&summary.RouteInvariantViolations,
+		&summary.OAuthCyberMissRequests,
+		&summary.OAuthCyberMissAttempts,
+		&summary.RelayCyberRequests,
+		&summary.RelayCyberAttempts,
+		&summary.LegacyCyberUnattributed,
+	)
+	return summary, err
+}
+
+func mergeCodexAuditRouteSummary(target *CodexAuditSummary, route CodexAuditSummary) {
+	if target == nil {
+		return
+	}
+	target.RelayRequests = route.RelayRequests
+	target.RelayDirect = route.RelayDirect
+	target.RelayPinned = route.RelayPinned
+	target.RelayLegacyUnknown = route.RelayLegacyUnknown
+	target.RelayRouteFailures = route.RelayRouteFailures
+	target.RelayFallbackPrevented = route.RelayFallbackPrevented
+	target.OAuthCyberMissRequests = route.OAuthCyberMissRequests
+	target.OAuthCyberMissAttempts = route.OAuthCyberMissAttempts
+	target.RelayCyberRequests = route.RelayCyberRequests
+	target.RelayCyberAttempts = route.RelayCyberAttempts
+	target.LegacyCyberUnattributed = route.LegacyCyberUnattributed
+	target.RouteInvariantViolations = route.RouteInvariantViolations
+	target.LegacyUsageRows = route.LegacyUsageRows
+	// Backward-compatible aggregate now follows the protected OAuth scope only;
+	// Relay provider policy events must never re-enter the leak counter.
+	target.UpstreamCyberPolicy = route.OAuthCyberMissAttempts
+}
+
+func (db *DB) codexAuditRelayRouteRows(ctx context.Context, start, end time.Time) ([]CodexAuditRelayRouteRow, error) {
+	startArg, endArg := db.timeRangeArgs(start, end)
+	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`
+		SELECT r.account_id, COALESCE(a.name, ''), COALESCE(r.route_source, ''), COALESCE(r.pin_kind, ''),
+		       COUNT(DISTINCT CASE WHEN r.audit_rn = 1 THEN r.audit_request_id END),
+		       COUNT(*),
+		       COALESCE(SUM(CASE WHEN r.audit_rn = 1 AND r.status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN r.audit_rn = 1 AND r.status_code BETWEEN 400 AND 499 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN r.audit_rn = 1 AND r.status_code >= 500 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN LOWER(COALESCE(r.upstream_error_kind, '')) = 'cyber_policy'
+		                              AND COALESCE(r.upstream_account_type, '') = 'openai_responses'
+		                              AND COALESCE(r.route_class, '') = 'cyb_relay'
+		                              AND COALESCE(r.route_group_id, 0) > 0
+		                         THEN 1 ELSE 0 END), 0)
+		FROM ranked_usage r
+		LEFT JOIN accounts a ON a.id = r.account_id
+		WHERE COALESCE(r.route_class, '') = 'cyb_relay'
+		GROUP BY r.account_id, COALESCE(a.name, ''), COALESCE(r.route_source, ''), COALESCE(r.pin_kind, '')
+		ORDER BY COUNT(DISTINCT CASE WHEN r.audit_rn = 1 THEN r.audit_request_id END) DESC, r.account_id
+	`, startArg, endArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]CodexAuditRelayRouteRow, 0)
+	for rows.Next() {
+		var item CodexAuditRelayRouteRow
+		if err := rows.Scan(&item.AccountID, &item.AccountName, &item.RouteSource, &item.PinKind, &item.Requests, &item.Attempts, &item.Successes, &item.Errors4xx, &item.Errors5xx, &item.CyberPolicy); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (db *DB) codexAuditRouteSignalRows(ctx context.Context, start, end time.Time) ([]CodexAuditRouteSignalRow, error) {
+	startArg, endArg := db.timeRangeArgs(start, end)
+	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`
+		SELECT COALESCE(route_signals, '[]'), created_at
+		FROM final_usage
+		WHERE COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'direct'
+		ORDER BY created_at DESC
+		LIMIT 100000
+	`, startArg, endArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type aggregate struct {
+		count int64
+		last  time.Time
+	}
+	aggregates := map[string]aggregate{}
+	for rows.Next() {
+		var rawSignals string
+		var createdRaw any
+		if err := rows.Scan(&rawSignals, &createdRaw); err != nil {
+			return nil, err
+		}
+		created, err := parseDBTimeValue(createdRaw)
+		if err != nil {
+			continue
+		}
+		var signals []string
+		if err := json.Unmarshal([]byte(rawSignals), &signals); err != nil {
+			if fallback := strings.TrimSpace(rawSignals); fallback != "" && fallback != "[]" {
+				signals = []string{fallback}
+			}
+		}
+		seen := map[string]struct{}{}
+		for _, signal := range signals {
+			signal = strings.TrimSpace(signal)
+			if signal == "" {
+				continue
+			}
+			if _, ok := seen[signal]; ok {
+				continue
+			}
+			seen[signal] = struct{}{}
+			item := aggregates[signal]
+			item.count++
+			if item.last.IsZero() || created.After(item.last) {
+				item.last = created
+			}
+			aggregates[signal] = item
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	result := make([]CodexAuditRouteSignalRow, 0, len(aggregates))
+	for signal, item := range aggregates {
+		result = append(result, CodexAuditRouteSignalRow{Signal: signal, Requests: item.count, LastSeen: item.last})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Requests == result[j].Requests {
+			return result[i].Signal < result[j].Signal
+		}
+		return result[i].Requests > result[j].Requests
+	})
+	return result, nil
+}
+
 func summarizeCodexAudit(report *CodexAuditReport) CodexAuditSummary {
 	var summary CodexAuditSummary
 	for _, row := range report.PromptFilter {
@@ -783,14 +1096,14 @@ func summarizeCodexAudit(report *CodexAuditReport) CodexAuditSummary {
 
 func codexAuditVerdict(report *CodexAuditReport) string {
 	switch {
-	case report.Summary.UpstreamCyberPolicy > 0:
-		return "suspected_miss"
-	case report.Summary.ReviewErrors > 0:
-		return "review_error_risk"
-	case report.Usage.Errors5xx > 0:
+	case report.Summary.OAuthCyberMissAttempts > 0:
+		return "oauth_cyber_risk"
+	case report.Summary.RouteInvariantViolations > 0:
+		return "route_invariant_violation"
+	case report.Summary.RelayRouteFailures > 0 || report.Usage.Errors5xx > 0:
 		return "operational_issue"
-	case report.Summary.PromptBlocks > 0:
-		return "blocked_activity"
+	case report.Summary.RelayCyberAttempts > 0:
+		return "relay_quality_issue"
 	default:
 		return "normal"
 	}

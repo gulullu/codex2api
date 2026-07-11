@@ -1344,8 +1344,8 @@ func TestSQLiteCybRelaySettingsRoundtripAndNormalizeTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSystemSettings(default TTL) returned error: %v", err)
 	}
-	if got.PromptFilterCybRelaySessionPinTTLSeconds != 3600 {
-		t.Fatalf("default TTL = %d, want 3600", got.PromptFilterCybRelaySessionPinTTLSeconds)
+	if got.PromptFilterCybRelaySessionPinTTLSeconds != 600 {
+		t.Fatalf("default TTL = %d, want 600", got.PromptFilterCybRelaySessionPinTTLSeconds)
 	}
 
 	got.PromptFilterCybRelaySessionPinTTLSeconds = 100000

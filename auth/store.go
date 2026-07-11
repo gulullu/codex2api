@@ -216,7 +216,7 @@ type ModelCooldown struct {
 type AccountFilter func(*Account) bool
 
 const (
-	DefaultCybRelaySessionPinTTLSeconds = 3600
+	DefaultCybRelaySessionPinTTLSeconds = 600
 	MinCybRelaySessionPinTTLSeconds     = 60
 	MaxCybRelaySessionPinTTLSeconds     = 86400
 )

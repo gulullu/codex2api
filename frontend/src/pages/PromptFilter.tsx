@@ -170,8 +170,8 @@ const defaultForm: PromptFilterForm = {
   prompt_filter_cyb_relay_enabled: false,
   prompt_filter_cyb_relay_group_id: 0,
   prompt_filter_cyb_relay_session_pin_enabled: true,
-  prompt_filter_cyb_relay_session_pin_ttl_seconds: 3600,
-  prompt_filter_semantic_review_enabled: true,
+  prompt_filter_cyb_relay_session_pin_ttl_seconds: 600,
+  prompt_filter_semantic_review_enabled: false,
   prompt_filter_semantic_review_api_key: '',
   prompt_filter_semantic_review_api_key_configured: false,
   prompt_filter_semantic_review_api_key_count: 0,
@@ -239,7 +239,7 @@ function customRuleDraftFromRule(rule: PromptFilterRule): CustomRuleDraft {
 
 const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilterForm => ({
   prompt_filter_enabled: Boolean(settings?.prompt_filter_enabled),
-  prompt_filter_mode: settings?.prompt_filter_mode || 'monitor',
+  prompt_filter_mode: 'monitor',
   prompt_filter_threshold: settings?.prompt_filter_threshold || 50,
   prompt_filter_strict_threshold: settings?.prompt_filter_strict_threshold || 90,
   prompt_filter_log_matches: settings?.prompt_filter_log_matches ?? true,
@@ -247,8 +247,8 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_sensitive_words: settings?.prompt_filter_sensitive_words || '',
   prompt_filter_custom_patterns: settings?.prompt_filter_custom_patterns || '[]',
   prompt_filter_disabled_patterns: settings?.prompt_filter_disabled_patterns || '[]',
-  prompt_filter_review_enabled: Boolean(settings?.prompt_filter_review_enabled),
-  prompt_filter_review_all: Boolean(settings?.prompt_filter_review_all),
+  prompt_filter_review_enabled: false,
+  prompt_filter_review_all: false,
   prompt_filter_review_api_key: '',
   prompt_filter_review_api_key_configured: Boolean(settings?.prompt_filter_review_api_key_configured),
   prompt_filter_review_api_key_count: settings?.prompt_filter_review_api_key_count || 0,
@@ -259,8 +259,8 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_cyb_relay_enabled: Boolean(settings?.prompt_filter_cyb_relay_enabled),
   prompt_filter_cyb_relay_group_id: settings?.prompt_filter_cyb_relay_group_id || 0,
   prompt_filter_cyb_relay_session_pin_enabled: settings?.prompt_filter_cyb_relay_session_pin_enabled ?? true,
-  prompt_filter_cyb_relay_session_pin_ttl_seconds: settings?.prompt_filter_cyb_relay_session_pin_ttl_seconds || 3600,
-  prompt_filter_semantic_review_enabled: settings?.prompt_filter_semantic_review_enabled ?? true,
+  prompt_filter_cyb_relay_session_pin_ttl_seconds: settings?.prompt_filter_cyb_relay_session_pin_ttl_seconds || 600,
+  prompt_filter_semantic_review_enabled: false,
   prompt_filter_semantic_review_api_key: '',
   prompt_filter_semantic_review_api_key_configured: Boolean(settings?.prompt_filter_semantic_review_api_key_configured),
   prompt_filter_semantic_review_api_key_count: settings?.prompt_filter_semantic_review_api_key_count || 0,
@@ -289,6 +289,10 @@ function parseJSONList<T>(raw: string, fallback: T[] = []): T[] {
 
 function promptFilterSavePayload(form: PromptFilterForm): Partial<SystemSettings> {
   const payload: Partial<SystemSettings> = { ...form }
+  payload.prompt_filter_mode = 'monitor'
+  payload.prompt_filter_review_enabled = false
+  payload.prompt_filter_review_all = false
+  payload.prompt_filter_semantic_review_enabled = false
   // 展示用字段，不参与写入。
   delete payload.prompt_filter_review_api_key_configured
   delete payload.prompt_filter_review_api_key_count
@@ -302,7 +306,7 @@ function promptFilterSavePayload(form: PromptFilterForm): Partial<SystemSettings
   }
   payload.prompt_filter_semantic_review_strategy = payload.prompt_filter_semantic_review_strategy || 'round_robin'
   payload.prompt_filter_cyb_relay_group_id = Math.max(0, Math.trunc(payload.prompt_filter_cyb_relay_group_id || 0))
-  payload.prompt_filter_cyb_relay_session_pin_ttl_seconds = Math.max(60, Math.min(86400, Math.trunc(payload.prompt_filter_cyb_relay_session_pin_ttl_seconds || 3600)))
+  payload.prompt_filter_cyb_relay_session_pin_ttl_seconds = Math.max(60, Math.min(86400, Math.trunc(payload.prompt_filter_cyb_relay_session_pin_ttl_seconds || 600)))
   payload.prompt_filter_semantic_review_providers = (payload.prompt_filter_semantic_review_providers || []).map((provider) => {
     const apiKey = provider.api_key?.trim()
     const normalized: SemanticReviewProvider = {
@@ -375,11 +379,7 @@ export default function PromptFilter() {
     }
   }, [data.settings])
 
-  const modeOptions = [
-    { label: t('promptFilter.modeMonitor'), value: 'monitor' },
-    { label: t('promptFilter.modeWarn'), value: 'warn' },
-    { label: t('promptFilter.modeBlock'), value: 'block' },
-  ]
+  const modeOptions = [{ label: t('promptFilter.modeMonitor'), value: 'monitor' }]
   const booleanOptions = [
     { label: t('common.enabled'), value: 'true' },
     { label: t('common.disabled'), value: 'false' },
@@ -620,12 +620,16 @@ function OverviewView({
   onSave: () => void
 }) {
   const { t } = useTranslation()
+  // Omni and the legacy semantic-review controls are intentionally retired from
+  // codex2api. Keep the dormant fields for rollback compatibility, but never
+  // expose them in the active routing UI.
+  const legacyReviewControlsVisible = false
   const [semanticTesting, setSemanticTesting] = useState(false)
   const [semanticTestProviderID, setSemanticTestProviderID] = useState<string | null>(null)
   const [semanticTestResult, setSemanticTestResult] = useState<SemanticReviewConnectionTestResponse | null>(null)
   const [semanticTestError, setSemanticTestError] = useState<string | null>(null)
   const stats = useMemo(() => ({
-    blocks: recentLogs.filter((log) => log.action === 'block').length,
+    routes: recentLogs.filter((log) => log.source === 'cyb_relay_routed').length,
     upstream: recentLogs.filter((log) => log.source === 'upstream_cyber_policy').length,
     latest: recentLogs[0]?.created_at,
   }), [recentLogs])
@@ -701,7 +705,7 @@ function OverviewView({
         <MetricTile label={t('promptFilter.currentMode')}>
           {modeOptions.find((item) => item.value === form.prompt_filter_mode)?.label ?? form.prompt_filter_mode}
         </MetricTile>
-        <MetricTile label={t('promptFilter.recentBlockedLogs')}>{stats.blocks}</MetricTile>
+        <MetricTile label={t('promptFilter.recentBlockedLogs')}>{stats.routes}</MetricTile>
         <MetricTile label={t('promptFilter.totalLogs')}>{totalLogs}</MetricTile>
         <MetricTile label={t('promptFilter.latestLog')}>
           {stats.latest ? formatRelativeTime(stats.latest, { variant: 'compact' }) : '-'}
@@ -722,16 +726,17 @@ function OverviewView({
               </Field>
               <Field label={t('promptFilter.mode')}>
                 <Select
-                  value={form.prompt_filter_mode}
-                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_mode: value }))}
+                  value="monitor"
+                  onValueChange={() => undefined}
                   options={modeOptions}
+                  disabled
                 />
               </Field>
               <Field label={t('promptFilter.threshold')}>
-                <Input type="number" min={1} max={100} value={form.prompt_filter_threshold} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_threshold: parseInt(event.target.value, 10) || 1 }))} />
+                <Input type="number" min={1} max={1000} value={form.prompt_filter_threshold} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_threshold: parseInt(event.target.value, 10) || 1 }))} />
               </Field>
               <Field label={t('promptFilter.strictThreshold')}>
-                <Input type="number" min={1} max={100} value={form.prompt_filter_strict_threshold} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: parseInt(event.target.value, 10) || 1 }))} />
+                <Input type="number" min={1} max={1000} value={form.prompt_filter_strict_threshold} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: parseInt(event.target.value, 10) || 1 }))} />
               </Field>
               <Field label={t('promptFilter.logMatches')}>
                 <Select value={form.prompt_filter_log_matches ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_log_matches: value === 'true' }))} options={booleanOptions} />
@@ -744,7 +749,7 @@ function OverviewView({
               <Textarea rows={5} value={form.prompt_filter_sensitive_words} placeholder={t('promptFilter.sensitiveWordsPlaceholder')} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_sensitive_words: event.target.value }))} />
             </Field>
 
-            <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+            {legacyReviewControlsVisible ? <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
               <div>
                 <SectionTitle title={t('promptFilter.reviewTitle')} />
                 <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.reviewDesc')}</p>
@@ -803,7 +808,7 @@ function OverviewView({
                 />
                 <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewApiKeyHint')}</span>
               </Field>
-            </div>
+            </div> : null}
 
             <div className="space-y-4 rounded-lg border border-primary/20 bg-primary/[0.03] p-4">
               <div>
@@ -844,7 +849,7 @@ function OverviewView({
                     value={form.prompt_filter_cyb_relay_session_pin_ttl_seconds}
                     onChange={(event) => setForm((current) => ({
                       ...current,
-                      prompt_filter_cyb_relay_session_pin_ttl_seconds: Math.max(60, Math.min(86400, parseInt(event.target.value, 10) || 3600)),
+                      prompt_filter_cyb_relay_session_pin_ttl_seconds: Math.max(60, Math.min(86400, parseInt(event.target.value, 10) || 600)),
                     }))}
                   />
                   <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.cybRelaySessionPinTTLHint')}</span>
@@ -856,7 +861,7 @@ function OverviewView({
               </div>
             </div>
 
-            <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+            {legacyReviewControlsVisible ? <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -1020,7 +1025,7 @@ function OverviewView({
                   )
                 })}
               </div>
-            </div>
+            </div> : null}
             <Button onClick={onSave} disabled={saving}>
               <Save className="size-4" />
               {saving ? t('common.saving') : t('common.save')}
@@ -1145,10 +1150,10 @@ function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; cle
 
         <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
           <Field label={t('promptFilter.colAction')}>
-            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'block', value: 'block' }, { label: 'route', value: 'route' }, { label: 'warn', value: 'warn' }, { label: 'allow', value: 'allow' }]} />
+            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'route', value: 'route' }, { label: 'allow / monitor', value: 'allow' }]} />
           </Field>
           <Field label={t('promptFilter.source')}>
-            <Select value={draftFilters.source} onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'local_filter', value: 'local_filter' }, { label: 'cyb_relay_routed', value: 'cyb_relay_routed' }, { label: 'semantic_review_disagreement', value: 'semantic_review_disagreement' }, { label: 'upstream_cyber_policy', value: 'upstream_cyber_policy' }]} />
+            <Select value={draftFilters.source} onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'local_filter', value: 'local_filter' }, { label: 'cyb_relay_routed', value: 'cyb_relay_routed' }, { label: 'upstream_cyber_policy', value: 'upstream_cyber_policy' }, { label: 'session_bleed', value: 'session_bleed' }]} />
           </Field>
           <Field label={t('promptFilter.endpoint')}>
             <Input value={draftFilters.endpoint} onChange={(event) => setDraftFilters((current) => ({ ...current, endpoint: event.target.value }))} placeholder="/v1/responses" />
@@ -1817,13 +1822,12 @@ function VerdictPanel({ verdict }: { verdict: PromptFilterVerdict }) {
   return (
     <div className="rounded-lg border border-border bg-muted/25 p-3">
       <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-2 text-sm">
-        <MiniStat label="Mode" value={verdict.mode || '-'} />
-        <MiniStat label="Score" value={`${verdict.score} / ${verdict.threshold}`} />
-        <MiniStat label="Matches" value={String(verdict.matched?.length ?? 0)} />
-        <MiniStat label="Review" value={verdict.reviewed ? (verdict.review_flagged ? 'Flagged' : 'Cleared') : '-'} />
+        <MiniStat label="Route" value={verdict.action === 'route' ? 'Relay' : 'OAuth'} />
+        <MiniStat label="Mode" value="monitor" />
+        <MiniStat label="Signal Score" value={`${verdict.score} / ${verdict.threshold}`} />
+        <MiniStat label="Signals" value={String(verdict.matched?.length ?? 0)} />
       </div>
       {verdict.reason ? <p className="mt-3 text-sm text-muted-foreground">{verdict.reason}</p> : null}
-      {verdict.review_error ? <p className="mt-2 text-sm text-destructive">{verdict.review_error}</p> : null}
       {verdict.matched?.length ? (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {verdict.matched.map((match, index) => (
@@ -1963,7 +1967,6 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
           {log.route_class === 'cyb_relay' || log.source === 'cyb_relay_routed' ? <Badge variant="outline" className="border-sky-500/30 text-[11px] text-sky-700 dark:text-sky-300">cyb relay</Badge> : null}
           {!compact && log.route_group_id ? <Badge variant="outline" className="text-[11px]">group {log.route_group_id}{log.route_pinned ? ' · pinned' : ''}</Badge> : null}
           {log.source === 'upstream_cyber_policy' ? <Badge variant="outline" className="text-[11px]">upstream</Badge> : null}
-          {log.review_model ? <Badge variant="outline" className="text-[11px]">{log.review_flagged ? 'review flagged' : 'review cleared'}</Badge> : null}
         </div>
       </TableCell>
       <TableCell>
@@ -1987,7 +1990,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         {!compact && log.client_ip ? <div className="text-xs text-muted-foreground">{log.client_ip}</div> : null}
       </TableCell>
       <TableCell className="min-w-0">
-        <div className="truncate text-muted-foreground" title={stripHitMarkers(log.text_preview || log.error_code || log.review_error || '')}>{log.text_preview ? <HighlightedPromptPreview text={log.text_preview} /> : (log.error_code || log.review_error || '-')}</div>
+        <div className="truncate text-muted-foreground" title={stripHitMarkers(log.text_preview || log.error_code || '')}>{log.text_preview ? <HighlightedPromptPreview text={log.text_preview} /> : (log.error_code || '-')}</div>
         {hasFull ? (
           <button
             type="button"
@@ -1998,7 +2001,6 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
             {expanded ? t('promptFilter.collapseFullText') : t('promptFilter.viewFullText')}
           </button>
         ) : null}
-        {!compact && log.review_model ? <div className="mt-1 truncate text-xs text-muted-foreground">{log.review_model}</div> : null}
       </TableCell>
     </TableRow>
     {expanded && hasFull ? (

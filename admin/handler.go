@@ -448,7 +448,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/prompt-filter/logs/match", h.MatchPromptFilterLog)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
-	api.POST("/prompt-filter/semantic-review/test", h.TestPromptFilterSemanticReview)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)

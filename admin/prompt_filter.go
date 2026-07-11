@@ -74,17 +74,15 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
+	cfg.Mode = promptfilter.ModeMonitor
+	cfg.Review.Enabled = false
+	cfg.Review.All = false
 	verdict := promptfilter.InspectText(text, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg, endpoint)
-	}
-	if verdict.Action == promptfilter.ActionWarn {
-		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
+	if !cfg.LogMatches || len(verdict.Matched) == 0 {
 		return false
 	}
-	if verdict.Action != promptfilter.ActionBlock {
-		return false
-	}
+	verdict.Action = promptfilter.ActionAllow
+	verdict.Mode = promptfilter.ModeMonitor
 	textPreview := promptfilter.RedactedPreview(verdict.TextPreview, 500)
 	if redactPreview {
 		textPreview = "[redacted]"
@@ -103,16 +101,8 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 		APIKeyName:      keyName,
 		APIKeyMasked:    keyMasked,
 		ClientIP:        c.ClientIP(),
-		ReviewModel:     verdict.ReviewModel,
-		ReviewFlagged:   verdict.ReviewFlagged,
-		ReviewError:     verdict.ReviewError,
 	})
-	if writeBlock != nil {
-		writeBlock(c)
-	} else {
-		writeError(c, http.StatusBadRequest, "Prompt 被检查规则拦截")
-	}
-	return true
+	return false
 }
 
 func (h *Handler) recordPromptFilterLog(c *gin.Context, input *database.PromptFilterLogInput) {
@@ -136,14 +126,19 @@ func (h *Handler) ListPromptFilterLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	logs, total, err := h.db.ListPromptFilterLogsPage(ctx, database.PromptFilterLogQuery{
-		Page:     page,
-		PageSize: pageSize,
-		Source:   c.Query("source"),
-		Action:   c.Query("action"),
-		Endpoint: c.Query("endpoint"),
-		Model:    c.Query("model"),
-		APIKeyID: apiKeyID,
-		Query:    c.Query("q"),
+		Page:                page,
+		PageSize:            pageSize,
+		Source:              c.Query("source"),
+		Action:              c.Query("action"),
+		Endpoint:            c.Query("endpoint"),
+		Model:               c.Query("model"),
+		APIKeyID:            apiKeyID,
+		Query:               c.Query("q"),
+		LogicalRequestID:    c.Query("logical_request_id"),
+		RouteClass:          c.Query("route_class"),
+		RouteSource:         c.Query("route_source"),
+		UpstreamAccountType: c.Query("upstream_account_type"),
+		CyberScope:          c.Query("cyber_scope"),
 	})
 	if err != nil {
 		writeInternalError(c, err)
@@ -218,9 +213,13 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 	}
 	cfg := h.store.GetPromptFilterConfig()
 	cfg.Enabled = true
+	cfg.Mode = promptfilter.ModeMonitor
+	cfg.Review.Enabled = false
+	cfg.Review.All = false
 	verdict := promptfilter.InspectText(req.Text, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = reviewPromptFilterVerdict(c.Request.Context(), req.Text, verdict, cfg, req.Endpoint)
+	if route, signals := proxy.PromptFilterRouteSignal(verdict, req.Text, cfg, req.Endpoint); route {
+		verdict.Action = "route"
+		verdict.Reason = "relay route signals: " + strings.Join(signals, ", ")
 	}
 	c.JSON(http.StatusOK, promptFilterTestResponse{Verdict: verdict})
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
@@ -23,26 +24,71 @@ const (
 	promptRiskDispositionBlock   = "block_policy"
 	promptRiskDispositionRelay   = "route_cyb"
 
-	cybRelayRouteClass        = "cyb_relay"
-	cybRelayPinCacheNamespace = "cyb-route-pin"
-	cybRelayCacheTimeout      = 500 * time.Millisecond
+	cybRelayRouteClass         = "cyb_relay"
+	cybRelayRouteSourceDefault = "default"
+	cybRelayRouteSourceDirect  = "direct"
+	cybRelayRouteSourcePin     = "pin"
+	cybRelayPinCacheNamespace  = "cyb-route-pin-v2"
+	cybRelayCacheTimeout       = 500 * time.Millisecond
 
 	contextPromptRiskDecision   = "promptRiskDecision"
 	contextCybWSRoutePinned     = "cybWSRoutePinned"
 	contextUpstreamAccountID    = "upstreamAccountID"
 	contextUpstreamAccountType  = "upstreamAccountType"
 	contextNestedPromptDecision = "nestedPromptRiskDecision"
+	contextLogicalRequestID     = "logicalRequestID"
+	contextLogicalRequestStart  = "logicalRequestStart"
 )
 
 type promptRiskDecision struct {
 	Disposition string
 	Reason      string
 	Signals     []string
+	RouteSource string
+	PinKind     string
 	RoutePinned bool
 }
 
 func defaultPromptRiskDecision() promptRiskDecision {
-	return promptRiskDecision{Disposition: promptRiskDispositionDefault}
+	return promptRiskDecision{Disposition: promptRiskDispositionDefault, RouteSource: cybRelayRouteSourceDefault}
+}
+
+func logicalRequestID(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if value, ok := c.Get(contextLogicalRequestID); ok {
+		if requestID, ok := value.(string); ok && strings.TrimSpace(requestID) != "" {
+			return strings.TrimSpace(requestID)
+		}
+	}
+	return beginLogicalRequest(c)
+}
+
+// beginLogicalRequest creates an internal, server-controlled identity used only
+// for audit de-duplication. It must never reuse the client supplied X-Request-ID.
+// HTTP requests call this lazily once; Responses WebSocket calls it once per
+// response.create turn so retries share an ID without merging separate turns.
+func beginLogicalRequest(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	requestID := uuid.NewString()
+	c.Set(contextLogicalRequestID, requestID)
+	c.Set(contextLogicalRequestStart, time.Now())
+	return requestID
+}
+
+func logicalRequestDurationMs(c *gin.Context) int {
+	if c == nil {
+		return 0
+	}
+	if value, ok := c.Get(contextLogicalRequestStart); ok {
+		if startedAt, ok := value.(time.Time); ok && !startedAt.IsZero() {
+			return int(time.Since(startedAt).Milliseconds())
+		}
+	}
+	return 0
 }
 
 func (d promptRiskDecision) blocks() bool {
@@ -92,7 +138,13 @@ func setPromptRiskDecisionContext(c *gin.Context, decision promptRiskDecision, g
 	if c == nil {
 		return
 	}
+	if strings.TrimSpace(decision.RouteSource) == "" {
+		decision.RouteSource = cybRelayRouteSourceDefault
+	}
 	c.Set(contextPromptRiskDecision, decision)
+	c.Set("routeSource", decision.RouteSource)
+	c.Set("routeSignals", append([]string(nil), decision.Signals...))
+	c.Set("pinKind", decision.PinKind)
 	if decision.routesToCybRelay() {
 		c.Set("routeClass", cybRelayRouteClass)
 		c.Set("routeReason", decision.routeReason())
@@ -146,34 +198,39 @@ func cybRelayPinCacheKey(kind, owner, value string) string {
 	return strings.TrimSpace(kind) + ":" + hex.EncodeToString(sum[:])
 }
 
-func reliableCybSessionPinKey(c *gin.Context, rawBody []byte) string {
-	if c == nil {
-		return ""
-	}
-	apiKeyID := requestAPIKeyID(c)
-	owner := responseCacheOwner(apiKeyID)
-	var headers http.Header
-	if c.Request != nil {
-		headers = c.Request.Header
-	}
-	if explicit := ResolveExplicitSessionID(headers, rawBody); explicit != "" {
-		return cybRelayPinCacheKey("session", owner, explicit)
-	}
-	if seed := deriveContentSessionSeed(rawBody); strings.HasPrefix(seed, "content-") {
-		return cybRelayPinCacheKey("content", owner, seed)
-	}
-	return ""
+type cybRoutePinCandidate struct {
+	Kind string
+	Key  string
 }
 
-func previousResponseCybPinKey(c *gin.Context, rawBody []byte) string {
+func cybRoutePinCandidates(c *gin.Context, rawBody []byte) []cybRoutePinCandidate {
 	if c == nil {
-		return ""
+		return nil
 	}
-	previousID := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String())
-	if previousID == "" {
-		return ""
+	owner := responseCacheOwner(requestAPIKeyID(c))
+	candidates := make([]cybRoutePinCandidate, 0, 4)
+	seen := map[string]struct{}{}
+	add := func(kind, value string) {
+		key := cybRelayPinCacheKey(kind, owner, value)
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, cybRoutePinCandidate{Kind: kind, Key: key})
 	}
-	return cybRelayPinCacheKey("response", responseCacheOwner(requestAPIKeyID(c)), previousID)
+
+	// Exact continuation identifiers take precedence over broader session
+	// hints. Content hashes and Idempotency-Key are intentionally excluded.
+	add("previous_response_id", gjson.GetBytes(rawBody, "previous_response_id").String())
+	add("prompt_cache_key", gjson.GetBytes(rawBody, "prompt_cache_key").String())
+	if c.Request != nil {
+		add("conversation_id", c.Request.Header.Get("Conversation_id"))
+		add("session_id", c.Request.Header.Get("Session_id"))
+	}
+	return candidates
 }
 
 func (h *Handler) hasCybRoutePin(ctx context.Context, key string) bool {
@@ -215,37 +272,44 @@ func (h *Handler) applyCybRoutePin(c *gin.Context, rawBody []byte, decision prom
 		decision = promptRiskDecision{
 			Disposition: promptRiskDispositionRelay,
 			Reason:      "websocket session pinned to CYB relay",
-			Signals:     []string{"websocket_session_pin"},
+			Signals:     nil,
+			RouteSource: cybRelayRouteSourcePin,
+			PinKind:     "websocket",
 			RoutePinned: true,
 		}
 	}
 
-	sessionKey := reliableCybSessionPinKey(c, rawBody)
-	previousKey := previousResponseCybPinKey(c, rawBody)
+	candidates := cybRoutePinCandidates(c, rawBody)
 	requestCtx := context.Background()
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	if !decision.routesToCybRelay() && (h.hasCybRoutePin(requestCtx, sessionKey) || h.hasCybRoutePin(requestCtx, previousKey)) {
-		decision = promptRiskDecision{
-			Disposition: promptRiskDispositionRelay,
-			Reason:      "conversation pinned to CYB relay",
-			Signals:     []string{"conversation_pin"},
-			RoutePinned: true,
+	if !decision.routesToCybRelay() {
+		for _, candidate := range candidates {
+			if h.hasCybRoutePin(requestCtx, candidate.Key) {
+				decision = promptRiskDecision{
+					Disposition: promptRiskDispositionRelay,
+					Reason:      "conversation pinned to CYB relay",
+					Signals:     nil,
+					RouteSource: cybRelayRouteSourcePin,
+					PinKind:     candidate.Kind,
+					RoutePinned: true,
+				}
+				break
+			}
 		}
 	}
 
 	if decision.routesToCybRelay() {
-		pinTTL := time.Duration(cfg.SessionPinTTLSeconds) * time.Second
-		if sessionKey != "" {
-			decision.RoutePinned = h.writeCybRoutePin(sessionKey, pinTTL) || decision.RoutePinned
+		if strings.TrimSpace(decision.RouteSource) == "" || decision.RouteSource == cybRelayRouteSourceDefault {
+			decision.RouteSource = cybRelayRouteSourceDirect
 		}
-		if previousKey != "" {
-			decision.RoutePinned = h.writeCybRoutePin(previousKey, pinTTL) || decision.RoutePinned
+		pinTTL := time.Duration(cfg.SessionPinTTLSeconds) * time.Second
+		for _, candidate := range candidates {
+			_ = h.writeCybRoutePin(candidate.Key, pinTTL)
 		}
 		if c.Request != nil && isResponsesWebSocketUpgradeRequest(c.Request) {
 			c.Set(contextCybWSRoutePinned, true)
-			decision.RoutePinned = true
 		}
 	}
 
@@ -269,7 +333,7 @@ func (h *Handler) pinCybRelayResponseID(c *gin.Context, event []byte) {
 	if responseID == "" {
 		return
 	}
-	key := cybRelayPinCacheKey("response", responseCacheOwner(requestAPIKeyID(c)), responseID)
+	key := cybRelayPinCacheKey("previous_response_id", responseCacheOwner(requestAPIKeyID(c)), responseID)
 	_ = h.writeCybRoutePin(key, time.Duration(cfg.SessionPinTTLSeconds)*time.Second)
 }
 
@@ -285,6 +349,33 @@ func setUpstreamAccountContext(c *gin.Context, account *auth.Account) {
 	c.Set(contextUpstreamAccountType, accountType)
 }
 
+func clearUpstreamAccountContext(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.Set(contextUpstreamAccountID, int64(0))
+	c.Set(contextUpstreamAccountType, "")
+}
+
+func (h *Handler) logCybRelayUnavailable(c *gin.Context, endpoint, model, effectiveModel string, stream, viaWebsocket bool, attempt int) {
+	clearUpstreamAccountContext(c)
+	h.logUsageForRequest(c, &database.UsageLogInput{
+		AccountID:         0,
+		Endpoint:          endpoint,
+		Model:             model,
+		EffectiveModel:    effectiveModel,
+		StatusCode:        http.StatusServiceUnavailable,
+		DurationMs:        logicalRequestDurationMs(c),
+		InboundEndpoint:   endpoint,
+		Stream:            stream,
+		ViaWebsocket:      viaWebsocket,
+		IsRetryAttempt:    attempt > 0,
+		AttemptIndex:      attempt + 1,
+		UpstreamErrorKind: "relay_route_unavailable",
+		ErrorMessage:      "isolated relay route unavailable; OAuth fallback prevented",
+	})
+}
+
 func populateCybUsageRouteMeta(h *Handler, c *gin.Context, input *database.UsageLogInput) {
 	if input == nil {
 		return
@@ -295,6 +386,18 @@ func populateCybUsageRouteMeta(h *Handler, c *gin.Context, input *database.Usage
 		}
 		if value, ok := c.Get("routeReason"); ok {
 			input.RouteReason, _ = value.(string)
+		}
+		if value, ok := c.Get("routeSource"); ok {
+			input.RouteSource, _ = value.(string)
+		}
+		if value, ok := c.Get("routeSignals"); ok {
+			if signals, ok := value.([]string); ok {
+				encoded, _ := json.Marshal(signals)
+				input.RouteSignals = string(encoded)
+			}
+		}
+		if value, ok := c.Get("pinKind"); ok {
+			input.PinKind, _ = value.(string)
 		}
 		if value, ok := c.Get("routeGroupID"); ok {
 			input.RouteGroupID, _ = value.(int64)
@@ -326,6 +429,18 @@ func populateCybPromptFilterRouteMeta(c *gin.Context, input *database.PromptFilt
 	if value, ok := c.Get("routeReason"); ok {
 		input.RouteReason, _ = value.(string)
 	}
+	if value, ok := c.Get("routeSource"); ok {
+		input.RouteSource, _ = value.(string)
+	}
+	if value, ok := c.Get("routeSignals"); ok {
+		if signals, ok := value.([]string); ok {
+			encoded, _ := json.Marshal(signals)
+			input.RouteSignals = string(encoded)
+		}
+	}
+	if value, ok := c.Get("pinKind"); ok {
+		input.PinKind, _ = value.(string)
+	}
 	if value, ok := c.Get("routeGroupID"); ok {
 		input.RouteGroupID, _ = value.(int64)
 	}
@@ -342,20 +457,20 @@ func populateCybPromptFilterRouteMeta(c *gin.Context, input *database.PromptFilt
 
 func sendCybRelayUnavailableOpenAI(c *gin.Context) {
 	api.SendErrorWithStatus(c, api.NewAPIError(
-		api.ErrorCode("content_policy_violation"),
-		"This request could not be routed to the isolated safety pool. Please try again later.",
-		api.ErrorTypeInvalidRequest,
-	), http.StatusBadRequest)
+		api.ErrorCode("relay_route_unavailable"),
+		"The isolated relay route is temporarily unavailable. Please retry later.",
+		api.ErrorTypeServer,
+	), http.StatusServiceUnavailable)
 }
 
 func sendCybRelayUnavailableAnthropic(c *gin.Context) {
-	sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "This request could not be routed to the isolated safety pool. Please try again later.")
+	sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "The isolated relay route is temporarily unavailable. Please retry later.")
 }
 
 func writeCybRelayUnavailableWebSocket(conn *websocket.Conn) error {
 	return writeResponsesWSError(conn, api.NewAPIError(
-		api.ErrorCode("content_policy_violation"),
-		"This request could not be routed to the isolated safety pool. Please try again later.",
-		api.ErrorTypeInvalidRequest,
+		api.ErrorCode("relay_route_unavailable"),
+		"The isolated relay route is temporarily unavailable. Please retry later.",
+		api.ErrorTypeServer,
 	))
 }

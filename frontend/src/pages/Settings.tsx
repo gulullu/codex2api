@@ -1179,7 +1179,7 @@ export default function Settings() {
     prompt_filter_cyb_relay_enabled: false,
     prompt_filter_cyb_relay_group_id: 0,
     prompt_filter_cyb_relay_session_pin_enabled: true,
-    prompt_filter_cyb_relay_session_pin_ttl_seconds: 3600,
+    prompt_filter_cyb_relay_session_pin_ttl_seconds: 600,
     prompt_filter_semantic_review_enabled: true,
     prompt_filter_semantic_review_api_key: '',
     prompt_filter_semantic_review_api_key_configured: false,
@@ -2759,13 +2759,10 @@ export default function Settings() {
                   </SettingField>
                   <SettingField label={t('settings.promptFilterMode')} description={t('settings.promptFilterModeDesc')}>
                     <Select
-                      value={settingsForm.prompt_filter_mode}
-                      onValueChange={(value) => autoSaveStringField('prompt_filter_mode', value)}
-                      options={[
-                        { label: t('promptFilter.modeMonitor'), value: 'monitor' },
-                        { label: t('promptFilter.modeWarn'), value: 'warn' },
-                        { label: t('promptFilter.modeBlock'), value: 'block' },
-                      ]}
+                      value="monitor"
+                      onValueChange={() => undefined}
+                      options={[{ label: t('promptFilter.modeMonitor'), value: 'monitor' }]}
+                      disabled
                     />
                   </SettingField>
                 </div>
