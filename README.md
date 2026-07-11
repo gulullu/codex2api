@@ -82,6 +82,13 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
+<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> provides cost-effective AI model API access with support for mainstream models including OpenAI, Claude, and Gemini. Top-up ratio of ¥0.2 = $1 credit, bringing per-call costs down to under 10% of official pricing. Plans start at ¥25/28 days; the Premium plan (¥129/28 days) includes about $4,752 in model credit (plans cover OpenAI models only), with high-concurrency support and 95%+ SLA stability.</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> is a high-availability AI model API relay platform for individual developers and enterprise teams. Supports Codex/Claude Code at ~1/10 official pricing. Register using the link and promo code <code>CODEX2API</code> to get $3 test credit. </td>
 </tr>

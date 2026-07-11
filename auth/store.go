@@ -153,6 +153,9 @@ type Account struct {
 	dispatchCountMu           sync.Mutex
 	dispatchWindowUsed        int64
 	dispatchWindowResetAt     time.Time
+	// SchedulerPriority 账号调度优先级（issue #358）：数值大者严格先调度，
+	// 同优先级内才按健康档位与调度分竞争。0 为默认；负值可把账号压为兜底渠道。
+	SchedulerPriority int64
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -3615,6 +3618,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if limit, ok := row.GetCredentialInt64("dispatch_count_limit"); ok {
 		account.SetDispatchCountLimit(limit)
 	}
+	if priority, ok := row.GetCredentialInt64("scheduler_priority"); ok {
+		account.SetSchedulerPriority(priority)
+	}
 	account.recomputeEffectiveAutoPause(s)
 	for _, cooldown := range modelCooldowns[row.ID] {
 		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
@@ -3885,6 +3891,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		s.mu.RLock()
 
 		var best *Account
+		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
@@ -3911,11 +3918,15 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				continue
 			}
 
+			// 账号调度优先级严格先于健康档位与调度分（issue #358）
+			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			if priority > bestPriority ||
-				(priority == bestPriority && (dispatchScore > bestDispatchScore ||
-					(dispatchScore == bestDispatchScore && load < bestLoad) ||
-					(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
+			if schedulerPriority > bestSchedulerPriority ||
+				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
+					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+						(dispatchScore == bestDispatchScore && load < bestLoad) ||
+						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load
@@ -4047,6 +4058,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 
 		var best *Account
 		var metadataRefreshCandidate *Account
+		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
@@ -4079,11 +4091,15 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 				continue
 			}
 
+			// 账号调度优先级严格先于健康档位与调度分（issue #358）
+			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			if priority > bestPriority ||
-				(priority == bestPriority && (dispatchScore > bestDispatchScore ||
-					(dispatchScore == bestDispatchScore && load < bestLoad) ||
-					(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
+			if schedulerPriority > bestSchedulerPriority ||
+				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
+					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+						(dispatchScore == bestDispatchScore && load < bestLoad) ||
+						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load

@@ -19,6 +19,7 @@ type fastSchedulerEntry struct {
 	dbID          int64
 	dispatchScore float64
 	proven        bool
+	priority      int64 // 账号调度优先级（issue #358）：桶内降序排列，高优先级段先被轮询
 }
 
 type fastSchedulerPosition struct {
@@ -99,6 +100,9 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 		}
 		if mode == "remaining_quota" {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				usageI := entries[i].acc.usagePercentForScheduling()
 				usageJ := entries[j].acc.usagePercentForScheduling()
 				if usageI == usageJ {
@@ -111,6 +115,9 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 			})
 		} else {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				if entries[i].dispatchScore == entries[j].dispatchScore {
 					if entries[i].proven != entries[j].proven {
 						return entries[i].proven
@@ -185,6 +192,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			dbID:          acc.DBID,
 			dispatchScore: dispatchScore,
 			proven:        proven,
+			priority:      acc.schedulerPriority(),
 		})
 	}
 
@@ -196,6 +204,9 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		}
 		if s.schedulerMode == "remaining_quota" {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				usageI := entries[i].acc.usagePercentForScheduling()
 				usageJ := entries[j].acc.usagePercentForScheduling()
 				if usageI == usageJ {
@@ -208,6 +219,9 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 			})
 		} else {
 			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].priority != entries[j].priority {
+					return entries[i].priority > entries[j].priority
+				}
 				if entries[i].dispatchScore == entries[j].dispatchScore {
 					if entries[i].proven != entries[j].proven {
 						return entries[i].proven
@@ -291,9 +305,24 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 				zeroCursor.Store(0)
 				cursor = &zeroCursor
 			}
-			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), cursor, baseLimit, now, apiKeyID, exclude, filter)
-			if acc != nil {
-				return acc
+			// 桶内按调度优先级降序排列：相同优先级为一段，段内 round-robin，
+			// 高优先级段拿不到账号才轮到下一段（issue #358）。
+			segStart := 0
+			stale := false
+			for segStart < len(bucket) {
+				segEnd := segStart + 1
+				for segEnd < len(bucket) && bucket[segEnd].priority == bucket[segStart].priority {
+					segEnd++
+				}
+				acc, segStale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, now, apiKeyID, exclude, filter)
+				if acc != nil {
+					return acc
+				}
+				if segStale {
+					stale = true
+					break
+				}
+				segStart = segEnd
 			}
 			if stale {
 				changed = true
@@ -397,9 +426,13 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		dbID:          acc.DBID,
 		dispatchScore: dispatchScore,
 		proven:        proven,
+		priority:      acc.schedulerPriority(),
 	})
 	if s.schedulerMode == "remaining_quota" {
 		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].priority != entries[j].priority {
+				return entries[i].priority > entries[j].priority
+			}
 			usageI := entries[i].acc.usagePercentForScheduling()
 			usageJ := entries[j].acc.usagePercentForScheduling()
 			if usageI == usageJ {
@@ -415,6 +448,9 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		// 这样同一个 round 里,用得少的账号被先轮到,自然把负载摊平到所有可用账号上,
 		// 避免出现"轮询模式仍然一直薅同一个号"的现象 (issue #150)。
 		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].priority != entries[j].priority {
+				return entries[i].priority > entries[j].priority
+			}
 			usageI := entries[i].acc.usagePercentForScheduling()
 			usageJ := entries[j].acc.usagePercentForScheduling()
 			if usageI == usageJ {
@@ -430,6 +466,9 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		})
 	} else {
 		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].priority != entries[j].priority {
+				return entries[i].priority > entries[j].priority
+			}
 			if entries[i].dispatchScore == entries[j].dispatchScore {
 				if entries[i].proven != entries[j].proven {
 					return entries[i].proven

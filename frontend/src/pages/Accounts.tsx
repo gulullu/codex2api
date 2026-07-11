@@ -563,6 +563,27 @@ function dispatchCountLimitInputToValue(value: string): number | null {
   return parsed;
 }
 
+function formatSchedulerPriorityInput(value?: number | null): string {
+  if (typeof value !== "number" || value === 0) return "";
+  return String(Math.trunc(value));
+}
+
+function isSchedulerPriorityInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^-?\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < -100 || parsed > 100;
+}
+
+function schedulerPriorityInputToValue(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isFinite(parsed) || parsed === 0) return null;
+  return parsed;
+}
+
 function getMediaQueryMatch(query: string): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -763,6 +784,8 @@ export default function Accounts() {
   const [editIgnoreUsageLimitStatusMode, setEditIgnoreUsageLimitStatusMode] =
     useState<"inherit" | "enabled" | "disabled">("inherit");
   const [editDispatchCountLimitInput, setEditDispatchCountLimitInput] =
+    useState("");
+  const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
@@ -3324,6 +3347,9 @@ export default function Accounts() {
     setEditDispatchCountLimitInput(
       formatDispatchCountLimitInput(account.dispatch_count_limit),
     );
+    setEditSchedulerPriorityInput(
+      formatSchedulerPriorityInput(account.scheduler_priority),
+    );
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -3372,6 +3398,7 @@ export default function Accounts() {
     setEditAutoPause7dDisabled(false);
     setEditIgnoreUsageLimitStatusMode("inherit");
     setEditDispatchCountLimitInput("");
+    setEditSchedulerPriorityInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditCustomHeadersText("");
@@ -3419,6 +3446,9 @@ export default function Accounts() {
   );
   const editDispatchCountLimitInvalid = isDispatchCountLimitInputInvalid(
     editDispatchCountLimitInput,
+  );
+  const editSchedulerPriorityInvalid = isSchedulerPriorityInputInvalid(
+    editSchedulerPriorityInput,
   );
   const editDispatchCountLimitPreview =
     editDispatchCountLimitInvalid
@@ -3486,7 +3516,8 @@ export default function Accounts() {
       concurrencyInputInvalid ||
       editAutoPause5hThresholdInvalid ||
       editAutoPause7dThresholdInvalid ||
-      editDispatchCountLimitInvalid
+      editDispatchCountLimitInvalid ||
+      editSchedulerPriorityInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
       return;
@@ -3522,6 +3553,9 @@ export default function Accounts() {
             : editIgnoreUsageLimitStatusMode === "enabled",
         dispatch_count_limit: dispatchCountLimitInputToValue(
           editDispatchCountLimitInput,
+        ),
+        scheduler_priority: schedulerPriorityInputToValue(
+          editSchedulerPriorityInput,
         ),
         custom_headers: parsedCustomHeaders.value,
       };
@@ -6236,7 +6270,8 @@ export default function Accounts() {
                           concurrencyInputInvalid ||
                           editAutoPause5hThresholdInvalid ||
                           editAutoPause7dThresholdInvalid ||
-                          editDispatchCountLimitInvalid)) ||
+                          editDispatchCountLimitInvalid ||
+                          editSchedulerPriorityInvalid)) ||
                       openAIAccountInputInvalid
                     }
                   >
@@ -6735,6 +6770,37 @@ export default function Accounts() {
                               })}
                             </div>
                           ) : null}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerPriorityTitle")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.schedulerPriorityHint")}
+                        </div>
+                        <div className="mt-3">
+                          <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                            {t("accounts.schedulerPriorityLabel")}
+                          </label>
+                          <Input
+                            inputMode="numeric"
+                            value={editSchedulerPriorityInput}
+                            placeholder={t(
+                              "accounts.schedulerPriorityPlaceholder",
+                            )}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditSchedulerPriorityInput(event.target.value)
+                            }
+                          />
+                          <div
+                            className={`mt-1.5 text-xs ${editSchedulerPriorityInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                          >
+                            {editSchedulerPriorityInvalid
+                              ? t("accounts.schedulerPriorityRange")
+                              : t("accounts.schedulerPriorityDefault")}
+                          </div>
                         </div>
                       </div>
 

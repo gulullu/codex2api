@@ -82,6 +82,13 @@
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
+<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> 提供高性价比 AI 模型 API 接入服务，支持 OpenAI、Claude、Gemini 等主流模型。充值比例仅 0.2 元 = 1 美元额度，调用成本低至官方价格 1 折以内。套餐 ¥25/28 天起，其中尊享套餐 ¥129/28 天，包含约 $4752 模型额度（套餐仅支持 OpenAI 模型），支持高并发请求及 95%+ SLA 稳定保障。</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
 </tr>
