@@ -34,6 +34,7 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
+import { buildOpenAIResponsesCopyDraft } from "../lib/openAIResponsesCopy";
 import { formatLongUsageWindowLabel } from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -872,6 +873,7 @@ export default function Accounts() {
       codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
+  const [copySourceAccountName, setCopySourceAccountName] = useState("");
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
   const [openAIModelMappingMode, setOpenAIModelMappingMode] =
     useState<ModelMappingMode>("form");
@@ -2075,6 +2077,7 @@ export default function Accounts() {
       setOpenAIModelMappingMode("form");
       setOpenAIModelMappingEntries(emptyModelMappingEntries());
       setAddCustomHeadersText("");
+      setCopySourceAccountName("");
       void reload();
     } catch (error) {
       showToast(
@@ -2084,6 +2087,41 @@ export default function Accounts() {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const openOpenAIResponsesCopy = (account: AccountRow) => {
+    const draft = buildOpenAIResponsesCopyDraft(account);
+    const mapping = draft.model_mapping ?? "";
+    const parsedMapping = parseModelMappingEntries(mapping);
+    setOpenAIForm(draft);
+    setOpenAIModelDraft("");
+    setOpenAIModelMappingText(mapping);
+    setOpenAIModelMappingMode(parsedMapping.ok ? "form" : "json");
+    setOpenAIModelMappingEntries(
+      parsedMapping.ok ? parsedMapping.entries : emptyModelMappingEntries(),
+    );
+    setAddCustomHeadersText(formatCustomHeadersText(draft.custom_headers));
+    setCopySourceAccountName(formatAccountName(account));
+    setAddMethod("openai");
+    setShowAdd(true);
+  };
+
+  const openFreshAddModal = () => {
+    setCopySourceAccountName("");
+    setAddMethod("oauth");
+    setOpenAIForm({
+      base_url: "https://api.openai.com",
+      api_key: "",
+      models: [],
+      codex_client_metadata_mode: "auto",
+      proxy_url: "",
+    });
+    setOpenAIModelDraft("");
+    setOpenAIModelMappingText("");
+    setOpenAIModelMappingMode("form");
+    setOpenAIModelMappingEntries(emptyModelMappingEntries());
+    setAddCustomHeadersText("");
+    setShowAdd(true);
   };
 
   const handleFetchEditOpenAIModels = async () => {
@@ -3428,6 +3466,9 @@ export default function Accounts() {
     scoreMode === "custom" ? parseIntegerInput(scoreInput) : null;
   const parsedBaseConcurrency =
     concurrencyMode === "custom" ? parseIntegerInput(concurrencyInput) : null;
+  const concurrencyInputMax = editingAccount?.openai_responses_api
+    ? 10000
+    : 50;
   const scoreInputInvalid =
     scoreMode === "custom" &&
     (parsedScoreBias === null ||
@@ -3437,7 +3478,7 @@ export default function Accounts() {
     concurrencyMode === "custom" &&
     (parsedBaseConcurrency === null ||
       parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > 50);
+      parsedBaseConcurrency > concurrencyInputMax);
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
@@ -3868,7 +3909,7 @@ export default function Accounts() {
                       <Button
                         size="sm"
                         className="min-w-0 sm:flex-none"
-                        onClick={() => setShowAdd(true)}
+                        onClick={openFreshAddModal}
                       >
                         <Plus className="size-3.5" />
                         {t("accounts.addAccount")}
@@ -4558,7 +4599,7 @@ export default function Accounts() {
                 emptyTitle={t("accounts.noData")}
                 emptyDescription={t("accounts.noDataDesc")}
                 action={
-                  <Button onClick={() => setShowAdd(true)}>
+                  <Button onClick={openFreshAddModal}>
                     {t("accounts.addAccount")}
                   </Button>
                 }
@@ -4593,6 +4634,7 @@ export default function Accounts() {
                           onToggleSelect={() => toggleSelect(account.id)}
                           onOpenDetail={() => openAccountDetail(account)}
                           onEdit={() => openSchedulerEditor(account)}
+                          onCopy={() => openOpenAIResponsesCopy(account)}
                           onUsage={() => setUsageAccount(account)}
                           onTest={() => setTestingAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
@@ -5089,6 +5131,9 @@ export default function Accounts() {
                                     )}
                                     includeTest={false}
                                     includeDelete={false}
+                                    onCopy={() =>
+                                      openOpenAIResponsesCopy(account)
+                                    }
                                     onTest={() => setTestingAccount(account)}
                                     onRefresh={() => void handleRefresh(account)}
                                     onGenerateAuthJson={() =>
@@ -5159,6 +5204,7 @@ export default function Accounts() {
               setSessionJson("");
               setSessionProxyUrl("");
               setAddCustomHeadersText("");
+              setCopySourceAccountName("");
             }}
             footer={
               <>
@@ -5199,6 +5245,7 @@ export default function Accounts() {
                     setSessionJson("");
                     setSessionProxyUrl("");
                     setAddCustomHeadersText("");
+                    setCopySourceAccountName("");
                   }}
                 >
                   {t("common.cancel")}
@@ -5479,6 +5526,13 @@ export default function Accounts() {
                   </p>
                   <p>{t("accounts.openaiResponsesDesc")}</p>
                 </div>
+                {copySourceAccountName ? (
+                  <div className="rounded-xl border border-primary/25 bg-primary/5 px-4 py-3 text-sm text-muted-foreground">
+                    {t("accounts.copyAccountPrepared", {
+                      name: copySourceAccountName,
+                    })}
+                  </div>
+                ) : null}
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
                     {t("accounts.openaiNameLabel")}
@@ -6674,19 +6728,24 @@ export default function Accounts() {
                           <div className="mt-3 space-y-2">
                             <Input
                               inputMode="numeric"
+                              min={1}
+                              max={concurrencyInputMax}
                               value={concurrencyInput}
                               onChange={(
                                 event: ChangeEvent<HTMLInputElement>,
                               ) => setConcurrencyInput(event.target.value)}
                               placeholder={t(
                                 "accounts.schedulerConcurrencyPlaceholder",
+                                { max: concurrencyInputMax },
                               )}
                             />
                             <div
                               className={`text-xs ${concurrencyInputInvalid ? "text-red-500" : "text-muted-foreground"}`}
                             >
                               {concurrencyInputInvalid
-                                ? t("accounts.schedulerConcurrencyRange")
+                                ? t("accounts.schedulerConcurrencyRange", {
+                                    max: concurrencyInputMax,
+                                  })
                                 : t("accounts.schedulerCustomValuePreview", {
                                     value:
                                       parsedBaseConcurrency ??
@@ -9655,6 +9714,7 @@ function AccountRowActionsMenu({
   authJsonExporting,
   includeTest = true,
   includeDelete = true,
+  onCopy,
   onTest,
   onRefresh,
   onGenerateAuthJson,
@@ -9670,6 +9730,7 @@ function AccountRowActionsMenu({
   authJsonExporting: boolean;
   includeTest?: boolean;
   includeDelete?: boolean;
+  onCopy: () => void;
   onTest: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
@@ -9686,6 +9747,16 @@ function AccountRowActionsMenu({
   const resetCredits = account.rate_limit_reset_credits ?? 0;
 
   const items: HeaderActionMenuItem[] = [
+    ...(account.openai_responses_api
+      ? [
+          {
+            key: "copy-responses-account",
+            label: t("accounts.copyAccount"),
+            icon: <Copy className="size-3.5" />,
+            onSelect: onCopy,
+          },
+        ]
+      : []),
     ...(includeTest
       ? [
           {
@@ -9977,6 +10048,7 @@ function AccountMobileCard({
   onToggleSelect,
   onOpenDetail,
   onEdit,
+  onCopy,
   onUsage,
   onTest,
   onRefresh,
@@ -10003,6 +10075,7 @@ function AccountMobileCard({
   onToggleSelect: () => void;
   onOpenDetail: () => void;
   onEdit: () => void;
+  onCopy: () => void;
   onUsage: () => void;
   onTest: () => void;
   onRefresh: () => void;
@@ -10311,6 +10384,7 @@ function AccountMobileCard({
               account={account}
               refreshing={refreshing}
               authJsonExporting={authJsonExporting}
+              onCopy={onCopy}
               onTest={onTest}
               onRefresh={onRefresh}
               onGenerateAuthJson={onGenerateAuthJson}
@@ -10536,6 +10610,7 @@ function AccountMobileCard({
           account={account}
           refreshing={refreshing}
           authJsonExporting={authJsonExporting}
+          onCopy={onCopy}
           onTest={onTest}
           onRefresh={onRefresh}
           onGenerateAuthJson={onGenerateAuthJson}

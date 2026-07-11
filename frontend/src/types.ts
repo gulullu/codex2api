@@ -220,6 +220,19 @@ export interface AddOpenAIResponsesAccountRequest {
   codex_client_metadata_mode?: CodexClientMetadataMode
   proxy_url: string
   custom_headers?: Record<string, string> | null
+  score_bias_override?: number | null
+  base_concurrency_override?: number | null
+  skip_warm_tier?: boolean
+  allowed_api_key_ids?: number[] | null
+  tags?: string[] | null
+  group_ids?: number[] | null
+  auto_pause_5h_threshold?: number | null
+  auto_pause_7d_threshold?: number | null
+  auto_pause_5h_disabled?: boolean
+  auto_pause_7d_disabled?: boolean
+  ignore_usage_limit_status_override?: boolean | null
+  dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
 }
 
 export interface UpdateOpenAIResponsesAccountRequest {

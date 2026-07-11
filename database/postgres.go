@@ -5611,19 +5611,9 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 }
 
 func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, credentials map[string]interface{}, proxyURL string) (int64, error) {
-	if credentials == nil {
-		credentials = map[string]interface{}{}
-	}
-	credJSON, err := json.Marshal(credentials)
-	if err != nil {
-		return 0, err
-	}
-
-	return db.insertRowID(ctx,
-		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3) RETURNING id`,
-		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3)`,
-		name, credJSON, proxyURL,
-	)
+	return db.InsertOpenAIResponsesAccountWithConfig(ctx, name, credentials, proxyURL, OpenAIResponsesAccountConfig{
+		BaseConcurrencyOverride: DefaultOpenAIResponsesBaseConcurrency,
+	})
 }
 
 // GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重，排除已删除账号）

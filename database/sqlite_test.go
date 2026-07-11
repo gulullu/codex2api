@@ -2488,6 +2488,38 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestInsertOpenAIResponsesAccountWithConfigRollsBackOnGroupFailure(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	before, err := db.CountAll(ctx)
+	if err != nil {
+		t.Fatalf("CountAll before: %v", err)
+	}
+	_, err = db.InsertOpenAIResponsesAccountWithConfig(ctx, "atomic-copy", map[string]interface{}{
+		"api_key":  "secret",
+		"base_url": "https://relay.example.com",
+	}, "", OpenAIResponsesAccountConfig{
+		BaseConcurrencyOverride: 10000,
+		GroupIDs:                []int64{999999},
+	})
+	if err == nil {
+		t.Fatal("expected foreign-key failure")
+	}
+	after, err := db.CountAll(ctx)
+	if err != nil {
+		t.Fatalf("CountAll after: %v", err)
+	}
+	if after != before {
+		t.Fatalf("account count = %d after failed insert, want %d", after, before)
+	}
+}
+
 func TestUsageLogsIncludeAccountNameForOpenAIResponsesAccount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

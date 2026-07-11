@@ -1146,6 +1146,81 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	}
 }
 
+func TestUpdateAccountSchedulerAllowsResponsesAPIConcurrencyTo10000(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertOpenAIResponsesAccount(context.Background(), "relay", map[string]interface{}{
+		"upstream_type": "openai_responses",
+		"api_key":       "test-key",
+		"base_url":      "https://relay.example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"base_concurrency_override":10000}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateAccountScheduler(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 10000 {
+		t.Fatalf("base concurrency = %+v, want 10000", row.BaseConcurrencyOverride)
+	}
+}
+
+func TestUpdateAccountSchedulerKeepsOAuthConcurrencyAt50(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"base_concurrency_override":51}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateAccountScheduler(ginCtx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	assertErrorMessage(t, recorder, "base_concurrency_override 超出范围，必须在 1..50 之间")
+}
+
+func TestBatchUpdateAccountsRejectsResponsesConcurrencyForMixedTypes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	oauthID := insertTestAccount(t, db)
+	responsesID, err := db.InsertOpenAIResponsesAccount(context.Background(), "relay", map[string]interface{}{
+		"upstream_type": "openai_responses",
+		"api_key":       "test-key",
+		"base_url":      "https://relay.example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	body := fmt.Sprintf(`{"ids":[%d,%d],"base_concurrency_override":10000}`, oauthID, responsesID)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-update", strings.NewReader(body))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.BatchUpdateAccounts(ginCtx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	assertErrorMessage(t, recorder, "base_concurrency_override 超出范围，必须在 1..50 之间")
+}
+
 func TestUpdateAccountSchedulerPersistsAllowedAPIKeyIDs(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

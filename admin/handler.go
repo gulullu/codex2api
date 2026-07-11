@@ -1084,12 +1084,15 @@ type accountSchedulerUpdate struct {
 	CredentialUpdates       map[string]interface{}
 }
 
-func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
+func parseAccountSchedulerUpdate(req updateAccountSchedulerReq, baseConcurrencyMax int64) (accountSchedulerUpdate, error) {
+	if baseConcurrencyMax <= 0 {
+		baseConcurrencyMax = defaultAccountBaseConcurrencyMax
+	}
 	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, 50)
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, baseConcurrencyMax)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1286,14 +1289,21 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 
-	update, err := parseAccountSchedulerUpdate(req)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	baseConcurrencyMax := defaultAccountBaseConcurrencyMax
+	if len(req.BaseConcurrencyOverride) > 0 && string(req.BaseConcurrencyOverride) != "null" {
+		baseConcurrencyMax, err = h.baseConcurrencyMaxForTargets(ctx, []int64{id})
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号类型失败: "+err.Error())
+			return
+		}
+	}
+	update, err := parseAccountSchedulerUpdate(req, baseConcurrencyMax)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
 
 	if update.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
@@ -2499,6 +2509,37 @@ type addOpenAIResponsesAccountReq struct {
 	CodexClientMetadataMode *string           `json:"codex_client_metadata_mode"`
 	ProxyURL                string            `json:"proxy_url"`
 	CustomHeaders           map[string]string `json:"custom_headers"`
+	ScoreBiasOverride       json.RawMessage   `json:"score_bias_override"`
+	BaseConcurrencyOverride json.RawMessage   `json:"base_concurrency_override"`
+	SkipWarmTier            json.RawMessage   `json:"skip_warm_tier"`
+	AllowedAPIKeyIDs        json.RawMessage   `json:"allowed_api_key_ids"`
+	Tags                    json.RawMessage   `json:"tags"`
+	GroupIDs                json.RawMessage   `json:"group_ids"`
+	AutoPause5hThreshold    json.RawMessage   `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold    json.RawMessage   `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled     json.RawMessage   `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled     json.RawMessage   `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride      json.RawMessage   `json:"ignore_usage_limit_status_override"`
+	DispatchCountLimit      json.RawMessage   `json:"dispatch_count_limit"`
+	SchedulerPriority       json.RawMessage   `json:"scheduler_priority"`
+}
+
+func (r addOpenAIResponsesAccountReq) schedulerRequest() updateAccountSchedulerReq {
+	return updateAccountSchedulerReq{
+		ScoreBiasOverride:       r.ScoreBiasOverride,
+		BaseConcurrencyOverride: r.BaseConcurrencyOverride,
+		SkipWarmTier:            r.SkipWarmTier,
+		AllowedAPIKeyIDs:        r.AllowedAPIKeyIDs,
+		Tags:                    r.Tags,
+		GroupIDs:                r.GroupIDs,
+		AutoPause5hThreshold:    r.AutoPause5hThreshold,
+		AutoPause7dThreshold:    r.AutoPause7dThreshold,
+		AutoPause5hDisabled:     r.AutoPause5hDisabled,
+		AutoPause7dDisabled:     r.AutoPause7dDisabled,
+		UsageLimitOverride:      r.UsageLimitOverride,
+		DispatchCountLimit:      r.DispatchCountLimit,
+		SchedulerPriority:       r.SchedulerPriority,
+	}
 }
 
 type fetchOpenAIResponsesModelsReq struct {
@@ -2569,9 +2610,42 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 			return
 		}
 	}
+	schedulerUpdate, err := parseAccountSchedulerUpdate(req.schedulerRequest(), responsesAPIBaseConcurrencyMax)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !schedulerUpdate.BaseConcurrencyOverride.Set || !schedulerUpdate.BaseConcurrencyOverride.Value.Valid {
+		schedulerUpdate.BaseConcurrencyOverride = database.OptionalNullInt64{
+			Set:   true,
+			Value: sql.NullInt64{Int64: responsesAPIDefaultBaseConcurrency, Valid: true},
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	if schedulerUpdate.AllowedAPIKeyIDs.Set {
+		missing, err := h.findMissingAPIKeyIDs(ctx, schedulerUpdate.AllowedAPIKeyIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			writeError(c, http.StatusBadRequest, "allowed_api_key_ids 包含不存在的 API Key ID")
+			return
+		}
+	}
+	if schedulerUpdate.GroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, schedulerUpdate.GroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID")
+			return
+		}
+	}
 
 	existing, err := h.db.GetAllOpenAIAPIKeys(ctx)
 	if err != nil {
@@ -2600,7 +2674,19 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 	if len(customHeaders) > 0 {
 		credentials["custom_headers"] = cloneCustomHeaders(customHeaders)
 	}
-	id, err := h.db.InsertOpenAIResponsesAccount(ctx, name, credentials, req.ProxyURL)
+	for key, value := range schedulerUpdate.CredentialUpdates {
+		credentials[key] = value
+	}
+	if schedulerUpdate.AllowedAPIKeyIDs.Set {
+		credentials["allowed_api_key_ids"] = append([]int64(nil), schedulerUpdate.AllowedAPIKeyIDs.Values...)
+	}
+	id, err := h.db.InsertOpenAIResponsesAccountWithConfig(ctx, name, credentials, req.ProxyURL, database.OpenAIResponsesAccountConfig{
+		ScoreBiasOverride:       nullableInt64Pointer(schedulerUpdate.ScoreBiasOverride.Value),
+		BaseConcurrencyOverride: schedulerUpdate.BaseConcurrencyOverride.Value.Int64,
+		SkipWarmTier:            schedulerUpdate.SkipWarmTier.Set && schedulerUpdate.SkipWarmTier.Value,
+		Tags:                    schedulerUpdate.Tags.Values,
+		GroupIDs:                schedulerUpdate.GroupIDs.Values,
+	})
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -2620,7 +2706,13 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		CustomHeaders:           customHeaders,
 		Email:                   baseURL,
 		PlanType:                "api",
+		ScoreBiasOverride:       nullableInt64Pointer(schedulerUpdate.ScoreBiasOverride.Value),
+		BaseConcurrencyOverride: nullableInt64Pointer(schedulerUpdate.BaseConcurrencyOverride.Value),
+		SkipWarmTier:            schedulerUpdate.SkipWarmTier.Set && schedulerUpdate.SkipWarmTier.Value,
+		Tags:                    append([]string(nil), schedulerUpdate.Tags.Values...),
+		GroupIDs:                append([]int64(nil), schedulerUpdate.GroupIDs.Values...),
 	})
+	h.applyAccountSchedulerRuntimeUpdate(id, schedulerUpdate)
 
 	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
 	c.JSON(http.StatusOK, gin.H{
@@ -4330,7 +4422,18 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		return
 	}
 
-	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	baseConcurrencyMax := defaultAccountBaseConcurrencyMax
+	if len(req.BaseConcurrencyOverride) > 0 && string(req.BaseConcurrencyOverride) != "null" {
+		resolvedMax, resolveErr := h.baseConcurrencyMaxForTargets(ctx, ids)
+		if resolveErr != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号类型失败: "+resolveErr.Error())
+			return
+		}
+		baseConcurrencyMax = resolvedMax
+	}
+	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq, baseConcurrencyMax)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -4341,9 +4444,6 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请提供要更新的字段")
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
 
 	if schedulerUpdate.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, schedulerUpdate.AllowedAPIKeyIDs.Values)
