@@ -45,6 +45,8 @@ const chartColors = {
   default: '#64748b',
   relayDirect: '#16a34a',
   relayPinned: '#0ea5e9',
+  relayProbe: '#7c3aed',
+  relayOverflow: '#d97706',
   oauthCyber: '#dc2626',
   relayError: '#f97316',
 }
@@ -191,42 +193,46 @@ export default function CodexAudit() {
 
       <StateShell loading={loading && !report} error={error} isEmpty={!loading && !report} onRetry={() => void reload()} emptyTitle="暂无巡检数据">
         {report ? (
-          <div className="w-full min-w-0 max-w-full space-y-4">
-            <Card className="w-full min-w-0 overflow-hidden border-border/70 bg-gradient-to-br from-background via-background to-muted/40 shadow-sm">
+          <div key={rangeHours} className="w-full min-w-0 max-w-full space-y-4">
+            <Card className="w-full min-w-0 overflow-hidden border-border/70 bg-gradient-to-br from-background via-background to-muted/30 shadow-sm">
               <CardContent className="min-w-0 p-0">
-                <div className="grid min-w-0 grid-cols-1 lg:grid-cols-[minmax(0,1fr)_minmax(520px,2fr)]">
-                  <div className="min-w-0 border-b border-border/70 p-4 sm:p-5 lg:border-b-0 lg:border-r">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className={`flex size-12 items-center justify-center rounded-lg ${toneIconClass(meta.tone)} [&>svg]:size-6`}>
-                        {meta.tone === 'ok' ? <ShieldCheck /> : meta.tone === 'warn' ? <ShieldAlert /> : <ShieldX />}
+                <div className="flex min-w-0 flex-col gap-4 border-b border-border/70 p-4 sm:p-5 xl:flex-row xl:items-center xl:justify-between">
+                  <div className="flex min-w-0 items-start gap-3 sm:gap-4">
+                    <div className={`flex size-11 shrink-0 items-center justify-center rounded-xl ${toneIconClass(meta.tone)} [&>svg]:size-5`}>
+                      {meta.tone === 'ok' ? <ShieldCheck /> : meta.tone === 'warn' ? <ShieldAlert /> : <ShieldX />}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h2 className="text-lg font-semibold tracking-tight text-foreground sm:text-xl">{meta.title}</h2>
+                        <Badge className={verdictClass(meta.tone)}>{meta.label}</Badge>
                       </div>
-                      <Badge className={verdictClass(meta.tone)}>{meta.label}</Badge>
-                    </div>
-                    <div className="mt-5">
-                      <h2 className="text-xl font-semibold tracking-tight text-foreground">{meta.title}</h2>
-                      <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">{meta.description}</p>
-                    </div>
-                    <div className="mt-5 grid gap-2 text-sm">
-                      <WindowLine label="巡检窗口" value={`${formatBeijingTime(report.window_start)} 至 ${formatBeijingTime(report.window_end)}`} />
-                      <WindowLine label="生成时间" value={formatBeijingTime(report.generated_at)} />
-                      <WindowLine label="运行健康" value={health?.status || '-'} tone={health?.status === 'ok' ? 'ok' : 'warn'} />
+                      <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">{meta.description}</p>
                     </div>
                   </div>
+                  <div className="grid min-w-0 gap-2 sm:grid-cols-3 xl:w-[720px]">
+                    <WindowLine label="历史筛选窗口" value={`${formatBeijingTime(report.window_start)} 至 ${formatBeijingTime(report.window_end)}`} />
+                    <WindowLine label="报表生成" value={formatBeijingTime(report.generated_at)} />
+                    <WindowLine label="运行健康 · 实时" value={`${health?.status || '-'} · 不受时间筛选`} tone={health?.status === 'ok' ? 'ok' : 'warn'} />
+                  </div>
+                </div>
 
-                  <div className="grid min-w-0 grid-cols-1 gap-px bg-border/70 sm:grid-cols-2 xl:grid-cols-4">
-                    <SignalTile label="逻辑请求" value={formatNumber(report.usage.requests)} detail={`${formatNumber(report.usage.upstream_attempts)} 次上游尝试 · 错误率 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
-                    <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · 成功 ${formatPercent(relaySuccessRate)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
-                    <SignalTile label="本轮规则直达" value={formatNumber(report.summary.relay_direct)} detail="当前完整 payload 直接命中" icon={<Gauge />} tone="ok" />
-                    <SignalTile label="历史 Pin 延续" value={formatNumber(report.summary.relay_pinned)} detail={`旧口径 ${formatNumber(report.summary.relay_legacy_unknown)}`} icon={<Zap />} tone={report.summary.relay_legacy_unknown ? 'neutral' : 'ok'} />
-                    <SignalTile label="OAuth CYB 漏放" value={formatNumber(report.summary.oauth_cyber_miss_attempts)} detail={`${formatNumber(report.summary.oauth_cyber_miss_requests)} 个逻辑请求`} icon={<AlertTriangle />} tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'} />
-                    <SignalTile label="Relay CYB" value={formatNumber(report.summary.relay_cyber_attempts)} detail={`${formatNumber(report.summary.relay_cyber_requests)} 个请求 · 不计漏放`} icon={<ShieldAlert />} tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'} />
-                    <SignalTile label="路由异常" value={formatNumber(report.summary.relay_route_failures)} detail={`越界 ${formatNumber(report.summary.route_invariant_violations)} · 阻止回退 ${formatNumber(report.summary.relay_fallback_prevented)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
-                    <SignalTile label="会话串扰" value={formatNumber(report.summary.session_bleed)} detail={report.summary.session_bleed ? '⚠️ 立即排查！' : '被动监测中·真实流量'} icon={<ShieldAlert />} tone={report.summary.session_bleed ? 'bad' : 'ok'} />
-                    <SignalTile label="首字 P95" value={formatMS(report.usage.first_token_p95_ms)} detail={`${formatNumber(report.usage.first_token_samples)} 个样本`} icon={<Clock3 />} tone={firstTokenTone} />
-                    <SignalTile label="WS 占比" value={formatPercent(report.usage.websocket_ratio || 0)} detail={`${formatNumber(report.usage.websocket_requests)} 个 WS 请求`} icon={<Zap />} tone={(report.usage.websocket_ratio || 0) >= 0.85 ? 'ok' : 'warn'} />
-                    <SignalTile label="高频探针" value={formatNumber(report.summary.probe_high_frequency || 0)} detail={`已短路 ${formatNumber(report.summary.probe_short_circuits)} / 观测 ${formatNumber(report.summary.probe_observed)}`} icon={<CheckCircle2 />} tone={report.summary.probe_high_frequency ? 'warn' : 'ok'} />
-                    <AccountPoolTile accounts={accounts} />
-                  </div>
+                <div className="grid min-w-0 grid-cols-2 gap-3 p-3 sm:grid-cols-3 sm:p-4 xl:grid-cols-6">
+                  <SignalTile label="逻辑请求" value={formatNumber(report.usage.requests)} detail={`${formatNumber(report.usage.upstream_attempts)} 次尝试 · 错误 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
+                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · Pin ${formatNumber(report.summary.relay_pinned)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="规则直达" value={formatNumber(report.summary.relay_direct)} detail="完整 payload 本轮命中" icon={<Gauge />} tone="ok" />
+                  <SignalTile label="探针 → Relay" value={formatNumber(report.summary.relay_probe || 0)} detail="探针一律进入 Relay 上游" icon={<Zap />} tone="ok" />
+                  <SignalTile label="OAuth 容量溢出" value={formatNumber(report.summary.relay_overflow || 0)} detail="OAuth 可用并发不足时分流" icon={<BarChart3 />} tone="neutral" />
+                  <SignalTile label="Relay 成功率" value={formatPercent(relaySuccessRate)} detail={`${formatNumber(relaySuccesses)} / ${formatNumber(report.summary.relay_requests)}`} icon={<CheckCircle2 />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="OAuth CYB" value={formatNumber(report.summary.oauth_cyber_miss_attempts)} detail={`${formatNumber(report.summary.oauth_cyber_miss_requests)} 个逻辑请求`} icon={<AlertTriangle />} tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'} />
+                  <SignalTile label="Relay CYB" value={formatNumber(report.summary.relay_cyber_attempts)} detail={`${formatNumber(report.summary.relay_cyber_requests)} 个请求 · 不计漏放`} icon={<ShieldAlert />} tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'} />
+                  <SignalTile label="路由异常" value={formatNumber(report.summary.relay_route_failures)} detail={`越界 ${formatNumber(report.summary.route_invariant_violations)} · 阻止回退 ${formatNumber(report.summary.relay_fallback_prevented)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
+                  <SignalTile label="会话串扰" value={formatNumber(report.summary.session_bleed)} detail={report.summary.session_bleed ? '⚠️ 立即排查' : '当前窗口未检测到'} icon={<ShieldAlert />} tone={report.summary.session_bleed ? 'bad' : 'ok'} />
+                  <SignalTile label="首字 P95" value={formatMS(report.usage.first_token_p95_ms)} detail={`${formatNumber(report.usage.first_token_samples)} 个历史样本`} icon={<Clock3 />} tone={firstTokenTone} />
+                  <SignalTile label="WS 占比" value={formatPercent(report.usage.websocket_ratio || 0)} detail={`${formatNumber(report.usage.websocket_requests)} 个 WS 请求`} icon={<Zap />} tone={(report.usage.websocket_ratio || 0) >= 0.85 ? 'ok' : 'warn'} />
+                </div>
+
+                <div className="border-t border-border/70 p-3 sm:p-4">
+                  <AccountPoolTile accounts={accounts} />
                 </div>
               </CardContent>
             </Card>
@@ -249,10 +255,10 @@ export default function CodexAudit() {
                 tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'}
               />
             </div>
-            <SessionBleedPanel />
+            <SessionBleedPanel start={report.window_start} end={report.window_end} />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.85fr)]">
-              <ChartPanel title="请求与 Relay 路由趋势" description="按逻辑请求聚合默认路由、本轮规则直达、历史 Pin、OAuth CYB 和 Relay 路由失败。">
+              <ChartPanel title="请求与 Relay 路由趋势" description="按当前筛选窗口聚合默认路由、规则直达、探针、OAuth 容量溢出、历史 Pin 与异常。">
                 <ResponsiveContainer width="100%" height={286}>
                   <LineChart data={timeline} margin={{ top: 12, right: 18, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="4 4" stroke="hsl(var(--border))" vertical={false} />
@@ -263,6 +269,8 @@ export default function CodexAudit() {
                     <Line type="monotone" dataKey="default_requests" name="默认 OAuth" stroke={chartColors.default} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_direct" name="Relay 直达" stroke={chartColors.relayDirect} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_pinned" name="Relay Pin" stroke={chartColors.relayPinned} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_probe" name="探针 → Relay" stroke={chartColors.relayProbe} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_overflow" name="OAuth 容量溢出" stroke={chartColors.relayOverflow} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="oauth_cyber_attempts" name="OAuth CYB" stroke={chartColors.oauthCyber} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_route_failures" name="Relay 路由失败" stroke={chartColors.relayError} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                   </LineChart>
@@ -314,20 +322,11 @@ export default function CodexAudit() {
               </Panel>
             </div>
 
-            <Panel title="Relay 路由案卷" description="记录本轮规则直达与历史 Pin 的来源、信号、账号和完整脱敏请求，便于复盘分流原因。">
-              {(report.route_samples || []).length ? (
-                <div className="space-y-2">
-                  {(report.route_samples || []).map((log) => <AuditLogRow key={log.id} log={log} />)}
-                </div>
-              ) : <EmptyState>当前窗口内暂无 Relay 路由样本</EmptyState>}
-            </Panel>
+            <RelayRouteCasesPanel start={report.window_start} end={report.window_end} />
 
-            <div className="grid min-w-0 gap-4 xl:grid-cols-2">
-              <ProbePanel report={report} />
-              <Panel title="首字慢请求" description="按首字时间倒序列出最慢样本，用于观察 WS 和上游延迟。">
-                <UsageSampleTable rows={report.slow_requests || []} empty="暂无慢请求样本" showFirstToken />
-              </Panel>
-            </div>
+            <Panel title="首字慢请求" description="按当前筛选窗口的首字时间倒序列出最慢样本，用于观察 WS 和上游延迟。">
+              <UsageSampleTable rows={report.slow_requests || []} empty="暂无慢请求样本" showFirstToken />
+            </Panel>
 
           </div>
         ) : null}
@@ -379,7 +378,60 @@ function CyberPolicyPanel({ title, description, rows, total, empty, tone }: { ti
   )
 }
 
-function SessionBleedPanel() {
+function RelayRouteCasesPanel({ start, end }: { start: string; end: string }) {
+  const [logs, setLogs] = useState<PromptFilterLog[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    void api.getCodexAuditCases({ kind: 'relay_route', start, end, page, pageSize: AUDIT_PAGE_SIZE })
+      .then((res) => {
+        if (cancelled) return
+        setLogs(res.items ?? [])
+        setTotal(res.total ?? 0)
+      })
+      .catch((err) => {
+        if (!cancelled) setError(getErrorMessage(err))
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [end, page, start])
+
+  const totalPages = Math.max(1, Math.ceil(total / AUDIT_PAGE_SIZE))
+  return (
+    <Panel title="Relay 路由案卷" description="按逻辑请求归并重试记录；总数、分页和稳定排序均使用当前筛选窗口的同一组 start/end。">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs text-muted-foreground">共 {formatNumber(total)} 个逻辑请求</span>
+        {loading ? <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><RefreshCw className="size-3.5 animate-spin" />加载中</span> : null}
+      </div>
+      {error ? (
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{error}</div>
+      ) : logs.length ? (
+        <>
+          <div className="space-y-2">
+            {logs.map((log) => <AuditLogRow key={log.id} log={log} />)}
+          </div>
+          {total > AUDIT_PAGE_SIZE ? (
+            <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={total} pageSize={AUDIT_PAGE_SIZE} />
+          ) : null}
+        </>
+      ) : (
+        <EmptyState>{loading ? '正在加载 Relay 路由案卷…' : '当前窗口内暂无 Relay 路由样本'}</EmptyState>
+      )}
+    </Panel>
+  )
+}
+
+function SessionBleedPanel({ start, end }: { start: string; end: string }) {
   const [logs, setLogs] = useState<PromptFilterLog[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
@@ -390,15 +442,15 @@ function SessionBleedPanel() {
     setLoading(true)
     setError(null)
     try {
-      const res = await api.getPromptFilterLogs({ source: 'session_bleed', page, pageSize: AUDIT_PAGE_SIZE })
-      setLogs(res.logs ?? [])
+      const res = await api.getCodexAuditCases({ kind: 'session_bleed', start, end, page, pageSize: AUDIT_PAGE_SIZE })
+      setLogs(res.items ?? [])
       setTotal(res.total ?? 0)
     } catch (err) {
       setError(getErrorMessage(err))
     } finally {
       setLoading(false)
     }
-  }, [page])
+  }, [end, page, start])
 
   useEffect(() => {
     void load()
@@ -416,9 +468,9 @@ function SessionBleedPanel() {
               <ShieldAlert className="size-5" />
             </div>
             <div className="min-w-0">
-              <h3 className="text-sm font-semibold text-foreground">会话串扰监测 · 被动实时检测</h3>
+              <h3 className="text-sm font-semibold text-foreground">会话串扰监测 · 当前筛选窗口</h3>
               <p className="mt-1 max-w-2xl text-xs leading-relaxed text-muted-foreground">
-                在真实流量的上游 WS 读流上校验 response_id 一致性：一个请求流本应自始至终同一个 response_id，出现第二个不同的即别的请求的帧串入本流（跨用户串扰）。零探针、零误报、实时上报，无需人工发检测。
+                在上游 WS 读流上校验 response_id 一致性；案卷与右上角历史时间范围保持同一 start/end 窗口。
               </p>
             </div>
           </div>
@@ -518,11 +570,11 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
   const active = accounts.filter((a) => a.status === 'active' && a.enabled !== false)
   const healthy = active.length > 0 && active.length === accounts.length
   return (
-    <div className="min-w-0 bg-background/95 p-4 sm:col-span-2 xl:col-span-2">
+    <div className="min-w-0 rounded-xl border border-border/60 bg-background/75 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <div className="flex size-7 items-center justify-center rounded-lg bg-primary/10 text-primary [&>svg]:size-4"><BarChart3 /></div>
-          <span className="text-xs font-medium text-muted-foreground">账号池 · 上游 Pro 号 · 7d 配额 / 并发</span>
+          <span className="text-xs font-medium text-muted-foreground">实时账号池 · 不受历史时间筛选 · 7d 配额 / 并发</span>
         </div>
         <div className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ${healthy ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'}`}>
           <span className={`size-1.5 rounded-full ${healthy ? 'bg-emerald-500' : 'bg-amber-500'}`} />
@@ -557,7 +609,7 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
 
 function SignalTile({ label, value, detail, icon, tone, className }: { label: string; value: ReactNode; detail: string; icon: ReactNode; tone: Tone; className?: string }) {
   return (
-    <div className={`min-w-0 bg-background/95 p-4 ${className ?? ''}`}>
+    <div className={`flex min-h-[132px] min-w-0 flex-col justify-between rounded-xl border border-border/60 bg-background/80 p-3.5 shadow-sm transition-colors hover:border-border sm:p-4 ${className ?? ''}`}>
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="text-xs font-medium text-muted-foreground">{label}</div>
@@ -567,7 +619,7 @@ function SignalTile({ label, value, detail, icon, tone, className }: { label: st
           {icon}
         </div>
       </div>
-      <div className="mt-3 truncate text-xs text-muted-foreground">{detail}</div>
+      <div className="mt-3 line-clamp-2 text-xs leading-5 text-muted-foreground">{detail}</div>
     </div>
   )
 }
@@ -611,41 +663,6 @@ function Panel({ title, description, children }: { title: string; description?: 
         {children}
       </CardContent>
     </Card>
-  )
-}
-
-function ProbePanel({ report }: { report: CodexAuditReport }) {
-  const highFrequency = (report.probe_high_frequency?.length ? report.probe_high_frequency : report.probe_short_circuits) || []
-  const observed = report.probe_observed || []
-  const [tab, setTab] = useState<'high_frequency' | 'observed'>('high_frequency')
-  const tabs = [
-    { key: 'high_frequency', label: '高频（已短路）', count: highFrequency.length },
-    { key: 'observed', label: '只观测未短路', count: observed.length },
-  ] as const
-  return (
-    <Panel title="探针行为" description="观察高频探针是否已被本地短路，以及是否仍有只观测未短路的探针。">
-      <div className="mb-3 inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5">
-        {tabs.map(({ key, label, count }) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => setTab(key)}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] font-semibold transition-colors ${
-              tab === key
-                ? 'bg-background text-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            {label}
-            <span className={`rounded-full px-1.5 text-[11px] font-medium leading-4 ${tab === key ? 'bg-muted text-foreground' : 'bg-muted/60 text-muted-foreground'}`}>
-              {formatNumber(count)}
-            </span>
-          </button>
-        ))}
-      </div>
-      {/* key 用于在切换 tab 时重置 usePaged 的页码 */}
-      <ProbeTable key={tab} rows={tab === 'high_frequency' ? highFrequency : observed} />
-    </Panel>
   )
 }
 
@@ -715,69 +732,6 @@ function MobileField({ label, value, wide = false, wrap = false }: { label: stri
     <div className={`min-w-0 ${wide ? 'col-span-2' : ''}`}>
       <div className="text-[11px] leading-none text-muted-foreground">{label}</div>
       <div className={`mt-1 text-xs font-medium text-foreground ${wrap ? 'line-clamp-3 break-words' : 'truncate'}`} title={title}>
-        {value}
-      </div>
-    </div>
-  )
-}
-
-const PROBE_PAGE_SIZE = 5
-
-function ProbeTable({ rows }: { rows: CodexAuditReport['probe_observed'] }) {
-  const { pageRows, page, totalPages, setPage, total, pageSize } = usePaged(rows, PROBE_PAGE_SIZE)
-  if (!rows.length) {
-    return <EmptyState compact>暂无探针记录</EmptyState>
-  }
-  return (
-    <>
-      <div className="grid gap-2">
-      {pageRows.map((row, index) => {
-        const apiKeyName = row.api_key_name || row.api_key_masked || String(row.api_key_id || '-')
-        return (
-          <div
-            key={`${row.api_key_id}-${row.endpoint}-${row.model}-${row.signature}-${row.stream}-${index}`}
-            className="min-w-0 rounded-lg border border-border/60 bg-muted/20 p-3"
-          >
-            <div className="flex min-w-0 items-start justify-between gap-3">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium text-foreground" title={apiKeyName}>
-                  {apiKeyName}
-                </div>
-                <div className="mt-1 truncate text-xs text-muted-foreground" title={`${row.model || '-'} · ${row.endpoint || '-'}`}>
-                  {row.model || '-'} · {row.endpoint || '-'}
-                </div>
-              </div>
-              <Badge variant="outline" className="shrink-0 bg-background/70 text-xs">
-                {formatNumber(row.count)} 次
-              </Badge>
-            </div>
-
-            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-              <ProbeMeta label="签名" value={row.signature || '-'} wide wrap />
-              <ProbeMeta label="流式" value={row.stream ? '是' : '否'} />
-              <ProbeMeta label="频率" value={formatRate(row.rate_per_minute || 0)} />
-              <ProbeMeta label="平均间隔" value={formatDuration(row.average_interval_seconds || 0)} />
-              <ProbeMeta label="跨度" value={formatDuration(row.span_seconds || 0)} />
-            </div>
-          </div>
-        )
-      })}
-      </div>
-      {total > pageSize ? (
-        <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={total} pageSize={pageSize} />
-      ) : null}
-    </>
-  )
-}
-
-function ProbeMeta({ label, value, wide = false, wrap = false }: { label: string; value: string; wide?: boolean; wrap?: boolean }) {
-  return (
-    <div className={`min-w-0 rounded-md bg-background/70 px-2.5 py-2 ring-1 ring-border/45 ${wide ? 'col-span-2' : ''}`}>
-      <div className="text-[11px] leading-none text-muted-foreground">{label}</div>
-      <div
-        className={`mt-1 text-xs font-medium text-foreground ${wrap ? 'line-clamp-2 break-all' : 'truncate'}`}
-        title={value}
-      >
         {value}
       </div>
     </div>
@@ -884,19 +838,6 @@ function formatMS(value?: number) {
   if (!value) return '-'
   if (value >= 1000) return `${(value / 1000).toFixed(1)}s`
   return `${value}ms`
-}
-
-function formatDuration(seconds: number) {
-  if (seconds >= 3600) return `${Math.round(seconds / 3600)}h`
-  if (seconds >= 60) return `${Math.round(seconds / 60)}m`
-  return `${Math.round(seconds)}s`
-}
-
-function formatRate(value?: number) {
-  const rate = value || 0
-  if (!rate) return '-'
-  if (rate >= 10) return `${Math.round(rate)}/min`
-  return `${rate.toFixed(1)}/min`
 }
 
 function formatShortTime(value: string) {

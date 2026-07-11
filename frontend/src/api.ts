@@ -12,6 +12,8 @@ import type {
   CreateAccountResponse,
   CreateAPIKeyResponse,
   CreateAPIKeyRequest,
+  CodexAuditCaseKind,
+  CodexAuditCasesResponse,
   CodexAuditReport,
   FetchOpenAIResponsesModelsRequest,
   FetchOpenAIResponsesModelsResponse,
@@ -336,6 +338,15 @@ export const api = {
     if (params.bucketMinutes) search.set('bucket_minutes', String(params.bucketMinutes))
     if (params.limit) search.set('limit', String(params.limit))
     return request<CodexAuditReport>(`/audit/codex2api?${search.toString()}`)
+  },
+  getCodexAuditCases: (params: { kind: CodexAuditCaseKind; start: string; end: string; page?: number; pageSize?: number }) => {
+    const search = new URLSearchParams()
+    search.set('kind', params.kind)
+    search.set('start', params.start)
+    search.set('end', params.end)
+    if (params.page) search.set('page', String(params.page))
+    if (params.pageSize) search.set('page_size', String(params.pageSize))
+    return request<CodexAuditCasesResponse>(`/audit/codex2api/cases?${search.toString()}`)
   },
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),

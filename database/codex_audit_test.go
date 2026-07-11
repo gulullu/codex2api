@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -323,4 +324,112 @@ func promptLogicalIDs(logs []*PromptFilterLog) []string {
 		result = append(result, log.LogicalRequestID)
 	}
 	return result
+}
+
+func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	inputs := []*PromptFilterLogInput{
+		{LogicalRequestID: "duplicate", Source: "cyb_relay_routed", FullText: "superseded"},
+		{LogicalRequestID: "duplicate", Source: "cyb_relay_routed", FullText: "canonical"},
+		{LogicalRequestID: "alpha", Source: "cyb_relay_routed"},
+		{LogicalRequestID: "beta", Source: "cyb_relay_routed"},
+		{Source: "cyb_relay_routed", FullText: "legacy-one"},
+		{Source: "cyb_relay_routed", FullText: "legacy-two"},
+		{LogicalRequestID: "different-kind", Source: "session_bleed"},
+		{LogicalRequestID: "outside-window", Source: "cyb_relay_routed"},
+	}
+	for _, input := range inputs {
+		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
+			t.Fatalf("InsertPromptFilterLog: %v", err)
+		}
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_filter_logs SET created_at = $1`, db.timeArg(now)); err != nil {
+		t.Fatalf("set stable created_at: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_filter_logs SET created_at = $1 WHERE logical_request_id = 'outside-window'`, db.timeArg(now.Add(-2*time.Hour))); err != nil {
+		t.Fatalf("move outside-window record: %v", err)
+	}
+
+	query := CodexAuditCasesQuery{
+		Kind:     CodexAuditCaseRelayRoute,
+		Start:    now.Add(-time.Minute),
+		End:      now.Add(time.Minute),
+		Page:     1,
+		PageSize: 2,
+	}
+	page1, err := db.ListCodexAuditCasesPage(ctx, query)
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if page1.Total != 5 || len(page1.Items) != 2 || page1.Page != 1 || page1.PageSize != 2 {
+		t.Fatalf("page 1 metadata = total:%d len:%d page:%d size:%d, want 5/2/1/2", page1.Total, len(page1.Items), page1.Page, page1.PageSize)
+	}
+
+	all := append([]*PromptFilterLog{}, page1.Items...)
+	for page := 2; page <= 3; page++ {
+		query.Page = page
+		result, err := db.ListCodexAuditCasesPage(ctx, query)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if result.Total != page1.Total || !result.WindowStart.Equal(page1.WindowStart) || !result.WindowEnd.Equal(page1.WindowEnd) {
+			t.Fatalf("page %d changed total/window: %+v", page, result)
+		}
+		all = append(all, result.Items...)
+	}
+	if len(all) != 5 {
+		t.Fatalf("combined canonical items = %d, want 5", len(all))
+	}
+	ids := make([]int64, 0, len(all))
+	logicalCounts := map[string]int{}
+	duplicateText := ""
+	for _, item := range all {
+		ids = append(ids, item.ID)
+		logicalCounts[item.LogicalRequestID]++
+		if item.LogicalRequestID == "duplicate" {
+			duplicateText = item.FullText
+		}
+		if item.LogicalRequestID == "outside-window" || item.Source != "cyb_relay_routed" {
+			t.Fatalf("unexpected item in relay window: %+v", item)
+		}
+	}
+	if logicalCounts["duplicate"] != 1 || duplicateText != "canonical" {
+		t.Fatalf("duplicate canonicalization = count:%d text:%q, want 1/canonical", logicalCounts["duplicate"], duplicateText)
+	}
+	if !sort.SliceIsSorted(ids, func(i, j int) bool { return ids[i] > ids[j] }) {
+		t.Fatalf("case ids are not stably ordered descending: %v", ids)
+	}
+}
+
+func TestCodexAuditSummaryCountsProbeAndOAuthOverflowRoutes(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{
+			LogicalRequestID:    "probe-route",
+			StatusCode:          200,
+			RouteClass:          "cyb_relay",
+			RouteSource:         "probe",
+			RouteSignals:        `["probe_request"]`,
+			RouteGroupID:        42,
+			UpstreamAccountType: "openai_responses",
+		},
+		&UsageLogInput{
+			LogicalRequestID:    "overflow-route",
+			StatusCode:          200,
+			RouteClass:          "cyb_relay",
+			RouteSource:         "overflow",
+			RouteGroupID:        42,
+			UpstreamAccountType: "openai_responses",
+		},
+	)
+	report := buildCodexAuditTestReport(t, db)
+	if report.Summary.RelayProbe != 1 || report.Summary.RelayOverflow != 1 || report.Summary.RelayLegacyUnknown != 0 {
+		t.Fatalf("new route sources = probe:%d overflow:%d legacy:%d, want 1/1/0", report.Summary.RelayProbe, report.Summary.RelayOverflow, report.Summary.RelayLegacyUnknown)
+	}
+	if report.Summary.RouteInvariantViolations != 0 {
+		t.Fatalf("new route sources were treated as invariant violations: %d", report.Summary.RouteInvariantViolations)
+	}
 }

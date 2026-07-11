@@ -60,6 +60,8 @@ type CodexAuditSummary struct {
 	RelayRequests              int64 `json:"relay_requests"`
 	RelayDirect                int64 `json:"relay_direct"`
 	RelayPinned                int64 `json:"relay_pinned"`
+	RelayProbe                 int64 `json:"relay_probe"`
+	RelayOverflow              int64 `json:"relay_overflow"`
 	RelayLegacyUnknown         int64 `json:"relay_legacy_unknown"`
 	RelayRouteFailures         int64 `json:"relay_route_failures"`
 	RelayFallbackPrevented     int64 `json:"relay_fallback_prevented"`
@@ -111,6 +113,8 @@ type CodexAuditTimelinePoint struct {
 	DefaultRequests          int64     `json:"default_requests"`
 	RelayDirect              int64     `json:"relay_direct"`
 	RelayPinned              int64     `json:"relay_pinned"`
+	RelayProbe               int64     `json:"relay_probe"`
+	RelayOverflow            int64     `json:"relay_overflow"`
 	RelayLegacyUnknown       int64     `json:"relay_legacy_unknown"`
 	RelayRouteFailures       int64     `json:"relay_route_failures"`
 	OAuthCyberAttempts       int64     `json:"oauth_cyber_attempts"`
@@ -189,9 +193,12 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 	}
 
 	report := &CodexAuditReport{
-		WindowStart: start,
-		WindowEnd:   end,
-		GeneratedAt: now,
+		WindowStart:        start,
+		WindowEnd:          end,
+		GeneratedAt:        now,
+		ProbeObserved:      []CodexAuditProbeRow{},
+		ProbeShortCircuits: []CodexAuditProbeRow{},
+		ProbeHighFrequency: []CodexAuditProbeRow{},
 		Notes: []string{
 			"Sub2 bridge account state is not queried from inside codex2api; use the external s12 audit workflow when bridge schedulability must be confirmed.",
 		},
@@ -215,9 +222,11 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 	if report.RouteSignals, err = db.codexAuditRouteSignalRows(ctx, start, end); err != nil {
 		return nil, err
 	}
-	if report.RouteSamples, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "cyb_relay_routed", Start: start, End: end}); err != nil {
+	routeCases, err := db.ListCodexAuditCasesPage(ctx, CodexAuditCasesQuery{Kind: CodexAuditCaseRelayRoute, Page: 1, PageSize: query.Limit, Start: start, End: end})
+	if err != nil {
 		return nil, err
 	}
+	report.RouteSamples = routeCases.Items
 	if report.OAuthCyberCases, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "upstream_cyber_policy", CyberScope: "oauth", Start: start, End: end}); err != nil {
 		return nil, err
 	}
@@ -225,15 +234,6 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 		return nil, err
 	}
 	if report.SuspiciousSamples, err = db.codexAuditSuspiciousSamples(ctx, start, end, query.Limit); err != nil {
-		return nil, err
-	}
-	if report.ProbeObserved, err = db.codexAuditProbeObserved(ctx, start, end, query.Limit); err != nil {
-		return nil, err
-	}
-	if report.ProbeShortCircuits, err = db.codexAuditProbeShortCircuits(ctx, start, end, query.Limit); err != nil {
-		return nil, err
-	}
-	if report.ProbeHighFrequency, err = db.codexAuditProbeHighFrequency(ctx, start, end, query.Limit); err != nil {
 		return nil, err
 	}
 	if report.PolicyErrors, err = db.codexAuditUsageSamples(ctx, start, end, query.Limit, "policy"); err != nil {
@@ -432,6 +432,10 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 				point.RelayDirect++
 			case "pin":
 				point.RelayPinned++
+			case "probe":
+				point.RelayProbe++
+			case "overflow":
+				point.RelayOverflow++
 			default:
 				point.RelayLegacyUnknown++
 			}
@@ -444,7 +448,7 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 		if logicalID != "" {
 			invariant := (routeClass == "cyb_relay" && accountID > 0 && accountType != "openai_responses") ||
 				(routeClass == "cyb_relay" && routeGroupID <= 0) ||
-				(routeClass == "cyb_relay" && routeSource != "direct" && routeSource != "pin") ||
+				(routeClass == "cyb_relay" && routeSource != "direct" && routeSource != "pin" && routeSource != "probe" && routeSource != "overflow" && routeSource != "continuation") ||
 				(routeSource == "pin" && pinKind == "") ||
 				(routeSource == "direct" && (routeSignals == "" || routeSignals == "[]" || routeSignals == "null")) ||
 				(routeSource == "pin" && routeSignals != "" && routeSignals != "[]" && routeSignals != "null") ||
@@ -881,14 +885,16 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'direct' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'pin' THEN 1 ELSE 0 END), 0),
-		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin') THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'probe' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'overflow' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation') THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND (status_code >= 500 OR COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay')) THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay') THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') = '' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') <> '' AND (
 		      (COALESCE(route_class, '') = 'cyb_relay' AND account_id > 0 AND COALESCE(upstream_account_type, '') <> 'openai_responses') OR
 		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) <= 0) OR
-		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin')) OR
+		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation')) OR
 		      (COALESCE(route_source, '') = 'pin' AND COALESCE(pin_kind, '') = '') OR
 		      (COALESCE(route_source, '') = 'direct' AND COALESCE(route_signals, '[]') IN ('', '[]', 'null')) OR
 		      (COALESCE(route_source, '') = 'pin' AND COALESCE(route_signals, '[]') NOT IN ('', '[]', 'null')) OR
@@ -916,6 +922,8 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		&summary.RelayRequests,
 		&summary.RelayDirect,
 		&summary.RelayPinned,
+		&summary.RelayProbe,
+		&summary.RelayOverflow,
 		&summary.RelayLegacyUnknown,
 		&summary.RelayRouteFailures,
 		&summary.RelayFallbackPrevented,
@@ -937,6 +945,8 @@ func mergeCodexAuditRouteSummary(target *CodexAuditSummary, route CodexAuditSumm
 	target.RelayRequests = route.RelayRequests
 	target.RelayDirect = route.RelayDirect
 	target.RelayPinned = route.RelayPinned
+	target.RelayProbe = route.RelayProbe
+	target.RelayOverflow = route.RelayOverflow
 	target.RelayLegacyUnknown = route.RelayLegacyUnknown
 	target.RelayRouteFailures = route.RelayRouteFailures
 	target.RelayFallbackPrevented = route.RelayFallbackPrevented

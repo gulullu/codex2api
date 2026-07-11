@@ -873,6 +873,8 @@ export interface CodexAuditSummary {
   relay_requests: number
   relay_direct: number
   relay_pinned: number
+  relay_probe: number
+  relay_overflow: number
   relay_legacy_unknown: number
   relay_route_failures: number
   relay_fallback_prevented: number
@@ -897,6 +899,8 @@ export interface CodexAuditTimelinePoint {
   default_requests: number
   relay_direct: number
   relay_pinned: number
+  relay_probe: number
+  relay_overflow: number
   relay_legacy_unknown: number
   relay_route_failures: number
   oauth_cyber_attempts: number
@@ -973,6 +977,17 @@ export interface CodexAuditReport {
   last_cyber_policy_at?: string
   last_oauth_cyber_policy_at?: string
   last_relay_cyber_policy_at?: string
+}
+
+export type CodexAuditCaseKind = 'relay_route' | 'session_bleed' | 'oauth_cyber' | 'relay_cyber'
+
+export interface CodexAuditCasesResponse {
+  items: PromptFilterLog[]
+  total: number
+  page: number
+  page_size: number
+  window_start: string
+  window_end: string
 }
 
 export interface PromptFilterRulePatternTestResponse {

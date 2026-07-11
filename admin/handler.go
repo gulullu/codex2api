@@ -440,6 +440,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/audit/codex2api", h.GetCodexAuditReport)
+	api.GET("/audit/codex2api/cases", h.GetCodexAuditCases)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
