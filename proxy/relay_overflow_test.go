@@ -6,11 +6,14 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 func int64Pointer(value int64) *int64 {
@@ -295,5 +298,74 @@ func TestRelayRequiredContinuationRejectsOAuthOwnerWithReplayError(t *testing.T)
 	}
 	if got := atomic.LoadInt64(&oauth.ActiveRequests); got != 0 {
 		t.Fatalf("OAuth active requests = %d, conflicting owner must not be acquired", got)
+	}
+}
+
+func TestRouteSelectionFailureSpec(t *testing.T) {
+	tests := []struct {
+		name              string
+		routeErr          routeSelectionError
+		wantStatus        int
+		wantOpenAIType    api.ErrorType
+		wantAnthropicType string
+		wantWSClose       int
+	}{
+		{
+			name:              "replay required",
+			routeErr:          routeSelectionError{Kind: routeSwitchRequiresReplay, Message: "resend full context"},
+			wantStatus:        http.StatusConflict,
+			wantOpenAIType:    api.ErrorTypeInvalidRequest,
+			wantAnthropicType: "invalid_request_error",
+			wantWSClose:       websocket.ClosePolicyViolation,
+		},
+		{
+			name:              "owner unavailable",
+			routeErr:          routeSelectionError{Kind: continuationOwnerUnavailable, Message: "retry later"},
+			wantStatus:        http.StatusServiceUnavailable,
+			wantOpenAIType:    api.ErrorTypeServer,
+			wantAnthropicType: "overloaded_error",
+			wantWSClose:       websocket.CloseTryAgainLater,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := routeSelectionFailureSpecFor(tt.routeErr)
+			if spec.HTTPStatusCode != tt.wantStatus || spec.OpenAIErrorType != tt.wantOpenAIType || spec.AnthropicErrorType != tt.wantAnthropicType || spec.WebSocketCloseCode != tt.wantWSClose {
+				t.Fatalf("spec = %+v, want status=%d openai=%q anthropic=%q ws=%d", spec, tt.wantStatus, tt.wantOpenAIType, tt.wantAnthropicType, tt.wantWSClose)
+			}
+			apiErr := routeSelectionAPIError(tt.routeErr, spec)
+			if apiErr.Code != api.ErrorCode(tt.routeErr.Kind) || apiErr.Message != tt.routeErr.Message || apiErr.Type != tt.wantOpenAIType {
+				t.Fatalf("api error = %+v", apiErr)
+			}
+		})
+	}
+}
+
+func TestLogRouteSelectionErrorInitializesLogicalRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+	ctx := newRouteTestContext()
+	ctx.Set(contextUpstreamAccountID, int64(99))
+	ctx.Set(contextUpstreamAccountType, "oauth")
+	routeErr := routeSelectionError{Kind: continuationOwnerUnavailable, Message: "retry later"}
+	spec := routeSelectionFailureSpecFor(routeErr)
+
+	before := time.Now()
+	handler.logRouteSelectionError(ctx, "/v1/responses", "gpt-5.4", "gpt-5.4", false, false, 0, routeErr, spec)
+	after := time.Now()
+
+	if requestID := logicalRequestID(ctx); requestID == "" {
+		t.Fatal("logical request ID was not initialized")
+	}
+	startedValue, ok := ctx.Get(contextLogicalRequestStart)
+	started, typeOK := startedValue.(time.Time)
+	if !ok || !typeOK || started.Before(before) || started.After(after) {
+		t.Fatalf("logical request start = %#v, want within [%s, %s]", startedValue, before, after)
+	}
+	if accountID, _ := ctx.Get(contextUpstreamAccountID); accountID != int64(0) {
+		t.Fatalf("upstream account ID = %#v, want cleared", accountID)
+	}
+	if accountType := ctx.GetString(contextUpstreamAccountType); accountType != "" {
+		t.Fatalf("upstream account type = %q, want cleared", accountType)
 	}
 }

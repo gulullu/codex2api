@@ -1822,8 +1822,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
-				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt, routeErr)
-				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer), http.StatusServiceUnavailable)
+				spec := routeSelectionFailureSpecFor(routeErr)
+				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
+				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
@@ -2893,8 +2894,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
-				h.logRouteSelectionError(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt, routeErr)
-				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer), http.StatusServiceUnavailable)
+				spec := routeSelectionFailureSpecFor(routeErr)
+				h.logRouteSelectionError(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt, routeErr, spec)
+				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
@@ -3426,8 +3428,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
-				h.logRouteSelectionError(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt, routeErr)
-				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer), http.StatusServiceUnavailable)
+				spec := routeSelectionFailureSpecFor(routeErr)
+				h.logRouteSelectionError(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
+				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {

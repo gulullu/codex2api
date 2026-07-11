@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"log"
-	"net/http"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -160,15 +159,17 @@ func (h *Handler) nextRoutedAccountForSession(
 	}
 }
 
-func (h *Handler) logRouteSelectionError(c *gin.Context, endpoint, model, effectiveModel string, stream, viaWebsocket bool, attempt int, routeErr routeSelectionError) {
+func (h *Handler) logRouteSelectionError(c *gin.Context, endpoint, model, effectiveModel string, stream, viaWebsocket bool, attempt int, routeErr routeSelectionError, spec routeSelectionFailureSpec) {
+	_ = logicalRequestID(c)
+	durationMs := logicalRequestDurationMs(c)
 	clearUpstreamAccountContext(c)
 	h.logUsageForRequest(c, &database.UsageLogInput{
 		AccountID:         0,
 		Endpoint:          endpoint,
 		Model:             model,
 		EffectiveModel:    effectiveModel,
-		StatusCode:        http.StatusServiceUnavailable,
-		DurationMs:        logicalRequestDurationMs(c),
+		StatusCode:        spec.HTTPStatusCode,
+		DurationMs:        durationMs,
 		InboundEndpoint:   endpoint,
 		Stream:            stream,
 		ViaWebsocket:      viaWebsocket,

@@ -3,11 +3,14 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
 
@@ -31,6 +34,37 @@ type responseRouteOwner struct {
 type routeSelectionError struct {
 	Kind    string
 	Message string
+}
+
+type routeSelectionFailureSpec struct {
+	HTTPStatusCode     int
+	OpenAIErrorType    api.ErrorType
+	AnthropicErrorType string
+	WebSocketCloseCode int
+}
+
+func routeSelectionFailureSpecFor(routeErr routeSelectionError) routeSelectionFailureSpec {
+	spec := routeSelectionFailureSpec{
+		HTTPStatusCode:     http.StatusServiceUnavailable,
+		OpenAIErrorType:    api.ErrorTypeServer,
+		AnthropicErrorType: "overloaded_error",
+		WebSocketCloseCode: websocket.CloseTryAgainLater,
+	}
+	if routeErr.Kind == routeSwitchRequiresReplay {
+		spec.HTTPStatusCode = http.StatusConflict
+		spec.OpenAIErrorType = api.ErrorTypeInvalidRequest
+		spec.AnthropicErrorType = "invalid_request_error"
+		spec.WebSocketCloseCode = websocket.ClosePolicyViolation
+	}
+	return spec
+}
+
+func routeSelectionAPIError(routeErr routeSelectionError, spec routeSelectionFailureSpec) *api.APIError {
+	return api.NewAPIError(
+		api.ErrorCode(routeErr.Kind),
+		routeErr.Message,
+		spec.OpenAIErrorType,
+	)
 }
 
 func clearRouteSelectionError(c *gin.Context) {

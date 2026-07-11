@@ -261,10 +261,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
-				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt, routeErr)
-				apiErr = api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer)
+				spec := routeSelectionFailureSpecFor(routeErr)
+				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt, routeErr, spec)
+				apiErr = routeSelectionAPIError(routeErr, spec)
 				_ = writeResponsesWSError(conn, apiErr)
-				return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
+				return newResponsesWSCloseError(spec.WebSocketCloseCode, apiErr.Message, apiErr)
 			}
 			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt)

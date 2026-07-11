@@ -176,8 +176,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
-				h.logRouteSelectionError(c, "/v1/messages", model, effectiveModel, isStream, false, attempt, routeErr)
-				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", routeErr.Message)
+				spec := routeSelectionFailureSpecFor(routeErr)
+				h.logRouteSelectionError(c, "/v1/messages", model, effectiveModel, isStream, false, attempt, routeErr, spec)
+				sendAnthropicError(c, spec.HTTPStatusCode, spec.AnthropicErrorType, routeErr.Message)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
