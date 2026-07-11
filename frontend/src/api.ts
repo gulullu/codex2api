@@ -26,6 +26,7 @@ import type {
   InviteResponse,
   MessageResponse,
   ModelSyncResponse,
+  ModelPricingOverride,
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
@@ -569,6 +570,23 @@ export const api = {
       builtin_version: string
       updated: boolean
     }>('/codex-cli-version/sync', { method: 'POST' }),
+  listModelPricing: () =>
+    request<{
+      models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
+      sync_url: string
+      default_sync_url: string
+      models_dev_url: string
+    }>('/model-pricing'),
+  updateModelPricing: (payload: { model: string; reset?: boolean; pricing?: ModelPricingOverride }) =>
+    request<{ model: string; reset: boolean }>('/model-pricing', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  syncModelPricing: (url: string) =>
+    request<{ source_url: string; fetched: number; applied: number; skipped: number }>('/model-pricing/sync', {
+      method: 'POST',
+      body: JSON.stringify({ url: url ?? '' }),
+    }),
   batchTestAccounts: (ids?: number[]) =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', {
       method: 'POST',
@@ -584,6 +602,13 @@ export const api = {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))
     return request<CPAExportEntry[]>(`/accounts/export?${sp.toString()}`)
+  },
+  /** 导出回收站账号；ids 为空则导出回收站全部。 */
+  exportRecycleBinAccounts: (ids?: number[]) => {
+    const sp = new URLSearchParams()
+    if (ids && ids.length > 0) sp.set('ids', ids.join(','))
+    const q = sp.toString()
+    return request<CPAExportEntry[]>(`/accounts/recycle-bin/export${q ? `?${q}` : ''}`)
   },
   downloadAccountAuthJSON: (id: number) =>
     requestBlob(`/accounts/${id}/auth-json`),

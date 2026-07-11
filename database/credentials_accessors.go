@@ -35,22 +35,35 @@ func (a *AccountRow) GetCredentialFloat64(key string) (float64, bool) {
 }
 
 func (a *AccountRow) GetCredentialBool(key string) bool {
+	value := a.GetCredentialOptionalBool(key)
+	return value != nil && *value
+}
+
+// GetCredentialOptionalBool returns nil when the credential is absent, null,
+// or malformed. A non-nil false value is preserved for account-level
+// overrides that must distinguish "disabled" from "inherit global".
+func (a *AccountRow) GetCredentialOptionalBool(key string) *bool {
 	if a == nil || a.Credentials == nil {
-		return false
+		return nil
 	}
 	v, ok := a.Credentials[key]
 	if !ok || v == nil {
-		return false
+		return nil
 	}
+	var value bool
 	switch val := v.(type) {
 	case bool:
-		return val
+		value = val
 	case string:
 		parsed, err := strconv.ParseBool(val)
-		return err == nil && parsed
+		if err != nil {
+			return nil
+		}
+		value = parsed
 	default:
-		return false
+		return nil
 	}
+	return &value
 }
 
 func (a *AccountRow) GetCredentialStringMap(key string) map[string]string {

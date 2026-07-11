@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -29,6 +31,32 @@ const (
 // isReasoningTruncationTokens 判断 reasoning token 数是否命中截断指纹（518*n - 2）。
 func isReasoningTruncationTokens(tokens int) bool {
 	return tokens >= reasoningTruncationStep-2 && (tokens+2)%reasoningTruncationStep == 0
+}
+
+// continueKeepAllEncrypted 逃生阀：CODEX_CONTINUE_KEEP_ALL_ENCRYPTED=1 时恢复
+// 「折叠输出保留每轮全部 encrypted_content」的旧行为（issue #353 之前）。
+func continueKeepAllEncrypted() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_CONTINUE_KEEP_ALL_ENCRYPTED"))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// stripReasoningEncryptedContent 删除 reasoning item 的 encrypted_content 字段
+//（保留 summary 文本），非 reasoning item 原样返回。
+func stripReasoningEncryptedContent(item json.RawMessage) json.RawMessage {
+	if gjson.GetBytes(item, "type").String() != "reasoning" {
+		return item
+	}
+	if !gjson.GetBytes(item, "encrypted_content").Exists() {
+		return item
+	}
+	if out, err := sjson.DeleteBytes([]byte(item), "encrypted_content"); err == nil {
+		return out
+	}
+	return item
 }
 
 // 续想折叠的停止原因。
@@ -95,6 +123,11 @@ type foldState struct {
 	firstUsage   *UsageInfo        // 第 1 轮 usage（重构下游 usage 的 input/cached 来源）
 	sumReasoning int               // 各轮 reasoning tokens 之和
 	flushedAny   bool              // 是否已向客户端冲刷过暂定输出
+
+	// lastRoundReasoningStart 是最后一轮 readRound 开始时 finalOutput 的长度。
+	// 该下标之前的项属于更早各轮的 reasoning：下发客户端时剥离其 encrypted_content，
+	// 只保留最后一轮的完整加密上下文（见 clientFacingOutput / issue #353）。
+	lastRoundReasoningStart int
 }
 
 func (st *foldState) nextSeq() int64 {
@@ -152,6 +185,28 @@ func buildContinuationBody(baseBody []byte, replayTail []json.RawMessage) ([]byt
 	return sjson.SetRawBytes(baseBody, "input", merged)
 }
 
+// clientFacingOutput 返回下发给客户端的 output items：只有最后一轮的 reasoning
+// 保留完整 encrypted_content，更早各轮的 reasoning 剥离该字段。续想把每轮
+// reasoning 全量累加进 finalOutput（正常单响应只含 1 份）；不收敛会让客户端把
+// N 份账号绑定的加密载荷回传，逐轮把上下文顶爆窗口、并在跨账号换号时成批被拒
+//（issue #353）。早期各轮的加密上下文已在折叠时经 replayTail 回放并产出最终答案，
+// 使命已尽，无需再让客户端驱动一遍。逃生阀见 continueKeepAllEncrypted。
+func (st *foldState) clientFacingOutput() []json.RawMessage {
+	start := st.lastRoundReasoningStart
+	if continueKeepAllEncrypted() || start <= 0 || start > len(st.finalOutput) {
+		return st.finalOutput
+	}
+	out := make([]json.RawMessage, len(st.finalOutput))
+	for i, item := range st.finalOutput {
+		if i < start {
+			out[i] = stripReasoningEncryptedContent(item)
+		} else {
+			out[i] = item
+		}
+	}
+	return out
+}
+
 // rebuildTerminalEvent 重构折叠后的下游 terminal 事件：保留第 1 轮的响应
 // 身份（id/created_at），采用最终轮的 status/error/incomplete_details，output
 // 换成折叠后的完整列表，usage 换成单响应视角的重构值。
@@ -167,7 +222,7 @@ func (st *foldState) rebuildTerminalEvent(terminal []byte, finalRoundUsage *Usag
 			resp, _ = sjson.SetRawBytes(resp, key, []byte(v.Raw))
 		}
 	}
-	outputRaw, err := json.Marshal(st.finalOutput)
+	outputRaw, err := json.Marshal(st.clientFacingOutput())
 	if err != nil {
 		outputRaw = []byte(`[]`)
 	}
@@ -232,7 +287,7 @@ func (st *foldState) syntheticIncompleteEvent(reason string, finalRoundUsage *Us
 		base = json.RawMessage(`{}`)
 	}
 	resp := []byte(base)
-	outputRaw, err := json.Marshal(st.finalOutput)
+	outputRaw, err := json.Marshal(st.clientFacingOutput())
 	if err != nil {
 		outputRaw = []byte(`[]`)
 	}
@@ -412,6 +467,9 @@ func runContinueThinkingFold(firstResp *http.Response, f *continueFold) continue
 		result.RoundsRun = roundNo
 		result.FinalResponse = resp
 		roundStart := time.Now()
+		// 记录本轮 reasoning 在 finalOutput 中的起点：若本轮成为最后一轮，
+		// 该起点之前（更早各轮）的 reasoning 下发时剥离 encrypted_content。
+		st.lastRoundReasoningStart = len(st.finalOutput)
 		outcome := st.readRound(resp.Body, roundNo, f)
 		resp.Body.Close()
 

@@ -1,5 +1,5 @@
 import type { ChangeEvent, ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
@@ -329,7 +329,9 @@ function ModelMappingEditor({
   const { t } = useTranslation()
   const [mappings, setMappings] = useState<ModelMappingEntry[]>(() => parseModelMappingEntries(value, fallbackEntries))
   const lastEmittedValueRef = useRef<string | null>(null)
-  const sourceSelectOptions = useMemo(() => {
+  const sourceListId = useId()
+  const targetListId = useId()
+  const sourceSuggestions = useMemo(() => {
     if (!sourceOptions) return []
     const byValue = new Map(sourceOptions.map((option) => [option.value, option]))
     for (const [source] of mappings) {
@@ -340,7 +342,7 @@ function ModelMappingEditor({
     }
     return [...byValue.values()]
   }, [mappings, sourceOptions])
-  const targetSelectOptions = useMemo(() => {
+  const targetSuggestions = useMemo(() => {
     if (!targetOptions) return []
     const byValue = new Map(targetOptions.map((option) => [option.value, option]))
     for (const [, target] of mappings) {
@@ -400,45 +402,25 @@ function ModelMappingEditor({
               <span className="text-[11px] font-semibold text-muted-foreground sm:hidden">
                 {sourceLabel}
               </span>
-              {sourceOptions ? (
-                <Select
-                  compact
-                  value={k.trim()}
-                  options={sourceSelectOptions}
-                  placeholder={sourcePlaceholder}
-                  disabled={sourceSelectOptions.length === 0}
-                  onValueChange={(next) => handleChange(i, 0, next)}
-                />
-              ) : (
-                <Input
-                  className="h-8 px-2 font-mono text-xs"
-                  placeholder={sourcePlaceholder}
-                  value={k}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
-                />
-              )}
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                list={sourceOptions ? sourceListId : undefined}
+                placeholder={sourcePlaceholder}
+                value={k}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 0, e.target.value)}
+              />
             </div>
             <div className="min-w-0 space-y-1 sm:space-y-0">
               <span className="text-[11px] font-semibold text-muted-foreground sm:hidden">
                 {targetLabel}
               </span>
-              {targetOptions ? (
-                <Select
-                  compact
-                  value={v.trim()}
-                  options={targetSelectOptions}
-                  placeholder={targetPlaceholder}
-                  disabled={targetSelectOptions.length === 0}
-                  onValueChange={(next) => handleChange(i, 1, next)}
-                />
-              ) : (
-                <Input
-                  className="h-8 px-2 font-mono text-xs"
-                  placeholder={targetPlaceholder}
-                  value={v}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
-                />
-              )}
+              <Input
+                className="h-8 px-2 font-mono text-xs"
+                list={targetOptions ? targetListId : undefined}
+                placeholder={targetPlaceholder}
+                value={v}
+                onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
+              />
             </div>
             <button
               type="button"
@@ -451,6 +433,20 @@ function ModelMappingEditor({
           </div>
         ))}
       </div>
+      {sourceOptions ? (
+        <datalist id={sourceListId}>
+          {sourceSuggestions.map((option) => (
+            <option key={option.value} value={option.value} label={option.label} />
+          ))}
+        </datalist>
+      ) : null}
+      {targetOptions ? (
+        <datalist id={targetListId}>
+          {targetSuggestions.map((option) => (
+            <option key={option.value} value={option.value} label={option.label} />
+          ))}
+        </datalist>
+      ) : null}
       <Button type="button" variant="outline" size="sm" className="self-start" onClick={handleAdd}>
         + {t('settings2.addMapping')}
       </Button>
@@ -1219,6 +1215,7 @@ export default function Settings() {
     smart_pacing_enabled: false,
     smart_pacing_min_concurrency: 1,
     smart_pacing_windows: '5h,7d',
+    ignore_usage_limit_status: false,
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
@@ -1697,12 +1694,75 @@ export default function Settings() {
   const [activeSection, setActiveSection] = useState<string>('settings-overview')
   const [endpointsOpen, setEndpointsOpen] = useState(false)
   const [modelPanel, setModelPanel] = useState<ModelPanelKey | null>(null)
+  // 点击跳转时短暂锁定，避免 smooth scroll 过程中 scroll-spy 来回闪。
+  const sectionClickLockRef = useRef(false)
+  const settingsNavRef = useRef<HTMLElement | null>(null)
+
   const scrollToSection = useCallback((id: string) => {
     const el = document.getElementById(id)
     if (!el) return
+    sectionClickLockRef.current = true
     setActiveSection(id)
     el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    window.setTimeout(() => {
+      sectionClickLockRef.current = false
+    }, 800)
   }, [])
+
+  // 滚动时根据当前视口位置高亮对应顶栏模块（scroll-spy）。
+  useEffect(() => {
+    const sectionIds = settingsSections.map((section) => section.id)
+
+    const resolveActiveSection = () => {
+      if (sectionClickLockRef.current) return
+
+      // 固定顶栏下方的“阅读线”：已滚过该线的最后一个 section 视为当前模块。
+      const marker = Math.max(96, Math.round(window.innerHeight * 0.16))
+      const markerY = window.scrollY + marker
+
+      // 必须按文档位置排序，不能按导航数组顺序（页面区块与 tab 顺序可能不一致）。
+      const positioned: Array<{ id: string; y: number }> = []
+      for (const id of sectionIds) {
+        const el = document.getElementById(id)
+        if (!el) continue
+        positioned.push({
+          id,
+          y: el.getBoundingClientRect().top + window.scrollY,
+        })
+      }
+      positioned.sort((a, b) => a.y - b.y)
+
+      let current = positioned[0]?.id ?? 'settings-overview'
+      for (const item of positioned) {
+        if (item.y <= markerY + 1) current = item.id
+      }
+
+      // 接近页底时强制高亮文档中最后一节，避免末段高度不够顶不到阅读线。
+      const doc = document.documentElement
+      const nearBottom = window.scrollY + window.innerHeight >= doc.scrollHeight - 32
+      if (nearBottom && positioned.length > 0) {
+        current = positioned[positioned.length - 1].id
+      }
+
+      setActiveSection((prev) => (prev === current ? prev : current))
+    }
+
+    resolveActiveSection()
+    window.addEventListener('scroll', resolveActiveSection, { passive: true })
+    window.addEventListener('resize', resolveActiveSection)
+    return () => {
+      window.removeEventListener('scroll', resolveActiveSection)
+      window.removeEventListener('resize', resolveActiveSection)
+    }
+  }, [settingsSections])
+
+  // 当前模块变化时，把对应 pill 滚进顶栏可视区（窄屏横向滚动导航）。
+  useEffect(() => {
+    const nav = settingsNavRef.current
+    if (!nav) return
+    const btn = nav.querySelector<HTMLElement>(`[data-section-id="${activeSection}"]`)
+    btn?.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' })
+  }, [activeSection])
 
   if (showInitialSkeleton) {
     return <SettingsSkeleton />
@@ -1730,6 +1790,7 @@ export default function Settings() {
           )}
         >
           <nav
+            ref={settingsNavRef}
             aria-label={t('settings.navLabel')}
             className={cn(
               'flex min-w-0 flex-1 items-center gap-1 overflow-x-auto rounded-full border border-border/80 bg-card/95 p-1.5 shadow-[0_10px_40px_hsl(222_30%_12%/0.12)] backdrop-blur-xl',
@@ -1743,6 +1804,8 @@ export default function Settings() {
                 <button
                   key={section.id}
                   type="button"
+                  data-section-id={section.id}
+                  aria-current={active ? 'true' : undefined}
                   onClick={() => scrollToSection(section.id)}
                   className={cn(
                     'inline-flex shrink-0 items-center gap-2 rounded-full px-3.5 py-2 text-[13px] font-semibold tracking-tight transition-all duration-200 sm:px-4 sm:py-2.5 sm:text-sm',
@@ -2128,6 +2191,16 @@ export default function Settings() {
                 </SettingField>
               </div>
               <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField
+                  label={t('settings.ignoreUsageLimitStatus')}
+                  description={t('settings.ignoreUsageLimitStatusHint')}
+                  layout="switch"
+                >
+                  <Switch
+                    checked={settingsForm.ignore_usage_limit_status}
+                    onCheckedChange={(checked) => autoSaveBooleanField('ignore_usage_limit_status', checked)}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.smartPacingEnabled')} description={t('settings.smartPacingEnabledHint')} layout="switch">
                   <Switch
                     checked={settingsForm.smart_pacing_enabled}

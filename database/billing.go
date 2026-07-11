@@ -76,6 +76,22 @@ var (
 			LongOutputPricePerMToken:    45.0,
 			LongCacheReadPricePerMToken: 1.0,
 		}},
+		// gpt-5.6-terra: 官方 standard 同 gpt-5.4（$2.5/$15），priority 2×；
+		// 独立规范键，便于定价页单独覆盖，不与 gpt-5.4 互相污染。
+		{model: "gpt-5.6-terra", pricing: ModelPricing{
+			InputPricePerMToken:                 2.5,
+			InputPricePerMTokenPriority:         5.0,
+			OutputPricePerMToken:                15.0,
+			OutputPricePerMTokenPriority:        30.0,
+			CacheReadPricePerMToken:             0.25,
+			CacheReadPricePerMTokenPriority:     0.5,
+			LongInputPricePerMToken:             5.0,
+			LongInputPricePerMTokenPriority:     10.0,
+			LongOutputPricePerMToken:            22.5,
+			LongOutputPricePerMTokenPriority:    45.0,
+			LongCacheReadPricePerMToken:         0.5,
+			LongCacheReadPricePerMTokenPriority: 1.0,
+		}},
 		// gpt-5.6-luna: 全新最低档。priority 均为 2× standard，由 fast 档兜底自动得出。
 		{model: "gpt-5.6-luna", pricing: ModelPricing{
 			InputPricePerMToken:         1.0,
@@ -145,16 +161,32 @@ var (
 
 func GetModelPricing(model string) *ModelPricing {
 	normalized := normalizeBillingModelName(model)
+	canonical := normalized
+	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
+		canonical = codexModel
+	}
+	base := baseModelPricing(normalized, canonical)
+
+	// custom / synced 覆盖：以代码默认为底，合并非 0 字段（部分覆盖）。
+	// 覆盖表拷贝到本地副本再改，绝不改动共享的默认 pricing 指针。
+	if ov, ok := lookupModelPricingOverride(canonical); ok {
+		merged := *base
+		ov.applyNonZero(&merged)
+		return &merged
+	}
+	return base
+}
+
+// baseModelPricing 返回代码内置的模型定价（不含覆盖）。normalized 为归一化后的模型名，
+// canonical 为 codex 归一后的规范名（用于规则表查找）。
+func baseModelPricing(normalized, canonical string) *ModelPricing {
 	if pricing := claudeFamilyPricing(normalized); pricing != nil {
 		return pricing
 	}
 	if pricing := geminiFamilyPricing(normalized); pricing != nil {
 		return pricing
 	}
-	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
-		normalized = codexModel
-	}
-	if pricing := modelRulePricing(normalized); pricing != nil {
+	if pricing := modelRulePricing(canonical); pricing != nil {
 		return pricing
 	}
 	return defaultModelPricing
@@ -257,13 +289,13 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 		return "gpt-5.5", true
 	// GPT-5.6 三个变体官方定价各不相同（developers.openai.com/api/docs/pricing）：
 	//   sol   $5/$30（standard，priority 2× = $10/$60）——同 gpt-5.5 standard 但 priority 更低
-	//   terra $2.5/$15 —— 与 gpt-5.4 完全一致，直接复用
+	//   terra $2.5/$15 —— 与 gpt-5.4 同价，但独立规范键，定价页可单独配置
 	//   luna  $1/$6 —— 全新档位
 	// priority 均为 standard 的 2×，由 serviceTierCostMultiplier 兜底自动得出，无需显式配置。
 	case strings.Contains(compact, "gpt-5.6-sol") || strings.Contains(compact, "gpt5-6-sol") || strings.Contains(compact, "gpt5.6-sol"):
 		return "gpt-5.6-sol", true
 	case strings.Contains(compact, "gpt-5.6-terra") || strings.Contains(compact, "gpt5-6-terra") || strings.Contains(compact, "gpt5.6-terra"):
-		return "gpt-5.4", true
+		return "gpt-5.6-terra", true
 	case strings.Contains(compact, "gpt-5.6-luna") || strings.Contains(compact, "gpt5-6-luna") || strings.Contains(compact, "gpt5.6-luna"):
 		return "gpt-5.6-luna", true
 	case strings.Contains(compact, "gpt-5.6") || strings.Contains(compact, "gpt5-6") || strings.Contains(compact, "gpt5.6"):

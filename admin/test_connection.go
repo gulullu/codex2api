@@ -216,7 +216,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			}
 			// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断；
 			// 临时账号（回收站）不回写任何调度状态。
-			if !isTransient && (isOpenAIResponsesAccount || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100))) {
+			if !isTransient && (isOpenAIResponsesAccount || usageState.UsageWindowLimitsIgnored || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100))) {
 				h.store.RecordManualTestSuccess(account, time.Since(start))
 			}
 			if isTransient {
@@ -309,6 +309,9 @@ func buildTestPayloadWithContent(model string, content string) []byte {
 }
 
 func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
+	if state.UsageWindowLimitsIgnored {
+		return "", false
+	}
 	if state.Premium5hRateLimited {
 		remaining := time.Until(state.Reset5hAt).Round(time.Second)
 		if remaining < 0 {
@@ -324,6 +327,9 @@ func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool
 
 func applyUsageLimitedAccountState(store *auth.Store, account *auth.Account, state proxy.CodexUsageSyncResult) bool {
 	if store == nil || account == nil {
+		return false
+	}
+	if state.UsageWindowLimitsIgnored {
 		return false
 	}
 	if state.Premium5hRateLimited || state.Usage7dRateLimited {

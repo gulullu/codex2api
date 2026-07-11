@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -195,7 +196,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
 	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
-	for retries := 0; sendErr != nil && retries < 2; retries++ {
+	for retries := 0; shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
 
@@ -229,6 +230,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		apiKey:      apiKey,
 		readErrChan: make(chan error, 1),
 	}, nil
+}
+
+func shouldRetryWebsocketSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	return !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig
 }
 
 // prepareWebsocketBody 准备 WebSocket 请求体
@@ -302,7 +311,9 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	} else {
 		headers.Set("Originator", proxy.Originator)
 	}
-	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics"} {
+	// X-Oai-Attestation：DeviceCheck 设备认证头（上游 openai/codex#20619），
+	// 仅在下游携带时透传，本代理不伪造（假 token 服务端验证必败，反而暴露）。
+	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics", "X-Oai-Attestation"} {
 		if value := strings.TrimSpace(ginHeaders.Get(name)); value != "" {
 			headers.Set(name, value)
 		}
@@ -331,6 +342,9 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) error {
 	if !wc.IsConnected() {
 		return fmt.Errorf("websocket connection is not connected")
+	}
+	if err := wc.ensureReadLeaseForSend(requestID); err != nil {
+		return err
 	}
 	return wc.WriteMessage(websocket.TextMessage, body)
 }
@@ -361,19 +375,21 @@ type WsResponse struct {
 
 // ReadStream 读取 SSE 流
 func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
-	if r.conn == nil || !r.conn.IsConnected() {
+	if r.conn == nil {
 		return fmt.Errorf("websocket connection is not available")
+	}
+	if r.pendingReq != nil {
+		if err := r.conn.ensureReadLeaseForResponse(r.pendingReq.RequestID); err != nil {
+			return fmt.Errorf("websocket connection is not available: %w", err)
+		}
 	}
 
 	for {
 		msgType, payload, err := r.conn.ReadMessage()
 		if err != nil {
-			// 检查是否是正常关闭
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return nil
-			}
-			// 非正常关闭(close 1006/1009/1011、broken pipe、unexpected EOF、读超时等)：
-			// 连接已不可靠，标记为坏连接，Close() 时销毁并移出连接池，避免复用与 CLOSE_WAIT 滞留。
+			// ReadStream only returns successfully after consuming an explicit
+			// response terminal frame. Any socket close here, including 1000/1001,
+			// is premature and must preserve the real close error for the consumer.
 			r.markConnBroken()
 			return fmt.Errorf("websocket read error: %w", err)
 		}
@@ -556,7 +572,7 @@ func (r *WsResponse) Close() error {
 	r.closed = true
 
 	// 移除等待请求
-	if r.conn != nil && r.conn.session != nil {
+	if r.conn != nil && r.conn.session != nil && r.pendingReq != nil {
 		r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
 	}
 
@@ -633,13 +649,15 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 
 	// 检查 HTTP 握手响应状态。WebSocket 握手成功的标准状态是 101，
 	// 但这里要包装成现有 handler 可消费的 SSE HTTP 200 响应。
-	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(wsResp.HTTPResponse())
+	handshakeResp := wsResp.HTTPResponse()
+	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(handshakeResp)
 	if handshakeFailed {
+		detail := formatFailedHandshakeHTTPBody(statusCode, handshakeResp)
 		wsResp.Close()
 		return &http.Response{
 			StatusCode: statusCode,
 			Header:     handshakeHeader.Clone(),
-			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+			Body:       io.NopCloser(strings.NewReader(detail)),
 		}, nil
 	}
 

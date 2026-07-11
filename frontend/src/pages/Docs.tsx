@@ -31,6 +31,7 @@ import {
   buildEndpointSpecs,
 } from "./docs/docsContent";
 import { DEFAULT_CLAUDE_MODEL_MAP } from "../lib/modelMapping";
+import { getLobeIconFileUrl } from "../components/ModelLogo";
 import type { SystemSettings } from "../types";
 
 const FALLBACK_MODELS = [
@@ -46,13 +47,12 @@ type QuickServiceTier = "default" | "fast";
 type QuickReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra";
 
 const CC_SWITCH_LOGO = "https://ccswitch.io/assets/cc-switch-logo-BPrI77SG.png";
-const LOBE_ICON_BASE =
-  "https://unpkg.com/@lobehub/icons-static-svg@latest/icons";
+// Bundled from npm `@lobehub/icons-static-svg`.
 const CLIENT_ICON_SRC: Record<QuickToolTab, string> = {
-  "codex-cli": `${LOBE_ICON_BASE}/codex-color.svg`,
-  "claude-code": `${LOBE_ICON_BASE}/claudecode-color.svg`,
+  "codex-cli": getLobeIconFileUrl("codex-color.svg") ?? "",
+  "claude-code": getLobeIconFileUrl("claudecode-color.svg") ?? "",
   "cc-switch": CC_SWITCH_LOGO,
-  "cherry-studio": `${LOBE_ICON_BASE}/cherrystudio-color.svg`,
+  "cherry-studio": getLobeIconFileUrl("cherrystudio-color.svg") ?? "",
 };
 
 const CC_SWITCH_APPS: Record<

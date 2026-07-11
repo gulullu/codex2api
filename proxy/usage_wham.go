@@ -409,6 +409,7 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	if account == nil || usage == nil {
 		return result
 	}
+	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	if store != nil && usage.PlanType != "" {
 		store.UpdateAccountPlanType(account, usage.PlanType)

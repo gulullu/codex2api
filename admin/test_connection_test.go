@@ -83,6 +83,19 @@ func TestFormatUsageLimitedTestErrorReportsSuccessfulProbeAsLimited(t *testing.T
 	}
 }
 
+func TestFormatUsageLimitedTestErrorAcceptsSuccessfulProbeWhenIgnored(t *testing.T) {
+	msg, limited := formatUsageLimitedTestError(proxy.CodexUsageSyncResult{
+		Premium5hRateLimited:     false,
+		UsagePct5h:               100,
+		HasUsage5h:               true,
+		UsageWindowLimitsIgnored: true,
+	})
+
+	if limited || msg != "" {
+		t.Fatalf("formatUsageLimitedTestError() = (%q, %v), want empty successful result", msg, limited)
+	}
+}
+
 func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstreamBody := `{"error":{"message":"Your authentication token has been invalidated.","code":"token_invalidated"},"status":401}`

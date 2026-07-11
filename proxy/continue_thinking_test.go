@@ -291,6 +291,97 @@ func TestFoldTwoRounds(t *testing.T) {
 	}
 }
 
+// TestFoldTerminalOutputKeepsOnlyLastRoundEncryptedContent 验证 issue #353 修复：
+// 折叠后的 response.completed.output 里，只有最后一轮 reasoning 保留
+// encrypted_content，更早各轮剥离（防止 N 份账号绑定加密载荷被客户端回传后
+// 顶爆上下文窗口 / 跨账号成批被拒）。同轮续想用的 replayTail 不受影响。
+func TestFoldTerminalOutputKeepsOnlyLastRoundEncryptedContent(t *testing.T) {
+	c := &foldCollector{
+		nextResp: []*http.Response{
+			// 第 2 轮：仍命中指纹（516）→ 继续第 3 轮
+			sseResponse(
+				evCreated(),
+				evReasoningAdded(1, 0),
+				evReasoningDone(2, 0, "enc-r2"),
+				evCompleted(3, 120, 600, 516),
+			),
+			// 第 3 轮：干净结束（400 未命中）→ 最后一轮
+			sseResponse(
+				evCreated(),
+				evReasoningAdded(1, 0),
+				evReasoningDone(2, 0, "enc-r3"),
+				evMessageAdded(3, 1),
+				evMessageDelta(4, 1, "final answer"),
+				evMessageDone(5, 1, "final answer"),
+				evCompleted(6, 140, 900, 400),
+			),
+		},
+	}
+	res := c.fold(testBaseBody, 8, sseResponse(
+		evCreated(),
+		evReasoningAdded(1, 0),
+		evReasoningDone(2, 0, "enc-r1"),
+		evCompleted(3, 100, 600, 516), // 命中指纹
+	))
+	if res.RoundsRun != 3 || res.StopReason != continueStopClean {
+		t.Fatalf("unexpected result: RoundsRun=%d stop=%s", res.RoundsRun, res.StopReason)
+	}
+
+	final := c.events[len(c.events)-1]
+	if gjson.GetBytes(final, "type").String() != "response.completed" {
+		t.Fatalf("最终事件应为 response.completed: %s", final)
+	}
+	output := gjson.GetBytes(final, "response.output").Array()
+
+	var reasoningEnc []string
+	for _, item := range output {
+		if item.Get("type").String() == "reasoning" {
+			reasoningEnc = append(reasoningEnc, item.Get("encrypted_content").String())
+		}
+	}
+	if len(reasoningEnc) != 3 {
+		t.Fatalf("output 应含 3 个 reasoning item, got %d: %s", len(reasoningEnc), final)
+	}
+	// 前两轮剥离，最后一轮保留
+	if reasoningEnc[0] != "" || reasoningEnc[1] != "" {
+		t.Errorf("更早各轮 reasoning 应剥离 encrypted_content: got %q, %q", reasoningEnc[0], reasoningEnc[1])
+	}
+	if reasoningEnc[2] != "enc-r3" {
+		t.Errorf("最后一轮 reasoning 应保留 encrypted_content: got %q", reasoningEnc[2])
+	}
+
+	// replayTail（发上游续想）不受影响：第 1 轮续想体仍带 enc-r1
+	if got := gjson.GetBytes(c.rounds[0], "input.1.encrypted_content").String(); got != "enc-r1" {
+		t.Errorf("续想体 1 应保留 enc-r1, got %q", got)
+	}
+}
+
+// TestFoldTerminalOutputKeepAllEncryptedEscapeHatch 验证逃生阀恢复旧行为。
+func TestFoldTerminalOutputKeepAllEncryptedEscapeHatch(t *testing.T) {
+	t.Setenv("CODEX_CONTINUE_KEEP_ALL_ENCRYPTED", "1")
+	c := &foldCollector{
+		nextResp: []*http.Response{sseResponse(
+			evCreated(),
+			evReasoningAdded(1, 0),
+			evReasoningDone(2, 0, "enc-b"),
+			evMessageAdded(3, 1),
+			evMessageDone(5, 1, "answer"),
+			evCompleted(6, 120, 900, 400),
+		)},
+	}
+	c.fold(testBaseBody, 8, sseResponse(
+		evCreated(),
+		evReasoningAdded(1, 0),
+		evReasoningDone(2, 0, "enc-a"),
+		evCompleted(3, 100, 600, 516),
+	))
+	final := c.events[len(c.events)-1]
+	output := gjson.GetBytes(final, "response.output").Array()
+	if output[0].Get("encrypted_content").String() != "enc-a" {
+		t.Errorf("逃生阀开启时更早轮应保留 encrypted_content: %s", output[0].Raw)
+	}
+}
+
 func TestFoldMaxRoundsGuard(t *testing.T) {
 	c := &foldCollector{}
 	res := c.fold(testBaseBody, 1, sseResponse( // maxRounds=1:即使命中指纹也不续想

@@ -23,6 +23,7 @@ import type {
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
+  CodexClientMetadataMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
   OpsOverviewResponse,
@@ -32,12 +33,14 @@ import type {
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
+import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
 import { formatLongUsageWindowLabel } from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -757,6 +760,8 @@ export default function Accounts() {
     useState(false);
   const [editAutoPause7dDisabled, setEditAutoPause7dDisabled] =
     useState(false);
+  const [editIgnoreUsageLimitStatusMode, setEditIgnoreUsageLimitStatusMode] =
+    useState<"inherit" | "enabled" | "disabled">("inherit");
   const [editDispatchCountLimitInput, setEditDispatchCountLimitInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
@@ -771,6 +776,7 @@ export default function Accounts() {
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
+      codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
   const [openAIModelDraft, setOpenAIModelDraft] = useState("");
@@ -840,6 +846,7 @@ export default function Accounts() {
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
+      codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
@@ -891,7 +898,9 @@ export default function Accounts() {
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
+  const [batchUpdateTags, setBatchUpdateTags] = useState(false);
   const [batchTags, setBatchTags] = useState<string[]>([]);
+  const [batchUpdateGroups, setBatchUpdateGroups] = useState(false);
   const [batchGroupIds, setBatchGroupIds] = useState<number[]>([]);
   const [batchMetaSubmitting, setBatchMetaSubmitting] = useState(false);
   const [showBatchQuotaAutoPauseEditor, setShowBatchQuotaAutoPauseEditor] =
@@ -2035,6 +2044,7 @@ export default function Accounts() {
         base_url: "https://api.openai.com",
         api_key: "",
         models: [],
+        codex_client_metadata_mode: "auto",
         proxy_url: "",
       });
       setOpenAIModelDraft("");
@@ -3083,30 +3093,27 @@ export default function Accounts() {
   };
 
   const openBatchMetaEditor = () => {
-    const selectedAccounts = accounts.filter((account) =>
-      selected.has(account.id),
-    );
-    const tagSet = new Set<string>();
-    const groupSet = new Set<number>();
-    for (const account of selectedAccounts) {
-      for (const tag of account.tags ?? []) tagSet.add(tag);
-      for (const id of account.group_ids ?? []) groupSet.add(id);
-    }
-    setBatchTags(Array.from(tagSet).sort());
-    setBatchGroupIds(Array.from(groupSet).sort((a, b) => a - b));
+    setBatchUpdateTags(false);
+    setBatchTags([]);
+    setBatchUpdateGroups(false);
+    setBatchGroupIds([]);
     setShowBatchMetaEditor(true);
   };
 
   const handleBatchSaveMeta = async () => {
     const ids = Array.from(selected);
-    if (ids.length === 0) return;
+    if (ids.length === 0 || (!batchUpdateTags && !batchUpdateGroups)) return;
     setBatchMetaSubmitting(true);
     try {
-      const result = await api.batchUpdateAccounts({
-        ids,
-        tags: batchTags,
-        group_ids: batchGroupIds,
-      });
+      const result = await api.batchUpdateAccounts(
+        buildBatchMetadataUpdate({
+          ids,
+          updateTags: batchUpdateTags,
+          tags: batchTags,
+          updateGroups: batchUpdateGroups,
+          groupIds: batchGroupIds,
+        }),
+      );
       showToast(
         t("accounts.batchMetaDone", {
           success: result.success,
@@ -3307,6 +3314,13 @@ export default function Accounts() {
     );
     setEditAutoPause5hDisabled(account.auto_pause_5h_disabled ?? false);
     setEditAutoPause7dDisabled(account.auto_pause_7d_disabled ?? false);
+    setEditIgnoreUsageLimitStatusMode(
+      account.ignore_usage_limit_status_override === true
+        ? "enabled"
+        : account.ignore_usage_limit_status_override === false
+          ? "disabled"
+          : "inherit",
+    );
     setEditDispatchCountLimitInput(
       formatDispatchCountLimitInput(account.dispatch_count_limit),
     );
@@ -3322,6 +3336,8 @@ export default function Accounts() {
       base_url: account.base_url || "https://api.openai.com",
       api_key: "",
       models: account.models ?? [],
+      codex_client_metadata_mode:
+        account.codex_client_metadata_mode ?? "auto",
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
@@ -3354,6 +3370,7 @@ export default function Accounts() {
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
     setEditAutoPause7dDisabled(false);
+    setEditIgnoreUsageLimitStatusMode("inherit");
     setEditDispatchCountLimitInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
@@ -3365,6 +3382,7 @@ export default function Accounts() {
       base_url: "https://api.openai.com",
       api_key: "",
       models: [],
+      codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
@@ -3498,6 +3516,10 @@ export default function Accounts() {
         ),
         auto_pause_5h_disabled: editAutoPause5hDisabled,
         auto_pause_7d_disabled: editAutoPause7dDisabled,
+        ignore_usage_limit_status_override:
+          editIgnoreUsageLimitStatusMode === "inherit"
+            ? null
+            : editIgnoreUsageLimitStatusMode === "enabled",
         dispatch_count_limit: dispatchCountLimitInputToValue(
           editDispatchCountLimitInput,
         ),
@@ -5470,6 +5492,37 @@ export default function Accounts() {
                   />
                 </div>
                 <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.codexClientMetadataMode")}
+                  </label>
+                  <Select
+                    value={
+                      openAIForm.codex_client_metadata_mode ?? "auto"
+                    }
+                    onValueChange={(value) =>
+                      setOpenAIForm((form) => ({
+                        ...form,
+                        codex_client_metadata_mode:
+                          value as CodexClientMetadataMode,
+                      }))
+                    }
+                    options={[
+                      {
+                        value: "auto",
+                        label: t("accounts.codexClientMetadataAuto"),
+                      },
+                      {
+                        value: "always",
+                        label: t("accounts.codexClientMetadataAlways"),
+                      },
+                      {
+                        value: "off",
+                        label: t("accounts.codexClientMetadataOff"),
+                      },
+                    ]}
+                  />
+                </div>
+                <div>
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <label className="text-sm font-semibold text-muted-foreground">
                       {t("accounts.openaiModels")} *
@@ -6284,6 +6337,37 @@ export default function Accounts() {
                       />
                     </div>
                     <div>
+                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                        {t("accounts.codexClientMetadataMode")}
+                      </label>
+                      <Select
+                        value={
+                          editOpenAIForm.codex_client_metadata_mode ?? "auto"
+                        }
+                        onValueChange={(value) =>
+                          setEditOpenAIForm((form) => ({
+                            ...form,
+                            codex_client_metadata_mode:
+                              value as CodexClientMetadataMode,
+                          }))
+                        }
+                        options={[
+                          {
+                            value: "auto",
+                            label: t("accounts.codexClientMetadataAuto"),
+                          },
+                          {
+                            value: "always",
+                            label: t("accounts.codexClientMetadataAlways"),
+                          },
+                          {
+                            value: "off",
+                            label: t("accounts.codexClientMetadataOff"),
+                          },
+                        ]}
+                      />
+                    </div>
+                    <div>
                       <div className="mb-2 flex items-center justify-between gap-2">
                         <label className="text-sm font-semibold text-muted-foreground">
                           {t("accounts.openaiModels")} *
@@ -6661,6 +6745,33 @@ export default function Accounts() {
                         <div className="mt-1 text-xs text-muted-foreground">
                           {t("accounts.autoPauseHint")}
                         </div>
+                        <div className="mt-4 flex flex-col gap-3 border-b border-border pb-4 sm:flex-row sm:items-center sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.ignoreUsageLimitStatus")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.ignoreUsageLimitStatusHint")}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 flex-wrap gap-2">
+                            <TogglePill
+                              active={editIgnoreUsageLimitStatusMode === "inherit"}
+                              onClick={() => setEditIgnoreUsageLimitStatusMode("inherit")}
+                              label={t("accounts.ignoreUsageLimitStatusInherit")}
+                            />
+                            <TogglePill
+                              active={editIgnoreUsageLimitStatusMode === "enabled"}
+                              onClick={() => setEditIgnoreUsageLimitStatusMode("enabled")}
+                              label={t("common.enabled")}
+                            />
+                            <TogglePill
+                              active={editIgnoreUsageLimitStatusMode === "disabled"}
+                              onClick={() => setEditIgnoreUsageLimitStatusMode("disabled")}
+                              label={t("common.disabled")}
+                            />
+                          </div>
+                        </div>
                         <div className="mt-4 grid gap-4 md:grid-cols-2">
                           <QuotaAutoPauseWindowEditor
                             disabledLabel={t("accounts.autoPause5hDisabled")}
@@ -6848,7 +6959,10 @@ export default function Accounts() {
                 <Button
                   type="button"
                   onClick={() => void handleBatchSaveMeta()}
-                  disabled={batchMetaSubmitting}
+                  disabled={
+                    batchMetaSubmitting ||
+                    (!batchUpdateTags && !batchUpdateGroups)
+                  }
                 >
                   {batchMetaSubmitting ? t("common.saving") : t("common.save")}
                 </Button>
@@ -6860,33 +6974,93 @@ export default function Accounts() {
                 {t("accounts.batchMetaDesc", { count: selected.size })}
               </div>
               <div className="rounded-xl border border-border p-4">
-                <div className="text-sm font-semibold text-foreground">
-                  {t("accounts.tagsLabel")}
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-foreground">
+                      {t("accounts.tagsLabel")}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t("accounts.batchMetaFieldHint")}
+                    </div>
+                  </div>
+                  <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                    <span>
+                      {t(
+                        batchUpdateTags
+                          ? "common.enabled"
+                          : "common.disabled",
+                      )}
+                    </span>
+                    <Switch
+                      checked={batchUpdateTags}
+                      onCheckedChange={setBatchUpdateTags}
+                      aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.tagsLabel")}`}
+                    />
+                  </label>
                 </div>
                 <ChipInput
                   className="mt-3"
                   value={batchTags}
                   onChange={setBatchTags}
-                  placeholder={t("accounts.tagsPlaceholder")}
+                  placeholder={t(
+                    batchUpdateTags
+                      ? "accounts.tagsPlaceholder"
+                      : "accounts.batchMetaFieldHint",
+                  )}
+                  disabled={!batchUpdateTags}
                   maxVisible={6}
                 />
               </div>
               <div className="rounded-xl border border-border p-4">
-                <div className="text-sm font-semibold text-foreground">
-                  {t("accounts.groupsLabel")}
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-foreground">
+                      {t("accounts.groupsLabel")}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t("accounts.batchMetaFieldHint")}
+                    </div>
+                  </div>
+                  <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                    <span>
+                      {t(
+                        batchUpdateGroups
+                          ? "common.enabled"
+                          : "common.disabled",
+                      )}
+                    </span>
+                    <Switch
+                      checked={batchUpdateGroups}
+                      onCheckedChange={setBatchUpdateGroups}
+                      aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
+                    />
+                  </label>
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
                     groups={allGroups}
                     value={batchGroupIds}
                     onChange={setBatchGroupIds}
-                    allLabel={t("accounts.groupsUnbound")}
+                    allLabel={t(
+                      batchUpdateGroups
+                        ? "accounts.groupsUnbound"
+                        : "accounts.batchMetaFieldHint",
+                    )}
                     selectedLabel={t("accounts.groupsSelected", {
                       count: batchGroupIds.length,
                     })}
-                    placeholder={t("accounts.groupsPlaceholder")}
+                    placeholder={t(
+                      batchUpdateGroups
+                        ? "accounts.groupsPlaceholder"
+                        : "accounts.batchMetaFieldHint",
+                    )}
                     emptyLabel={t("accounts.groupsNone")}
-                    emptyHint={t("accounts.groupsSelectHint")}
+                    emptyHint={t(
+                      batchUpdateGroups
+                        ? "accounts.groupsSelectHint"
+                        : "accounts.batchMetaFieldHint",
+                    )}
+                    disabled={!batchUpdateGroups}
                   />
                 </div>
               </div>
@@ -7344,8 +7518,17 @@ function RecycleBinView({
     null,
   );
   const [planFilter, setPlanFilter] = useState<
-    "all" | "pro" | "prolite" | "plus" | "team" | "free" | "api" | "unknown"
+    | "all"
+    | "pro"
+    | "prolite"
+    | "plus"
+    | "team"
+    | "k12"
+    | "free"
+    | "api"
+    | "unknown"
   >("all");
+  const [exporting, setExporting] = useState(false);
   const [showEmptyConfirm, setShowEmptyConfirm] = useState(false);
   const [emptyConfirmText, setEmptyConfirmText] = useState("");
   const [autoRestore, setAutoRestore] = useState(() => {
@@ -7364,7 +7547,7 @@ function RecycleBinView({
     DEFAULT_PAGE_SIZE_OPTIONS,
   );
 
-  const busy = batchActing || emptying || batchTesting;
+  const busy = batchActing || emptying || batchTesting || exporting;
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -7623,6 +7806,65 @@ function RecycleBinView({
     }
   };
 
+  const handleExport = async (
+    format: "json" | "txt",
+    scope: "selected" | "filtered",
+  ) => {
+    const ids =
+      scope === "selected"
+        ? [...selectedIds]
+        : filteredRows.map((row) => row.id);
+    if (ids.length === 0) {
+      showToast(t("accounts.exportNoAccounts"), "error");
+      return;
+    }
+    setExporting(true);
+    try {
+      const data = await api.exportRecycleBinAccounts(ids);
+      if (data.length === 0) {
+        showToast(t("accounts.exportNoAccounts"), "error");
+        return;
+      }
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      let exportedCount = data.length;
+      if (format === "json") {
+        const blob = new Blob([JSON.stringify(data, null, 2)], {
+          type: "application/json",
+        });
+        downloadBlob(blob, `codex2api-recycle-${ts}-${data.length}.json`);
+      } else {
+        // TXT：每行一个邮箱（无邮箱则用 account_id 兜底），不导出 token。
+        const lines = data
+          .map((e) => {
+            const email = (e.email || "").trim();
+            if (email) return email;
+            return (e.account_id || "").trim();
+          })
+          .filter(Boolean);
+        if (lines.length === 0) {
+          showToast(t("accounts.exportNoAccounts"), "error");
+          return;
+        }
+        exportedCount = lines.length;
+        const blob = new Blob([`${lines.join("\n")}\n`], {
+          type: "text/plain;charset=utf-8",
+        });
+        downloadBlob(
+          blob,
+          `codex2api-recycle-emails-${ts}-${lines.length}.txt`,
+        );
+      }
+      showToast(t("accounts.exportSuccess", { count: exportedCount }));
+    } catch (error) {
+      showToast(
+        `${t("accounts.exportFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const emptyKeyword = t("accounts.recycleBinEmptyKeyword");
   const emptyConfirmMatched = emptyConfirmText.trim() === emptyKeyword;
 
@@ -7675,6 +7917,32 @@ function RecycleBinView({
                 <ToggleLeft className="size-4 text-muted-foreground" />
               )}
               <span className="max-sm:hidden">{t("accounts.recycleBinAutoRestore")}</span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy || loading || filteredRows.length === 0}
+              onClick={() => void handleExport("json", "filtered")}
+              title={t("accounts.recycleBinExportFilteredJson")}
+            >
+              <Download className="size-3.5" />
+              <span className="max-sm:hidden">
+                {exporting
+                  ? t("accounts.recycleBinExporting")
+                  : t("accounts.recycleBinExportFilteredJson")}
+              </span>
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy || loading || filteredRows.length === 0}
+              onClick={() => void handleExport("txt", "filtered")}
+              title={t("accounts.recycleBinExportFilteredTxt")}
+            >
+              <FileText className="size-3.5" />
+              <span className="max-sm:hidden">
+                {t("accounts.recycleBinExportFilteredTxt")}
+              </span>
             </Button>
             <Button
               variant="outline"
@@ -7748,6 +8016,7 @@ function RecycleBinView({
                     "prolite",
                     "plus",
                     "team",
+                    "k12",
                     "free",
                     "api",
                     "unknown",
@@ -7768,9 +8037,11 @@ function RecycleBinView({
                         ? t("accounts.recycleBinPlanUnknown")
                         : key === "prolite"
                           ? "ProLite"
-                          : key === "api"
-                            ? "API"
-                            : key.charAt(0).toUpperCase() + key.slice(1)}
+                          : key === "k12"
+                            ? "K12"
+                            : key === "api"
+                              ? "API"
+                              : key.charAt(0).toUpperCase() + key.slice(1)}
                   </button>
                 ))}
               </div>
@@ -7782,6 +8053,26 @@ function RecycleBinView({
                     count: selectedIds.size,
                   })}
                 </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void handleExport("json", "selected")}
+                  title={t("accounts.recycleBinExportSelectedJson")}
+                >
+                  <Download className="size-3.5" />
+                  {t("accounts.recycleBinExportSelectedJson")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void handleExport("txt", "selected")}
+                  title={t("accounts.recycleBinExportSelectedTxt")}
+                >
+                  <FileText className="size-3.5" />
+                  {t("accounts.recycleBinExportSelectedTxt")}
+                </Button>
                 <Button
                   size="sm"
                   variant="outline"
@@ -8543,11 +8834,16 @@ function getAccountRateLimitWindow(
     reason === "rate_limited" ||
     reason === "rate_limited_5h" ||
     reason === "rate_limited_7d";
-  const has7dLimit = isActiveUsageWindowExhausted(
-    account.usage_percent_7d,
-    account.reset_7d_at,
-  );
+  const usageWindowsAreInformational =
+    account.ignore_usage_limit_status_effective === true;
+  const has7dLimit =
+    !usageWindowsAreInformational &&
+    isActiveUsageWindowExhausted(
+      account.usage_percent_7d,
+      account.reset_7d_at,
+    );
   const has5hLimit =
+    !usageWindowsAreInformational &&
     isPremiumUsagePlan(account.plan_type) &&
     isActiveUsageWindowExhausted(account.usage_percent_5h, account.reset_5h_at);
   const has5hAutoPause = isActiveAutoPauseWindowReached(

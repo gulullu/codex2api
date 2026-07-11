@@ -23,6 +23,9 @@ func sqliteConnectDSN(dsn string) string {
 	}
 
 	q := url.Values{}
+	// deferred 事务（BeginTx 默认）从读锁升级写锁遇忙会立刻 SQLITE_BUSY，
+	// busy_timeout 拦不住；immediate 让写事务在 BEGIN 就拿写锁、正常走等待。
+	q.Add("_txlock", "immediate")
 	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis))
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
@@ -235,7 +238,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					transport_retry_policy TEXT DEFAULT 'rotate',
 					codex_synced_cli_version TEXT DEFAULT '',
 					codex_cli_version_sync_enabled INTEGER DEFAULT 1,
-					codex_cli_version_sync_interval_hours INTEGER DEFAULT 12
+					codex_cli_version_sync_interval_hours INTEGER DEFAULT 12,
+					model_pricing_overrides TEXT DEFAULT '{}',
+					model_pricing_sync_url TEXT DEFAULT '',
+					ignore_usage_limit_status INTEGER DEFAULT 0
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -436,6 +442,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_synced_cli_version", "TEXT DEFAULT ''"},
 		{"system_settings", "codex_cli_version_sync_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_cli_version_sync_interval_hours", "INTEGER DEFAULT 12"},
+		{"system_settings", "model_pricing_overrides", "TEXT DEFAULT '{}'"},
+		{"system_settings", "model_pricing_sync_url", "TEXT DEFAULT ''"},
+		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},

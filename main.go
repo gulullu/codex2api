@@ -203,6 +203,9 @@ func main() {
 		log.Printf("%s 连接池: max_conns=%d", cfg.Database.Label(), settings.PgMaxConns)
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
+	if overrides, perr := database.ParseModelPricingOverridesJSON(settings.ModelPricingOverrides); perr == nil {
+		database.SetModelPricingOverrides(overrides)
+	}
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
 	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_mode=%s first_token_timeout=%ds billing_tier_policy=%s",
 		runtimeSettings.ClientCompatMode,

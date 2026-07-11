@@ -24,6 +24,7 @@ const ImageStudio = lazy(() => import('./pages/ImageStudio'))
 const PromptFilter = lazy(() => import('./pages/PromptFilter'))
 const CodexAudit = lazy(() => import('./pages/CodexAudit'))
 const ThemeSettings = lazy(() => import('./pages/ThemeSettings'))
+const ModelPricing = lazy(() => import('./pages/ModelPricing'))
 
 export default function App() {
   return (
@@ -65,6 +66,7 @@ function AdminApp() {
           <Route path="/ops/errors" element={<OperationsErrors />} />
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
+          <Route path="/model-pricing" element={<ModelPricing />} />
           <Route path="/theme" element={<ThemeSettings />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/docs" element={<Docs />} />

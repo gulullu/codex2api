@@ -44,6 +44,32 @@ const (
 const UpstreamOpenAIResponses = "openai_responses"
 
 const (
+	CodexClientMetadataModeAuto   = "auto"
+	CodexClientMetadataModeAlways = "always"
+	CodexClientMetadataModeOff    = "off"
+)
+
+func NormalizeCodexClientMetadataMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case CodexClientMetadataModeAlways:
+		return CodexClientMetadataModeAlways
+	case CodexClientMetadataModeOff:
+		return CodexClientMetadataModeOff
+	default:
+		return CodexClientMetadataModeAuto
+	}
+}
+
+func IsValidCodexClientMetadataMode(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case CodexClientMetadataModeAuto, CodexClientMetadataModeAlways, CodexClientMetadataModeOff:
+		return true
+	default:
+		return false
+	}
+}
+
+const (
 	DefaultTestContent  = "hi"
 	MaxTestContentRunes = 8192
 )
@@ -60,26 +86,27 @@ func NormalizeTestContent(content string) string {
 
 // Account 运行时账号状态
 type Account struct {
-	mu             sync.RWMutex
-	DBID           int64 // 数据库 ID
-	RefreshToken   string
-	SessionToken   string
-	AccessToken    string
-	ExpiresAt      time.Time
-	AccountID      string
-	Email          string
-	PlanType       string
-	ProxyURL       string
-	CustomHeaders  map[string]string
-	UpstreamType   string
-	BaseURL        string
-	APIKey         string
-	Models         []string
-	ModelMapping   string
-	Status         AccountStatus
-	CooldownUtil   time.Time
-	CooldownReason string // rate_limited / unauthorized / 空
-	ErrorMsg       string
+	mu                      sync.RWMutex
+	DBID                    int64 // 数据库 ID
+	RefreshToken            string
+	SessionToken            string
+	AccessToken             string
+	ExpiresAt               time.Time
+	AccountID               string
+	Email                   string
+	PlanType                string
+	ProxyURL                string
+	CustomHeaders           map[string]string
+	UpstreamType            string
+	BaseURL                 string
+	APIKey                  string
+	Models                  []string
+	ModelMapping            string
+	CodexClientMetadataMode string
+	Status                  AccountStatus
+	CooldownUtil            time.Time
+	CooldownReason          string // rate_limited / unauthorized / 空
+	ErrorMsg                string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
@@ -164,12 +191,15 @@ type Account struct {
 	BaseConcurrencyOverride *int64
 	CreditEnabled           bool // 信用账号标记
 	CreditSkipUsageWindow   bool // 跳过用量窗口惩罚和本地限流标记
-	SkipWarmTier            bool // 跳过 warm 层级降级
-	AllowedAPIKeyIDs        []int64
-	allowedAPIKeySet        map[int64]struct{}
-	Tags                    []string
-	GroupIDs                []int64
-	ModelCooldowns          map[string]ModelCooldown
+	// IgnoreUsageLimitStatusOverride 为 nil 时跟随全局设置；effective 值由 Store 解析。
+	IgnoreUsageLimitStatusOverride *bool
+	ignoreUsageLimitStatus         bool
+	SkipWarmTier                   bool // 跳过 warm 层级降级
+	AllowedAPIKeyIDs               []int64
+	allowedAPIKeySet               map[int64]struct{}
+	Tags                           []string
+	GroupIDs                       []int64
+	ModelCooldowns                 map[string]ModelCooldown
 
 	SubscriptionExpiresAt time.Time
 }
@@ -323,6 +353,15 @@ func (a *Account) OpenAIResponsesModelMapping() string {
 		return ""
 	}
 	return strings.TrimSpace(a.ModelMapping)
+}
+
+func (a *Account) OpenAIResponsesCodexClientMetadataMode() string {
+	if a == nil {
+		return CodexClientMetadataModeAuto
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return NormalizeCodexClientMetadataMode(a.CodexClientMetadataMode)
 }
 
 func (a *Account) OpenAIResponsesCredentials() (baseURL, apiKey string) {
@@ -1326,6 +1365,44 @@ func (a *Account) creditSkipsUsageWindowLocked() bool {
 	return a.CreditEnabled && a.CreditSkipUsageWindow
 }
 
+func (a *Account) recomputeEffectiveIgnoreUsageLimitStatus(global bool) {
+	if a.IgnoreUsageLimitStatusOverride != nil {
+		a.ignoreUsageLimitStatus = *a.IgnoreUsageLimitStatusOverride
+		return
+	}
+	a.ignoreUsageLimitStatus = global
+}
+
+func (a *Account) skipsUsageWindowLimitsLocked() bool {
+	return a.creditSkipsUsageWindowLocked() || a.ignoreUsageLimitStatus
+}
+
+// IgnoresUsageLimitStatus reports whether usage-window percentages are
+// informational for this account and Responses outcomes decide availability.
+func (a *Account) IgnoresUsageLimitStatus() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.ignoreUsageLimitStatus
+}
+
+// GetIgnoreUsageLimitStatusOverride returns the account override. nil means
+// the account follows the global setting.
+func (a *Account) GetIgnoreUsageLimitStatusOverride() *bool {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.IgnoreUsageLimitStatusOverride == nil {
+		return nil
+	}
+	value := *a.IgnoreUsageLimitStatusOverride
+	return &value
+}
+
 // SkipsUsageWindowLimits 判断账号是否应跳过 5h/7d 用量窗口触发的本地限流。
 func (a *Account) SkipsUsageWindowLimits() bool {
 	if a == nil {
@@ -1333,12 +1410,12 @@ func (a *Account) SkipsUsageWindowLimits() bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.creditSkipsUsageWindowLocked()
+	return a.skipsUsageWindowLimitsLocked()
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
 func (a *Account) usageExhaustedLocked() bool {
-	if a.creditSkipsUsageWindowLocked() {
+	if a.skipsUsageWindowLimitsLocked() {
 		return false
 	}
 	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
@@ -2198,6 +2275,7 @@ type Store struct {
 	codexContinueMaxRounds       atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
 	codexCLIVersionSyncEnabled   atomic.Bool  // 后台定时同步 Codex CLI 模拟版本，默认 true
 	codexCLIVersionSyncInterval  atomic.Int64 // 定时同步间隔（小时），默认 12
+	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
 
 	// 重试间隔与传输错误重试策略（issue #331）
 	retryIntervalMS      atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
@@ -2686,6 +2764,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexContinueMaxRounds.Store(int64(database.NormalizeCodexContinueMaxRounds(settings.CodexContinueMaxRounds)))
 	s.codexCLIVersionSyncEnabled.Store(settings.CodexCLIVersionSyncEnabled)
 	s.codexCLIVersionSyncInterval.Store(int64(database.NormalizeCodexCLIVersionSyncIntervalHours(settings.CodexCLIVersionSyncIntervalHours)))
+	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
 
@@ -3349,6 +3428,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	apiKey := row.GetCredential("api_key")
 	models := normalizeModelList(row.GetCredentialStringSlice("models"))
 	modelMapping := strings.TrimSpace(row.GetCredential("model_mapping"))
+	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
 	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
 		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
@@ -3356,18 +3436,19 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 
 	account := &Account{
-		DBID:          row.ID,
-		RefreshToken:  rt,
-		SessionToken:  st,
-		ProxyURL:      strings.TrimSpace(row.ProxyURL),
-		CustomHeaders: row.GetCredentialStringMap("custom_headers"),
-		HealthTier:    HealthTierWarm,
-		AddedAt:       row.CreatedAt.UnixNano(),
-		UpstreamType:  upstreamType,
-		BaseURL:       strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		APIKey:        strings.TrimSpace(apiKey),
-		Models:        models,
-		ModelMapping:  modelMapping,
+		DBID:                    row.ID,
+		RefreshToken:            rt,
+		SessionToken:            st,
+		ProxyURL:                strings.TrimSpace(row.ProxyURL),
+		CustomHeaders:           row.GetCredentialStringMap("custom_headers"),
+		HealthTier:              HealthTierWarm,
+		AddedAt:                 row.CreatedAt.UnixNano(),
+		UpstreamType:            upstreamType,
+		BaseURL:                 strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		APIKey:                  strings.TrimSpace(apiKey),
+		Models:                  models,
+		ModelMapping:            modelMapping,
+		CodexClientMetadataMode: codexClientMetadataMode,
 	}
 	if isOpenAIResponsesAccount {
 		account.HealthTier = HealthTierHealthy
@@ -3387,6 +3468,8 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.CreditEnabled = row.CreditEnabled
 	account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
+	account.IgnoreUsageLimitStatusOverride = row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
+	account.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
 	account.SkipWarmTier = row.SkipWarmTier
 	if row.Status == "error" {
 		account.Status = StatusError
@@ -4617,6 +4700,27 @@ func (s *Store) GetPromptFilterConfig() promptfilter.Config {
 	return promptfilter.DefaultConfig()
 }
 
+// SetIgnoreUsageLimitStatus updates the global default and immediately
+// recomputes accounts that inherit it. Existing explicit cooldowns are kept
+// until a real Responses success confirms recovery.
+func (s *Store) SetIgnoreUsageLimitStatus(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.ignoreUsageLimitStatus.Store(enabled)
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveIgnoreUsageLimitStatus(enabled)
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+		acc.mu.Unlock()
+		s.fastSchedulerUpdate(acc)
+	}
+}
+
+func (s *Store) IgnoreUsageLimitStatus() bool {
+	return s != nil && s.ignoreUsageLimitStatus.Load()
+}
+
 func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
 	s.mu.Lock()
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
@@ -4759,6 +4863,7 @@ func (s *Store) AddAccount(acc *Account) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	acc.mu.Lock()
+	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
@@ -4867,6 +4972,28 @@ func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64)
 
 	acc.mu.Lock()
 	acc.setAllowedAPIKeyIDsLocked(allowedAPIKeyIDs)
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+// ApplyAccountIgnoreUsageLimitStatus updates a nullable account override.
+// override=nil means follow the global setting.
+func (s *Store) ApplyAccountIgnoreUsageLimitStatus(dbID int64, override *bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if override == nil {
+		acc.IgnoreUsageLimitStatusOverride = nil
+	} else {
+		value := *override
+		acc.IgnoreUsageLimitStatusOverride = &value
+	}
+	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -5188,7 +5315,7 @@ func (s *Store) accountAllowedForAPIKey(acc *Account, apiKeyID int64) bool {
 	return acc.AllowsAPIKey(apiKeyID) && s.APIKeyAllowsAccount(apiKeyID, acc)
 }
 
-func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, modelMapping string, proxyURL string) bool {
+func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, proxyURL string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -5202,6 +5329,7 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 	}
 	acc.Models = normalizeModelList(models)
 	acc.ModelMapping = strings.TrimSpace(modelMapping)
+	acc.CodexClientMetadataMode = NormalizeCodexClientMetadataMode(codexClientMetadataMode)
 	acc.ProxyURL = strings.TrimSpace(proxyURL)
 	acc.Email = acc.BaseURL
 	acc.PlanType = "api"
@@ -5551,6 +5679,51 @@ func (s *Store) ClearCooldown(acc *Account) {
 	}
 }
 
+func isUsageLimitCooldownReason(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limit":
+		return true
+	default:
+		return false
+	}
+}
+
+// ConfirmResponsesAvailable clears only a usage/rate-limit cooldown after a
+// completed Responses request succeeds. Authentication and unrelated error
+// states are intentionally untouched.
+func (s *Store) ConfirmResponsesAvailable(acc *Account) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if !acc.ignoreUsageLimitStatus || acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) {
+		acc.mu.Unlock()
+		return false
+	}
+	acc.Status = StatusReady
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.ErrorMsg = ""
+	acc.LastRateLimitedAt = time.Time{}
+	if acc.HealthTier != HealthTierBanned {
+		acc.HealthTier = HealthTierWarm
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.db.ClearCooldown(ctx, acc.DBID); err != nil {
+			log.Printf("[账号 %d] Responses 成功后清理用量限流冷却失败: %v", acc.DBID, err)
+		}
+	}
+	return true
+}
+
 // RecordManualTestSuccess clears failure/cooldown state after an explicit admin
 // connection test succeeds.
 func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
@@ -5564,6 +5737,7 @@ func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	wasCooling := acc.Status == StatusCooldown
 	wasError := acc.Status == StatusError
 	wasBanned := acc.HealthTier == HealthTierBanned
+	wasUsageLimitCooldown := acc.ignoreUsageLimitStatus && wasCooling && isUsageLimitCooldownReason(acc.CooldownReason)
 	premium5hLimited := acc.premium5hRateLimitedLocked(now)
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(true)
@@ -5576,8 +5750,13 @@ func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = now
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
+	if wasUsageLimitCooldown {
+		acc.LastRateLimitedAt = time.Time{}
+	}
 	if premium5hLimited {
 		acc.HealthTier = HealthTierRisky
+	} else if wasUsageLimitCooldown {
+		acc.HealthTier = HealthTierHealthy
 	} else if wasBanned || wasCooling || wasError {
 		acc.HealthTier = HealthTierWarm
 	} else if acc.HealthTier == "" {
@@ -6055,6 +6234,12 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 
 		// 跳过正在处理请求的账号
 		if atomic.LoadInt64(&acc.ActiveRequests) > 0 {
+			continue
+		}
+
+		// 用量窗口对该账号仅作展示参考时（忽略用量限制/重置券跳过窗口），
+		// 快照不构成"账号已耗尽"的依据，不做自动清理。
+		if acc.SkipsUsageWindowLimits() {
 			continue
 		}
 

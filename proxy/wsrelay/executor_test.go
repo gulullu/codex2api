@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -65,6 +66,25 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 	if got := headers.Get("Session_id"); got != "session-123" {
 		t.Fatalf("Session_id = %q", got)
+	}
+}
+
+// TestPrepareWebsocketHeadersForwardsAttestationOnlyWhenPresent 验证 WS 路径同样
+// 只在下游携带 DeviceCheck token（openai/codex#20619）时透传，缺失不伪造。
+func TestPrepareWebsocketHeadersForwardsAttestationOnlyWhenPresent(t *testing.T) {
+	exec := NewExecutor()
+	acc := &auth.Account{DBID: 42, AccountID: "42"}
+
+	withToken := exec.prepareWebsocketHeaders("token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{
+		"X-Oai-Attestation": []string{"v1.real-devicecheck-token"},
+	})
+	if got := withToken.Get("X-Oai-Attestation"); got != "v1.real-devicecheck-token" {
+		t.Fatalf("X-Oai-Attestation = %q, want passthrough of downstream token", got)
+	}
+
+	without := exec.prepareWebsocketHeaders("token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{})
+	if got := without.Get("X-Oai-Attestation"); got != "" {
+		t.Fatalf("X-Oai-Attestation = %q, want empty (never fabricate)", got)
 	}
 }
 
@@ -485,5 +505,28 @@ func TestStatelessOneShotEnabled(t *testing.T) {
 	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
 	if !statelessOneShotEnabled() {
 		t.Fatal("CODEX_WS_STATELESS_ONESHOT=1 must disable slot reuse")
+	}
+}
+
+func TestShouldRetryWebsocketSendError(t *testing.T) {
+	messageTooBig := fmt.Errorf("send interrupted: %w", &websocket.CloseError{
+		Code: websocket.CloseMessageTooBig,
+		Text: "message too big",
+	})
+	if shouldRetryWebsocketSendError(messageTooBig) {
+		t.Fatal("close 1009 must return to the handler for HTTP fallback without rebuilding WebSocket connections")
+	}
+
+	if !shouldRetryWebsocketSendError(errors.New("temporary write failure")) {
+		t.Fatal("ordinary transport write failures should retain the bounded reconnect retry")
+	}
+	if !shouldRetryWebsocketSendError(fmt.Errorf("send interrupted: %w", &websocket.CloseError{
+		Code: websocket.CloseInternalServerErr,
+		Text: "temporary upstream failure",
+	})) {
+		t.Fatal("retryable peer closes other than 1009 should retain the bounded reconnect retry")
+	}
+	if shouldRetryWebsocketSendError(nil) {
+		t.Fatal("nil is not a retryable send error")
 	}
 }

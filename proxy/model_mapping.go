@@ -154,6 +154,22 @@ func wildcardModelPatternMatch(pattern string, model string) bool {
 	return true
 }
 
+func applyReasoningEffortModelToBody(rawBody []byte, entry ReasoningEffortModel) ([]byte, error) {
+	updatedBody, err := sjson.SetBytes(rawBody, "model", entry.Model)
+	if err != nil {
+		return rawBody, err
+	}
+	updatedBody, err = sjson.SetBytes(updatedBody, "reasoning_effort", entry.Effort)
+	if err != nil {
+		return rawBody, err
+	}
+	updatedBody, err = sjson.SetBytes(updatedBody, "reasoning.effort", entry.Effort)
+	if err != nil {
+		return rawBody, err
+	}
+	return updatedBody, nil
+}
+
 func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedModels []string) ([]byte, string, string, bool) {
 	originalModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
 	effectiveModel := originalModel
@@ -166,15 +182,7 @@ func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedMod
 	mappingApplied := false
 	if entry, ok := resolveReasoningEffortModelAlias(originalModel, h.store.GetReasoningEffortModels(), supportedModels); ok {
 		var err error
-		updatedBody, err = sjson.SetBytes(updatedBody, "model", entry.Model)
-		if err != nil {
-			return rawBody, originalModel, effectiveModel, false
-		}
-		updatedBody, err = sjson.SetBytes(updatedBody, "reasoning_effort", entry.Effort)
-		if err != nil {
-			return rawBody, originalModel, effectiveModel, false
-		}
-		updatedBody, err = sjson.SetBytes(updatedBody, "reasoning.effort", entry.Effort)
+		updatedBody, err = applyReasoningEffortModelToBody(updatedBody, entry)
 		if err != nil {
 			return rawBody, originalModel, effectiveModel, false
 		}
@@ -347,4 +355,80 @@ func stripCompactModelSuffixFromBody(rawBody []byte) ([]byte, string, bool) {
 		return rawBody, model, false
 	}
 	return updated, stripped, true
+}
+
+// compactModelMappingCandidates returns endpoint-qualified aliases before their
+// base names so compact-specific rules override general model rules.
+func compactModelMappingCandidates(models ...string) []string {
+	candidates := make([]string, 0, len(models)*2)
+	seen := make(map[string]struct{}, len(models)*2)
+	add := func(model string) {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			return
+		}
+		key := strings.ToLower(model)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, model)
+	}
+
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		if baseModel, stripped := stripCompactModelSuffix(model); stripped {
+			add(model)
+			add(baseModel)
+			continue
+		}
+		add(model + compactOpenAIModelSuffix)
+		add(model)
+	}
+	return candidates
+}
+
+// applyConfiguredCompactModelMappingToBody resolves the endpoint-qualified
+// compact alias before the base model. This lets the same rule work whether a
+// client sends "model" or "model-openai-compact", while preserving the full
+// requested name for per-account routing and usage logs.
+func (h *Handler) applyConfiguredCompactModelMappingToBody(rawBody []byte, supportedModels []string) ([]byte, string, string, bool) {
+	originalModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	if originalModel == "" || !gjson.ValidBytes(rawBody) || h == nil || h.store == nil {
+		return rawBody, originalModel, originalModel, false
+	}
+
+	candidates := compactModelMappingCandidates(originalModel)
+	if len(candidates) > 0 {
+		compactAlias := candidates[0]
+		if mappedModel, ok := resolveConfiguredModelMapping(compactAlias, h.store.GetCodexModelMapping(), supportedModels); ok && mappedModel != "" && !strings.EqualFold(mappedModel, compactAlias) {
+			effectiveModel := mappedModel
+			updatedBody := rawBody
+			var err error
+			if entry, ok := resolveReasoningEffortModelAlias(mappedModel, h.store.GetReasoningEffortModels(), supportedModels); ok {
+				updatedBody, err = applyReasoningEffortModelToBody(updatedBody, entry)
+				effectiveModel = entry.Model
+			} else {
+				updatedBody, err = sjson.SetBytes(updatedBody, "model", mappedModel)
+			}
+			if err != nil {
+				return rawBody, originalModel, originalModel, false
+			}
+			return updatedBody, originalModel, effectiveModel, true
+		}
+	}
+
+	baseBody, baseModel, stripped := stripCompactModelSuffixFromBody(rawBody)
+	if !stripped {
+		baseBody = rawBody
+		baseModel = originalModel
+	}
+	mappedBody, _, effectiveModel, mappingApplied := h.applyConfiguredModelMappingToBody(baseBody, supportedModels)
+	if effectiveModel == "" {
+		effectiveModel = baseModel
+	}
+	return mappedBody, originalModel, effectiveModel, mappingApplied || stripped
 }

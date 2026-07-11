@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 )
 
@@ -109,5 +111,37 @@ func TestProbeUsageSnapshotWhamRateLimitedKeepsAccountUsable(t *testing.T) {
 	}
 	if account.CooldownReason == "unauthorized" {
 		t.Fatal("account marked unauthorized cooldown by wham 429")
+	}
+}
+
+func TestProbeUsageSnapshotWhamCannotClearResponsesCooldownWhenUsageStatusIgnored(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"plan_type":"plus",
+			"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":0,"limit_window_seconds":18000,"reset_after_seconds":1800}}
+		}`))
+	}))
+	defer server.Close()
+	restore := proxy.SetWhamUsageURLForTest(server.URL)
+	defer restore()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	store.SetUsageProbeResponsesFallbackEnabled(false)
+	account := &auth.Account{DBID: 3, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.MarkPremium5hRateLimited(account, time.Now().Add(time.Hour))
+
+	h := &Handler{store: store}
+	if err := h.ProbeUsageSnapshot(context.Background(), account); err != nil {
+		t.Fatalf("ProbeUsageSnapshot() error = %v", err)
+	}
+	if !account.HasActiveCooldown() {
+		t.Fatal("WHAM metadata cleared a cooldown that requires Responses success")
 	}
 }

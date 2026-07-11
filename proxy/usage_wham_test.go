@@ -617,6 +617,39 @@ func TestApplyWhamUsage_CreditAccountSkips7dWindowLimit(t *testing.T) {
 	}
 }
 
+func TestApplyWhamUsage_IgnoredUsageStatusRemainsMetadataOnly(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &auth.Account{DBID: 2, AccessToken: "at", PlanType: "team", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy}
+	store.AddAccount(account)
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "team"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 18000, ResetAt: now.Add(2 * time.Hour).Unix()}
+	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 604800, ResetAt: now.Add(5 * 24 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if !result.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = false, want true")
+	}
+	if result.Premium5hRateLimited || result.Usage7dRateLimited {
+		t.Fatalf("WHAM metadata created a cooldown: %+v", result)
+	}
+	if !account.IsAvailable() {
+		t.Fatal("WHAM 100% metadata must not remove an account from scheduling")
+	}
+	if pct5h, _, ok := account.GetUsageSnapshot5h(); !ok || pct5h != 100 {
+		t.Fatalf("5h snapshot = (%v, %v), want 100 and valid", pct5h, ok)
+	}
+	if pct7d, ok := account.GetUsagePercent7d(); !ok || pct7d != 100 {
+		t.Fatalf("7d snapshot = (%v, %v), want 100 and valid", pct7d, ok)
+	}
+}
+
 func TestWhamUsageJSON_RoundTrip(t *testing.T) {
 	in := WhamUsage{PlanType: "plus"}
 	in.RateLimit.Allowed = true
