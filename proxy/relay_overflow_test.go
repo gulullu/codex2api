@@ -1,0 +1,199 @@
+package proxy
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
+)
+
+func int64Pointer(value int64) *int64 {
+	return &value
+}
+
+func newRelayOverflowTestHandler() (*Handler, *auth.Account, *auth.Account) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	store.SetCybRelayConfig(auth.CybRelayConfig{Enabled: true, GroupID: 7})
+	oauth := &auth.Account{
+		DBID:                    1,
+		AccessToken:             "oauth",
+		PlanType:                "pro",
+		Status:                  auth.StatusReady,
+		BaseConcurrencyOverride: int64Pointer(1),
+	}
+	relay := &auth.Account{
+		DBID:                    2,
+		UpstreamType:            auth.UpstreamOpenAIResponses,
+		BaseURL:                 "https://relay.example/v1",
+		APIKey:                  "relay-key",
+		Status:                  auth.StatusReady,
+		GroupIDs:                []int64{7},
+		BaseConcurrencyOverride: int64Pointer(1),
+	}
+	store.AddAccount(oauth)
+	store.AddAccount(relay)
+	return NewHandler(store, nil, nil, nil), oauth, relay
+}
+
+func newRouteTestContext() *gin.Context {
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	return ctx
+}
+
+func TestNextRoutedAccountPrefersOAuthWhenCapacityExists(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, oauth, _ := newRelayOverflowTestHandler()
+	ctx := newRouteTestContext()
+
+	account, _, decision := handler.nextRoutedAccountForSession(
+		ctx,
+		context.Background(),
+		"",
+		0,
+		newRetryAccountExclusions(),
+		nil,
+		defaultPromptRiskDecision(),
+	)
+	if account == nil || account.ID() != oauth.ID() {
+		t.Fatalf("account = %#v, want OAuth %d", account, oauth.ID())
+	}
+	if decision.routesToCybRelay() || decision.RouteSource != cybRelayRouteSourceDefault {
+		t.Fatalf("decision = %+v, want default OAuth route", decision)
+	}
+	handler.store.Release(account)
+}
+
+func TestNextRoutedAccountOverflowsToRelayWhenOAuthIsFull(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, oauth, relay := newRelayOverflowTestHandler()
+	atomic.StoreInt64(&oauth.ActiveRequests, 1)
+	ctx := newRouteTestContext()
+
+	account, _, decision := handler.nextRoutedAccountForSession(
+		ctx,
+		context.Background(),
+		"",
+		0,
+		newRetryAccountExclusions(),
+		nil,
+		defaultPromptRiskDecision(),
+	)
+	if account == nil || account.ID() != relay.ID() {
+		t.Fatalf("account = %#v, want Relay %d", account, relay.ID())
+	}
+	if !decision.routesToCybRelay() || decision.RouteSource != cybRelayRouteSourceOverflow {
+		t.Fatalf("decision = %+v, want overflow Relay route", decision)
+	}
+	if len(decision.Signals) != 1 || decision.Signals[0] != relayOverflowSignal {
+		t.Fatalf("signals = %#v, want %q", decision.Signals, relayOverflowSignal)
+	}
+	handler.store.Release(account)
+	atomic.StoreInt64(&oauth.ActiveRequests, 0)
+}
+
+func TestDirectRelayRouteNeverFallsBackToOAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, oauth, relay := newRelayOverflowTestHandler()
+	atomic.StoreInt32(&relay.Disabled, 1)
+	ctx := newRouteTestContext()
+	required := promptRiskDecision{
+		Disposition: promptRiskDispositionRelay,
+		RouteSource: cybRelayRouteSourceProbe,
+		Signals:     []string{probeRouteSignal},
+	}
+
+	account, _, decision := handler.nextRoutedAccountForSession(
+		ctx,
+		context.Background(),
+		"",
+		0,
+		newRetryAccountExclusions(),
+		nil,
+		required,
+	)
+	if account != nil {
+		handler.store.Release(account)
+		t.Fatalf("account = %#v, want nil when dedicated Relay is unavailable", account)
+	}
+	if !decision.routesToCybRelay() || decision.RouteSource != cybRelayRouteSourceProbe {
+		t.Fatalf("decision = %+v, want original Relay-only decision", decision)
+	}
+	if got := atomic.LoadInt64(&oauth.ActiveRequests); got != 0 {
+		t.Fatalf("OAuth active requests = %d, direct Relay route must not touch OAuth", got)
+	}
+}
+
+func TestProbeRequestRoutesDirectlyToRelayEvenWithLegacyShortCircuitDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("CODEX_PROBE_SHORT_CIRCUIT_ENABLED", "false")
+	handler, _, _ := newRelayOverflowTestHandler()
+	ctx := newRouteTestContext()
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+
+	if blocked := handler.inspectPromptFilterOpenAI(ctx, body, "/v1/responses", "gpt-5.4"); blocked {
+		t.Fatal("probe must route, not block")
+	}
+	decision, ok := promptRiskDecisionFromContext(ctx)
+	if !ok || !decision.routesToCybRelay() {
+		t.Fatalf("decision = %+v, present=%v; want Relay route", decision, ok)
+	}
+	if decision.RouteSource != cybRelayRouteSourceProbe {
+		t.Fatalf("route source = %q, want %q", decision.RouteSource, cybRelayRouteSourceProbe)
+	}
+	if len(decision.Signals) != 1 || decision.Signals[0] != probeRouteSignal {
+		t.Fatalf("signals = %#v, want probe signal", decision.Signals)
+	}
+}
+
+func TestPreviousResponseOwnerKeepsOverflowContinuationOnExactRelayAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, _, relay := newRelayOverflowTestHandler()
+	handler.SetRuntimeCache(cache.NewMemory(32))
+
+	responseCtx := newRouteTestContext()
+	responseCtx.Set(contextAPIKeyID, int64(101))
+	setUpstreamAccountContext(responseCtx, relay)
+	handler.setSelectedRouteDecision(responseCtx, overflowPromptRiskDecision())
+	handler.pinCybRelayResponseID(responseCtx, []byte(`{"id":"resp_overflow_1"}`))
+
+	continueCtx := newRouteTestContext()
+	continueCtx.Set(contextAPIKeyID, int64(101))
+	continueBody := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_overflow_1","input":"continue"}`)
+	handler.loadResponseRouteOwner(continueCtx, continueBody)
+
+	owner, ok := responseRouteOwnerFromContext(continueCtx)
+	if !ok || owner.AccountID != relay.ID() {
+		t.Fatalf("owner = %+v, present=%v; want Relay %d", owner, ok, relay.ID())
+	}
+	account, _, decision := handler.nextRoutedAccountForSession(
+		continueCtx,
+		context.Background(),
+		"",
+		101,
+		newRetryAccountExclusions(),
+		nil,
+		defaultPromptRiskDecision(),
+	)
+	if account == nil || account.ID() != relay.ID() {
+		t.Fatalf("account = %#v, want exact Relay owner %d", account, relay.ID())
+	}
+	if decision.RouteSource != cybRelayRouteSourceContinuation || !decision.routesToCybRelay() {
+		t.Fatalf("decision = %+v, want Relay continuation", decision)
+	}
+	handler.store.Release(account)
+
+	otherKeyCtx := newRouteTestContext()
+	otherKeyCtx.Set(contextAPIKeyID, int64(202))
+	handler.loadResponseRouteOwner(otherKeyCtx, continueBody)
+	if owner, ok := responseRouteOwnerFromContext(otherKeyCtx); ok {
+		t.Fatalf("cross-key owner leaked: %+v", owner)
+	}
+}

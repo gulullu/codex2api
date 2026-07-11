@@ -203,7 +203,7 @@ func TestCybRelayPromptPolicyMatrix(t *testing.T) {
 		},
 		{
 			name:            "Omni would flag but local safe request stays default",
-			text:            "hello world",
+			text:            "explain binary search",
 			endpoint:        "/v1/responses",
 			wantDisposition: promptRiskDispositionDefault,
 		},

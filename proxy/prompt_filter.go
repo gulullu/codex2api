@@ -180,8 +180,18 @@ func (h *Handler) reviewPromptFilterVerdictDetailed(ctx context.Context, text st
 func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, localVerdict promptfilter.Verdict, text string, endpoint string, model string) bool {
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	cybSignal, signals := promptFilterCYBSignal(localVerdict, text, cfg, endpoint)
+	relayCfg := h.cybRelayConfig()
+	probeRoute := relayCfg.Enabled && relayCfg.GroupID > 0 && cybRelayTextEndpoint(endpoint) && detectProbeRoute(rawBody, endpoint, text)
 	decision := defaultPromptRiskDecision()
-	if cybSignal {
+	if probeRoute {
+		signals = appendUniqueRouteSignal(signals, probeRouteSignal)
+		decision = promptRiskDecision{
+			Disposition: promptRiskDispositionRelay,
+			Reason:      "Probe isolated to relay pool",
+			Signals:     signals,
+			RouteSource: cybRelayRouteSourceProbe,
+		}
+	} else if cybSignal {
 		decision = promptRiskDecision{
 			Disposition: promptRiskDispositionRelay,
 			Reason:      "CYB risk isolated to relay pool",

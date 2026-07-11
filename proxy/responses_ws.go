@@ -186,6 +186,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
+	h.loadResponseRouteOwner(c, rawBody)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -225,11 +226,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}
 
 	accountFilter := accountFilterForModel(effectiveModel)
-	if promptDecision.routesToCybRelay() {
+	relayCfg := h.cybRelayConfig()
+	if promptDecision.routesToCybRelay() || (relayCfg.Enabled && relayCfg.GroupID > 0) {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, false)
 	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	wsRetrySettings := CurrentRuntimeSettings()
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
@@ -245,6 +246,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	var lastBody []byte
 	var lastRetryableUpstreamErr *api.APIError
 	retryExclusions := newRetryAccountExclusions()
+	routeRequirement := promptDecision
 	invalidEncryptedContentRetried := false
 	forceHTTPAfterWSMessageTooBig := false
 	var lastUpstreamCancel context.CancelFunc
@@ -255,9 +257,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		promptDecision = selectedDecision
 		if account == nil {
-			if promptDecision.routesToCybRelay() {
+			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt)
 				_ = writeCybRelayUnavailableWebSocket(conn)
 				return newResponsesWSCloseError(websocket.CloseTryAgainLater, "CYB relay unavailable", nil)

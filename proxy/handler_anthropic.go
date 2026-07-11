@@ -144,7 +144,6 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
@@ -162,6 +161,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	routeRequirement := promptDecision
 	forceHTTPAfterWSMessageTooBig := false
 
 	var lastUpstreamCancel context.CancelFunc
@@ -172,9 +172,10 @@ func (h *Handler) Messages(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		promptDecision = selectedDecision
 		if account == nil {
-			if promptDecision.routesToCybRelay() {
+			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/messages", model, effectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableAnthropic(c)
 				return

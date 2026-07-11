@@ -24,12 +24,14 @@ const (
 	promptRiskDispositionBlock   = "block_policy"
 	promptRiskDispositionRelay   = "route_cyb"
 
-	cybRelayRouteClass         = "cyb_relay"
-	cybRelayRouteSourceDefault = "default"
-	cybRelayRouteSourceDirect  = "direct"
-	cybRelayRouteSourcePin     = "pin"
-	cybRelayPinCacheNamespace  = "cyb-route-pin-v2"
-	cybRelayCacheTimeout       = 500 * time.Millisecond
+	cybRelayRouteClass          = "cyb_relay"
+	cybRelayRouteSourceDefault  = "default"
+	cybRelayRouteSourceDirect   = "direct"
+	cybRelayRouteSourceProbe    = "probe"
+	cybRelayRouteSourceOverflow = "overflow"
+	cybRelayRouteSourcePin      = "pin"
+	cybRelayPinCacheNamespace   = "cyb-route-pin-v2"
+	cybRelayCacheTimeout        = 500 * time.Millisecond
 
 	contextPromptRiskDecision   = "promptRiskDecision"
 	contextCybWSRoutePinned     = "cybWSRoutePinned"
@@ -318,19 +320,20 @@ func (h *Handler) applyCybRoutePin(c *gin.Context, rawBody []byte, decision prom
 }
 
 func (h *Handler) pinCybRelayResponseID(c *gin.Context, event []byte) {
+	responseID := strings.TrimSpace(gjson.GetBytes(event, "response.id").String())
+	if responseID == "" {
+		responseID = strings.TrimSpace(gjson.GetBytes(event, "id").String())
+	}
+	if responseID == "" {
+		return
+	}
+	h.recordResponseRouteOwner(c, responseID)
 	decision, ok := promptRiskDecisionFromContext(c)
 	if !ok || !decision.routesToCybRelay() {
 		return
 	}
 	cfg := h.cybRelayConfig()
 	if !cfg.Enabled || !cfg.SessionPinEnabled {
-		return
-	}
-	responseID := strings.TrimSpace(gjson.GetBytes(event, "response.id").String())
-	if responseID == "" {
-		responseID = strings.TrimSpace(gjson.GetBytes(event, "id").String())
-	}
-	if responseID == "" {
 		return
 	}
 	key := cybRelayPinCacheKey("previous_response_id", responseCacheOwner(requestAPIKeyID(c)), responseID)
