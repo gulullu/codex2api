@@ -638,7 +638,7 @@
     "healthBarNoRequests": "该时段无请求",
     "editScheduler": "编辑配置",
     "copyAccount": "复制账号配置",
-    "copyAccountPrepared": "已复制 {{name}} 的非敏感配置。API Key 未复制，请填写新 Key，并按需修改 URL。",
+    "copyAccountPrepared": "已复制 {{name}} 的非敏感配置。API Key 和认证类自定义请求头未复制，请重新填写所需凭据，并按需修改 URL。",
     "schedulerEditTitle": "编辑账号配置",
     "schedulerEditDesc": "为当前账号调整调度参数，并限制允许调用的 API Key。当前套餐：{{plan}}",
     "schedulerScoreLabel": "分数（总加权分）",

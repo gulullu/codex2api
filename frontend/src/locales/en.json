@@ -638,7 +638,7 @@
     "healthBarNoRequests": "No requests in this window",
     "editScheduler": "Edit Settings",
     "copyAccount": "Copy account settings",
-    "copyAccountPrepared": "Non-sensitive settings from {{name}} were copied. The API key was not copied; enter a new key and change the URL if needed.",
+    "copyAccountPrepared": "Non-sensitive settings from {{name}} were copied. The API key and authentication custom headers were not copied; re-enter the required credentials and change the URL if needed.",
     "schedulerEditTitle": "Edit Account Settings",
     "schedulerEditDesc": "Adjust scheduler settings and restrict which API keys can use this account. Current plan: {{plan}}",
     "schedulerScoreLabel": "Score (Total Bias)",

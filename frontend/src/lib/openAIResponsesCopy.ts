@@ -1,4 +1,5 @@
 import type { AccountRow, AddOpenAIResponsesAccountRequest } from '../types'
+import { filterCopiedCustomHeaders } from './sensitiveHeaders'
 
 const DEFAULT_RESPONSES_BASE_CONCURRENCY = 10000
 
@@ -22,7 +23,7 @@ export function buildOpenAIResponsesCopyDraft(
     codex_client_metadata_mode:
       account.codex_client_metadata_mode ?? 'auto',
     proxy_url: account.proxy_url ?? '',
-    custom_headers: { ...(account.custom_headers ?? {}) },
+    custom_headers: filterCopiedCustomHeaders(account.custom_headers),
     score_bias_override: account.score_bias_override ?? null,
     base_concurrency_override:
       account.base_concurrency_override ?? DEFAULT_RESPONSES_BASE_CONCURRENCY,
