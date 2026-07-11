@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronDown, Clock3, Gauge, RefreshCw, ShieldAlert, ShieldCheck, ShieldX, Zap } from 'lucide-react'
 import {
   Bar,
@@ -47,6 +47,7 @@ const chartColors = {
   relayPinned: '#0ea5e9',
   relayProbe: '#7c3aed',
   relayOverflow: '#d97706',
+  relayContinuation: '#db2777',
   oauthCyber: '#dc2626',
   relayError: '#f97316',
 }
@@ -218,7 +219,7 @@ export default function CodexAudit() {
 
                 <div className="grid min-w-0 grid-cols-2 gap-3 p-3 sm:grid-cols-3 sm:p-4 xl:grid-cols-6">
                   <SignalTile label="逻辑请求" value={formatNumber(report.usage.requests)} detail={`${formatNumber(report.usage.upstream_attempts)} 次尝试 · 错误 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
-                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · Pin ${formatNumber(report.summary.relay_pinned)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · Pin ${formatNumber(report.summary.relay_pinned)} · 续链 ${formatNumber(report.summary.relay_continuation || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
                   <SignalTile label="规则直达" value={formatNumber(report.summary.relay_direct)} detail="完整 payload 本轮命中" icon={<Gauge />} tone="ok" />
                   <SignalTile label="探针 → Relay" value={formatNumber(report.summary.relay_probe || 0)} detail="探针一律进入 Relay 上游" icon={<Zap />} tone="ok" />
                   <SignalTile label="OAuth 容量溢出" value={formatNumber(report.summary.relay_overflow || 0)} detail="OAuth 可用并发不足时分流" icon={<BarChart3 />} tone="neutral" />
@@ -258,7 +259,7 @@ export default function CodexAudit() {
             <SessionBleedPanel start={report.window_start} end={report.window_end} />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.85fr)]">
-              <ChartPanel title="请求与 Relay 路由趋势" description="按当前筛选窗口聚合默认路由、规则直达、探针、OAuth 容量溢出、历史 Pin 与异常。">
+              <ChartPanel title="请求与 Relay 路由趋势" description="按当前筛选窗口聚合默认路由、规则直达、探针、OAuth 容量溢出、Relay 续链、历史 Pin 与异常。">
                 <ResponsiveContainer width="100%" height={286}>
                   <LineChart data={timeline} margin={{ top: 12, right: 18, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="4 4" stroke="hsl(var(--border))" vertical={false} />
@@ -271,6 +272,7 @@ export default function CodexAudit() {
                     <Line type="monotone" dataKey="relay_pinned" name="Relay Pin" stroke={chartColors.relayPinned} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_probe" name="探针 → Relay" stroke={chartColors.relayProbe} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_overflow" name="OAuth 容量溢出" stroke={chartColors.relayOverflow} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_continuation" name="Relay 续链" stroke={chartColors.relayContinuation} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="oauth_cyber_attempts" name="OAuth CYB" stroke={chartColors.oauthCyber} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_route_failures" name="Relay 路由失败" stroke={chartColors.relayError} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                   </LineChart>
@@ -303,7 +305,7 @@ export default function CodexAudit() {
                 />
               </Panel>
 
-              <Panel title="Relay 账号与路由来源" description="按 Relay 账号、Direct/Pin 来源和 Pin 类型统计成功率与上游质量。">
+              <Panel title="Relay 账号与路由来源" description="按 Relay 账号、最终路由来源和 Pin 类型统计成功率与上游质量。">
                 <SimpleTable
                   columns={['账号', '来源', 'Pin', '请求', '尝试', '成功', '4xx', '5xx', 'CYB']}
                   rows={(report.relay_routes || []).map((row) => [
@@ -408,7 +410,7 @@ function RelayRouteCasesPanel({ start, end }: { start: string; end: string }) {
 
   const totalPages = Math.max(1, Math.ceil(total / AUDIT_PAGE_SIZE))
   return (
-    <Panel title="Relay 路由案卷" description="按逻辑请求归并重试记录；总数、分页和稳定排序均使用当前筛选窗口的同一组 start/end。">
+    <Panel title="Relay 路由案卷" description="以最终上游调用的路由与账号为准，按逻辑请求归并重试；文本来自同请求的脱敏检查记录。">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <span className="text-xs text-muted-foreground">共 {formatNumber(total)} 个逻辑请求</span>
         {loading ? <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><RefreshCw className="size-3.5 animate-spin" />加载中</span> : null}
@@ -437,23 +439,30 @@ function SessionBleedPanel({ start, end }: { start: string; end: string }) {
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const requestSequence = useRef(0)
 
   const load = useCallback(async () => {
+    const sequence = ++requestSequence.current
     setLoading(true)
     setError(null)
     try {
       const res = await api.getCodexAuditCases({ kind: 'session_bleed', start, end, page, pageSize: AUDIT_PAGE_SIZE })
+      if (sequence !== requestSequence.current) return
       setLogs(res.items ?? [])
       setTotal(res.total ?? 0)
     } catch (err) {
+      if (sequence !== requestSequence.current) return
       setError(getErrorMessage(err))
     } finally {
-      setLoading(false)
+      if (sequence === requestSequence.current) setLoading(false)
     }
   }, [end, page, start])
 
   useEffect(() => {
     void load()
+    return () => {
+      requestSequence.current++
+    }
   }, [load])
 
   const totalPages = Math.max(1, Math.ceil(total / AUDIT_PAGE_SIZE))
@@ -512,6 +521,16 @@ function SessionBleedPanel({ start, end }: { start: string; end: string }) {
   )
 }
 
+function routeCaseBadge(log: PromptFilterLog) {
+  const source = (log.route_source || '').trim()
+  if (source === 'pin') return `pin · ${log.pin_kind || 'unknown'}`
+  if (source === 'probe') return 'probe'
+  if (source === 'overflow') return 'overflow'
+  if (source === 'continuation') return 'continuation'
+  if (source === 'direct') return 'direct'
+  return source || 'relay'
+}
+
 function AuditLogRow({ log }: { log: PromptFilterLog }) {
   const [open, setOpen] = useState(false)
   const full = (log.full_text || '').trim()
@@ -519,7 +538,7 @@ function AuditLogRow({ log }: { log: PromptFilterLog }) {
   const badge = log.source === 'session_bleed'
     ? 'session_bleed'
     : log.source === 'cyb_relay_routed'
-      ? (log.route_source === 'pin' ? `pin · ${log.pin_kind || 'unknown'}` : 'direct')
+      ? routeCaseBadge(log)
       : 'cyber_policy'
   return (
     <div className="min-w-0 rounded-lg border border-border/60 bg-background/70">
@@ -543,7 +562,7 @@ function AuditLogRow({ log }: { log: PromptFilterLog }) {
             <span>{log.model || '-'}</span>
           </div>
           <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-            <span>账号 #{log.account_id || '-'}</span>
+            <span>账号 {log.account_name || (log.account_id ? `#${log.account_id}` : '-')}</span>
             <span>{log.upstream_account_type || 'unknown'}</span>
             <span>路由 {log.route_source || log.route_class || '-'}</span>
             <span>Pin {log.pin_kind || '-'}</span>

@@ -804,9 +804,10 @@ export interface PromptFilterLog {
   client_request_id?: string
   logical_request_id?: string
   account_id?: number
+  account_name?: string
   route_class?: string
   route_reason?: string
-  route_source?: 'default' | 'direct' | 'pin' | string
+  route_source?: 'default' | 'direct' | 'pin' | 'probe' | 'overflow' | 'continuation' | string
   route_signals?: string
   pin_kind?: string
   route_group_id?: number
@@ -888,6 +889,7 @@ export interface CodexAuditSummary {
   relay_pinned: number
   relay_probe: number
   relay_overflow: number
+  relay_continuation: number
   relay_legacy_unknown: number
   relay_route_failures: number
   relay_fallback_prevented: number
@@ -914,6 +916,7 @@ export interface CodexAuditTimelinePoint {
   relay_pinned: number
   relay_probe: number
   relay_overflow: number
+  relay_continuation: number
   relay_legacy_unknown: number
   relay_route_failures: number
   oauth_cyber_attempts: number

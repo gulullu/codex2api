@@ -16,18 +16,31 @@ import (
 func TestGetCodexAuditCasesUsesExplicitWindowAndPagination(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)
-	for _, input := range []*database.PromptFilterLogInput{
-		{LogicalRequestID: "relay-one", Source: "cyb_relay_routed"},
-		{LogicalRequestID: "relay-two", Source: "cyb_relay_routed"},
-		{LogicalRequestID: "bleed-one", Source: "session_bleed"},
+	db.SetUsageLogConfig(database.UsageLogModeFull, 1, 1)
+	for _, input := range []*database.UsageLogInput{
+		{LogicalRequestID: "relay-one", StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		{LogicalRequestID: "relay-two", StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "overflow", RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
 	} {
-		if err := db.InsertPromptFilterLog(context.Background(), input); err != nil {
-			t.Fatalf("InsertPromptFilterLog: %v", err)
+		if err := db.InsertUsageLog(context.Background(), input); err != nil {
+			t.Fatalf("InsertUsageLog: %v", err)
 		}
 	}
 
 	start := time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
 	end := time.Now().Add(time.Minute).UTC().Truncate(time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		result, err := db.ListCodexAuditCasesPage(context.Background(), database.CodexAuditCasesQuery{
+			Kind: database.CodexAuditCaseRelayRoute, Start: start, End: end, Page: 1, PageSize: 10,
+		})
+		if err == nil && result.Total == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("usage logs were not flushed before deadline: result=%+v err=%v", result, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	params := url.Values{
 		"kind":      {database.CodexAuditCaseRelayRoute},
 		"start":     {start.Format(time.RFC3339)},

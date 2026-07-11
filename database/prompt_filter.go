@@ -31,6 +31,7 @@ type PromptFilterLog struct {
 	ClientRequestID     string    `json:"client_request_id"`
 	LogicalRequestID    string    `json:"logical_request_id"`
 	AccountID           int64     `json:"account_id"`
+	AccountName         string    `json:"account_name,omitempty"`
 	RouteClass          string    `json:"route_class"`
 	RouteReason         string    `json:"route_reason"`
 	RouteSource         string    `json:"route_source"`

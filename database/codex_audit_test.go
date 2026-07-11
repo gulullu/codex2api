@@ -331,25 +331,41 @@ func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
 
-	inputs := []*PromptFilterLogInput{
-		{LogicalRequestID: "duplicate", Source: "cyb_relay_routed", FullText: "superseded"},
-		{LogicalRequestID: "duplicate", Source: "cyb_relay_routed", FullText: "canonical"},
-		{LogicalRequestID: "alpha", Source: "cyb_relay_routed"},
-		{LogicalRequestID: "beta", Source: "cyb_relay_routed"},
-		{Source: "cyb_relay_routed", FullText: "legacy-one"},
-		{Source: "cyb_relay_routed", FullText: "legacy-two"},
-		{LogicalRequestID: "different-kind", Source: "session_bleed"},
-		{LogicalRequestID: "outside-window", Source: "cyb_relay_routed"},
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO accounts (id, name, credentials) VALUES (105, 'final-relay', '{}')`); err != nil {
+		t.Fatalf("insert relay account: %v", err)
 	}
-	for _, input := range inputs {
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "duplicate", AccountID: 104, StatusCode: 502, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "duplicate", AccountID: 105, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "continuation", RouteSignals: `["previous_response_owner"]`, RouteGroupID: 42, UpstreamAccountType: "openai_responses", Endpoint: "/v1/responses", EffectiveModel: "gpt-5.5", APIKeyID: 7, APIKeyName: "case-key"},
+		&UsageLogInput{LogicalRequestID: "alpha", AccountID: 101, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "probe", AccountID: 102, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "probe", RouteSignals: `["probe_request"]`, RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "overflow", AccountID: 103, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "overflow", RouteSignals: `["oauth_no_dispatch_slot"]`, RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "pin", AccountID: 103, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "prompt_cache_key", RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{AccountID: 103, StatusCode: 200, RouteClass: "cyb_relay", RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{AccountID: 103, StatusCode: 200, RouteClass: "cyb_relay", RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "outside-window", AccountID: 103, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "overflow", RouteGroupID: 42, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "default-route", AccountID: 201, StatusCode: 200, RouteClass: "default", RouteSource: "default", UpstreamAccountType: "oauth"},
+	)
+
+	prompts := []*PromptFilterLogInput{
+		{LogicalRequestID: "duplicate", Source: "cyb_relay_routed", FullText: "superseded", RouteSource: "direct", AccountID: 999},
+		{LogicalRequestID: "duplicate", Source: "cyb_relay_routed", FullText: "canonical", RouteSource: "direct", AccountID: 999},
+		{LogicalRequestID: "alpha", Source: "cyb_relay_routed", FullText: "alpha payload"},
+		{LogicalRequestID: "probe", Source: "cyb_relay_routed", FullText: "probe payload"},
+		{LogicalRequestID: "different-kind", Source: "session_bleed"},
+	}
+	for _, input := range prompts {
 		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
 			t.Fatalf("InsertPromptFilterLog: %v", err)
 		}
 	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET created_at = $1`, db.timeArg(now)); err != nil {
+		t.Fatalf("set stable usage created_at: %v", err)
+	}
 	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_filter_logs SET created_at = $1`, db.timeArg(now)); err != nil {
 		t.Fatalf("set stable created_at: %v", err)
 	}
-	if _, err := db.conn.ExecContext(ctx, `UPDATE prompt_filter_logs SET created_at = $1 WHERE logical_request_id = 'outside-window'`, db.timeArg(now.Add(-2*time.Hour))); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET created_at = $1 WHERE logical_request_id = 'outside-window'`, db.timeArg(now.Add(-2*time.Hour))); err != nil {
 		t.Fatalf("move outside-window record: %v", err)
 	}
 
@@ -358,14 +374,14 @@ func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
 		Start:    now.Add(-time.Minute),
 		End:      now.Add(time.Minute),
 		Page:     1,
-		PageSize: 2,
+		PageSize: 3,
 	}
 	page1, err := db.ListCodexAuditCasesPage(ctx, query)
 	if err != nil {
 		t.Fatalf("page 1: %v", err)
 	}
-	if page1.Total != 5 || len(page1.Items) != 2 || page1.Page != 1 || page1.PageSize != 2 {
-		t.Fatalf("page 1 metadata = total:%d len:%d page:%d size:%d, want 5/2/1/2", page1.Total, len(page1.Items), page1.Page, page1.PageSize)
+	if page1.Total != 7 || len(page1.Items) != 3 || page1.Page != 1 || page1.PageSize != 3 {
+		t.Fatalf("page 1 metadata = total:%d len:%d page:%d size:%d, want 7/3/1/3", page1.Total, len(page1.Items), page1.Page, page1.PageSize)
 	}
 
 	all := append([]*PromptFilterLog{}, page1.Items...)
@@ -380,17 +396,22 @@ func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
 		}
 		all = append(all, result.Items...)
 	}
-	if len(all) != 5 {
-		t.Fatalf("combined canonical items = %d, want 5", len(all))
+	if len(all) != 7 {
+		t.Fatalf("combined canonical items = %d, want 7", len(all))
 	}
 	ids := make([]int64, 0, len(all))
 	logicalCounts := map[string]int{}
 	duplicateText := ""
+	routeSources := map[string]int{}
 	for _, item := range all {
 		ids = append(ids, item.ID)
 		logicalCounts[item.LogicalRequestID]++
+		routeSources[item.RouteSource]++
 		if item.LogicalRequestID == "duplicate" {
 			duplicateText = item.FullText
+			if item.RouteSource != "continuation" || item.AccountID != 105 || item.AccountName != "final-relay" || item.APIKeyID != 7 || item.APIKeyName != "case-key" {
+				t.Fatalf("final usage metadata was not authoritative: %+v", item)
+			}
 		}
 		if item.LogicalRequestID == "outside-window" || item.Source != "cyb_relay_routed" {
 			t.Fatalf("unexpected item in relay window: %+v", item)
@@ -398,6 +419,11 @@ func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
 	}
 	if logicalCounts["duplicate"] != 1 || duplicateText != "canonical" {
 		t.Fatalf("duplicate canonicalization = count:%d text:%q, want 1/canonical", logicalCounts["duplicate"], duplicateText)
+	}
+	for _, source := range []string{"direct", "probe", "overflow", "continuation", "pin", ""} {
+		if routeSources[source] == 0 {
+			t.Fatalf("missing final route source %q in cases: %v", source, routeSources)
+		}
 	}
 	if !sort.SliceIsSorted(ids, func(i, j int) bool { return ids[i] > ids[j] }) {
 		t.Fatalf("case ids are not stably ordered descending: %v", ids)
@@ -424,12 +450,31 @@ func TestCodexAuditSummaryCountsProbeAndOAuthOverflowRoutes(t *testing.T) {
 			RouteGroupID:        42,
 			UpstreamAccountType: "openai_responses",
 		},
+		&UsageLogInput{
+			LogicalRequestID:    "continuation-route",
+			StatusCode:          200,
+			RouteClass:          "cyb_relay",
+			RouteSource:         "continuation",
+			RouteSignals:        `["previous_response_owner"]`,
+			RouteGroupID:        42,
+			UpstreamAccountType: "openai_responses",
+		},
 	)
 	report := buildCodexAuditTestReport(t, db)
-	if report.Summary.RelayProbe != 1 || report.Summary.RelayOverflow != 1 || report.Summary.RelayLegacyUnknown != 0 {
-		t.Fatalf("new route sources = probe:%d overflow:%d legacy:%d, want 1/1/0", report.Summary.RelayProbe, report.Summary.RelayOverflow, report.Summary.RelayLegacyUnknown)
+	if report.Summary.RelayProbe != 1 || report.Summary.RelayOverflow != 1 || report.Summary.RelayContinuation != 1 || report.Summary.RelayLegacyUnknown != 0 {
+		t.Fatalf("new route sources = probe:%d overflow:%d continuation:%d legacy:%d, want 1/1/1/0", report.Summary.RelayProbe, report.Summary.RelayOverflow, report.Summary.RelayContinuation, report.Summary.RelayLegacyUnknown)
 	}
 	if report.Summary.RouteInvariantViolations != 0 {
 		t.Fatalf("new route sources were treated as invariant violations: %d", report.Summary.RouteInvariantViolations)
+	}
+	var timelineContinuation int64
+	for _, point := range report.Timeline {
+		timelineContinuation += point.RelayContinuation
+		if point.RelayLegacyUnknown != 0 {
+			t.Fatalf("continuation leaked into timeline legacy bucket: %+v", point)
+		}
+	}
+	if timelineContinuation != 1 {
+		t.Fatalf("timeline continuation = %d, want 1", timelineContinuation)
 	}
 }

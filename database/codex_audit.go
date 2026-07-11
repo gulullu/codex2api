@@ -62,6 +62,7 @@ type CodexAuditSummary struct {
 	RelayPinned                int64 `json:"relay_pinned"`
 	RelayProbe                 int64 `json:"relay_probe"`
 	RelayOverflow              int64 `json:"relay_overflow"`
+	RelayContinuation          int64 `json:"relay_continuation"`
 	RelayLegacyUnknown         int64 `json:"relay_legacy_unknown"`
 	RelayRouteFailures         int64 `json:"relay_route_failures"`
 	RelayFallbackPrevented     int64 `json:"relay_fallback_prevented"`
@@ -115,6 +116,7 @@ type CodexAuditTimelinePoint struct {
 	RelayPinned              int64     `json:"relay_pinned"`
 	RelayProbe               int64     `json:"relay_probe"`
 	RelayOverflow            int64     `json:"relay_overflow"`
+	RelayContinuation        int64     `json:"relay_continuation"`
 	RelayLegacyUnknown       int64     `json:"relay_legacy_unknown"`
 	RelayRouteFailures       int64     `json:"relay_route_failures"`
 	OAuthCyberAttempts       int64     `json:"oauth_cyber_attempts"`
@@ -436,6 +438,8 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 				point.RelayProbe++
 			case "overflow":
 				point.RelayOverflow++
+			case "continuation":
+				point.RelayContinuation++
 			default:
 				point.RelayLegacyUnknown++
 			}
@@ -887,6 +891,7 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'pin' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'probe' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'overflow' THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') = 'continuation' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation') THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND (status_code >= 500 OR COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay')) THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay') THEN 1 ELSE 0 END), 0),
@@ -924,6 +929,7 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		&summary.RelayPinned,
 		&summary.RelayProbe,
 		&summary.RelayOverflow,
+		&summary.RelayContinuation,
 		&summary.RelayLegacyUnknown,
 		&summary.RelayRouteFailures,
 		&summary.RelayFallbackPrevented,
@@ -947,6 +953,7 @@ func mergeCodexAuditRouteSummary(target *CodexAuditSummary, route CodexAuditSumm
 	target.RelayPinned = route.RelayPinned
 	target.RelayProbe = route.RelayProbe
 	target.RelayOverflow = route.RelayOverflow
+	target.RelayContinuation = route.RelayContinuation
 	target.RelayLegacyUnknown = route.RelayLegacyUnknown
 	target.RelayRouteFailures = route.RelayRouteFailures
 	target.RelayFallbackPrevented = route.RelayFallbackPrevented
