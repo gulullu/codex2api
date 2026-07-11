@@ -42,6 +42,47 @@ type reviewResult struct {
 	CategoryScores map[string]float64 `json:"category_scores"`
 }
 
+// ReviewOutcome exposes the full moderation result needed by routing policy.
+// Flagged is the provider's raw aggregate flag. Categories are OR-merged across
+// results and CategoryScores retain the maximum score observed per category.
+type ReviewOutcome struct {
+	Model          string             `json:"model"`
+	Flagged        bool               `json:"flagged"`
+	Categories     map[string]bool    `json:"categories"`
+	CategoryScores map[string]float64 `json:"category_scores"`
+
+	// The image policy is evaluated per raw result before aggregation so a
+	// non-standard flagged result with empty category maps cannot be hidden by a
+	// later result that does contain category metadata.
+	imagePolicyEvaluated bool
+	imagePolicyFlagged   bool
+}
+
+func newReviewOutcome(model string) ReviewOutcome {
+	return ReviewOutcome{
+		Model:          strings.TrimSpace(model),
+		Categories:     make(map[string]bool),
+		CategoryScores: make(map[string]float64),
+	}
+}
+
+// FlaggedForEndpoint applies the existing endpoint-specific moderation policy
+// to a detailed outcome. Text endpoints use the provider's aggregate flagged
+// value; image endpoints retain the narrower image policy below.
+func (o ReviewOutcome) FlaggedForEndpoint(endpoint string) bool {
+	if !isImageModerationTarget(endpoint) {
+		return o.Flagged
+	}
+	if o.imagePolicyEvaluated {
+		return o.imagePolicyFlagged
+	}
+	return reviewResultBlocks(reviewResult{
+		Flagged:        o.Flagged,
+		Categories:     o.Categories,
+		CategoryScores: o.CategoryScores,
+	})
+}
+
 func NormalizeReviewConfig(cfg ReviewConfig) ReviewConfig {
 	defaults := DefaultReviewConfig()
 	// 规范化多 key：按行/逗号/分号/空白切分，去空去重，再以换行拼回，
@@ -115,23 +156,32 @@ func ValidateReviewConfig(cfg ReviewConfig) error {
 var reviewKeyCursor atomic.Uint64
 
 func (c ReviewClient) ReviewText(ctx context.Context, text string, cfg ReviewConfig, requestEndpoint string) (bool, string, error) {
+	outcome, err := c.ReviewTextDetailed(ctx, text, cfg)
+	return outcome.FlaggedForEndpoint(requestEndpoint), outcome.Model, err
+}
+
+// ReviewTextDetailed performs the same moderation request and key failover as
+// ReviewText while preserving category-level evidence for downstream routing.
+// ReviewText remains the compatibility wrapper for existing callers.
+func (c ReviewClient) ReviewTextDetailed(ctx context.Context, text string, cfg ReviewConfig) (ReviewOutcome, error) {
 	cfg = NormalizeReviewConfig(cfg)
+	empty := newReviewOutcome(cfg.Model)
 	if !cfg.Ready() {
-		return false, cfg.Model, nil
+		return empty, nil
 	}
 	if strings.TrimSpace(text) == "" {
-		return false, cfg.Model, nil
+		return empty, nil
 	}
 	endpoint, err := reviewEndpoint(cfg.BaseURL)
 	if err != nil {
-		return false, cfg.Model, err
+		return empty, err
 	}
 	payload, err := json.Marshal(reviewRequest{
 		Model: cfg.Model,
 		Input: text,
 	})
 	if err != nil {
-		return false, cfg.Model, err
+		return empty, err
 	}
 
 	keys := cfg.APIKeyList()
@@ -140,30 +190,31 @@ func (c ReviewClient) ReviewText(ctx context.Context, text string, cfg ReviewCon
 	var lastErr error
 	for i := 0; i < len(keys); i++ {
 		key := keys[(start+uint64(i))%uint64(len(keys))]
-		flagged, model, retriable, reqErr := c.reviewOnce(ctx, endpoint, key, payload, cfg, requestEndpoint)
+		outcome, retriable, reqErr := c.reviewOnceDetailed(ctx, endpoint, key, payload, cfg)
 		if reqErr == nil {
-			return flagged, model, nil
+			return outcome, nil
 		}
 		lastErr = reqErr
 		if !retriable {
-			return false, cfg.Model, reqErr
+			return empty, reqErr
 		}
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("review request failed")
 	}
-	return false, cfg.Model, lastErr
+	return empty, lastErr
 }
 
-// reviewOnce 用单个 key 发起一次 Moderations 请求。retriable 表示该错误是否
+// reviewOnceDetailed 用单个 key 发起一次 Moderations 请求。retriable 表示该错误是否
 // 值得切换到下一个 key 重试（限流/失效 key/服务端错误/网络错误）。
-func (c ReviewClient) reviewOnce(ctx context.Context, endpoint, apiKey string, payload []byte, cfg ReviewConfig, requestEndpoint string) (flagged bool, model string, retriable bool, err error) {
+func (c ReviewClient) reviewOnceDetailed(ctx context.Context, endpoint, apiKey string, payload []byte, cfg ReviewConfig) (ReviewOutcome, bool, error) {
+	empty := newReviewOutcome(cfg.Model)
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(timeoutCtx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return false, cfg.Model, false, err
+		return empty, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -175,31 +226,42 @@ func (c ReviewClient) reviewOnce(ctx context.Context, endpoint, apiKey string, p
 	resp, err := client.Do(req)
 	if err != nil {
 		// 网络错误：换下一个 key 再试。
-		return false, cfg.Model, true, err
+		return empty, true, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, cfg.Model, reviewStatusRetriable(resp.StatusCode), fmt.Errorf("review request failed with status %d", resp.StatusCode)
+		return empty, reviewStatusRetriable(resp.StatusCode), fmt.Errorf("review request failed with status %d", resp.StatusCode)
 	}
 
 	var decoded reviewResponse
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
-		return false, cfg.Model, false, err
+		return empty, false, err
 	}
 	if len(decoded.Results) == 0 {
-		return false, cfg.Model, false, fmt.Errorf("review response missing results")
+		return empty, false, fmt.Errorf("review response missing results")
 	}
+	outcome := newReviewOutcome(decoded.Model)
+	if outcome.Model == "" {
+		outcome.Model = cfg.Model
+	}
+	outcome.imagePolicyEvaluated = true
 	for _, result := range decoded.Results {
-		if reviewOnceBlocks(result, requestEndpoint) {
-			flagged = true
-			break
+		outcome.Flagged = outcome.Flagged || result.Flagged
+		outcome.imagePolicyFlagged = outcome.imagePolicyFlagged || reviewResultBlocks(result)
+		for category, flagged := range result.Categories {
+			if flagged {
+				outcome.Categories[category] = true
+			} else if _, exists := outcome.Categories[category]; !exists {
+				outcome.Categories[category] = false
+			}
+		}
+		for category, score := range result.CategoryScores {
+			if current, exists := outcome.CategoryScores[category]; !exists || score > current {
+				outcome.CategoryScores[category] = score
+			}
 		}
 	}
-	model = strings.TrimSpace(decoded.Model)
-	if model == "" {
-		model = cfg.Model
-	}
-	return flagged, model, false, nil
+	return outcome, false, nil
 }
 
 // reviewStatusRetriable 判断某个 HTTP 状态码是否应切换到下一个 key 重试：
@@ -217,18 +279,9 @@ func isImageModerationTarget(endpoint string) bool {
 	return strings.Contains(strings.ToLower(endpoint), "image")
 }
 
-// reviewOnceBlocks 依据请求端点选择 omni 拦截口径：生图端点只按性相关类别拦（reviewResultBlocks），
-// 文本端点仍按 omni 全类别 flagged 判定，保留 illicit（黑客等）/violence/hate 等对文本的覆盖。
-func reviewOnceBlocks(r reviewResult, requestEndpoint string) bool {
-	if isImageModerationTarget(requestEndpoint) {
-		return reviewResultBlocks(r)
-	}
-	return r.Flagged
-}
-
-// reviewResultBlocks 仅用于生图端点：只按性相关类别拦截——未成年性内容零容忍（类别命中或分数≥0.15），
-// 成人色情按 OpenAI 校准的类别判定；violence/self-harm 等不由本层硬拦。文本端点不走此函数。
-// 网络攻击风险仍由本地规则、语义复核与上游 cyber_policy 兜底。
+// reviewResultBlocks 仅用于生图端点：拦截性内容、高风险 illicit 与仇恨/威胁类别；
+// violence/self-harm 不由本层硬拦，避免误伤历史、游戏、武侠等生图场景。
+// 文本端点仍直接使用 provider 的全类别 flagged 判定。
 func reviewResultBlocks(r reviewResult) bool {
 	// 非标准审核响应（既无类别也无分数）时退回旧行为，避免静默关审核。
 	if len(r.Categories) == 0 && len(r.CategoryScores) == 0 {

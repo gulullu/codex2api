@@ -236,6 +236,22 @@ func (h *Handler) DeleteAccountGroup(c *gin.Context) {
 	force := strings.EqualFold(c.Query("force"), "true")
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
+	if h.store != nil {
+		cfg := h.store.GetCybRelayConfig()
+		if cfg.Enabled && cfg.GroupID == id {
+			writeError(c, http.StatusConflict, "启用中的 CYB relay 分组不能删除")
+			return
+		}
+	}
+	settings, err := h.db.GetSystemSettings(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if settings != nil && settings.PromptFilterCybRelayEnabled && settings.PromptFilterCybRelayGroupID == id {
+		writeError(c, http.StatusConflict, "启用中的 CYB relay 分组不能删除")
+		return
+	}
 	if err := h.db.DeleteAccountGroup(ctx, id, force); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "分组不存在")

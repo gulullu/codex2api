@@ -676,6 +676,71 @@ func TestSQLiteMigratesLegacyAPIKeysColumns(t *testing.T) {
 	}
 }
 
+func TestSQLiteMigratesCybRelayRoutingColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-routing.db")
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE usage_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER DEFAULT 0, status_code INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
+		`CREATE TABLE system_settings (id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1))`,
+		`CREATE TABLE prompt_filter_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, action TEXT DEFAULT '')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("create legacy routing table: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy sqlite: %v", err)
+	}
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite legacy routing) returned error: %v", err)
+	}
+	defer db.Close()
+
+	expected := map[string][]string{
+		"usage_logs": {
+			"route_class", "route_reason", "route_group_id", "route_pinned", "upstream_account_type",
+		},
+		"system_settings": {
+			"prompt_filter_cyb_relay_enabled", "prompt_filter_cyb_relay_group_id",
+			"prompt_filter_cyb_relay_session_pin_enabled", "prompt_filter_cyb_relay_session_pin_ttl_seconds",
+		},
+		"prompt_filter_logs": {
+			"account_id", "route_class", "route_reason", "route_group_id", "route_pinned", "upstream_account_type",
+		},
+	}
+	for table, names := range expected {
+		rows, err := db.conn.QueryContext(context.Background(), fmt.Sprintf("PRAGMA table_info(%s)", table))
+		if err != nil {
+			t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+		}
+		columns := make(map[string]bool)
+		for rows.Next() {
+			var cid, notNull, pk int
+			var name, columnType string
+			var defaultValue sql.NullString
+			if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+				rows.Close()
+				t.Fatalf("scan table_info(%s): %v", table, err)
+			}
+			columns[name] = true
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close table_info(%s): %v", table, err)
+		}
+		for _, name := range names {
+			if !columns[name] {
+				t.Errorf("%s missing migrated column %s", table, name)
+			}
+		}
+	}
+}
+
 func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1237,6 +1302,65 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 }
 
+func TestSQLiteCybRelaySettingsRoundtripAndNormalizeTTL(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		SiteName:                                 "CodexProxy",
+		MaxConcurrency:                           2,
+		TestModel:                                "gpt-5.4",
+		TestConcurrency:                          1,
+		PromptFilterCybRelayEnabled:              true,
+		PromptFilterCybRelayGroupID:              42,
+		PromptFilterCybRelaySessionPinEnabled:    true,
+		PromptFilterCybRelaySessionPinTTLSeconds: 10,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings returned error: %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings returned error: %v", err)
+	}
+	if !got.PromptFilterCybRelayEnabled || got.PromptFilterCybRelayGroupID != 42 || !got.PromptFilterCybRelaySessionPinEnabled {
+		t.Fatalf("cyb relay settings = %+v", got)
+	}
+	if got.PromptFilterCybRelaySessionPinTTLSeconds != 60 {
+		t.Fatalf("TTL = %d, want minimum 60", got.PromptFilterCybRelaySessionPinTTLSeconds)
+	}
+
+	got.PromptFilterCybRelaySessionPinTTLSeconds = 0
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(default TTL) returned error: %v", err)
+	}
+	got, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(default TTL) returned error: %v", err)
+	}
+	if got.PromptFilterCybRelaySessionPinTTLSeconds != 3600 {
+		t.Fatalf("default TTL = %d, want 3600", got.PromptFilterCybRelaySessionPinTTLSeconds)
+	}
+
+	got.PromptFilterCybRelaySessionPinTTLSeconds = 100000
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(max TTL) returned error: %v", err)
+	}
+	got, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(max TTL) returned error: %v", err)
+	}
+	if got.PromptFilterCybRelaySessionPinTTLSeconds != 86400 {
+		t.Fatalf("maximum TTL = %d, want 86400", got.PromptFilterCybRelaySessionPinTTLSeconds)
+	}
+}
+
 func TestSystemSettingsNormalizeBlankBillingTierPolicy(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1372,6 +1496,43 @@ func TestUsageLogsPersistEffectiveModel(t *testing.T) {
 	}
 	if logs[0].ReasoningEffort != "high" {
 		t.Fatalf("ReasoningEffort = %q, want high", logs[0].ReasoningEffort)
+	}
+}
+
+func TestSQLiteUsageLogsPersistRouteMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:           77,
+		Endpoint:            "/v1/responses",
+		Model:               "gpt-5.4",
+		StatusCode:          200,
+		RouteClass:          "cyb_relay",
+		RouteReason:         "technical_cyber_intent",
+		RouteGroupID:        42,
+		RoutePinned:         true,
+		UpstreamAccountType: "openai_responses",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog returned error: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs returned error: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	got := logs[0]
+	if got.RouteClass != "cyb_relay" || got.RouteReason != "technical_cyber_intent" || got.RouteGroupID != 42 || !got.RoutePinned || got.UpstreamAccountType != "openai_responses" {
+		t.Fatalf("route metadata = %+v", got)
 	}
 }
 
@@ -2720,18 +2881,24 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
-		Source:          "local_filter",
-		Endpoint:        "/v1/responses",
-		Model:           "gpt-5.4",
-		Action:          "allow",
-		Mode:            "block",
-		Score:           100,
-		Threshold:       50,
-		MatchedPatterns: `[{"name":"credential_theft","weight":100}]`,
-		TextPreview:     "preview",
-		ReviewModel:     "omni-moderation-latest",
-		ReviewFlagged:   false,
-		ReviewError:     "temporary failure",
+		Source:              "local_filter",
+		Endpoint:            "/v1/responses",
+		Model:               "gpt-5.4",
+		Action:              "allow",
+		Mode:                "block",
+		Score:               100,
+		Threshold:           50,
+		MatchedPatterns:     `[{"name":"credential_theft","weight":100}]`,
+		TextPreview:         "preview",
+		ReviewModel:         "omni-moderation-latest",
+		ReviewFlagged:       false,
+		ReviewError:         "temporary failure",
+		AccountID:           77,
+		RouteClass:          "cyb_relay",
+		RouteReason:         "technical_cyber_intent",
+		RouteGroupID:        42,
+		RoutePinned:         true,
+		UpstreamAccountType: "openai_responses",
 	}); err != nil {
 		t.Fatalf("InsertPromptFilterLog 返回错误: %v", err)
 	}
@@ -2746,6 +2913,9 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	got := logs[0]
 	if got.ReviewModel != "omni-moderation-latest" || got.ReviewFlagged || got.ReviewError != "temporary failure" {
 		t.Fatalf("review metadata = %+v", got)
+	}
+	if got.AccountID != 77 || got.RouteClass != "cyb_relay" || got.RouteReason != "technical_cyber_intent" || got.RouteGroupID != 42 || !got.RoutePinned || got.UpstreamAccountType != "openai_responses" {
+		t.Fatalf("route metadata = %+v", got)
 	}
 }
 

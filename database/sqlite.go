@@ -143,7 +143,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			image_bytes INTEGER DEFAULT 0,
 			image_format TEXT DEFAULT '',
 			image_size TEXT DEFAULT '',
-			error_message TEXT DEFAULT ''
+			error_message TEXT DEFAULT '',
+			route_class TEXT DEFAULT '',
+			route_reason TEXT DEFAULT '',
+			route_group_id INTEGER DEFAULT 0,
+			route_pinned INTEGER DEFAULT 0,
+			upstream_account_type TEXT DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,7 +246,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_cli_version_sync_interval_hours INTEGER DEFAULT 12,
 					model_pricing_overrides TEXT DEFAULT '{}',
 					model_pricing_sync_url TEXT DEFAULT '',
-					ignore_usage_limit_status INTEGER DEFAULT 0
+					ignore_usage_limit_status INTEGER DEFAULT 0,
+					prompt_filter_cyb_relay_enabled INTEGER DEFAULT 0,
+					prompt_filter_cyb_relay_group_id INTEGER DEFAULT 0,
+					prompt_filter_cyb_relay_session_pin_enabled INTEGER DEFAULT 1,
+					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 3600
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -344,7 +353,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			review_model TEXT DEFAULT '',
 			review_flagged INTEGER DEFAULT 0,
 			review_error TEXT DEFAULT '',
-			full_text TEXT DEFAULT ''
+			full_text TEXT DEFAULT '',
+			account_id INTEGER DEFAULT 0,
+			route_class TEXT DEFAULT '',
+			route_reason TEXT DEFAULT '',
+			route_group_id INTEGER DEFAULT 0,
+			route_pinned INTEGER DEFAULT 0,
+			upstream_account_type TEXT DEFAULT ''
 		);`,
 	}
 	for _, stmt := range statements {
@@ -396,6 +411,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
 		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
+		{"usage_logs", "route_class", "TEXT DEFAULT ''"},
+		{"usage_logs", "route_reason", "TEXT DEFAULT ''"},
+		{"usage_logs", "route_group_id", "INTEGER DEFAULT 0"},
+		{"usage_logs", "route_pinned", "INTEGER DEFAULT 0"},
+		{"usage_logs", "upstream_account_type", "TEXT DEFAULT ''"},
 		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
 		{"api_keys", "quota_used", "REAL DEFAULT 0"},
 		{"api_keys", "total_used", "REAL DEFAULT 0"},
@@ -478,11 +498,21 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_semantic_review_failure_policy", "TEXT DEFAULT 'block'"},
 		{"system_settings", "prompt_filter_semantic_review_log_retention_days", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_semantic_review_provider_pool", "TEXT DEFAULT ''"},
+		{"system_settings", "prompt_filter_cyb_relay_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "prompt_filter_cyb_relay_group_id", "INTEGER DEFAULT 0"},
+		{"system_settings", "prompt_filter_cyb_relay_session_pin_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "prompt_filter_cyb_relay_session_pin_ttl_seconds", "INTEGER DEFAULT 3600"},
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "review_error", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "full_text", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "client_request_id", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "account_id", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "route_class", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "route_reason", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "route_group_id", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "route_pinned", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "upstream_account_type", "TEXT DEFAULT ''"},
 		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
 		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.118.0'"},
 		{"system_settings", "codex_user_agent_config", "TEXT DEFAULT '{}'"},

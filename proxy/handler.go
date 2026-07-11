@@ -170,11 +170,11 @@ const (
 )
 
 const (
-	contextAPIKeyID     = "apiKeyID"
-	contextAPIKeyName   = "apiKeyName"
+	contextAPIKeyID         = "apiKeyID"
+	contextAPIKeyName       = "apiKeyName"
 	contextPromptFilterText = "promptFilterText"
-	contextAPIKeyMasked = "apiKeyMasked"
-	contextAPIKeyRow    = "apiKeyRow"
+	contextAPIKeyMasked     = "apiKeyMasked"
+	contextAPIKeyRow        = "apiKeyRow"
 )
 
 func requestAPIKeyID(c *gin.Context) int64 {
@@ -626,6 +626,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
+	populateCybUsageRouteMeta(h, c, input)
 	markCyberPolicyUsageKind(input)
 	h.logUsage(input)
 }
@@ -1659,8 +1660,22 @@ func (h *Handler) Responses(c *gin.Context) {
 	// 官方账号全不可用（如纯中转部署）时整体提升到 compact 专用链路——
 	// 该链路对两类账号都能正确完成压缩。
 	pinBodySignalToCodexAccounts := requestBodyHasCompactionTrigger(rawBody)
+	promptInspected := false
+	promptDecision := defaultPromptRiskDecision()
 	if pinBodySignalToCodexAccounts {
-		if !h.storeHasAvailableCodexAccount() {
+		if h.cybRelayConfig().Enabled {
+			earlyModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+			if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", earlyModel) {
+				return
+			}
+			promptDecision, _ = promptRiskDecisionFromContext(c)
+			promptInspected = true
+			if promptDecision.routesToCybRelay() || !h.storeHasAvailableCodexAccount() {
+				setNestedPromptRiskDecision(c, promptDecision)
+				h.ResponsesCompact(c)
+				return
+			}
+		} else if !h.storeHasAvailableCodexAccount() {
 			h.ResponsesCompact(c)
 			return
 		}
@@ -1711,8 +1726,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	} else if probeCapture != nil {
 		defer probeCapture.finish()
 	}
-	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", model) {
-		return
+	if !promptInspected {
+		if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", model) {
+			return
+		}
+		promptDecision, _ = promptRiskDecisionFromContext(c)
 	}
 
 	rawBody = normalizeServiceTierField(rawBody)
@@ -1764,9 +1782,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	if pinBodySignalToCodexAccounts {
+	if pinBodySignalToCodexAccounts && !promptDecision.routesToCybRelay() {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
+	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1791,6 +1810,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
+			if promptDecision.routesToCybRelay() {
+				sendCybRelayUnavailableOpenAI(c)
+				return
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
@@ -1802,6 +1825,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		setUpstreamAccountContext(c, account)
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
@@ -2032,6 +2056,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
 					if eventType == "response.completed" {
+						h.pinCybRelayResponseID(c, data)
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
 							actualServiceTier = tier
@@ -2077,6 +2102,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
+					h.pinCybRelayResponseID(c, respBody)
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
@@ -2426,6 +2452,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
+					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -2557,6 +2584,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
+					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -2783,6 +2811,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses/compact", model) {
 		return
 	}
+	promptDecision, _ := promptRiskDecisionFromContext(c)
 
 	rawBody = normalizeServiceTierField(rawBody)
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
@@ -2824,6 +2853,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
 	openAIResponsesBody := PrepareOpenAIResponsesCompactBody(rawBody)
@@ -2843,6 +2873,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
+				if promptDecision.routesToCybRelay() {
+					sendCybRelayUnavailableOpenAI(c)
+					return
+				}
 				if (lastStatusCode == http.StatusTooManyRequests || lastStatusCode == http.StatusBadGateway) && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
@@ -2855,6 +2889,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		setUpstreamAccountContext(c, account)
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
 
@@ -3310,6 +3345,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/chat/completions", model) {
 		return
 	}
+	promptDecision, _ := promptRiskDecisionFromContext(c)
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -3340,6 +3376,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, codexBody)
@@ -3368,6 +3405,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
+			if promptDecision.routesToCybRelay() {
+				sendCybRelayUnavailableOpenAI(c)
+				return
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
@@ -3379,6 +3420,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		setUpstreamAccountContext(c, account)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
@@ -3616,6 +3658,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
+					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -3707,6 +3750,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
 				case "response.completed":
+					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier

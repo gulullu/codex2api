@@ -5961,243 +5961,251 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	SiteName                                   string  `json:"site_name"`
-	SiteLogo                                   string  `json:"site_logo"`
-	BackgroundImage                            string  `json:"background_image"`
-	BackgroundOpacity                          int     `json:"background_opacity"`
-	BackgroundBlur                             int     `json:"background_blur"`
-	BackgroundGlassOpacity                     int     `json:"background_glass_opacity"`
-	BackgroundGlassBlur                        int     `json:"background_glass_blur"`
-	MaxConcurrency                             int     `json:"max_concurrency"`
-	GlobalRPM                                  int     `json:"global_rpm"`
-	TestModel                                  string  `json:"test_model"`
-	TestContent                                string  `json:"test_content"`
-	TestConcurrency                            int     `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes           int     `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes                    int     `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency                      int     `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled         bool    `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes               int     `json:"recovery_probe_interval_minutes"`
-	LazyMode                                   bool    `json:"lazy_mode"`
-	ProxyURL                                   string  `json:"proxy_url"`
-	PgMaxConns                                 int     `json:"pg_max_conns"`
-	RedisPoolSize                              int     `json:"redis_pool_size"`
-	AutoCleanUnauthorized                      bool    `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited                       bool    `json:"auto_clean_rate_limited"`
-	AdminSecret                                string  `json:"admin_secret"`
-	AdminAuthSource                            string  `json:"admin_auth_source"`
-	AutoCleanFullUsage                         bool    `json:"auto_clean_full_usage"`
-	AutoCleanError                             bool    `json:"auto_clean_error"`
-	AutoCleanExpired                           bool    `json:"auto_clean_expired"`
-	ProxyPoolEnabled                           bool    `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled                       bool    `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                        bool    `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled                    bool    `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec                int     `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors                  bool    `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled                  bool    `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries                    int     `json:"codex_ws_silent_max_retries"`
-	CodexContinueThinkingEnabled               bool    `json:"codex_continue_thinking_enabled"`
-	CodexContinueMaxRounds                     int     `json:"codex_continue_max_rounds"`
-	CodexCLIVersionSyncEnabled                 bool    `json:"codex_cli_version_sync_enabled"`
-	CodexCLIVersionSyncIntervalHours           int     `json:"codex_cli_version_sync_interval_hours"`
-	CodexSyncedCLIVersion                      string  `json:"codex_synced_cli_version"`
-	SchedulerMode                              string  `json:"scheduler_mode"`
-	AffinityMode                               string  `json:"affinity_mode"`
-	MaxRetries                                 int     `json:"max_retries"`
-	MaxRateLimitRetries                        int     `json:"max_rate_limit_retries"`
-	AllowRemoteMigration                       bool    `json:"allow_remote_migration"`
-	DatabaseDriver                             string  `json:"database_driver"`
-	DatabaseLabel                              string  `json:"database_label"`
-	CacheDriver                                string  `json:"cache_driver"`
-	CacheLabel                                 string  `json:"cache_label"`
-	ExpiredCleaned                             int     `json:"expired_cleaned,omitempty"`
-	ModelMapping                               string  `json:"model_mapping"`
-	CodexModelMapping                          string  `json:"codex_model_mapping"`
-	ReasoningEffortModels                      string  `json:"reasoning_effort_models"`
-	ResinURL                                   string  `json:"resin_url"`
-	ResinPlatformName                          string  `json:"resin_platform_name"`
-	PromptFilterEnabled                        bool    `json:"prompt_filter_enabled"`
-	PromptFilterMode                           string  `json:"prompt_filter_mode"`
-	PromptFilterThreshold                      int     `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold                int     `json:"prompt_filter_strict_threshold"`
-	PromptFilterLogMatches                     bool    `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength                  int     `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords                 string  `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns                 string  `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns               string  `json:"prompt_filter_disabled_patterns"`
-	PromptFilterReviewEnabled                  bool    `json:"prompt_filter_review_enabled"`
-	PromptFilterReviewAll                      bool    `json:"prompt_filter_review_all"`
-	PromptFilterReviewAPIKeyConfigured         bool    `json:"prompt_filter_review_api_key_configured"`
-	PromptFilterReviewAPIKeyCount              int     `json:"prompt_filter_review_api_key_count"`
-	PromptFilterReviewBaseURL                  string  `json:"prompt_filter_review_base_url"`
-	PromptFilterReviewModel                    string  `json:"prompt_filter_review_model"`
-	PromptFilterReviewTimeoutSeconds           int     `json:"prompt_filter_review_timeout_seconds"`
-	PromptFilterReviewFailClosed               bool    `json:"prompt_filter_review_fail_closed"`
-	PromptFilterSemanticReviewEnabled          bool    `json:"prompt_filter_semantic_review_enabled"`
-	PromptFilterSemanticReviewAPIKeyConfigured bool    `json:"prompt_filter_semantic_review_api_key_configured"`
-	PromptFilterSemanticReviewAPIKeyCount      int     `json:"prompt_filter_semantic_review_api_key_count"`
-	PromptFilterSemanticReviewBaseURL          string  `json:"prompt_filter_semantic_review_base_url"`
-	PromptFilterSemanticReviewModel            string  `json:"prompt_filter_semantic_review_model"`
-	PromptFilterSemanticReviewTimeoutMS        int     `json:"prompt_filter_semantic_review_timeout_ms"`
-	PromptFilterSemanticReviewMaxConcurrency   int     `json:"prompt_filter_semantic_review_max_concurrency"`
-	PromptFilterSemanticReviewFailurePolicy    string  `json:"prompt_filter_semantic_review_failure_policy"`
-	PromptFilterSemanticReviewLogRetentionDays int     `json:"prompt_filter_semantic_review_log_retention_days"`
-	PromptFilterSemanticReviewStrategy         string  `json:"prompt_filter_semantic_review_strategy"`
+	SiteName                                   string                         `json:"site_name"`
+	SiteLogo                                   string                         `json:"site_logo"`
+	BackgroundImage                            string                         `json:"background_image"`
+	BackgroundOpacity                          int                            `json:"background_opacity"`
+	BackgroundBlur                             int                            `json:"background_blur"`
+	BackgroundGlassOpacity                     int                            `json:"background_glass_opacity"`
+	BackgroundGlassBlur                        int                            `json:"background_glass_blur"`
+	MaxConcurrency                             int                            `json:"max_concurrency"`
+	GlobalRPM                                  int                            `json:"global_rpm"`
+	TestModel                                  string                         `json:"test_model"`
+	TestContent                                string                         `json:"test_content"`
+	TestConcurrency                            int                            `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes           int                            `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes                    int                            `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency                      int                            `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled         bool                           `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes               int                            `json:"recovery_probe_interval_minutes"`
+	LazyMode                                   bool                           `json:"lazy_mode"`
+	ProxyURL                                   string                         `json:"proxy_url"`
+	PgMaxConns                                 int                            `json:"pg_max_conns"`
+	RedisPoolSize                              int                            `json:"redis_pool_size"`
+	AutoCleanUnauthorized                      bool                           `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                       bool                           `json:"auto_clean_rate_limited"`
+	AdminSecret                                string                         `json:"admin_secret"`
+	AdminAuthSource                            string                         `json:"admin_auth_source"`
+	AutoCleanFullUsage                         bool                           `json:"auto_clean_full_usage"`
+	AutoCleanError                             bool                           `json:"auto_clean_error"`
+	AutoCleanExpired                           bool                           `json:"auto_clean_expired"`
+	ProxyPoolEnabled                           bool                           `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                       bool                           `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                        bool                           `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled                    bool                           `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec                int                            `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors                  bool                           `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled                  bool                           `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries                    int                            `json:"codex_ws_silent_max_retries"`
+	CodexContinueThinkingEnabled               bool                           `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds                     int                            `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled                 bool                           `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours           int                            `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion                      string                         `json:"codex_synced_cli_version"`
+	SchedulerMode                              string                         `json:"scheduler_mode"`
+	AffinityMode                               string                         `json:"affinity_mode"`
+	MaxRetries                                 int                            `json:"max_retries"`
+	MaxRateLimitRetries                        int                            `json:"max_rate_limit_retries"`
+	AllowRemoteMigration                       bool                           `json:"allow_remote_migration"`
+	DatabaseDriver                             string                         `json:"database_driver"`
+	DatabaseLabel                              string                         `json:"database_label"`
+	CacheDriver                                string                         `json:"cache_driver"`
+	CacheLabel                                 string                         `json:"cache_label"`
+	ExpiredCleaned                             int                            `json:"expired_cleaned,omitempty"`
+	ModelMapping                               string                         `json:"model_mapping"`
+	CodexModelMapping                          string                         `json:"codex_model_mapping"`
+	ReasoningEffortModels                      string                         `json:"reasoning_effort_models"`
+	ResinURL                                   string                         `json:"resin_url"`
+	ResinPlatformName                          string                         `json:"resin_platform_name"`
+	PromptFilterEnabled                        bool                           `json:"prompt_filter_enabled"`
+	PromptFilterMode                           string                         `json:"prompt_filter_mode"`
+	PromptFilterThreshold                      int                            `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold                int                            `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches                     bool                           `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength                  int                            `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords                 string                         `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns                 string                         `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns               string                         `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled                  bool                           `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAll                      bool                           `json:"prompt_filter_review_all"`
+	PromptFilterReviewAPIKeyConfigured         bool                           `json:"prompt_filter_review_api_key_configured"`
+	PromptFilterReviewAPIKeyCount              int                            `json:"prompt_filter_review_api_key_count"`
+	PromptFilterReviewBaseURL                  string                         `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel                    string                         `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds           int                            `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed               bool                           `json:"prompt_filter_review_fail_closed"`
+	PromptFilterCybRelayEnabled                bool                           `json:"prompt_filter_cyb_relay_enabled"`
+	PromptFilterCybRelayGroupID                int64                          `json:"prompt_filter_cyb_relay_group_id"`
+	PromptFilterCybRelaySessionPinEnabled      bool                           `json:"prompt_filter_cyb_relay_session_pin_enabled"`
+	PromptFilterCybRelaySessionPinTTLSeconds   int                            `json:"prompt_filter_cyb_relay_session_pin_ttl_seconds"`
+	PromptFilterSemanticReviewEnabled          bool                           `json:"prompt_filter_semantic_review_enabled"`
+	PromptFilterSemanticReviewAPIKeyConfigured bool                           `json:"prompt_filter_semantic_review_api_key_configured"`
+	PromptFilterSemanticReviewAPIKeyCount      int                            `json:"prompt_filter_semantic_review_api_key_count"`
+	PromptFilterSemanticReviewBaseURL          string                         `json:"prompt_filter_semantic_review_base_url"`
+	PromptFilterSemanticReviewModel            string                         `json:"prompt_filter_semantic_review_model"`
+	PromptFilterSemanticReviewTimeoutMS        int                            `json:"prompt_filter_semantic_review_timeout_ms"`
+	PromptFilterSemanticReviewMaxConcurrency   int                            `json:"prompt_filter_semantic_review_max_concurrency"`
+	PromptFilterSemanticReviewFailurePolicy    string                         `json:"prompt_filter_semantic_review_failure_policy"`
+	PromptFilterSemanticReviewLogRetentionDays int                            `json:"prompt_filter_semantic_review_log_retention_days"`
+	PromptFilterSemanticReviewStrategy         string                         `json:"prompt_filter_semantic_review_strategy"`
 	PromptFilterSemanticReviewProviders        []proxy.SemanticReviewProvider `json:"prompt_filter_semantic_review_providers"`
-	ClientCompatMode                           string  `json:"client_compat_mode"`
-	CodexMinCLIVersion                         string  `json:"codex_min_cli_version"`
-	CodexUserAgentConfig                       string  `json:"codex_user_agent_config"`
-	UsageLogMode                               string  `json:"usage_log_mode"`
-	UsageLogBatchSize                          int     `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds               int     `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                          string  `json:"stream_flush_policy"`
-	StreamFlushIntervalMS                      int     `json:"stream_flush_interval_ms"`
-	FirstTokenMode                             string  `json:"first_token_mode"`
-	FirstTokenTimeoutSeconds                   int     `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                          string  `json:"billing_tier_policy"`
-	ShowFullUsageNumbers                       bool    `json:"show_full_usage_numbers"`
-	PublicKeyUsagePageEnabled                  bool    `json:"public_key_usage_page_enabled"`
-	ImageStorageBackend                        string  `json:"image_storage_backend"`
-	ImageS3Endpoint                            string  `json:"image_s3_endpoint"`
-	ImageS3Region                              string  `json:"image_s3_region"`
-	ImageS3Bucket                              string  `json:"image_s3_bucket"`
-	ImageS3AccessKey                           string  `json:"image_s3_access_key"`
-	ImageS3SecretKey                           string  `json:"image_s3_secret_key"`
-	ImageS3Prefix                              string  `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle                      bool    `json:"image_s3_force_path_style"`
-	AutoPause5hThreshold                       float64 `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold                       float64 `json:"auto_pause_7d_threshold"`
-	AutoPause5hGuardBandPercent                float64 `json:"auto_pause_5h_guard_band_percent"`
-	AutoPause5hGuardConcurrency                int     `json:"auto_pause_5h_guard_concurrency"`
-	SmartPacingEnabled                         bool    `json:"smart_pacing_enabled"`
-	SmartPacingMinConcurrency                  int     `json:"smart_pacing_min_concurrency"`
-	SmartPacingWindows                         string  `json:"smart_pacing_windows"`
-	IgnoreUsageLimitStatus                     bool    `json:"ignore_usage_limit_status"`
-	RetryIntervalMS                            int     `json:"retry_interval_ms"`
-	TransportRetryPolicy                       string  `json:"transport_retry_policy"`
+	ClientCompatMode                           string                         `json:"client_compat_mode"`
+	CodexMinCLIVersion                         string                         `json:"codex_min_cli_version"`
+	CodexUserAgentConfig                       string                         `json:"codex_user_agent_config"`
+	UsageLogMode                               string                         `json:"usage_log_mode"`
+	UsageLogBatchSize                          int                            `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds               int                            `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                          string                         `json:"stream_flush_policy"`
+	StreamFlushIntervalMS                      int                            `json:"stream_flush_interval_ms"`
+	FirstTokenMode                             string                         `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds                   int                            `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                          string                         `json:"billing_tier_policy"`
+	ShowFullUsageNumbers                       bool                           `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled                  bool                           `json:"public_key_usage_page_enabled"`
+	ImageStorageBackend                        string                         `json:"image_storage_backend"`
+	ImageS3Endpoint                            string                         `json:"image_s3_endpoint"`
+	ImageS3Region                              string                         `json:"image_s3_region"`
+	ImageS3Bucket                              string                         `json:"image_s3_bucket"`
+	ImageS3AccessKey                           string                         `json:"image_s3_access_key"`
+	ImageS3SecretKey                           string                         `json:"image_s3_secret_key"`
+	ImageS3Prefix                              string                         `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle                      bool                           `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold                       float64                        `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                       float64                        `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent                float64                        `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency                int                            `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                         bool                           `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency                  int                            `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                         string                         `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus                     bool                           `json:"ignore_usage_limit_status"`
+	RetryIntervalMS                            int                            `json:"retry_interval_ms"`
+	TransportRetryPolicy                       string                         `json:"transport_retry_policy"`
 }
 
 type updateSettingsReq struct {
-	SiteName                                   *string  `json:"site_name"`
-	SiteLogo                                   *string  `json:"site_logo"`
-	BackgroundImage                            *string  `json:"background_image"`
-	BackgroundOpacity                          *int     `json:"background_opacity"`
-	BackgroundBlur                             *int     `json:"background_blur"`
-	BackgroundGlassOpacity                     *int     `json:"background_glass_opacity"`
-	BackgroundGlassBlur                        *int     `json:"background_glass_blur"`
-	MaxConcurrency                             *int     `json:"max_concurrency"`
-	GlobalRPM                                  *int     `json:"global_rpm"`
-	TestModel                                  *string  `json:"test_model"`
-	TestContent                                *string  `json:"test_content"`
-	TestConcurrency                            *int     `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes           *int     `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes                    *int     `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency                      *int     `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled         *bool    `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes               *int     `json:"recovery_probe_interval_minutes"`
-	LazyMode                                   *bool    `json:"lazy_mode"`
-	ProxyURL                                   *string  `json:"proxy_url"`
-	PgMaxConns                                 *int     `json:"pg_max_conns"`
-	RedisPoolSize                              *int     `json:"redis_pool_size"`
-	AutoCleanUnauthorized                      *bool    `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited                       *bool    `json:"auto_clean_rate_limited"`
-	AdminSecret                                *string  `json:"admin_secret"`
-	AutoCleanFullUsage                         *bool    `json:"auto_clean_full_usage"`
-	AutoCleanError                             *bool    `json:"auto_clean_error"`
-	AutoCleanExpired                           *bool    `json:"auto_clean_expired"`
-	ProxyPoolEnabled                           *bool    `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled                       *bool    `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                        *bool    `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled                    *bool    `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec                *int     `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors                  *bool    `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled                  *bool    `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries                    *int     `json:"codex_ws_silent_max_retries"`
-	CodexContinueThinkingEnabled               *bool    `json:"codex_continue_thinking_enabled"`
-	CodexContinueMaxRounds                     *int     `json:"codex_continue_max_rounds"`
-	CodexCLIVersionSyncEnabled                 *bool    `json:"codex_cli_version_sync_enabled"`
-	CodexCLIVersionSyncIntervalHours           *int     `json:"codex_cli_version_sync_interval_hours"`
-	SchedulerMode                              *string  `json:"scheduler_mode"`
-	AffinityMode                               *string  `json:"affinity_mode"`
-	MaxRetries                                 *int     `json:"max_retries"`
-	MaxRateLimitRetries                        *int     `json:"max_rate_limit_retries"`
-	AllowRemoteMigration                       *bool    `json:"allow_remote_migration"`
-	ModelMapping                               *string  `json:"model_mapping"`
-	CodexModelMapping                          *string  `json:"codex_model_mapping"`
-	ReasoningEffortModels                      *string  `json:"reasoning_effort_models"`
-	ResinURL                                   *string  `json:"resin_url"`
-	ResinPlatformName                          *string  `json:"resin_platform_name"`
-	PromptFilterEnabled                        *bool    `json:"prompt_filter_enabled"`
-	PromptFilterMode                           *string  `json:"prompt_filter_mode"`
-	PromptFilterThreshold                      *int     `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold                *int     `json:"prompt_filter_strict_threshold"`
-	PromptFilterLogMatches                     *bool    `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength                  *int     `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords                 *string  `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns                 *string  `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns               *string  `json:"prompt_filter_disabled_patterns"`
-	PromptFilterReviewEnabled                  *bool    `json:"prompt_filter_review_enabled"`
-	PromptFilterReviewAll                      *bool    `json:"prompt_filter_review_all"`
-	PromptFilterReviewAPIKey                   *string  `json:"prompt_filter_review_api_key"`
-	PromptFilterReviewBaseURL                  *string  `json:"prompt_filter_review_base_url"`
-	PromptFilterReviewModel                    *string  `json:"prompt_filter_review_model"`
-	PromptFilterReviewTimeoutSeconds           *int     `json:"prompt_filter_review_timeout_seconds"`
-	PromptFilterReviewFailClosed               *bool    `json:"prompt_filter_review_fail_closed"`
-	PromptFilterSemanticReviewEnabled          *bool    `json:"prompt_filter_semantic_review_enabled"`
-	PromptFilterSemanticReviewAPIKey           *string  `json:"prompt_filter_semantic_review_api_key"`
-	PromptFilterSemanticReviewBaseURL          *string  `json:"prompt_filter_semantic_review_base_url"`
-	PromptFilterSemanticReviewModel            *string  `json:"prompt_filter_semantic_review_model"`
-	PromptFilterSemanticReviewTimeoutMS        *int     `json:"prompt_filter_semantic_review_timeout_ms"`
-	PromptFilterSemanticReviewMaxConcurrency   *int     `json:"prompt_filter_semantic_review_max_concurrency"`
-	PromptFilterSemanticReviewFailurePolicy    *string  `json:"prompt_filter_semantic_review_failure_policy"`
-	PromptFilterSemanticReviewLogRetentionDays *int     `json:"prompt_filter_semantic_review_log_retention_days"`
-	PromptFilterSemanticReviewStrategy         *string  `json:"prompt_filter_semantic_review_strategy"`
+	SiteName                                   *string                         `json:"site_name"`
+	SiteLogo                                   *string                         `json:"site_logo"`
+	BackgroundImage                            *string                         `json:"background_image"`
+	BackgroundOpacity                          *int                            `json:"background_opacity"`
+	BackgroundBlur                             *int                            `json:"background_blur"`
+	BackgroundGlassOpacity                     *int                            `json:"background_glass_opacity"`
+	BackgroundGlassBlur                        *int                            `json:"background_glass_blur"`
+	MaxConcurrency                             *int                            `json:"max_concurrency"`
+	GlobalRPM                                  *int                            `json:"global_rpm"`
+	TestModel                                  *string                         `json:"test_model"`
+	TestContent                                *string                         `json:"test_content"`
+	TestConcurrency                            *int                            `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes           *int                            `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes                    *int                            `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency                      *int                            `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled         *bool                           `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes               *int                            `json:"recovery_probe_interval_minutes"`
+	LazyMode                                   *bool                           `json:"lazy_mode"`
+	ProxyURL                                   *string                         `json:"proxy_url"`
+	PgMaxConns                                 *int                            `json:"pg_max_conns"`
+	RedisPoolSize                              *int                            `json:"redis_pool_size"`
+	AutoCleanUnauthorized                      *bool                           `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                       *bool                           `json:"auto_clean_rate_limited"`
+	AdminSecret                                *string                         `json:"admin_secret"`
+	AutoCleanFullUsage                         *bool                           `json:"auto_clean_full_usage"`
+	AutoCleanError                             *bool                           `json:"auto_clean_error"`
+	AutoCleanExpired                           *bool                           `json:"auto_clean_expired"`
+	ProxyPoolEnabled                           *bool                           `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                       *bool                           `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                        *bool                           `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled                    *bool                           `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec                *int                            `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors                  *bool                           `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled                  *bool                           `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries                    *int                            `json:"codex_ws_silent_max_retries"`
+	CodexContinueThinkingEnabled               *bool                           `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds                     *int                            `json:"codex_continue_max_rounds"`
+	CodexCLIVersionSyncEnabled                 *bool                           `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours           *int                            `json:"codex_cli_version_sync_interval_hours"`
+	SchedulerMode                              *string                         `json:"scheduler_mode"`
+	AffinityMode                               *string                         `json:"affinity_mode"`
+	MaxRetries                                 *int                            `json:"max_retries"`
+	MaxRateLimitRetries                        *int                            `json:"max_rate_limit_retries"`
+	AllowRemoteMigration                       *bool                           `json:"allow_remote_migration"`
+	ModelMapping                               *string                         `json:"model_mapping"`
+	CodexModelMapping                          *string                         `json:"codex_model_mapping"`
+	ReasoningEffortModels                      *string                         `json:"reasoning_effort_models"`
+	ResinURL                                   *string                         `json:"resin_url"`
+	ResinPlatformName                          *string                         `json:"resin_platform_name"`
+	PromptFilterEnabled                        *bool                           `json:"prompt_filter_enabled"`
+	PromptFilterMode                           *string                         `json:"prompt_filter_mode"`
+	PromptFilterThreshold                      *int                            `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold                *int                            `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches                     *bool                           `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength                  *int                            `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords                 *string                         `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns                 *string                         `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns               *string                         `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled                  *bool                           `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAll                      *bool                           `json:"prompt_filter_review_all"`
+	PromptFilterReviewAPIKey                   *string                         `json:"prompt_filter_review_api_key"`
+	PromptFilterReviewBaseURL                  *string                         `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel                    *string                         `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds           *int                            `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed               *bool                           `json:"prompt_filter_review_fail_closed"`
+	PromptFilterCybRelayEnabled                *bool                           `json:"prompt_filter_cyb_relay_enabled"`
+	PromptFilterCybRelayGroupID                *int64                          `json:"prompt_filter_cyb_relay_group_id"`
+	PromptFilterCybRelaySessionPinEnabled      *bool                           `json:"prompt_filter_cyb_relay_session_pin_enabled"`
+	PromptFilterCybRelaySessionPinTTLSeconds   *int                            `json:"prompt_filter_cyb_relay_session_pin_ttl_seconds"`
+	PromptFilterSemanticReviewEnabled          *bool                           `json:"prompt_filter_semantic_review_enabled"`
+	PromptFilterSemanticReviewAPIKey           *string                         `json:"prompt_filter_semantic_review_api_key"`
+	PromptFilterSemanticReviewBaseURL          *string                         `json:"prompt_filter_semantic_review_base_url"`
+	PromptFilterSemanticReviewModel            *string                         `json:"prompt_filter_semantic_review_model"`
+	PromptFilterSemanticReviewTimeoutMS        *int                            `json:"prompt_filter_semantic_review_timeout_ms"`
+	PromptFilterSemanticReviewMaxConcurrency   *int                            `json:"prompt_filter_semantic_review_max_concurrency"`
+	PromptFilterSemanticReviewFailurePolicy    *string                         `json:"prompt_filter_semantic_review_failure_policy"`
+	PromptFilterSemanticReviewLogRetentionDays *int                            `json:"prompt_filter_semantic_review_log_retention_days"`
+	PromptFilterSemanticReviewStrategy         *string                         `json:"prompt_filter_semantic_review_strategy"`
 	PromptFilterSemanticReviewProviders        *[]proxy.SemanticReviewProvider `json:"prompt_filter_semantic_review_providers"`
-	ClientCompatMode                           *string  `json:"client_compat_mode"`
-	CodexMinCLIVersion                         *string  `json:"codex_min_cli_version"`
-	CodexUserAgentConfig                       *string  `json:"codex_user_agent_config"`
-	UsageLogMode                               *string  `json:"usage_log_mode"`
-	UsageLogBatchSize                          *int     `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds               *int     `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                          *string  `json:"stream_flush_policy"`
-	StreamFlushIntervalMS                      *int     `json:"stream_flush_interval_ms"`
-	FirstTokenMode                             *string  `json:"first_token_mode"`
-	FirstTokenTimeoutSeconds                   *int     `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                          *string  `json:"billing_tier_policy"`
-	ShowFullUsageNumbers                       *bool    `json:"show_full_usage_numbers"`
-	PublicKeyUsagePageEnabled                  *bool    `json:"public_key_usage_page_enabled"`
-	ImageStorageBackend                        *string  `json:"image_storage_backend"`
-	ImageS3Endpoint                            *string  `json:"image_s3_endpoint"`
-	ImageS3Region                              *string  `json:"image_s3_region"`
-	ImageS3Bucket                              *string  `json:"image_s3_bucket"`
-	ImageS3AccessKey                           *string  `json:"image_s3_access_key"`
-	ImageS3SecretKey                           *string  `json:"image_s3_secret_key"`
-	ImageS3Prefix                              *string  `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle                      *bool    `json:"image_s3_force_path_style"`
-	AutoPause5hThreshold                       *float64 `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold                       *float64 `json:"auto_pause_7d_threshold"`
-	AutoPause5hGuardBandPercent                *float64 `json:"auto_pause_5h_guard_band_percent"`
-	AutoPause5hGuardConcurrency                *int     `json:"auto_pause_5h_guard_concurrency"`
-	SmartPacingEnabled                         *bool    `json:"smart_pacing_enabled"`
-	SmartPacingMinConcurrency                  *int     `json:"smart_pacing_min_concurrency"`
-	SmartPacingWindows                         *string  `json:"smart_pacing_windows"`
-	IgnoreUsageLimitStatus                     *bool    `json:"ignore_usage_limit_status"`
-	RetryIntervalMS                            *int     `json:"retry_interval_ms"`
-	TransportRetryPolicy                       *string  `json:"transport_retry_policy"`
+	ClientCompatMode                           *string                         `json:"client_compat_mode"`
+	CodexMinCLIVersion                         *string                         `json:"codex_min_cli_version"`
+	CodexUserAgentConfig                       *string                         `json:"codex_user_agent_config"`
+	UsageLogMode                               *string                         `json:"usage_log_mode"`
+	UsageLogBatchSize                          *int                            `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds               *int                            `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                          *string                         `json:"stream_flush_policy"`
+	StreamFlushIntervalMS                      *int                            `json:"stream_flush_interval_ms"`
+	FirstTokenMode                             *string                         `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds                   *int                            `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                          *string                         `json:"billing_tier_policy"`
+	ShowFullUsageNumbers                       *bool                           `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled                  *bool                           `json:"public_key_usage_page_enabled"`
+	ImageStorageBackend                        *string                         `json:"image_storage_backend"`
+	ImageS3Endpoint                            *string                         `json:"image_s3_endpoint"`
+	ImageS3Region                              *string                         `json:"image_s3_region"`
+	ImageS3Bucket                              *string                         `json:"image_s3_bucket"`
+	ImageS3AccessKey                           *string                         `json:"image_s3_access_key"`
+	ImageS3SecretKey                           *string                         `json:"image_s3_secret_key"`
+	ImageS3Prefix                              *string                         `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle                      *bool                           `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold                       *float64                        `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                       *float64                        `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent                *float64                        `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency                *int                            `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                         *bool                           `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency                  *int                            `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                         *string                         `json:"smart_pacing_windows"`
+	IgnoreUsageLimitStatus                     *bool                           `json:"ignore_usage_limit_status"`
+	RetryIntervalMS                            *int                            `json:"retry_interval_ms"`
+	TransportRetryPolicy                       *string                         `json:"transport_retry_policy"`
 }
 
 type promptFilterSemanticReviewResolved struct {
-	Enabled          bool
-	APIKey           string
-	BaseURL          string
-	Model            string
-	TimeoutMS        int
-	MaxConcurrency   int
-	FailurePolicy    string
-	LogRetentionDays int
-	Strategy         string
-	Providers        []proxy.SemanticReviewProvider
+	Enabled                bool
+	APIKey                 string
+	BaseURL                string
+	Model                  string
+	TimeoutMS              int
+	MaxConcurrency         int
+	FailurePolicy          string
+	LogRetentionDays       int
+	Strategy               string
+	Providers              []proxy.SemanticReviewProvider
 	ProviderPoolConfigured bool
 }
 
@@ -6940,6 +6948,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
+	cybRelayCfg := h.store.GetCybRelayConfig()
 	semanticReviewCfg := resolvePromptFilterSemanticReview(dbSettings)
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	imgCfg := imagestore.CurrentConfig()
@@ -7021,6 +7030,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterReviewModel:                    promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:           promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:               promptFilterCfg.Review.FailClosed,
+		PromptFilterCybRelayEnabled:                cybRelayCfg.Enabled,
+		PromptFilterCybRelayGroupID:                cybRelayCfg.GroupID,
+		PromptFilterCybRelaySessionPinEnabled:      cybRelayCfg.SessionPinEnabled,
+		PromptFilterCybRelaySessionPinTTLSeconds:   cybRelayCfg.SessionPinTTLSeconds,
 		PromptFilterSemanticReviewEnabled:          semanticReviewCfg.Enabled,
 		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewProviderKeyCount(semanticReviewCfg.Providers) > 0,
 		PromptFilterSemanticReviewAPIKeyCount:      semanticReviewProviderKeyCount(semanticReviewCfg.Providers),
@@ -7127,6 +7140,39 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
+	}
+	cybRelayCfg := h.store.GetCybRelayConfig()
+	cybRelayChanged := req.PromptFilterCybRelayEnabled != nil ||
+		req.PromptFilterCybRelayGroupID != nil ||
+		req.PromptFilterCybRelaySessionPinEnabled != nil ||
+		req.PromptFilterCybRelaySessionPinTTLSeconds != nil
+	if req.PromptFilterCybRelayEnabled != nil {
+		cybRelayCfg.Enabled = *req.PromptFilterCybRelayEnabled
+	}
+	if req.PromptFilterCybRelayGroupID != nil {
+		cybRelayCfg.GroupID = *req.PromptFilterCybRelayGroupID
+	}
+	if req.PromptFilterCybRelaySessionPinEnabled != nil {
+		cybRelayCfg.SessionPinEnabled = *req.PromptFilterCybRelaySessionPinEnabled
+	}
+	if req.PromptFilterCybRelaySessionPinTTLSeconds != nil {
+		cybRelayCfg.SessionPinTTLSeconds = *req.PromptFilterCybRelaySessionPinTTLSeconds
+	}
+	cybRelayCfg = auth.NormalizeCybRelayConfig(cybRelayCfg)
+	if cybRelayChanged && cybRelayCfg.Enabled {
+		if cybRelayCfg.GroupID <= 0 {
+			writeError(c, http.StatusBadRequest, "启用 CYB relay 时必须选择有效的账号分组")
+			return
+		}
+		missing, err := h.db.VerifyAccountGroupIDs(c.Request.Context(), []int64{cybRelayCfg.GroupID})
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验 CYB relay 账号分组失败: "+err.Error())
+			return
+		}
+		if len(missing) > 0 {
+			writeError(c, http.StatusBadRequest, "CYB relay 账号分组不存在")
+			return
+		}
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -7938,6 +7984,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("图片存储配置序列化失败: %v", encodeErr)
 		imgConfigJSON = "{}"
 	}
+	if cybRelayChanged {
+		h.store.SetCybRelayConfig(cybRelayCfg)
+		log.Printf("设置已更新: prompt_filter_cyb_relay enabled=%t group_id=%d session_pin=%t ttl_seconds=%d", cybRelayCfg.Enabled, cybRelayCfg.GroupID, cybRelayCfg.SessionPinEnabled, cybRelayCfg.SessionPinTTLSeconds)
+	}
 
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
@@ -8002,6 +8052,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterReviewModel:                    promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:           promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:               promptFilterCfg.Review.FailClosed,
+		PromptFilterCybRelayEnabled:                cybRelayCfg.Enabled,
+		PromptFilterCybRelayGroupID:                cybRelayCfg.GroupID,
+		PromptFilterCybRelaySessionPinEnabled:      cybRelayCfg.SessionPinEnabled,
+		PromptFilterCybRelaySessionPinTTLSeconds:   cybRelayCfg.SessionPinTTLSeconds,
 		PromptFilterSemanticReviewEnabled:          semanticReviewEnabled,
 		PromptFilterSemanticReviewAPIKey:           semanticReviewAPIKey,
 		PromptFilterSemanticReviewBaseURL:          semanticReviewBaseURL,
@@ -8139,6 +8193,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterReviewModel:                    promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:           promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:               promptFilterCfg.Review.FailClosed,
+		PromptFilterCybRelayEnabled:                cybRelayCfg.Enabled,
+		PromptFilterCybRelayGroupID:                cybRelayCfg.GroupID,
+		PromptFilterCybRelaySessionPinEnabled:      cybRelayCfg.SessionPinEnabled,
+		PromptFilterCybRelaySessionPinTTLSeconds:   cybRelayCfg.SessionPinTTLSeconds,
 		PromptFilterSemanticReviewEnabled:          semanticReviewResponse.Enabled,
 		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewProviderKeyCount(semanticReviewResponse.Providers) > 0,
 		PromptFilterSemanticReviewAPIKeyCount:      semanticReviewProviderKeyCount(semanticReviewResponse.Providers),

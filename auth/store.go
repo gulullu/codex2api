@@ -216,6 +216,36 @@ type ModelCooldown struct {
 type AccountFilter func(*Account) bool
 
 const (
+	DefaultCybRelaySessionPinTTLSeconds = 3600
+	MinCybRelaySessionPinTTLSeconds     = 60
+	MaxCybRelaySessionPinTTLSeconds     = 86400
+)
+
+// CybRelayConfig controls routing high-risk prompt-filter traffic to a
+// dedicated account group. The snapshot is stored atomically by Store.
+type CybRelayConfig struct {
+	Enabled              bool
+	GroupID              int64
+	SessionPinEnabled    bool
+	SessionPinTTLSeconds int
+}
+
+func NormalizeCybRelayConfig(cfg CybRelayConfig) CybRelayConfig {
+	if cfg.GroupID < 0 {
+		cfg.GroupID = 0
+	}
+	switch {
+	case cfg.SessionPinTTLSeconds <= 0:
+		cfg.SessionPinTTLSeconds = DefaultCybRelaySessionPinTTLSeconds
+	case cfg.SessionPinTTLSeconds < MinCybRelaySessionPinTTLSeconds:
+		cfg.SessionPinTTLSeconds = MinCybRelaySessionPinTTLSeconds
+	case cfg.SessionPinTTLSeconds > MaxCybRelaySessionPinTTLSeconds:
+		cfg.SessionPinTTLSeconds = MaxCybRelaySessionPinTTLSeconds
+	}
+	return cfg
+}
+
+const (
 	defaultBackgroundRefreshInterval = 2 * time.Minute
 	defaultUsageProbeMaxAge          = 10 * time.Minute
 	defaultUsageProbeConcurrency     = 16
@@ -275,6 +305,22 @@ type SchedulerDebugSnapshot struct {
 // ID 返回数据库 ID
 func (a *Account) ID() int64 {
 	return a.DBID
+}
+
+// HasGroupID reports whether the account belongs to id while protecting the
+// mutable GroupIDs slice from concurrent account refreshes.
+func (a *Account) HasGroupID(id int64) bool {
+	if a == nil || id <= 0 {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, groupID := range a.GroupIDs {
+		if groupID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Mu 返回读写锁（供外部包安全读取字段）
@@ -2291,6 +2337,7 @@ type Store struct {
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
 	promptFilterConfig    atomic.Value // promptfilter.Config
+	cybRelayConfig        atomic.Value // CybRelayConfig
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
 
@@ -2672,27 +2719,29 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:                     2,
-			TestConcurrency:                    50,
-			TestModel:                          "gpt-5.4",
-			TestContent:                        DefaultTestContent,
-			BackgroundRefreshIntervalMinutes:   2,
-			UsageProbeMaxAgeMinutes:            10,
-			UsageProbeConcurrency:              defaultUsageProbeConcurrency,
-			UsageProbeResponsesFallbackEnabled: true,
-			RecoveryProbeIntervalMinutes:       30,
-			LazyMode:                           false,
-			ProxyURL:                           "",
-			MaxRateLimitRetries:                1,
-			SchedulerMode:                      "round_robin",
-			CodexWSHideUpstreamErrors:          true,
-			CodexWSSilentRetryEnabled:          true,
-			CodexWSSilentMaxRetries:            2,
-			CodexContinueMaxRounds:             8,
-			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
-			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
-			SmartPacingMinConcurrency:          defaultSmartPacingMinConcurrency,
-			SmartPacingWindows:                 "5h,7d",
+			MaxConcurrency:                           2,
+			TestConcurrency:                          50,
+			TestModel:                                "gpt-5.4",
+			TestContent:                              DefaultTestContent,
+			BackgroundRefreshIntervalMinutes:         2,
+			UsageProbeMaxAgeMinutes:                  10,
+			UsageProbeConcurrency:                    defaultUsageProbeConcurrency,
+			UsageProbeResponsesFallbackEnabled:       true,
+			RecoveryProbeIntervalMinutes:             30,
+			LazyMode:                                 false,
+			ProxyURL:                                 "",
+			MaxRateLimitRetries:                      1,
+			SchedulerMode:                            "round_robin",
+			CodexWSHideUpstreamErrors:                true,
+			CodexWSSilentRetryEnabled:                true,
+			CodexWSSilentMaxRetries:                  2,
+			CodexContinueMaxRounds:                   8,
+			AutoPause5hGuardBandPercent:              defaultAutoPause5hGuardBandPercent,
+			AutoPause5hGuardConcurrency:              defaultAutoPause5hGuardConcurrency,
+			SmartPacingMinConcurrency:                defaultSmartPacingMinConcurrency,
+			SmartPacingWindows:                       "5h,7d",
+			PromptFilterCybRelaySessionPinEnabled:    true,
+			PromptFilterCybRelaySessionPinTTLSeconds: DefaultCybRelaySessionPinTTLSeconds,
 		}
 	}
 	s := &Store{
@@ -2743,6 +2792,12 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
 	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
+	s.SetCybRelayConfig(CybRelayConfig{
+		Enabled:              settings.PromptFilterCybRelayEnabled,
+		GroupID:              settings.PromptFilterCybRelayGroupID,
+		SessionPinEnabled:    settings.PromptFilterCybRelaySessionPinEnabled,
+		SessionPinTTLSeconds: settings.PromptFilterCybRelaySessionPinTTLSeconds,
+	})
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -4698,6 +4753,23 @@ func (s *Store) GetPromptFilterConfig() promptfilter.Config {
 		return promptfilter.NormalizeConfig(v)
 	}
 	return promptfilter.DefaultConfig()
+}
+
+func (s *Store) SetCybRelayConfig(cfg CybRelayConfig) {
+	if s == nil {
+		return
+	}
+	s.cybRelayConfig.Store(NormalizeCybRelayConfig(cfg))
+}
+
+func (s *Store) GetCybRelayConfig() CybRelayConfig {
+	if s == nil {
+		return NormalizeCybRelayConfig(CybRelayConfig{})
+	}
+	if value, ok := s.cybRelayConfig.Load().(CybRelayConfig); ok {
+		return NormalizeCybRelayConfig(value)
+	}
+	return NormalizeCybRelayConfig(CybRelayConfig{})
 }
 
 // SetIgnoreUsageLimitStatus updates the global default and immediately

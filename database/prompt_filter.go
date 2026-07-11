@@ -8,48 +8,60 @@ import (
 )
 
 type PromptFilterLog struct {
-	ID              int64     `json:"id"`
-	CreatedAt       time.Time `json:"created_at"`
-	Source          string    `json:"source"`
-	Endpoint        string    `json:"endpoint"`
-	Model           string    `json:"model"`
-	Action          string    `json:"action"`
-	Mode            string    `json:"mode"`
-	Score           int       `json:"score"`
-	Threshold       int       `json:"threshold"`
-	MatchedPatterns string    `json:"matched_patterns"`
-	TextPreview     string    `json:"text_preview"`
-	FullText        string    `json:"full_text"`
-	APIKeyID        int64     `json:"api_key_id"`
-	APIKeyName      string    `json:"api_key_name"`
-	APIKeyMasked    string    `json:"api_key_masked"`
-	ClientIP        string    `json:"client_ip"`
-	ErrorCode       string    `json:"error_code"`
-	ReviewModel     string    `json:"review_model"`
-	ReviewFlagged   bool      `json:"review_flagged"`
-	ReviewError     string    `json:"review_error"`
+	ID                  int64     `json:"id"`
+	CreatedAt           time.Time `json:"created_at"`
+	Source              string    `json:"source"`
+	Endpoint            string    `json:"endpoint"`
+	Model               string    `json:"model"`
+	Action              string    `json:"action"`
+	Mode                string    `json:"mode"`
+	Score               int       `json:"score"`
+	Threshold           int       `json:"threshold"`
+	MatchedPatterns     string    `json:"matched_patterns"`
+	TextPreview         string    `json:"text_preview"`
+	FullText            string    `json:"full_text"`
+	APIKeyID            int64     `json:"api_key_id"`
+	APIKeyName          string    `json:"api_key_name"`
+	APIKeyMasked        string    `json:"api_key_masked"`
+	ClientIP            string    `json:"client_ip"`
+	ErrorCode           string    `json:"error_code"`
+	ReviewModel         string    `json:"review_model"`
+	ReviewFlagged       bool      `json:"review_flagged"`
+	ReviewError         string    `json:"review_error"`
+	AccountID           int64     `json:"account_id"`
+	RouteClass          string    `json:"route_class"`
+	RouteReason         string    `json:"route_reason"`
+	RouteGroupID        int64     `json:"route_group_id"`
+	RoutePinned         bool      `json:"route_pinned"`
+	UpstreamAccountType string    `json:"upstream_account_type"`
 }
 
 type PromptFilterLogInput struct {
-	ClientRequestID string
-	Source          string
-	Endpoint        string
-	Model           string
-	Action          string
-	Mode            string
-	Score           int
-	Threshold       int
-	MatchedPatterns string
-	TextPreview     string
-	FullText        string
-	APIKeyID        int64
-	APIKeyName      string
-	APIKeyMasked    string
-	ClientIP        string
-	ErrorCode       string
-	ReviewModel     string
-	ReviewFlagged   bool
-	ReviewError     string
+	ClientRequestID     string
+	Source              string
+	Endpoint            string
+	Model               string
+	Action              string
+	Mode                string
+	Score               int
+	Threshold           int
+	MatchedPatterns     string
+	TextPreview         string
+	FullText            string
+	APIKeyID            int64
+	APIKeyName          string
+	APIKeyMasked        string
+	ClientIP            string
+	ErrorCode           string
+	ReviewModel         string
+	ReviewFlagged       bool
+	ReviewError         string
+	AccountID           int64
+	RouteClass          string
+	RouteReason         string
+	RouteGroupID        int64
+	RoutePinned         bool
+	UpstreamAccountType string
 }
 
 type PromptFilterLogQuery struct {
@@ -71,12 +83,14 @@ func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogI
 	_, err := db.conn.ExecContext(ctx, `
 		INSERT INTO prompt_filter_logs (
 			source, endpoint, model, action, mode, score, threshold_value, matched_patterns, text_preview,
-			api_key_id, api_key_name, api_key_masked, client_ip, error_code, review_model, review_flagged, review_error, full_text, client_request_id
+			api_key_id, api_key_name, api_key_masked, client_ip, error_code, review_model, review_flagged, review_error, full_text, client_request_id,
+			account_id, route_class, route_reason, route_group_id, route_pinned, upstream_account_type
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
 	`, input.Source, input.Endpoint, input.Model, input.Action, input.Mode, input.Score, input.Threshold,
 		input.MatchedPatterns, input.TextPreview, input.APIKeyID, input.APIKeyName, input.APIKeyMasked, input.ClientIP, input.ErrorCode,
-		input.ReviewModel, input.ReviewFlagged, input.ReviewError, input.FullText, input.ClientRequestID)
+		input.ReviewModel, input.ReviewFlagged, input.ReviewError, input.FullText, input.ClientRequestID,
+		input.AccountID, input.RouteClass, input.RouteReason, input.RouteGroupID, input.RoutePinned, input.UpstreamAccountType)
 	return err
 }
 
@@ -114,7 +128,9 @@ func (db *DB) ListPromptFilterLogsPage(ctx context.Context, query PromptFilterLo
 		       COALESCE(action, ''), COALESCE(mode, ''), COALESCE(score, 0), COALESCE(threshold_value, 0),
 		       COALESCE(matched_patterns, '[]'), COALESCE(text_preview, ''), COALESCE(api_key_id, 0),
 		       COALESCE(api_key_name, ''), COALESCE(api_key_masked, ''), COALESCE(client_ip, ''), COALESCE(error_code, ''),
-		       COALESCE(review_model, ''), COALESCE(review_flagged, false), COALESCE(review_error, ''), COALESCE(full_text, '')
+		       COALESCE(review_model, ''), COALESCE(review_flagged, false), COALESCE(review_error, ''), COALESCE(full_text, ''),
+		       COALESCE(account_id, 0), COALESCE(route_class, ''), COALESCE(route_reason, ''), COALESCE(route_group_id, 0),
+		       COALESCE(route_pinned, false), COALESCE(upstream_account_type, '')
 		FROM prompt_filter_logs
 		`+where+`
 		ORDER BY id DESC
@@ -131,7 +147,8 @@ func (db *DB) ListPromptFilterLogsPage(ctx context.Context, query PromptFilterLo
 		var createdAtRaw interface{}
 		if err := rows.Scan(&item.ID, &createdAtRaw, &item.Source, &item.Endpoint, &item.Model, &item.Action, &item.Mode,
 			&item.Score, &item.Threshold, &item.MatchedPatterns, &item.TextPreview, &item.APIKeyID, &item.APIKeyName,
-			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.FullText); err != nil {
+			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.FullText,
+			&item.AccountID, &item.RouteClass, &item.RouteReason, &item.RouteGroupID, &item.RoutePinned, &item.UpstreamAccountType); err != nil {
 			return nil, 0, err
 		}
 		createdAt, err := parseDBTimeValue(createdAtRaw)
@@ -173,8 +190,11 @@ func promptFilterLogWhere(query PromptFilterLogQuery) (string, []any) {
 			LOWER(COALESCE(error_code, '')) LIKE $%d OR
 			LOWER(COALESCE(review_error, '')) LIKE $%d OR
 			LOWER(COALESCE(api_key_name, '')) LIKE $%d OR
-			LOWER(COALESCE(api_key_masked, '')) LIKE $%d
-		)`, idx, idx, idx, idx, idx, idx, idx))
+			LOWER(COALESCE(api_key_masked, '')) LIKE $%d OR
+			LOWER(COALESCE(route_class, '')) LIKE $%d OR
+			LOWER(COALESCE(route_reason, '')) LIKE $%d OR
+			LOWER(COALESCE(upstream_account_type, '')) LIKE $%d
+		)`, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx))
 	}
 	if len(clauses) == 0 {
 		return "", args
@@ -209,7 +229,9 @@ func (db *DB) FindNearestPromptFilterLog(ctx context.Context, at time.Time, sour
 		       COALESCE(action, ''), COALESCE(mode, ''), COALESCE(score, 0), COALESCE(threshold_value, 0),
 		       COALESCE(matched_patterns, '[]'), COALESCE(text_preview, ''), COALESCE(api_key_id, 0),
 		       COALESCE(api_key_name, ''), COALESCE(api_key_masked, ''), COALESCE(client_ip, ''), COALESCE(error_code, ''),
-		       COALESCE(review_model, ''), COALESCE(review_flagged, false), COALESCE(review_error, ''), COALESCE(full_text, '')
+		       COALESCE(review_model, ''), COALESCE(review_flagged, false), COALESCE(review_error, ''), COALESCE(full_text, ''),
+		       COALESCE(account_id, 0), COALESCE(route_class, ''), COALESCE(route_reason, ''), COALESCE(route_group_id, 0),
+		       COALESCE(route_pinned, false), COALESCE(upstream_account_type, '')
 		FROM prompt_filter_logs
 		WHERE `+strings.Join(clauses, " AND ")+`
 		ORDER BY id DESC
@@ -227,7 +249,8 @@ func (db *DB) FindNearestPromptFilterLog(ctx context.Context, at time.Time, sour
 		var createdAtRaw interface{}
 		if err := rows.Scan(&item.ID, &createdAtRaw, &item.Source, &item.Endpoint, &item.Model, &item.Action, &item.Mode,
 			&item.Score, &item.Threshold, &item.MatchedPatterns, &item.TextPreview, &item.APIKeyID, &item.APIKeyName,
-			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.FullText); err != nil {
+			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.FullText,
+			&item.AccountID, &item.RouteClass, &item.RouteReason, &item.RouteGroupID, &item.RoutePinned, &item.UpstreamAccountType); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdAtRaw)

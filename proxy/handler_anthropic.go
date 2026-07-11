@@ -112,6 +112,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	if h.inspectPromptFilterAnthropic(c, rawBody, "/v1/messages", model) {
 		return
 	}
+	promptDecision, _ := promptRiskDecisionFromContext(c)
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 
@@ -143,6 +144,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
@@ -172,6 +174,10 @@ func (h *Handler) Messages(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
+			if promptDecision.routesToCybRelay() {
+				sendCybRelayUnavailableAnthropic(c)
+				return
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 				return
@@ -183,6 +189,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		setUpstreamAccountContext(c, account)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
@@ -400,6 +407,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				// 提取 usage
 				if eventType == "response.completed" {
+					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -478,6 +486,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
+					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier

@@ -173,6 +173,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	if h.inspectPromptFilterOpenAIForWebSocket(c, conn, rawBody, "/v1/responses", model) {
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, "prompt blocked", nil)
 	}
+	promptDecision, _ := promptRiskDecisionFromContext(c)
 
 	rawBody = normalizeServiceTierField(rawBody)
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
@@ -223,7 +224,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}
 
 	accountFilter := accountFilterForModel(effectiveModel)
+	if promptDecision.routesToCybRelay() {
+		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, false)
+	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyCybRelayAccountFilter(accountFilter, promptDecision)
 
 	wsRetrySettings := CurrentRuntimeSettings()
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
@@ -251,6 +256,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		if account == nil {
+			if promptDecision.routesToCybRelay() {
+				_ = writeCybRelayUnavailableWebSocket(conn)
+				return newResponsesWSCloseError(websocket.ClosePolicyViolation, "CYB relay unavailable", nil)
+			}
 			if lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
 			} else if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
@@ -265,6 +274,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		setUpstreamAccountContext(c, account)
+		attemptEffectiveModel := effectiveModel
+		attemptLogEffectiveModel := logEffectiveModel
 
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
@@ -279,7 +291,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
-		useWebsocket := !forceHTTPAfterWSMessageTooBig
+		useWebsocket := !forceHTTPAfterWSMessageTooBig && !account.IsOpenAIResponsesAPI()
 		// 生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
 		// 图片数据会卡死（issue #220）；自然语言生图意图也需保留图片工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -287,14 +299,32 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
 		upstreamBody := codexBody
-		if useWebsocket {
+		if account.IsOpenAIResponsesAPI() {
+			relayBody, deleteErr := sjson.DeleteBytes(rawBody, "type")
+			if deleteErr == nil {
+				upstreamBody = PrepareOpenAIResponsesBody(relayBody)
+			} else {
+				upstreamBody = PrepareOpenAIResponsesBody(rawBody)
+			}
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+				upstreamBody = mappedBody
+				attemptEffectiveModel = mappedModel
+				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
+			}
+		} else if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
 		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
-		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		var resp *http.Response
+		var reqErr error
+		if account.IsOpenAIResponsesAPI() {
+			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+		} else {
+			resp, reqErr = ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -392,7 +422,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			shouldRetry := false
 			if silentRetryEnabled && attempt < maxRetries {
 				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
@@ -402,7 +432,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
 				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
+				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           resp.StatusCode,
 				DurationMs:           durationMs,
 				ReasoningEffort:      reasoningEffort,
@@ -436,7 +466,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, attemptEffectiveModel, attemptLogEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -553,6 +583,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 		}
 		if eventType == "response.completed" {
+			h.pinCybRelayResponseID(c, data)
 			usage = extractUsageFromResult(parsed.Get("response.usage"))
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
@@ -780,6 +811,18 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	cfg := h.store.GetPromptFilterConfig()
 	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	c.Set(contextPromptFilterText, text)
+	if h.cybRelayConfig().Enabled {
+		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
+			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
+			decision := h.applyCybRoutePin(c, rawBody, defaultPromptRiskDecision())
+			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
+			return false
+		}
+		verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+		return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model, func() {
+			_ = writeResponsesWSError(conn, promptCyberPolicyError())
+		})
+	}
 	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
 		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 		return h.inspectSemanticReviewOpenAIForWebSocket(c, conn, rawBody, endpoint, model)

@@ -31,7 +31,7 @@ func TestReviewTextAllowsWhenNotFlagged(t *testing.T) {
 		BaseURL:        server.URL,
 		Model:          "omni-moderation-latest",
 		TimeoutSeconds: 2,
-	})
+	}, "/v1/responses")
 	if err != nil {
 		t.Fatalf("ReviewText returned error: %v", err)
 	}
@@ -57,9 +57,254 @@ func TestReviewTextReturnsErrorWhenResultsMissing(t *testing.T) {
 		BaseURL:        server.URL,
 		Model:          "omni-moderation-latest",
 		TimeoutSeconds: 2,
-	})
+	}, "/v1/responses")
 	if err == nil {
 		t.Fatal("ReviewText returned nil error, want missing results error")
+	}
+}
+
+func TestReviewTextDetailedAggregatesResults(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(reviewResponse{
+			Model: "omni-detailed",
+			Results: []reviewResult{
+				{
+					Flagged:        false,
+					Categories:     map[string]bool{"illicit": true, "hate": false},
+					CategoryScores: map[string]float64{"illicit": 0.2, "hate": 0.8},
+				},
+				{
+					Flagged:        true,
+					Categories:     map[string]bool{"illicit": false, "hate": true, "future-category": true},
+					CategoryScores: map[string]float64{"illicit": 0.7, "hate": 0.3, "future-category": 0.4},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := ReviewClient{HTTPClient: server.Client()}
+	outcome, err := client.ReviewTextDetailed(context.Background(), "hello", ReviewConfig{
+		Enabled:        true,
+		APIKey:         "test-key",
+		BaseURL:        server.URL,
+		Model:          "omni-moderation-latest",
+		TimeoutSeconds: 2,
+	})
+	if err != nil {
+		t.Fatalf("ReviewTextDetailed returned error: %v", err)
+	}
+	if outcome.Model != "omni-detailed" {
+		t.Fatalf("model = %q, want omni-detailed", outcome.Model)
+	}
+	if !outcome.Flagged {
+		t.Fatal("flagged = false, want OR-aggregated true")
+	}
+	for _, category := range []string{"illicit", "hate", "future-category"} {
+		if !outcome.Categories[category] {
+			t.Fatalf("category %q = false, want OR-aggregated true; categories=%v", category, outcome.Categories)
+		}
+	}
+	if got := outcome.CategoryScores["illicit"]; got != 0.7 {
+		t.Fatalf("illicit score = %v, want max 0.7", got)
+	}
+	if got := outcome.CategoryScores["hate"]; got != 0.8 {
+		t.Fatalf("hate score = %v, want max 0.8", got)
+	}
+	if !outcome.FlaggedForEndpoint("/v1/responses") {
+		t.Fatal("text endpoint flagged = false, want raw aggregate flag")
+	}
+	if !outcome.FlaggedForEndpoint("/v1/images/generations") {
+		t.Fatal("image endpoint flagged = false, want illicit image policy block")
+	}
+}
+
+func TestReviewTextDetailedPreservesPerResultImageFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(reviewResponse{
+			Model: "omni-moderation-latest",
+			Results: []reviewResult{
+				// A non-standard result with no category metadata must retain the
+				// legacy raw-flag fallback even if a later result has maps.
+				{Flagged: true},
+				{
+					Flagged:        false,
+					Categories:     map[string]bool{"violence": true},
+					CategoryScores: map[string]float64{"violence": 0.9},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := ReviewClient{HTTPClient: server.Client()}
+	outcome, err := client.ReviewTextDetailed(context.Background(), "hello", ReviewConfig{
+		Enabled:        true,
+		APIKey:         "test-key",
+		BaseURL:        server.URL,
+		TimeoutSeconds: 2,
+	})
+	if err != nil {
+		t.Fatalf("ReviewTextDetailed returned error: %v", err)
+	}
+	if !outcome.FlaggedForEndpoint("/v1/images/generations") {
+		t.Fatal("image endpoint flagged = false, want per-result fallback to preserve true")
+	}
+}
+
+func TestReviewTextDetailedFailsOverWithCategories(t *testing.T) {
+	reviewKeyCursor.Store(0)
+	t.Cleanup(func() { reviewKeyCursor.Store(0) })
+
+	var mu sync.Mutex
+	seen := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		seen[key]++
+		mu.Unlock()
+		if key == "bad" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(reviewResponse{
+			Model: "omni-failover",
+			Results: []reviewResult{{
+				Flagged:        true,
+				Categories:     map[string]bool{"illicit": true},
+				CategoryScores: map[string]float64{"illicit": 0.93},
+			}},
+		})
+	}))
+	defer server.Close()
+
+	client := ReviewClient{HTTPClient: server.Client()}
+	outcome, err := client.ReviewTextDetailed(context.Background(), "hello", ReviewConfig{
+		Enabled:        true,
+		APIKey:         "bad\ngood",
+		BaseURL:        server.URL,
+		TimeoutSeconds: 2,
+	})
+	if err != nil {
+		t.Fatalf("ReviewTextDetailed returned error: %v", err)
+	}
+	if outcome.Model != "omni-failover" || !outcome.Flagged || !outcome.Categories["illicit"] || outcome.CategoryScores["illicit"] != 0.93 {
+		t.Fatalf("unexpected failover outcome: %+v", outcome)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen["bad"] != 1 || seen["good"] != 1 {
+		t.Fatalf("expected deterministic bad->good failover, seen=%v", seen)
+	}
+}
+
+func TestReviewTextImagePolicyRegression(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		result   reviewResult
+		want     bool
+	}{
+		{
+			name:     "non-standard raw flag fallback",
+			endpoint: "/v1/images/generations",
+			result:   reviewResult{Flagged: true},
+			want:     true,
+		},
+		{
+			name:     "sexual minors score threshold",
+			endpoint: "/v1/images/generations",
+			result: reviewResult{
+				CategoryScores: map[string]float64{"sexual/minors": 0.15},
+			},
+			want: true,
+		},
+		{
+			name:     "adult sexual category",
+			endpoint: "/v1/images/edits",
+			result: reviewResult{
+				Categories: map[string]bool{"sexual": true},
+			},
+			want: true,
+		},
+		{
+			name:     "illicit score threshold",
+			endpoint: "/v1/images/generations",
+			result: reviewResult{
+				CategoryScores: map[string]float64{"illicit": 0.5},
+			},
+			want: true,
+		},
+		{
+			name:     "illicit violent score threshold",
+			endpoint: "/v1/images/generations",
+			result: reviewResult{
+				CategoryScores: map[string]float64{"illicit/violent": 0.5},
+			},
+			want: true,
+		},
+		{
+			name:     "hate category",
+			endpoint: "/v1/images/generations",
+			result: reviewResult{
+				Categories: map[string]bool{"hate": true},
+			},
+			want: true,
+		},
+		{
+			name:     "harassment threatening category",
+			endpoint: "/v1/images/generations",
+			result: reviewResult{
+				Categories: map[string]bool{"harassment/threatening": true},
+			},
+			want: true,
+		},
+		{
+			name:     "violence and self-harm remain allowed for images",
+			endpoint: "/v1/images/generations",
+			result: reviewResult{
+				Flagged:        true,
+				Categories:     map[string]bool{"violence": true, "self-harm": true},
+				CategoryScores: map[string]float64{"violence": 0.99, "self-harm": 0.99},
+			},
+			want: false,
+		},
+		{
+			name:     "text endpoint retains provider aggregate flag",
+			endpoint: "/v1/responses",
+			result: reviewResult{
+				Flagged:        true,
+				Categories:     map[string]bool{"violence": true},
+				CategoryScores: map[string]float64{"violence": 0.99},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(reviewResponse{
+					Model:   "omni-moderation-latest",
+					Results: []reviewResult{tt.result},
+				})
+			}))
+			defer server.Close()
+
+			client := ReviewClient{HTTPClient: server.Client()}
+			flagged, _, err := client.ReviewText(context.Background(), "hello", ReviewConfig{
+				Enabled:        true,
+				APIKey:         "test-key",
+				BaseURL:        server.URL,
+				TimeoutSeconds: 2,
+			}, tt.endpoint)
+			if err != nil {
+				t.Fatalf("ReviewText returned error: %v", err)
+			}
+			if flagged != tt.want {
+				t.Fatalf("flagged = %v, want %v", flagged, tt.want)
+			}
+		})
 	}
 }
 
@@ -172,7 +417,7 @@ func TestReviewTextFailsOverToNextKeyOn429(t *testing.T) {
 		BaseURL:        server.URL,
 		Model:          "omni-moderation-latest",
 		TimeoutSeconds: 2,
-	})
+	}, "/v1/responses")
 	if err != nil {
 		t.Fatalf("ReviewText returned error: %v", err)
 	}
@@ -205,7 +450,7 @@ func TestReviewTextReturnsErrorWhenAllKeysRateLimited(t *testing.T) {
 		BaseURL:        server.URL,
 		Model:          "omni-moderation-latest",
 		TimeoutSeconds: 2,
-	})
+	}, "/v1/responses")
 	if err == nil {
 		t.Fatal("ReviewText returned nil error, want error after all keys rate limited")
 	}
@@ -241,7 +486,7 @@ func TestReviewTextRoundRobinsAcrossKeys(t *testing.T) {
 	}
 	// 连续多次请求应把成功请求分摊到全部 key 上。
 	for i := 0; i < 9; i++ {
-		if _, _, err := client.ReviewText(context.Background(), "hello", cfg); err != nil {
+		if _, _, err := client.ReviewText(context.Background(), "hello", cfg, "/v1/responses"); err != nil {
 			t.Fatalf("ReviewText #%d error: %v", i, err)
 		}
 	}

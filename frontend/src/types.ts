@@ -651,6 +651,10 @@ export interface SystemSettings {
   prompt_filter_review_model: string
   prompt_filter_review_timeout_seconds: number
   prompt_filter_review_fail_closed: boolean
+  prompt_filter_cyb_relay_enabled: boolean
+  prompt_filter_cyb_relay_group_id: number
+  prompt_filter_cyb_relay_session_pin_enabled: boolean
+  prompt_filter_cyb_relay_session_pin_ttl_seconds: number
   prompt_filter_semantic_review_enabled: boolean
   prompt_filter_semantic_review_api_key?: string
   prompt_filter_semantic_review_api_key_configured?: boolean
@@ -782,6 +786,12 @@ export interface PromptFilterLog {
   review_model: string
   review_flagged: boolean
   review_error: string
+  account_id?: number
+  route_class?: string
+  route_reason?: string
+  route_group_id?: number
+  route_pinned?: boolean
+  upstream_account_type?: string
 }
 
 export interface PromptFilterLogsResponse {
@@ -1115,6 +1125,11 @@ export interface UsageLog {
   attempt_index: number
   upstream_error_kind: string
   error_message: string
+  route_class?: string
+  route_reason?: string
+  route_group_id?: number
+  route_pinned?: boolean
+  upstream_account_type?: string
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>

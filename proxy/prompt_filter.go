@@ -38,6 +38,22 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 	cfg := h.store.GetPromptFilterConfig()
 	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	c.Set(contextPromptFilterText, text)
+	if h.cybRelayConfig().Enabled {
+		if nested, ok := takeNestedPromptRiskDecision(c); ok {
+			setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
+			return nested.blocks()
+		}
+		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
+			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
+			decision := h.applyCybRoutePin(c, rawBody, defaultPromptRiskDecision())
+			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
+			return false
+		}
+		verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+		return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model, func() {
+			sendPromptCyberPolicyBlockedOpenAI(c)
+		})
+	}
 	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
 		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 		return h.inspectSemanticReviewOpenAI(c, rawBody, endpoint, model)
@@ -81,6 +97,18 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
+	if h.cybRelayConfig().Enabled {
+		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
+			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
+			decision := h.applyCybRoutePin(c, nil, defaultPromptRiskDecision())
+			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
+			return false
+		}
+		verdict := promptfilter.InspectText(text, cfg)
+		return h.inspectCybRelayPrompt(c, nil, verdict, text, endpoint, model, func() {
+			sendPromptCyberPolicyBlockedOpenAI(c)
+		})
+	}
 	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
 		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 		return h.inspectSemanticReviewTextOpenAI(c, text, endpoint, model)
@@ -125,6 +153,18 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	cfg := h.store.GetPromptFilterConfig()
 	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	c.Set(contextPromptFilterText, text)
+	if h.cybRelayConfig().Enabled {
+		if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
+			h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
+			decision := h.applyCybRoutePin(c, rawBody, defaultPromptRiskDecision())
+			h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
+			return false
+		}
+		verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+		return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model, func() {
+			sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", promptCyberPolicyMessage)
+		})
+	}
 	if verdict, ok := codexAmbientSuggestionClassifierBypass(text, cfg); ok {
 		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 		return h.inspectSemanticReviewAnthropic(c, rawBody, endpoint, model)
@@ -162,6 +202,167 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	return h.inspectSemanticReviewAnthropic(c, rawBody, endpoint, model)
 }
 
+var promptFilterHardBlockPatterns = map[string]struct{}{
+	codex55UnrestrictedInstructionsPatternName: {},
+	"credential_theft":                         {},
+	"malware_authoring":                        {},
+	"ransomware_deployment":                    {},
+	"phishing_generation":                      {},
+	"mfa_bypass":                               {},
+	"fraud_carding":                            {},
+}
+
+func promptFilterHardBlockVerdict(verdict promptfilter.Verdict) bool {
+	if verdict.Action != promptfilter.ActionBlock {
+		return false
+	}
+	for _, match := range verdict.Matched {
+		if _, ok := promptFilterHardBlockPatterns[match.Name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func cybRelayTextEndpoint(endpoint string) bool {
+	switch strings.ToLower(strings.TrimSpace(endpoint)) {
+	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/messages":
+		return true
+	default:
+		return false
+	}
+}
+
+func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg promptfilter.Config, endpoint string) (bool, []string) {
+	if !verdict.Enabled || !cybRelayTextEndpoint(endpoint) {
+		return false, nil
+	}
+	threshold := cfg.Threshold
+	if threshold <= 0 {
+		threshold = promptfilter.DefaultThreshold
+	}
+	signals := make([]string, 0, 3)
+	if verdict.Score >= threshold {
+		signals = append(signals, "local_threshold")
+	}
+	if promptfilter.IsHighRiskReviewVerdict(verdict) {
+		signals = append(signals, "local_high_risk")
+	}
+	if promptfilter.LooksLikeTechnicalCyberIntent(text) {
+		signals = append(signals, "technical_cyber_intent")
+	}
+	return len(signals) > 0, signals
+}
+
+func omniOutcomeRequiresPolicyBlock(outcome promptfilter.ReviewOutcome, cybSignal bool) bool {
+	if !outcome.Flagged {
+		return false
+	}
+	trueCategories := 0
+	for category, flagged := range outcome.Categories {
+		if !flagged {
+			continue
+		}
+		trueCategories++
+		if strings.EqualFold(strings.TrimSpace(category), "illicit") && cybSignal {
+			continue
+		}
+		// Every category except plain illicit is a non-CYB hard policy category.
+		// Unknown future categories also fail safe here.
+		return true
+	}
+	// A raw flag without category evidence is non-standard and must not be
+	// reclassified as CYB merely because the local detector also fired.
+	return trueCategories == 0 || !cybSignal
+}
+
+func (h *Handler) reviewPromptFilterVerdictDetailed(ctx context.Context, text string, verdict promptfilter.Verdict, cfg promptfilter.Config, endpoint string) (promptfilter.Verdict, promptfilter.ReviewOutcome, error) {
+	outcome, reviewErr := promptfilter.DefaultReviewClient.ReviewTextDetailed(ctx, text, cfg.Review)
+	flagged := outcome.FlaggedForEndpoint(endpoint)
+	verdict = promptfilter.ApplyReviewResult(verdict, flagged, outcome.Model, reviewErr, cfg.Review)
+	if reviewErr == nil && !flagged && len(verdict.Matched) == 0 {
+		verdict.Reason = "prompt review cleared request"
+	}
+	if reviewErr == nil && flagged {
+		switch promptfilter.NormalizeConfig(cfg).Mode {
+		case promptfilter.ModeBlock:
+			verdict.Action = promptfilter.ActionBlock
+		case promptfilter.ModeWarn:
+			verdict.Action = promptfilter.ActionWarn
+		}
+		verdict.Reason = "prompt review flagged request"
+	}
+	return verdict, outcome, reviewErr
+}
+
+func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, localVerdict promptfilter.Verdict, text string, endpoint string, model string, writeBlock func()) bool {
+	cfg := h.store.GetPromptFilterConfig()
+	cybSignal, signals := promptFilterCYBSignal(localVerdict, text, cfg, endpoint)
+	verdict := localVerdict
+	decision := defaultPromptRiskDecision()
+
+	if promptFilterHardBlockVerdict(localVerdict) {
+		decision = promptRiskDecision{
+			Disposition: promptRiskDispositionBlock,
+			Reason:      "matched explicit hard-block policy rule",
+			Signals:     []string{"explicit_hard_block"},
+		}
+	} else {
+		outcome := promptfilter.ReviewOutcome{}
+		var reviewErr error
+		if shouldReviewPromptFilterVerdict(verdict, cfg) {
+			verdict, outcome, reviewErr = h.reviewPromptFilterVerdictDetailed(c.Request.Context(), text, verdict, cfg, endpoint)
+		}
+
+		if strings.Contains(strings.ToLower(endpoint), "image") {
+			if verdict.Action == promptfilter.ActionBlock {
+				decision = promptRiskDecision{Disposition: promptRiskDispositionBlock, Reason: verdict.Reason, Signals: []string{"image_policy"}}
+			}
+		} else if reviewErr == nil && omniOutcomeRequiresPolicyBlock(outcome, cybSignal) {
+			verdict.Action = promptfilter.ActionBlock
+			verdict.Reason = "omni moderation matched non-CYB policy"
+			decision = promptRiskDecision{Disposition: promptRiskDispositionBlock, Reason: "omni moderation matched non-CYB policy", Signals: []string{"omni_non_cyb_policy"}}
+		} else if cybSignal {
+			if outcome.Flagged && outcome.Categories["illicit"] {
+				signals = append(signals, "omni_illicit")
+			}
+			if reviewErr != nil {
+				signals = append(signals, "omni_unavailable")
+			}
+			decision = promptRiskDecision{Disposition: promptRiskDispositionRelay, Reason: "CYB risk isolated to relay pool", Signals: signals}
+		} else if verdict.Action == promptfilter.ActionBlock {
+			decision = promptRiskDecision{Disposition: promptRiskDispositionBlock, Reason: verdict.Reason, Signals: []string{"prompt_policy"}}
+		}
+	}
+
+	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
+	if verdict.Action == promptfilter.ActionWarn {
+		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
+	}
+	decision = h.applyCybRoutePin(c, rawBody, decision)
+	h.logCybRelayDecision(c, endpoint, model, text, verdict, decision)
+	if !decision.blocks() {
+		return false
+	}
+	if writeBlock != nil {
+		writeBlock()
+	}
+	return true
+}
+
+func (h *Handler) logCybRelayDecision(c *gin.Context, endpoint string, model string, text string, baseVerdict promptfilter.Verdict, decision promptRiskDecision) {
+	if !decision.routesToCybRelay() {
+		return
+	}
+	verdict := baseVerdict
+	verdict.Enabled = true
+	verdict.Action = promptfilter.ActionRoute
+	verdict.Reason = decision.routeReason()
+	verdict.TextPreview = text
+	verdict.FullText = text
+	h.logPromptFilterVerdict(c, endpoint, model, "cyb_relay_routed", "", verdict)
+}
+
 func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict) {
 	if h == nil || h.db == nil || !verdict.Enabled {
 		return
@@ -193,10 +394,11 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 	}
 	// 被拦截（block）的请求仅记录脱敏后的检查文本预览，便于排查触发原因，
 	// 同时避免把 Authorization/API Key/token 等敏感值持久化到日志。
-	if verdict.Action == promptfilter.ActionBlock {
+	if verdict.Action == promptfilter.ActionBlock || verdict.Action == promptfilter.ActionRoute {
 		input.FullText = promptfilter.RedactedPreview(verdict.FullText, promptFilterFullTextMaxRunes)
 	}
 	populatePromptFilterAPIKeyMeta(c, input)
+	populateCybPromptFilterRouteMeta(c, input)
 	input.ClientRequestID = strings.TrimSpace(c.GetHeader("X-Client-Request-Id"))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

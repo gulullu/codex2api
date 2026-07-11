@@ -1273,11 +1273,13 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 
 func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
 	preferredFilter := h.withModelCooldownFilter(model, imagePreferredAccountFilter)
+	preferredFilter = h.applyCybRelayAccountFilter(preferredFilter, defaultPromptRiskDecision())
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
+	fallbackFilter := h.applyCybRelayAccountFilter(h.withModelCooldownFilter(model, nil), defaultPromptRiskDecision())
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, fallbackFilter)
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -1325,6 +1327,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		setUpstreamAccountContext(c, account)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
 		if deviceCfg == nil {

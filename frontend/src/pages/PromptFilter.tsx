@@ -12,7 +12,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
-import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, SemanticReviewConnectionTestResponse, SemanticReviewProvider, SemanticReviewStrategy, SystemSettings } from '../types'
+import type { AccountGroup, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, SemanticReviewConnectionTestResponse, SemanticReviewProvider, SemanticReviewStrategy, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -61,6 +61,10 @@ type PromptFilterForm = Pick<
   | 'prompt_filter_review_model'
   | 'prompt_filter_review_timeout_seconds'
   | 'prompt_filter_review_fail_closed'
+  | 'prompt_filter_cyb_relay_enabled'
+  | 'prompt_filter_cyb_relay_group_id'
+  | 'prompt_filter_cyb_relay_session_pin_enabled'
+  | 'prompt_filter_cyb_relay_session_pin_ttl_seconds'
   | 'prompt_filter_semantic_review_enabled'
   | 'prompt_filter_semantic_review_api_key'
   | 'prompt_filter_semantic_review_api_key_configured'
@@ -163,6 +167,10 @@ const defaultForm: PromptFilterForm = {
   prompt_filter_review_model: 'omni-moderation-latest',
   prompt_filter_review_timeout_seconds: 10,
   prompt_filter_review_fail_closed: true,
+  prompt_filter_cyb_relay_enabled: false,
+  prompt_filter_cyb_relay_group_id: 0,
+  prompt_filter_cyb_relay_session_pin_enabled: true,
+  prompt_filter_cyb_relay_session_pin_ttl_seconds: 3600,
   prompt_filter_semantic_review_enabled: true,
   prompt_filter_semantic_review_api_key: '',
   prompt_filter_semantic_review_api_key_configured: false,
@@ -248,6 +256,10 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_review_model: settings?.prompt_filter_review_model || 'omni-moderation-latest',
   prompt_filter_review_timeout_seconds: settings?.prompt_filter_review_timeout_seconds || 10,
   prompt_filter_review_fail_closed: settings?.prompt_filter_review_fail_closed ?? true,
+  prompt_filter_cyb_relay_enabled: Boolean(settings?.prompt_filter_cyb_relay_enabled),
+  prompt_filter_cyb_relay_group_id: settings?.prompt_filter_cyb_relay_group_id || 0,
+  prompt_filter_cyb_relay_session_pin_enabled: settings?.prompt_filter_cyb_relay_session_pin_enabled ?? true,
+  prompt_filter_cyb_relay_session_pin_ttl_seconds: settings?.prompt_filter_cyb_relay_session_pin_ttl_seconds || 3600,
   prompt_filter_semantic_review_enabled: settings?.prompt_filter_semantic_review_enabled ?? true,
   prompt_filter_semantic_review_api_key: '',
   prompt_filter_semantic_review_api_key_configured: Boolean(settings?.prompt_filter_semantic_review_api_key_configured),
@@ -289,6 +301,8 @@ function promptFilterSavePayload(form: PromptFilterForm): Partial<SystemSettings
     delete payload.prompt_filter_semantic_review_api_key
   }
   payload.prompt_filter_semantic_review_strategy = payload.prompt_filter_semantic_review_strategy || 'round_robin'
+  payload.prompt_filter_cyb_relay_group_id = Math.max(0, Math.trunc(payload.prompt_filter_cyb_relay_group_id || 0))
+  payload.prompt_filter_cyb_relay_session_pin_ttl_seconds = Math.max(60, Math.min(86400, Math.trunc(payload.prompt_filter_cyb_relay_session_pin_ttl_seconds || 3600)))
   payload.prompt_filter_semantic_review_providers = (payload.prompt_filter_semantic_review_providers || []).map((provider) => {
     const apiKey = provider.api_key?.trim()
     const normalized: SemanticReviewProvider = {
@@ -323,16 +337,18 @@ export default function PromptFilter() {
   const [testVerdict, setTestVerdict] = useState<PromptFilterVerdict | null>(null)
 
   const loadData = useCallback(async () => {
-    const [settings, logsResp, rules] = await Promise.all([
+    const [settings, logsResp, rules, groupsResp] = await Promise.all([
       api.getSettings(),
       api.getPromptFilterLogs({ limit: 5 }),
       api.getPromptFilterRules(),
+      api.listAccountGroups().catch(() => ({ groups: [] })),
     ])
     return {
       settings,
       recentLogs: logsResp.logs ?? [],
       totalLogs: logsResp.total ?? logsResp.logs?.length ?? 0,
       rules,
+      accountGroups: groupsResp.groups ?? [],
     }
   }, [])
 
@@ -341,12 +357,14 @@ export default function PromptFilter() {
     recentLogs: PromptFilterLog[]
     totalLogs: number
     rules: PromptFilterRulesResponse | null
+    accountGroups: AccountGroup[]
   }>({
     initialData: {
       settings: null,
       recentLogs: [],
       totalLogs: 0,
       rules: null,
+      accountGroups: [],
     },
     load: loadData,
   })
@@ -482,6 +500,7 @@ export default function PromptFilter() {
             booleanOptions={booleanOptions}
             semanticFailurePolicyOptions={semanticFailurePolicyOptions}
             endpointOptions={endpointOptions}
+            accountGroups={data.accountGroups}
             recentLogs={data.recentLogs}
             totalLogs={data.totalLogs}
             testText={testText}
@@ -561,6 +580,7 @@ function OverviewView({
   booleanOptions,
   semanticFailurePolicyOptions,
   endpointOptions,
+  accountGroups,
   recentLogs,
   totalLogs,
   testText,
@@ -583,6 +603,7 @@ function OverviewView({
   booleanOptions: { label: string; value: string }[]
   semanticFailurePolicyOptions: { label: string; value: string }[]
   endpointOptions: { label: string; value: string }[]
+  accountGroups: AccountGroup[]
   recentLogs: PromptFilterLog[]
   totalLogs: number
   testText: string
@@ -610,6 +631,13 @@ function OverviewView({
   }), [recentLogs])
 
   const semanticProviders = form.prompt_filter_semantic_review_providers || []
+  const relayGroupOptions = useMemo(() => [
+    { label: t('promptFilter.cybRelayGroupNotSelected'), value: '0' },
+    ...accountGroups.map((group) => ({
+      label: `${group.name} (${t('promptFilter.cybRelayGroupMembers', { count: group.member_count })})`,
+      value: String(group.id),
+    })),
+  ], [accountGroups, t])
 
   const updateSemanticProvider = (providerID: string, patch: Partial<SemanticReviewProvider>) => {
     setForm((current) => ({
@@ -777,10 +805,64 @@ function OverviewView({
               </Field>
             </div>
 
+            <div className="space-y-4 rounded-lg border border-primary/20 bg-primary/[0.03] p-4">
+              <div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <SectionTitle title={t('promptFilter.cybRelayTitle')} />
+                  <Badge variant="outline">{t('promptFilter.cybRelayRecommendedBadge')}</Badge>
+                </div>
+                <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.cybRelayDesc')}</p>
+              </div>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
+                <Field label={t('promptFilter.cybRelayEnabled')}>
+                  <Select
+                    value={form.prompt_filter_cyb_relay_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_cyb_relay_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </Field>
+                <Field label={t('promptFilter.cybRelayGroup')}>
+                  <Select
+                    value={String(form.prompt_filter_cyb_relay_group_id || 0)}
+                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_cyb_relay_group_id: Math.max(0, parseInt(value, 10) || 0) }))}
+                    options={relayGroupOptions}
+                  />
+                </Field>
+                <Field label={t('promptFilter.cybRelaySessionPin')}>
+                  <Select
+                    value={form.prompt_filter_cyb_relay_session_pin_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_cyb_relay_session_pin_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </Field>
+                <Field label={t('promptFilter.cybRelaySessionPinTTL')}>
+                  <Input
+                    type="number"
+                    min={60}
+                    max={86400}
+                    disabled={!form.prompt_filter_cyb_relay_session_pin_enabled}
+                    value={form.prompt_filter_cyb_relay_session_pin_ttl_seconds}
+                    onChange={(event) => setForm((current) => ({
+                      ...current,
+                      prompt_filter_cyb_relay_session_pin_ttl_seconds: Math.max(60, Math.min(86400, parseInt(event.target.value, 10) || 3600)),
+                    }))}
+                  />
+                  <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.cybRelaySessionPinTTLHint')}</span>
+                </Field>
+              </div>
+              <div className="flex items-start gap-2 rounded-md border border-amber-500/25 bg-amber-500/8 p-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <span>{t('promptFilter.cybRelayWarning')}</span>
+              </div>
+            </div>
+
             <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <SectionTitle title={t('promptFilter.semanticReviewTitle')} />
+                  <div className="flex flex-wrap items-center gap-2">
+                    <SectionTitle title={t('promptFilter.semanticReviewTitle')} />
+                    <Badge variant="outline">{t('promptFilter.semanticReviewLegacyBadge')}</Badge>
+                  </div>
                   <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.semanticReviewDesc')}</p>
                 </div>
                 <Button type="button" variant="outline" onClick={addSemanticProvider}>
@@ -1063,10 +1145,10 @@ function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; cle
 
         <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
           <Field label={t('promptFilter.colAction')}>
-            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'block', value: 'block' }, { label: 'warn', value: 'warn' }, { label: 'allow', value: 'allow' }]} />
+            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'block', value: 'block' }, { label: 'route', value: 'route' }, { label: 'warn', value: 'warn' }, { label: 'allow', value: 'allow' }]} />
           </Field>
           <Field label={t('promptFilter.source')}>
-            <Select value={draftFilters.source} onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'local_filter', value: 'local_filter' }, { label: 'semantic_review_disagreement', value: 'semantic_review_disagreement' }, { label: 'upstream_cyber_policy', value: 'upstream_cyber_policy' }]} />
+            <Select value={draftFilters.source} onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'local_filter', value: 'local_filter' }, { label: 'cyb_relay_routed', value: 'cyb_relay_routed' }, { label: 'semantic_review_disagreement', value: 'semantic_review_disagreement' }, { label: 'upstream_cyber_policy', value: 'upstream_cyber_policy' }]} />
           </Field>
           <Field label={t('promptFilter.endpoint')}>
             <Input value={draftFilters.endpoint} onChange={(event) => setDraftFilters((current) => ({ ...current, endpoint: event.target.value }))} placeholder="/v1/responses" />
@@ -1715,6 +1797,14 @@ function VerdictBadge({ verdict }: { verdict: PromptFilterVerdict }) {
       </Badge>
     )
   }
+  if (action === 'route') {
+    return (
+      <Badge variant="outline" className="gap-1.5 border-sky-500/30 text-sky-700 dark:text-sky-300">
+        <RefreshCw className="size-3" />
+        Route
+      </Badge>
+    )
+  }
   return (
     <Badge variant="outline" className="gap-1.5 border-emerald-500/30 text-emerald-700 dark:text-emerald-300">
       <CheckCircle2 className="size-3" />
@@ -1870,6 +1960,8 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
       <TableCell>
         <div className="flex flex-col items-start gap-1">
           <ActionBadge action={log.action} />
+          {log.route_class === 'cyb_relay' || log.source === 'cyb_relay_routed' ? <Badge variant="outline" className="border-sky-500/30 text-[11px] text-sky-700 dark:text-sky-300">cyb relay</Badge> : null}
+          {!compact && log.route_group_id ? <Badge variant="outline" className="text-[11px]">group {log.route_group_id}{log.route_pinned ? ' · pinned' : ''}</Badge> : null}
           {log.source === 'upstream_cyber_policy' ? <Badge variant="outline" className="text-[11px]">upstream</Badge> : null}
           {log.review_model ? <Badge variant="outline" className="text-[11px]">{log.review_flagged ? 'review flagged' : 'review cleared'}</Badge> : null}
         </div>
@@ -1932,6 +2024,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
 
 function ActionBadge({ action }: { action: string }) {
   if (action === 'block') return <Badge variant="destructive">block</Badge>
+  if (action === 'route') return <Badge variant="outline" className="border-sky-500/30 text-sky-700 dark:text-sky-300">route</Badge>
   if (action === 'warn') return <Badge variant="outline" className="border-amber-500/30 text-amber-700 dark:text-amber-300">warn</Badge>
   return <Badge variant="outline">allow</Badge>
 }

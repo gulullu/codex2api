@@ -713,7 +713,7 @@ func assertCyberPolicyErrorCode(t *testing.T, body []byte) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("response JSON: %v; body=%s", err, string(body))
 	}
-	if payload.Error.Code != "cyber_policy" {
-		t.Fatalf("error.code = %q, want cyber_policy; body=%s", payload.Error.Code, string(body))
+	if payload.Error.Code != "content_policy_violation" {
+		t.Fatalf("error.code = %q, want content_policy_violation; body=%s", payload.Error.Code, string(body))
 	}
 }

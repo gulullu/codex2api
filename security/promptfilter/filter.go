@@ -18,6 +18,7 @@ const (
 	ActionAllow = "allow"
 	ActionWarn  = "warn"
 	ActionBlock = "block"
+	ActionRoute = "route"
 
 	ModeMonitor = "monitor"
 	ModeWarn    = "warn"
@@ -957,11 +958,19 @@ func looksLikeTechnicalCyberIntent(text string) bool {
 	}
 	hasLow, hasOff := false, false
 	for _, w := range lowLevel {
-		if strings.Contains(lower, w) { hasLow = true; break }
+		if strings.Contains(lower, w) {
+			hasLow = true
+			break
+		}
 	}
-	if !hasLow { return false }
+	if !hasLow {
+		return false
+	}
 	for _, w := range offensive {
-		if strings.Contains(lower, w) { hasOff = true; break }
+		if strings.Contains(lower, w) {
+			hasOff = true
+			break
+		}
 	}
 	return hasOff
 }

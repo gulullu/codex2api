@@ -296,6 +296,11 @@ type usageLogEntry struct {
 	AttemptIndex         int
 	UpstreamErrorKind    string
 	ErrorMessage         string
+	RouteClass           string
+	RouteReason          string
+	RouteGroupID         int64
+	RoutePinned          bool
+	UpstreamAccountType  string
 }
 
 // New 创建数据库连接并自动建表。
@@ -697,6 +702,11 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS attempt_index INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_error_kind VARCHAR(64) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_class VARCHAR(32) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_reason TEXT DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_group_id BIGINT DEFAULT 0;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_pinned BOOLEAN DEFAULT FALSE;
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_account_type VARCHAR(50) DEFAULT '';
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 
@@ -807,6 +817,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_failure_policy TEXT DEFAULT 'block';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_log_retention_days INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_semantic_review_provider_pool TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_group_id BIGINT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_ttl_seconds INT DEFAULT 3600;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
@@ -868,13 +882,25 @@ func (db *DB) migrate(ctx context.Context) error {
 				review_model     VARCHAR(100) DEFAULT '',
 				review_flagged   BOOLEAN DEFAULT FALSE,
 				review_error     TEXT DEFAULT '',
-				full_text        TEXT DEFAULT ''
+				full_text        TEXT DEFAULT '',
+				account_id       BIGINT DEFAULT 0,
+				route_class      VARCHAR(32) DEFAULT '',
+				route_reason     TEXT DEFAULT '',
+				route_group_id   BIGINT DEFAULT 0,
+				route_pinned     BOOLEAN DEFAULT FALSE,
+				upstream_account_type VARCHAR(50) DEFAULT ''
 			);
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_error TEXT DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS full_text TEXT DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS client_request_id VARCHAR(128) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS account_id BIGINT DEFAULT 0;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_class VARCHAR(32) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_reason TEXT DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_group_id BIGINT DEFAULT 0;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_pinned BOOLEAN DEFAULT FALSE;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS upstream_account_type VARCHAR(50) DEFAULT '';
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);
 
@@ -1475,6 +1501,10 @@ type SystemSettings struct {
 	PromptFilterSemanticReviewFailurePolicy    string
 	PromptFilterSemanticReviewLogRetentionDays int
 	PromptFilterSemanticReviewProviderPool     string
+	PromptFilterCybRelayEnabled                bool
+	PromptFilterCybRelayGroupID                int64
+	PromptFilterCybRelaySessionPinEnabled      bool
+	PromptFilterCybRelaySessionPinTTLSeconds   int
 	SmartPacingEnabled                         bool   // issue #312 智能配速总开关
 	SmartPacingMinConcurrency                  int    // 配速并发下限
 	SmartPacingWindows                         string // "5h,7d" / "5h" / "7d"
@@ -1521,6 +1551,25 @@ func normalizeSemanticReviewLogRetentionDays(days int) int {
 		return 3650
 	}
 	return days
+}
+
+const (
+	defaultCybRelaySessionPinTTLSeconds = 3600
+	minCybRelaySessionPinTTLSeconds     = 60
+	maxCybRelaySessionPinTTLSeconds     = 86400
+)
+
+func normalizeCybRelaySessionPinTTLSeconds(seconds int) int {
+	if seconds <= 0 {
+		return defaultCybRelaySessionPinTTLSeconds
+	}
+	if seconds < minCybRelaySessionPinTTLSeconds {
+		return minCybRelaySessionPinTTLSeconds
+	}
+	if seconds > maxCybRelaySessionPinTTLSeconds {
+		return maxCybRelaySessionPinTTLSeconds
+	}
+	return seconds
 }
 
 func normalizeFirstTokenMode(mode string) string {
@@ -1655,7 +1704,11 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(model_pricing_overrides, '{}'),
 		       COALESCE(model_pricing_sync_url, ''),
 		       COALESCE(ignore_usage_limit_status, false),
-		       COALESCE(prompt_filter_semantic_review_provider_pool, '')
+		       COALESCE(prompt_filter_semantic_review_provider_pool, ''),
+		       COALESCE(prompt_filter_cyb_relay_enabled, false),
+		       COALESCE(prompt_filter_cyb_relay_group_id, 0),
+		       COALESCE(prompt_filter_cyb_relay_session_pin_enabled, true),
+		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 3600)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1715,6 +1768,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ModelPricingSyncURL,
 		&s.IgnoreUsageLimitStatus,
 		&s.PromptFilterSemanticReviewProviderPool,
+		&s.PromptFilterCybRelayEnabled,
+		&s.PromptFilterCybRelayGroupID,
+		&s.PromptFilterCybRelaySessionPinEnabled,
+		&s.PromptFilterCybRelaySessionPinTTLSeconds,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1739,6 +1796,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.PromptFilterSemanticReviewFailurePolicy = normalizeSemanticReviewFailurePolicy(s.PromptFilterSemanticReviewFailurePolicy)
 	s.PromptFilterSemanticReviewLogRetentionDays = normalizeSemanticReviewLogRetentionDays(s.PromptFilterSemanticReviewLogRetentionDays)
 	s.PromptFilterSemanticReviewProviderPool = strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool)
+	s.PromptFilterCybRelaySessionPinTTLSeconds = normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds)
 	return s, err
 }
 
@@ -1816,9 +1874,13 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					model_pricing_overrides,
 					model_pricing_sync_url,
 					ignore_usage_limit_status,
-					prompt_filter_semantic_review_provider_pool
+					prompt_filter_semantic_review_provider_pool,
+					prompt_filter_cyb_relay_enabled,
+					prompt_filter_cyb_relay_group_id,
+					prompt_filter_cyb_relay_session_pin_enabled,
+					prompt_filter_cyb_relay_session_pin_ttl_seconds
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1916,7 +1978,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					model_pricing_overrides = EXCLUDED.model_pricing_overrides,
 					model_pricing_sync_url = EXCLUDED.model_pricing_sync_url,
 					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status,
-					prompt_filter_semantic_review_provider_pool = EXCLUDED.prompt_filter_semantic_review_provider_pool
+					prompt_filter_semantic_review_provider_pool = EXCLUDED.prompt_filter_semantic_review_provider_pool,
+					prompt_filter_cyb_relay_enabled = EXCLUDED.prompt_filter_cyb_relay_enabled,
+					prompt_filter_cyb_relay_group_id = EXCLUDED.prompt_filter_cyb_relay_group_id,
+					prompt_filter_cyb_relay_session_pin_enabled = EXCLUDED.prompt_filter_cyb_relay_session_pin_enabled,
+					prompt_filter_cyb_relay_session_pin_ttl_seconds = EXCLUDED.prompt_filter_cyb_relay_session_pin_ttl_seconds
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1943,7 +2009,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		strings.TrimSpace(s.CodexSyncedCLIVersion),
 		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
 		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
-		s.IgnoreUsageLimitStatus, strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool))
+		s.IgnoreUsageLimitStatus, strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool),
+		s.PromptFilterCybRelayEnabled, s.PromptFilterCybRelayGroupID, s.PromptFilterCybRelaySessionPinEnabled,
+		normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds))
 	return err
 }
 
@@ -2308,6 +2376,11 @@ type UsageLog struct {
 	AttemptIndex         int       `json:"attempt_index"`
 	UpstreamErrorKind    string    `json:"upstream_error_kind"`
 	ErrorMessage         string    `json:"error_message"`
+	RouteClass           string    `json:"route_class"`
+	RouteReason          string    `json:"route_reason"`
+	RouteGroupID         int64     `json:"route_group_id"`
+	RoutePinned          bool      `json:"route_pinned"`
+	UpstreamAccountType  string    `json:"upstream_account_type"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
@@ -2387,6 +2460,11 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		AttemptIndex:         log.AttemptIndex,
 		UpstreamErrorKind:    log.UpstreamErrorKind,
 		ErrorMessage:         log.ErrorMessage,
+		RouteClass:           log.RouteClass,
+		RouteReason:          log.RouteReason,
+		RouteGroupID:         log.RouteGroupID,
+		RoutePinned:          log.RoutePinned,
+		UpstreamAccountType:  log.UpstreamAccountType,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -2438,6 +2516,11 @@ type UsageLogInput struct {
 	AttemptIndex         int
 	UpstreamErrorKind    string
 	ErrorMessage         string
+	RouteClass           string
+	RouteReason          string
+	RouteGroupID         int64
+	RoutePinned          bool
+	UpstreamAccountType  string
 }
 
 func (l *UsageLog) populateBillingBreakdown() {
@@ -2579,8 +2662,9 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 			  input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
 			  requested_service_tier, actual_service_tier, billing_service_tier,
 			  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
-			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)`)
+			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
+			  route_class, route_reason, route_group_id, route_pinned, upstream_account_type)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45)`)
 	if err != nil {
 		return fmt.Errorf("准备语句: %w", err)
 	}
@@ -2591,7 +2675,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
-			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket); err != nil {
+			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
+			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType); err != nil {
 			return fmt.Errorf("执行插入: %w", err)
 		}
 	}
@@ -2606,7 +2691,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 40 个参数）。
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行 45 个参数）。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -2618,7 +2703,7 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	}
 	defer tx.Rollback()
 
-	const maxRowsPerBatch = 1600
+	const maxRowsPerBatch = 1400
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -2649,28 +2734,31 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	valueArgs := make([]interface{}, 0, len(batch)*40)
+	const argsPerUsageLog = 45
+	valueArgs := make([]interface{}, 0, len(batch)*argsPerUsageLog)
 	argIdx := 1
 
 	for _, e := range batch {
-		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
-			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
-			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17, argIdx+18, argIdx+19,
-			argIdx+20, argIdx+21, argIdx+22, argIdx+23, argIdx+24, argIdx+25, argIdx+26, argIdx+27, argIdx+28, argIdx+29,
-			argIdx+30, argIdx+31, argIdx+32, argIdx+33, argIdx+34, argIdx+35, argIdx+36, argIdx+37, argIdx+38, argIdx+39))
+		placeholders := make([]string, argsPerUsageLog)
+		for i := range placeholders {
+			placeholders[i] = fmt.Sprintf("$%d", argIdx+i)
+		}
+		valueStrings = append(valueStrings, "("+strings.Join(placeholders, ", ")+")")
 		valueArgs = append(valueArgs, e.AccountID, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.CachedTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
-			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket)
-		argIdx += 40
+			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
+			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType)
+		argIdx += argsPerUsageLog
 	}
 
 	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, cached_tokens, service_tier,
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
-		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
+		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
+		route_class, route_reason, route_group_id, route_pinned, upstream_account_type)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := execer.ExecContext(ctx, query, valueArgs...)
@@ -3172,6 +3260,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+		            COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
 		            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -3192,7 +3281,9 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
-			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
+			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
+			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3630,6 +3721,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 		            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 		            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+		            COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
 		            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -3651,7 +3743,9 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens, &l.ServiceTier,
 			&l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier,
 			&l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize, &l.AccountBilled, &l.UserBilled,
-			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
+			&l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
+			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3767,6 +3861,9 @@ func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
 				OR LOWER(COALESCE(u.upstream_endpoint, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.route_class, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.route_reason, '')) LIKE LOWER(%[1]s)
+				OR LOWER(COALESCE(u.upstream_account_type, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(u.client_ip, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(a.name, '')) LIKE LOWER(%[1]s)
 				OR LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER(%[1]s)
@@ -3852,6 +3949,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+			            COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
 			            COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
@@ -3872,7 +3970,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw, &result.Total); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
+			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&credentialRaw, &l.AccountName, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
@@ -3904,6 +4004,7 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 			COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+			COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false), COALESCE(u.upstream_account_type, ''),
 			COALESCE(CAST(a.credentials AS TEXT), '{}'), COALESCE(a.name, ''), u.created_at
 		FROM usage_logs u
 		LEFT JOIN accounts a ON u.account_id = a.id
@@ -3923,7 +4024,9 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage,
+			&l.RouteClass, &l.RouteReason, &l.RouteGroupID, &l.RoutePinned, &l.UpstreamAccountType,
+			&credentialRaw, &l.AccountName, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
