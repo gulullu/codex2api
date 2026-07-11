@@ -260,6 +260,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
+			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
+				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt, routeErr)
+				apiErr = api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer)
+				_ = writeResponsesWSError(conn, apiErr)
+				return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
+			}
 			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, true, true, attempt)
 				_ = writeCybRelayUnavailableWebSocket(conn)

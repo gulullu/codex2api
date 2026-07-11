@@ -17,12 +17,47 @@ const (
 	responseOwnerRouteSignal        = "previous_response_owner"
 	cybRelayRouteSourceContinuation = "continuation"
 	contextResponseRouteOwner       = "responseRouteOwner"
+	contextRouteSelectionError      = "routeSelectionError"
+	routeSwitchRequiresReplay       = "route_switch_requires_replay"
+	continuationOwnerUnavailable    = "continuation_owner_unavailable"
 )
 
 type responseRouteOwner struct {
 	AccountID   int64  `json:"account_id"`
 	AccountType string `json:"account_type"`
 	RouteClass  string `json:"route_class"`
+}
+
+type routeSelectionError struct {
+	Kind    string
+	Message string
+}
+
+func clearRouteSelectionError(c *gin.Context) {
+	if c != nil {
+		c.Set(contextRouteSelectionError, routeSelectionError{})
+	}
+}
+
+func setRouteSelectionError(c *gin.Context, kind, message string) {
+	if c != nil {
+		c.Set(contextRouteSelectionError, routeSelectionError{
+			Kind:    strings.TrimSpace(kind),
+			Message: strings.TrimSpace(message),
+		})
+	}
+}
+
+func routeSelectionErrorFromContext(c *gin.Context) (routeSelectionError, bool) {
+	if c == nil {
+		return routeSelectionError{}, false
+	}
+	value, ok := c.Get(contextRouteSelectionError)
+	if !ok {
+		return routeSelectionError{}, false
+	}
+	routeErr, ok := value.(routeSelectionError)
+	return routeErr, ok && routeErr.Kind != ""
 }
 
 func responseRouteOwnerCacheKey(c *gin.Context, responseID string) string {
@@ -46,7 +81,13 @@ func responseRouteOwnerFromContext(c *gin.Context) (responseRouteOwner, bool) {
 }
 
 func (h *Handler) loadResponseRouteOwner(c *gin.Context, rawBody []byte) {
-	if h == nil || h.cache == nil || c == nil {
+	if c == nil {
+		return
+	}
+	// Responses WebSocket reuses one Gin context for multiple turns.
+	// Clear any owner from the prior turn before resolving this request.
+	c.Set(contextResponseRouteOwner, responseRouteOwner{})
+	if h == nil || h.cache == nil {
 		return
 	}
 	responseID := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String())

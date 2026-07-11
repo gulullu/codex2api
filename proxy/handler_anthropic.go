@@ -175,6 +175,11 @@ func (h *Handler) Messages(c *gin.Context) {
 		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
+			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
+				h.logRouteSelectionError(c, "/v1/messages", model, effectiveModel, isStream, false, attempt, routeErr)
+				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", routeErr.Message)
+				return
+			}
 			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/messages", model, effectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableAnthropic(c)

@@ -1821,6 +1821,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
+			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
+				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt, routeErr)
+				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer), http.StatusServiceUnavailable)
+				return
+			}
 			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableOpenAI(c)
@@ -2887,6 +2892,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
+			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
+				h.logRouteSelectionError(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt, routeErr)
+				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer), http.StatusServiceUnavailable)
+				return
+			}
 			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt)
 				sendCybRelayUnavailableOpenAI(c)
@@ -3415,6 +3425,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
+			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
+				h.logRouteSelectionError(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt, routeErr)
+				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(routeErr.Kind), routeErr.Message, api.ErrorTypeServer), http.StatusServiceUnavailable)
+				return
+			}
 			if routeRequirement.routesToCybRelay() {
 				h.logCybRelayUnavailable(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt)
 				sendCybRelayUnavailableOpenAI(c)

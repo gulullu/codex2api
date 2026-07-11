@@ -3,9 +3,11 @@ package proxy
 import (
 	"context"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -63,13 +65,15 @@ func (h *Handler) nextRoutedAccountForSession(
 	baseFilter auth.AccountFilter,
 	required promptRiskDecision,
 ) (*auth.Account, string, promptRiskDecision) {
+	clearRouteSelectionError(c)
 	if owner, ok := responseRouteOwnerFromContext(c); ok {
 		ownerIsRelay := owner.AccountType == auth.UpstreamOpenAIResponses || owner.RouteClass == cybRelayRouteClass
 		if required.routesToCybRelay() && !ownerIsRelay {
 			conflict := required
 			conflict.RouteSource = cybRelayRouteSourceContinuation
-			conflict.Reason = "previous_response_id belongs to OAuth but this request requires Relay"
+			conflict.Reason = "previous_response_id belongs to OAuth; resend full context without previous_response_id to use Relay"
 			conflict.Signals = appendUniqueRouteSignal(conflict.Signals, responseOwnerRouteSignal)
+			setRouteSelectionError(c, routeSwitchRequiresReplay, conflict.Reason)
 			h.setSelectedRouteDecision(c, conflict)
 			return nil, "", conflict
 		}
@@ -80,13 +84,20 @@ func (h *Handler) nextRoutedAccountForSession(
 			decision.Reason = "continued on the Relay account that owns previous_response_id"
 			decision.Signals = appendUniqueRouteSignal(decision.Signals, responseOwnerRouteSignal)
 		}
+		ownerBaseFilter := oauthOnlyAccountFilter(baseFilter)
+		if ownerIsRelay {
+			ownerBaseFilter = h.applyCybRelayAccountFilter(baseFilter, promptRiskDecision{Disposition: promptRiskDispositionRelay})
+		}
 		account, proxyURL := h.nextRetryAccountForSession(
 			ctx,
 			affinityKey,
 			apiKeyID,
 			exclusions,
-			responseOwnerAccountFilter(baseFilter, owner),
+			responseOwnerAccountFilter(ownerBaseFilter, owner),
 		)
+		if account == nil {
+			setRouteSelectionError(c, continuationOwnerUnavailable, "The account that owns previous_response_id is unavailable; retry later or resend full context")
+		}
 		h.setSelectedRouteDecision(c, decision)
 		return account, proxyURL, decision
 	}
@@ -147,4 +158,23 @@ func (h *Handler) nextRoutedAccountForSession(
 		}
 		log.Printf("first-token soft exclusions exhausted; retrying OAuth/Relay routing")
 	}
+}
+
+func (h *Handler) logRouteSelectionError(c *gin.Context, endpoint, model, effectiveModel string, stream, viaWebsocket bool, attempt int, routeErr routeSelectionError) {
+	clearUpstreamAccountContext(c)
+	h.logUsageForRequest(c, &database.UsageLogInput{
+		AccountID:         0,
+		Endpoint:          endpoint,
+		Model:             model,
+		EffectiveModel:    effectiveModel,
+		StatusCode:        http.StatusServiceUnavailable,
+		DurationMs:        logicalRequestDurationMs(c),
+		InboundEndpoint:   endpoint,
+		Stream:            stream,
+		ViaWebsocket:      viaWebsocket,
+		IsRetryAttempt:    attempt > 0,
+		AttemptIndex:      attempt + 1,
+		UpstreamErrorKind: routeErr.Kind,
+		ErrorMessage:      routeErr.Message,
+	})
 }

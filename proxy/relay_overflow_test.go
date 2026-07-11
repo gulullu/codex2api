@@ -197,3 +197,103 @@ func TestPreviousResponseOwnerKeepsOverflowContinuationOnExactRelayAccount(t *te
 		t.Fatalf("cross-key owner leaked: %+v", owner)
 	}
 }
+
+func TestLoadResponseRouteOwnerClearsPriorWebSocketTurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, _, relay := newRelayOverflowTestHandler()
+	handler.SetRuntimeCache(cache.NewMemory(32))
+
+	ctx := newRouteTestContext()
+	ctx.Set(contextAPIKeyID, int64(101))
+	setUpstreamAccountContext(ctx, relay)
+	handler.setSelectedRouteDecision(ctx, overflowPromptRiskDecision())
+	handler.pinCybRelayResponseID(ctx, []byte(`{"id":"resp_ws_turn_1"}`))
+
+	handler.loadResponseRouteOwner(ctx, []byte(`{"previous_response_id":"resp_ws_turn_1"}`))
+	if owner, ok := responseRouteOwnerFromContext(ctx); !ok || owner.AccountID != relay.ID() {
+		t.Fatalf("owner = %+v, present=%v; want Relay %d", owner, ok, relay.ID())
+	}
+
+	// A Responses WebSocket reuses the Gin context. A new independent turn must
+	// not inherit the previous turn's exact-account owner.
+	handler.loadResponseRouteOwner(ctx, []byte(`{"input":"independent turn"}`))
+	if owner, ok := responseRouteOwnerFromContext(ctx); ok {
+		t.Fatalf("stale WebSocket owner retained: %+v", owner)
+	}
+}
+
+func TestContinuationRelayOwnerMustRemainInConfiguredRelayGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, oauth, relay := newRelayOverflowTestHandler()
+	relay.GroupIDs = []int64{8}
+	ctx := newRouteTestContext()
+	ctx.Set(contextResponseRouteOwner, responseRouteOwner{
+		AccountID:   relay.ID(),
+		AccountType: auth.UpstreamOpenAIResponses,
+		RouteClass:  cybRelayRouteClass,
+	})
+
+	account, _, decision := handler.nextRoutedAccountForSession(
+		ctx,
+		context.Background(),
+		"",
+		0,
+		newRetryAccountExclusions(),
+		nil,
+		defaultPromptRiskDecision(),
+	)
+	if account != nil {
+		handler.store.Release(account)
+		t.Fatalf("account = %#v, want nil after Relay owner leaves configured group", account)
+	}
+	if decision.RouteSource != cybRelayRouteSourceContinuation {
+		t.Fatalf("decision = %+v, want continuation route", decision)
+	}
+	routeErr, ok := routeSelectionErrorFromContext(ctx)
+	if !ok || routeErr.Kind != continuationOwnerUnavailable {
+		t.Fatalf("route error = %+v, present=%v; want %q", routeErr, ok, continuationOwnerUnavailable)
+	}
+	if got := atomic.LoadInt64(&oauth.ActiveRequests); got != 0 {
+		t.Fatalf("OAuth active requests = %d, exact Relay continuation must not fall back", got)
+	}
+}
+
+func TestRelayRequiredContinuationRejectsOAuthOwnerWithReplayError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, oauth, _ := newRelayOverflowTestHandler()
+	ctx := newRouteTestContext()
+	ctx.Set(contextResponseRouteOwner, responseRouteOwner{
+		AccountID:   oauth.ID(),
+		AccountType: "oauth",
+		RouteClass:  "",
+	})
+	required := promptRiskDecision{
+		Disposition: promptRiskDispositionRelay,
+		RouteSource: cybRelayRouteSourceProbe,
+		Signals:     []string{probeRouteSignal},
+	}
+
+	account, _, decision := handler.nextRoutedAccountForSession(
+		ctx,
+		context.Background(),
+		"",
+		0,
+		newRetryAccountExclusions(),
+		nil,
+		required,
+	)
+	if account != nil {
+		handler.store.Release(account)
+		t.Fatalf("account = %#v, want explicit replay-required failure", account)
+	}
+	if decision.RouteSource != cybRelayRouteSourceContinuation || !decision.routesToCybRelay() {
+		t.Fatalf("decision = %+v, want Relay continuation conflict", decision)
+	}
+	routeErr, ok := routeSelectionErrorFromContext(ctx)
+	if !ok || routeErr.Kind != routeSwitchRequiresReplay {
+		t.Fatalf("route error = %+v, present=%v; want %q", routeErr, ok, routeSwitchRequiresReplay)
+	}
+	if got := atomic.LoadInt64(&oauth.ActiveRequests); got != 0 {
+		t.Fatalf("OAuth active requests = %d, conflicting owner must not be acquired", got)
+	}
+}
