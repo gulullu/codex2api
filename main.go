@@ -381,10 +381,13 @@ func main() {
 
 	// 健康检查
 	r.GET("/health", func(c *gin.Context) {
+		guardian, relay := store.RelayGuardianHealth()
 		c.JSON(200, gin.H{
 			"status":    "ok",
 			"available": store.AvailableCount(),
 			"total":     store.AccountCount(),
+			"guardian":  guardian,
+			"relay":     relay,
 		})
 	})
 

@@ -70,6 +70,7 @@ func buildRetryAttemptUsageLog(c *gin.Context, spec retryAttemptUsageSpec) *data
 		AttemptIndex:         spec.Attempt + 1,
 		UpstreamErrorKind:    errorKind,
 		ErrorMessage:         errorMessage,
+		GuardianAttemptOnly:  true,
 		LogicalRequestID:     logicalRequestID(c),
 	}
 }

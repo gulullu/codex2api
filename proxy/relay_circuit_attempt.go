@@ -60,6 +60,7 @@ func (a *relayCircuitAttempt) Failure(statusCode int) {
 		if auth.IsRelayCircuitFailureStatus(statusCode) {
 			store.ReportRelayCircuitFailure(permit, statusCode)
 		} else {
+			store.ReportRelayGuardianFailure(permit.Guardian, statusCode)
 			store.AbandonRelayCircuitRequest(permit)
 		}
 	})

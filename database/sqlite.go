@@ -152,7 +152,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			logical_request_id TEXT DEFAULT '',
 			route_source TEXT DEFAULT '',
 			route_signals TEXT DEFAULT '[]',
-			pin_kind TEXT DEFAULT ''
+			pin_kind TEXT DEFAULT '',
+			guardian_attempt_only INTEGER DEFAULT 0
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,8 +255,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					prompt_filter_cyb_relay_enabled INTEGER DEFAULT 0,
 					prompt_filter_cyb_relay_group_id INTEGER DEFAULT 0,
 					prompt_filter_cyb_relay_session_pin_enabled INTEGER DEFAULT 1,
-					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 600
+					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 600,
+					relay_guardian_mode TEXT DEFAULT 'off'
 				);`,
+		`CREATE TABLE IF NOT EXISTS relay_guardian_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			account_id INTEGER NOT NULL, account_name TEXT DEFAULT '', event_type TEXT NOT NULL,
+			from_state TEXT DEFAULT '', to_state TEXT DEFAULT '', actor TEXT DEFAULT '', reason TEXT DEFAULT '',
+			trigger_source TEXT DEFAULT '', window_seconds INTEGER DEFAULT 0, failure_count INTEGER DEFAULT 0,
+			user_visible_failures INTEGER DEFAULT 0, strong_gateway_failures INTEGER DEFAULT 0,
+			quarantine_seconds INTEGER DEFAULT 0, generation INTEGER DEFAULT 0,
+			logical_request_ids TEXT DEFAULT '[]', details TEXT DEFAULT '{}'
+		);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
 			enabled INTEGER DEFAULT 1,
@@ -428,6 +439,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "route_source", "TEXT DEFAULT ''"},
 		{"usage_logs", "route_signals", "TEXT DEFAULT '[]'"},
 		{"usage_logs", "pin_kind", "TEXT DEFAULT ''"},
+		{"usage_logs", "guardian_attempt_only", "INTEGER DEFAULT 0"},
 		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
 		{"api_keys", "quota_used", "REAL DEFAULT 0"},
 		{"api_keys", "total_used", "REAL DEFAULT 0"},
@@ -514,6 +526,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_cyb_relay_group_id", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_cyb_relay_session_pin_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "prompt_filter_cyb_relay_session_pin_ttl_seconds", "INTEGER DEFAULT 600"},
+		{"system_settings", "relay_guardian_mode", "TEXT DEFAULT 'off'"},
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "review_error", "TEXT DEFAULT ''"},
@@ -597,6 +610,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_image_assets_job_id ON image_assets(job_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_relay_guardian_events_created ON relay_guardian_events(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_relay_guardian_events_account_created ON relay_guardian_events(account_id, created_at);`,
 	}
 	for _, stmt := range indexStatements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {

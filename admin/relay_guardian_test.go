@@ -1,0 +1,141 @@
+package admin
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+
+	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
+	"github.com/gin-gonic/gin"
+)
+
+func guardianAdminTestStore(t *testing.T) *auth.Store {
+	t.Helper()
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 100, TestConcurrency: 1, TestModel: "gpt-5.4", RelayGuardianMode: "enforce", PromptFilterCybRelayEnabled: true, PromptFilterCybRelayGroupID: 7})
+	for _, id := range []int64{51, 50} {
+		store.AddAccount(&auth.Account{DBID: id, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example/v1", APIKey: "key", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy, GroupIDs: []int64{7}, Email: "relay"})
+	}
+	for _, logicalID := range []string{"u-1", "u-2"} {
+		store.ObserveRelayGuardianUsage(&database.UsageLogInput{AccountID: 51, LogicalRequestID: logicalID, StatusCode: 500, RouteClass: "cyb_relay", RouteGroupID: 7, UpstreamAccountType: auth.UpstreamOpenAIResponses})
+	}
+	return store
+}
+
+func guardianSettingsTestHandler(t *testing.T, db *database.DB) (*Handler, *auth.Store, cache.TokenCache) {
+	t.Helper()
+	settings := testCybRelaySystemSettings()
+	settings.RelayGuardianMode = "enforce"
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateRelayGuardianMode(context.Background(), "enforce"); err != nil {
+		t.Fatal(err)
+	}
+	tokenCache := cache.NewMemory(4)
+	store := auth.NewStore(db, tokenCache, settings)
+	return NewHandler(store, db, tokenCache, proxy.NewRateLimiter(0), "admin-secret"), store, tokenCache
+}
+
+func invokeGuardianModeUpdate(handler *Handler, mode string) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(map[string]any{"relay_guardian_mode": mode})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	return recorder
+}
+
+func TestRelayGuardianReleaseReturnsSingleAccountSnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := guardianAdminTestStore(t)
+	before, ok := store.RelayGuardianAccountStatus(51)
+	if !ok || before.State != auth.RelayGuardianQuarantined {
+		t.Fatalf("setup status=%+v", before)
+	}
+	body, _ := json.Marshal(map[string]any{"generation": before.Generation})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Params = gin.Params{{Key: "id", Value: "51"}}
+	(&Handler{store: store}).ReleaseRelayGuardian(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := response["account_id"]; !ok {
+		t.Fatalf("single account snapshot missing: %v", response)
+	}
+	if _, ok := response["accounts"]; ok {
+		t.Fatalf("endpoint returned full status: %v", response)
+	}
+	if generation, _ := response["generation"].(float64); uint64(generation) == before.Generation {
+		t.Fatalf("generation was not refreshed: %v", response)
+	}
+}
+
+func TestRelayGuardianModeUpdateReturns500WhenSettingsSaveFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, store, tokenCache := guardianSettingsTestHandler(t, db)
+	defer tokenCache.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recorder := invokeGuardianModeUpdate(handler, "monitor")
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if store.GetRelayGuardianMode() != auth.RelayGuardianEnforce {
+		t.Fatalf("failed save mutated runtime mode=%s", store.GetRelayGuardianMode())
+	}
+}
+
+func TestRelayGuardianModeUpdateReturns500WhenModeWriteFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	path := filepath.Join(t.TempDir(), "mode-trigger.db")
+	db, err := database.New("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	handler, store, tokenCache := guardianSettingsTestHandler(t, db)
+	defer tokenCache.Close()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER fail_relay_guardian_mode BEFORE UPDATE OF relay_guardian_mode ON system_settings BEGIN SELECT RAISE(FAIL, 'forced mode write failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	recorder := invokeGuardianModeUpdate(handler, "monitor")
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if store.GetRelayGuardianMode() != auth.RelayGuardianEnforce {
+		t.Fatalf("failed mode write mutated runtime mode=%s", store.GetRelayGuardianMode())
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.RelayGuardianMode != "enforce" {
+		t.Fatalf("failed mode write persisted=%s", persisted.RelayGuardianMode)
+	}
+}

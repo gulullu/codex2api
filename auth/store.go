@@ -2343,6 +2343,9 @@ type Store struct {
 	cybRelayConfig        atomic.Value // CybRelayConfig
 	relayCircuitOnce      sync.Once
 	relayCircuit          *relayCircuitBreaker
+	relayGuardianMode     atomic.Value // string: off / monitor / enforce
+	relayGuardianOnce     sync.Once
+	relayGuardian         *relayHealthGuardian
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
 
@@ -2803,6 +2806,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		SessionPinEnabled:    settings.PromptFilterCybRelaySessionPinEnabled,
 		SessionPinTTLSeconds: settings.PromptFilterCybRelaySessionPinTTLSeconds,
 	})
+	s.SetRelayGuardianMode(settings.RelayGuardianMode)
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -3668,9 +3672,11 @@ func (s *Store) LoadAccountByID(ctx context.Context, dbID int64) error {
 
 // StartBackgroundRefresh 启动后台定期刷新
 func (s *Store) StartBackgroundRefresh() {
+	s.RelayGuardianReconcile(context.Background())
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		guardianTicker := time.NewTicker(RelayGuardianScanInterval)
 		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
@@ -3688,6 +3694,7 @@ func (s *Store) StartBackgroundRefresh() {
 		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
 		defer boundaryProbeTimer.Stop()
+		defer guardianTicker.Stop()
 
 		resetRefreshTimer := func() {
 			if !refreshTimer.Stop() {
@@ -3704,6 +3711,8 @@ func (s *Store) StartBackgroundRefresh() {
 
 		for {
 			select {
+			case <-guardianTicker.C:
+				s.RelayGuardianReconcile(context.Background())
 			case <-refreshTimer.C:
 				if s.GetLazyMode() {
 					s.TriggerUsageProbeAsync()
@@ -4779,7 +4788,16 @@ func (s *Store) SetCybRelayConfig(cfg CybRelayConfig) {
 	if s == nil {
 		return
 	}
-	s.cybRelayConfig.Store(NormalizeCybRelayConfig(cfg))
+	previous := s.GetCybRelayConfig()
+	normalized := NormalizeCybRelayConfig(cfg)
+	var accounts []*Account
+	if s.relayGuardian != nil && (previous.Enabled != normalized.Enabled || previous.GroupID != normalized.GroupID) {
+		accounts = s.Accounts()
+	}
+	s.cybRelayConfig.Store(normalized)
+	if s.relayGuardian != nil {
+		s.relayGuardian.relayConfigChanged(previous, normalized, accounts)
+	}
 }
 
 func (s *Store) GetCybRelayConfig() CybRelayConfig {

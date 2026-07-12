@@ -49,6 +49,7 @@ type RelayCircuitPermit struct {
 	LeaseID    uint64
 	Probe      bool
 	Active     bool
+	Guardian   RelayGuardianPermit
 }
 
 // RelayCircuitSnapshot is a read-only admin/audit view. It is intentionally
@@ -694,6 +695,9 @@ func (s *Store) RelayCircuitSelectable(account *Account) bool {
 	if !s.isConfiguredRelayCircuitAccount(account) {
 		return true
 	}
+	if !s.RelayGuardianSelectable(account) {
+		return false
+	}
 	return s.relayCircuitManager().selectable(account.DBID)
 }
 
@@ -712,7 +716,17 @@ func (s *Store) BeginRelayCircuitRequest(account *Account) (RelayCircuitPermit, 
 	if !s.isConfiguredRelayCircuitAccount(account) {
 		return RelayCircuitPermit{}, false
 	}
-	return s.relayCircuitManager().begin(account.DBID)
+	permit, ok := s.relayCircuitManager().begin(account.DBID)
+	if !ok {
+		return RelayCircuitPermit{}, false
+	}
+	guardian, guardianOK := s.BeginRelayGuardianRequest(account)
+	if !guardianOK {
+		s.relayCircuitManager().abandon(permit)
+		return RelayCircuitPermit{}, false
+	}
+	permit.Guardian = guardian
+	return permit, true
 }
 
 // ReportRelayCircuitFailure records only the Relay server statuses owned by
@@ -723,6 +737,7 @@ func (s *Store) ReportRelayCircuitFailure(permit RelayCircuitPermit, statusCode 
 	if s == nil {
 		return false
 	}
+	s.ReportRelayGuardianFailure(permit.Guardian, statusCode)
 	return s.relayCircuitManager().reportFailure(permit, statusCode)
 }
 
@@ -732,6 +747,7 @@ func (s *Store) ReportRelayCircuitSuccess(permit RelayCircuitPermit) bool {
 	if s == nil {
 		return false
 	}
+	s.ReportRelayGuardianSuccess(permit.Guardian)
 	return s.relayCircuitManager().reportSuccess(permit)
 }
 
@@ -744,6 +760,7 @@ func (s *Store) AbandonRelayCircuitRequest(permit RelayCircuitPermit) bool {
 	if s == nil {
 		return false
 	}
+	s.AbandonRelayGuardianRequest(permit.Guardian)
 	return s.relayCircuitManager().abandon(permit)
 }
 

@@ -638,6 +638,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateCybUsageRouteMeta(h, c, input)
 	input.LogicalRequestID = logicalRequestID(c)
 	markCyberPolicyUsageKind(input)
+	h.store.ObserveRelayGuardianUsage(input)
 	h.logUsage(input)
 }
 
@@ -669,6 +670,7 @@ func (h *Handler) logContinueThinkingRounds(c *gin.Context, res continueFoldResu
 			RequestedServiceTier: usageTiers.RequestedServiceTier,
 			ActualServiceTier:    usageTiers.ActualServiceTier,
 			BillingServiceTier:   usageTiers.BillingServiceTier,
+			GuardianAttemptOnly:  true,
 			// 隐藏的续想轮不是「重试」：不置 IsRetryAttempt/AttemptIndex，
 			// 否则会污染重试统计并与外层 attempt 编号混淆。
 		}

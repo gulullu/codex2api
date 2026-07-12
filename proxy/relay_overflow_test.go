@@ -134,6 +134,56 @@ func TestDirectRelayRouteNeverFallsBackToOAuth(t *testing.T) {
 	}
 }
 
+func TestRelayCircuitHeldNeverEscapesToOAuthAcrossProtocols(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name         string
+		path         string
+		websocket    bool
+		continuation bool
+	}{
+		{name: "responses_http", path: "/v1/responses"},
+		{name: "chat_completions", path: "/v1/chat/completions"},
+		{name: "anthropic_messages", path: "/v1/messages"},
+		{name: "responses_inbound_ws", path: "/v1/responses", websocket: true},
+		{name: "responses_continuation", path: "/v1/responses", continuation: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, oauth, relay := newRelayOverflowTestHandler()
+			permit, ok := handler.store.BeginRelayCircuitRequest(relay)
+			if !ok || !permit.Active {
+				t.Fatalf("Relay circuit permit=%+v ok=%v", permit, ok)
+			}
+			if !handler.store.ReportRelayCircuitFailure(permit, http.StatusBadGateway) {
+				t.Fatal("failed to open Relay circuit")
+			}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, test.path, nil)
+			if test.websocket {
+				ctx.Request.Header.Set("Connection", "Upgrade")
+				ctx.Request.Header.Set("Upgrade", "websocket")
+			}
+			if test.continuation {
+				ctx.Set(contextResponseRouteOwner, responseRouteOwner{AccountID: relay.ID(), AccountType: auth.UpstreamOpenAIResponses, RouteClass: cybRelayRouteClass})
+			}
+			required := promptRiskDecision{Disposition: promptRiskDispositionRelay, RouteSource: cybRelayRouteSourceProbe, Signals: []string{probeRouteSignal}}
+			account, _, decision := handler.nextRoutedAccountForSession(ctx, ctx.Request.Context(), "", 0, newRetryAccountExclusions(), nil, required)
+			if account != nil {
+				handler.store.Release(account)
+				t.Fatalf("held Relay escaped to account=%d", account.ID())
+			}
+			if !decision.routesToCybRelay() {
+				t.Fatalf("Relay-only decision lost: %+v", decision)
+			}
+			if got := atomic.LoadInt64(&oauth.ActiveRequests); got != 0 {
+				t.Fatalf("OAuth touched under Relay-only %s: active=%d", test.name, got)
+			}
+		})
+	}
+}
+
 func TestProbeRequestRoutesDirectlyToRelayEvenWithLegacyShortCircuitDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("CODEX_PROBE_SHORT_CIRCUIT_ENABLED", "false")

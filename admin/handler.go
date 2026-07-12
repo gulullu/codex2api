@@ -431,6 +431,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
 	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
+	api.GET("/relay-guardian/status", h.GetRelayGuardianStatus)
+	api.GET("/relay-guardian/events", h.ListRelayGuardianEvents)
+	api.POST("/relay-guardian/accounts/:id/release", h.ReleaseRelayGuardian)
+	api.POST("/relay-guardian/accounts/:id/temporary-bypass", h.TemporaryBypassRelayGuardian)
 	api.GET("/runtime-status", h.GetRuntimeStatus)
 	api.GET("/system/update", h.GetSystemUpdate)
 	api.POST("/system/update", h.PerformSystemUpdate)
@@ -6231,6 +6235,7 @@ type settingsResponse struct {
 	IgnoreUsageLimitStatus                     bool                           `json:"ignore_usage_limit_status"`
 	RetryIntervalMS                            int                            `json:"retry_interval_ms"`
 	TransportRetryPolicy                       string                         `json:"transport_retry_policy"`
+	RelayGuardianMode                          string                         `json:"relay_guardian_mode"`
 }
 
 type updateSettingsReq struct {
@@ -6344,6 +6349,7 @@ type updateSettingsReq struct {
 	IgnoreUsageLimitStatus                     *bool                           `json:"ignore_usage_limit_status"`
 	RetryIntervalMS                            *int                            `json:"retry_interval_ms"`
 	TransportRetryPolicy                       *string                         `json:"transport_retry_policy"`
+	RelayGuardianMode                          *string                         `json:"relay_guardian_mode"`
 }
 
 type promptFilterSemanticReviewResolved struct {
@@ -7227,6 +7233,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		IgnoreUsageLimitStatus:                     h.store.IgnoreUsageLimitStatus(),
 		RetryIntervalMS:                            h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                       h.store.GetTransportRetryPolicy(),
+		RelayGuardianMode:                          string(h.store.GetRelayGuardianMode()),
 	})
 }
 
@@ -7273,6 +7280,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		case "5h,7d", "7d,5h", "5h", "7d", "":
 		default:
 			writeError(c, http.StatusBadRequest, "smart_pacing_windows 仅支持 5h,7d / 5h / 7d")
+			return
+		}
+	}
+	if req.RelayGuardianMode != nil {
+		normalized := database.NormalizeRelayGuardianMode(*req.RelayGuardianMode)
+		if normalized != strings.ToLower(strings.TrimSpace(*req.RelayGuardianMode)) {
+			writeError(c, http.StatusBadRequest, "relay_guardian_mode 仅支持 off / monitor / enforce")
 			return
 		}
 	}
@@ -8241,9 +8255,24 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		IgnoreUsageLimitStatus:                     h.store.IgnoreUsageLimitStatus(),
 		RetryIntervalMS:                            h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                       h.store.GetTransportRetryPolicy(),
+		RelayGuardianMode:                          string(h.store.GetRelayGuardianMode()),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if req.RelayGuardianMode != nil {
+			writeError(c, http.StatusInternalServerError, "无法持久化 Relay Guardian 设置")
+			return
+		}
+	}
+	if err == nil && req.RelayGuardianMode != nil {
+		mode := database.NormalizeRelayGuardianMode(*req.RelayGuardianMode)
+		if modeErr := h.db.UpdateRelayGuardianMode(c.Request.Context(), mode); modeErr != nil {
+			log.Printf("无法持久化 Relay Guardian 模式: %v", modeErr)
+			writeError(c, http.StatusInternalServerError, "无法持久化 Relay Guardian 模式")
+			return
+		} else {
+			h.store.SetRelayGuardianMode(mode)
+		}
 	}
 
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
@@ -8390,6 +8419,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		IgnoreUsageLimitStatus:                     h.store.IgnoreUsageLimitStatus(),
 		RetryIntervalMS:                            h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:                       h.store.GetTransportRetryPolicy(),
+		RelayGuardianMode:                          string(h.store.GetRelayGuardianMode()),
 	})
 }
 

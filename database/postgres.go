@@ -305,6 +305,7 @@ type usageLogEntry struct {
 	RouteSource          string
 	RouteSignals         string
 	PinKind              string
+	GuardianAttemptOnly  bool
 }
 
 // New 创建数据库连接并自动建表。
@@ -715,6 +716,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_source VARCHAR(16) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS route_signals TEXT DEFAULT '[]';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS pin_kind VARCHAR(32) DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS guardian_attempt_only BOOLEAN DEFAULT FALSE;
 
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_logical_request_created_at ON usage_logs(logical_request_id, created_at);
@@ -870,6 +872,19 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS relay_guardian_mode VARCHAR(16) DEFAULT 'off';
+
+	CREATE TABLE IF NOT EXISTS relay_guardian_events (
+		id BIGSERIAL PRIMARY KEY, created_at TIMESTAMPTZ DEFAULT NOW(), account_id BIGINT NOT NULL,
+		account_name TEXT DEFAULT '', event_type VARCHAR(64) NOT NULL, from_state VARCHAR(32) DEFAULT '',
+		to_state VARCHAR(32) DEFAULT '', actor VARCHAR(32) DEFAULT '', reason TEXT DEFAULT '',
+		trigger_source VARCHAR(64) DEFAULT '', window_seconds INT DEFAULT 0, failure_count INT DEFAULT 0,
+		user_visible_failures INT DEFAULT 0, strong_gateway_failures INT DEFAULT 0,
+		quarantine_seconds INT DEFAULT 0, generation BIGINT DEFAULT 0,
+		logical_request_ids TEXT DEFAULT '[]', details TEXT DEFAULT '{}'
+	);
+	CREATE INDEX IF NOT EXISTS idx_relay_guardian_events_created ON relay_guardian_events(created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_relay_guardian_events_account_created ON relay_guardian_events(account_id, created_at DESC);
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1527,6 +1542,7 @@ type SystemSettings struct {
 	PromptFilterCybRelayGroupID                int64
 	PromptFilterCybRelaySessionPinEnabled      bool
 	PromptFilterCybRelaySessionPinTTLSeconds   int
+	RelayGuardianMode                          string
 	SmartPacingEnabled                         bool   // issue #312 智能配速总开关
 	SmartPacingMinConcurrency                  int    // 配速并发下限
 	SmartPacingWindows                         string // "5h,7d" / "5h" / "7d"
@@ -1730,7 +1746,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_cyb_relay_enabled, false),
 		       COALESCE(prompt_filter_cyb_relay_group_id, 0),
 		       COALESCE(prompt_filter_cyb_relay_session_pin_enabled, true),
-		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 600)
+		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 600),
+		       COALESCE(NULLIF(TRIM(relay_guardian_mode), ''), 'off')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1794,6 +1811,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PromptFilterCybRelayGroupID,
 		&s.PromptFilterCybRelaySessionPinEnabled,
 		&s.PromptFilterCybRelaySessionPinTTLSeconds,
+		&s.RelayGuardianMode,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1819,6 +1837,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.PromptFilterSemanticReviewLogRetentionDays = normalizeSemanticReviewLogRetentionDays(s.PromptFilterSemanticReviewLogRetentionDays)
 	s.PromptFilterSemanticReviewProviderPool = strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool)
 	s.PromptFilterCybRelaySessionPinTTLSeconds = normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds)
+	s.RelayGuardianMode = NormalizeRelayGuardianMode(s.RelayGuardianMode)
 	return s, err
 }
 
@@ -2495,6 +2514,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		RouteSource:          log.RouteSource,
 		RouteSignals:         log.RouteSignals,
 		PinKind:              log.PinKind,
+		GuardianAttemptOnly:  log.GuardianAttemptOnly,
 	})
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
@@ -2555,6 +2575,7 @@ type UsageLogInput struct {
 	RouteSource          string
 	RouteSignals         string
 	PinKind              string
+	GuardianAttemptOnly  bool // persisted hidden attempt, not a user-visible final result
 }
 
 func (l *UsageLog) populateBillingBreakdown() {
@@ -2698,8 +2719,8 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 			  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
 			  route_class, route_reason, route_group_id, route_pinned, upstream_account_type,
-			  logical_request_id, route_source, route_signals, pin_kind)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49)`)
+			  logical_request_id, route_source, route_signals, pin_kind, guardian_attempt_only)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)`)
 	if err != nil {
 		return fmt.Errorf("准备语句: %w", err)
 	}
@@ -2712,7 +2733,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
 			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType,
-			e.LogicalRequestID, e.RouteSource, e.RouteSignals, e.PinKind); err != nil {
+			e.LogicalRequestID, e.RouteSource, e.RouteSignals, e.PinKind, e.GuardianAttemptOnly); err != nil {
 			return fmt.Errorf("执行插入: %w", err)
 		}
 	}
@@ -2740,7 +2761,7 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	defer tx.Rollback()
 
 	// 49 * 1337 = 65513，保持在 PostgreSQL 65535 参数上限以内。
-	const maxRowsPerBatch = 1337
+	const maxRowsPerBatch = 1310
 
 	// 分批处理
 	for start := 0; start < len(batch); start += maxRowsPerBatch {
@@ -2771,7 +2792,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 
 	// 使用 COPY 或批量 VALUES 优化插入性能
 	valueStrings := make([]string, 0, len(batch))
-	const argsPerUsageLog = 49
+	const argsPerUsageLog = 50
 	valueArgs := make([]interface{}, 0, len(batch)*argsPerUsageLog)
 	argIdx := 1
 
@@ -2787,7 +2808,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket,
 			e.RouteClass, e.RouteReason, e.RouteGroupID, e.RoutePinned, e.UpstreamAccountType,
-			e.LogicalRequestID, e.RouteSource, e.RouteSignals, e.PinKind)
+			e.LogicalRequestID, e.RouteSource, e.RouteSignals, e.PinKind, e.GuardianAttemptOnly)
 		argIdx += argsPerUsageLog
 	}
 
@@ -2797,7 +2818,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
 		route_class, route_reason, route_group_id, route_pinned, upstream_account_type,
-		logical_request_id, route_source, route_signals, pin_kind)
+		logical_request_id, route_source, route_signals, pin_kind, guardian_attempt_only)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
 	_, err := execer.ExecContext(ctx, query, valueArgs...)
