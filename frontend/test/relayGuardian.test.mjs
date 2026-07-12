@@ -17,10 +17,14 @@ const {
   buildRelayGuardianEventsQuery,
   getRelayGuardianActionAvailability,
   getRelayGuardianEventLabel,
+  getRelayGuardianReasonLabel,
   getRelayGuardianShadowActionMeta,
   getRelayGuardianStateMeta,
+  getRelayGuardianTriggerLabel,
   mergeRelayGuardianAccounts,
+  resolveRelayGuardianAccountName,
   resolveRelayGuardianState,
+  summarizeRelayGuardianEventDetails,
 } = await import(moduleURL)
 
 function guardianAccount(overrides = {}) {
@@ -150,4 +154,55 @@ test('monitor shadow actions explain the action enforce mode would take', () => 
   assert.equal(getRelayGuardianShadowActionMeta('last_resort').label, '本应降为最后兜底')
   assert.equal(getRelayGuardianShadowActionMeta('pool_alert').label, 'Relay 池级关联故障')
   assert.match(getRelayGuardianShadowActionMeta('pool_alert').description, /不.*批量隔离/)
+})
+
+test('current account name overrides stale guardian event names', () => {
+  assert.equal(resolveRelayGuardianAccountName(50, [
+    { id: 50, name: '主 Relay 账号', email: 'old@example.com' },
+  ], 'relay-50'), '主 Relay 账号')
+})
+
+test('account rename is reflected by the latest accounts response', () => {
+  const before = [{ id: 50, name: '旧名称', email: '' }]
+  const after = [{ id: 50, name: '新名称', email: '' }]
+  assert.equal(resolveRelayGuardianAccountName(50, before, 'relay-50'), '旧名称')
+  assert.equal(resolveRelayGuardianAccountName(50, after, 'relay-50'), '新名称')
+})
+
+test('generic relay-number names are not exposed when current account is unavailable', () => {
+  assert.equal(resolveRelayGuardianAccountName(51, [], 'relay-51'), '账号 #51')
+  assert.equal(resolveRelayGuardianAccountName(0, [], ''), 'Relay 池')
+})
+
+test('real historical names remain a safe fallback for deleted accounts', () => {
+  assert.equal(resolveRelayGuardianAccountName(53, [], '备用供应商'), '备用供应商')
+})
+
+test('periodic summary details are converted to operator-friendly Chinese', () => {
+  const result = summarizeRelayGuardianEventDetails({
+    counts: { configured: 3, healthy: 3 },
+    event_time: '2026-07-13T01:27:26.254707597+08:00',
+    mode: 'monitor',
+    window_id: '2026-07-12T17:25:00Z/5m',
+  })
+  assert.match(result.summary, /共 3 个账号，健康 3/)
+  assert.match(result.summary, /监控（只记录，不调整调度）/)
+  assert.match(result.summary, /统计周期：5 分钟/)
+  assert.match(result.raw, /"configured": 3/)
+})
+
+test('hourly audit and pool correlation fields receive readable summaries', () => {
+  const audit = summarizeRelayGuardianEventDetails({ audit_rows: 81, incremental_rows: 5, window_id: '2026-07-13T01:00:00Z/1h' })
+  assert.match(audit.summary, /增量 5 条，小时复核 81 条/)
+  assert.match(audit.summary, /1 小时/)
+
+  const pool = summarizeRelayGuardianEventDetails({ affected: 2, enabled: 3, protected_until: '2026-07-13T02:00:00+08:00' })
+  assert.match(pool.summary, /2\/3 个账号/)
+  assert.match(pool.summary, /池级保护至/)
+})
+
+test('known guardian reasons and triggers are translated', () => {
+  assert.equal(getRelayGuardianReasonLabel('periodic_summary'), '周期状态汇总')
+  assert.equal(getRelayGuardianReasonLabel('upstream_http_502'), '上游返回 HTTP 502')
+  assert.equal(getRelayGuardianTriggerLabel('strong_gateway_5m'), '5 分钟内强网关失败')
 })

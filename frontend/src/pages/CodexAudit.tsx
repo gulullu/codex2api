@@ -20,6 +20,7 @@ import { useLatestDataLoader } from '../hooks/useLatestDataLoader'
 import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import type { AccountRow, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
+import { getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -163,39 +164,6 @@ function formatRouteSignals(raw?: string | null) {
   return value.split(',').map((signal) => describeRouteSignal(signal.trim()).label).join('、')
 }
 
-const verdictMeta: Record<string, { label: string; title: string; description: string; tone: Tone }> = {
-  normal: {
-    label: '正常',
-    title: 'Relay 路由态势稳定',
-    description: '当前窗口内未发现 OAuth CYB、路由隔离失效或服务故障。',
-    tone: 'ok',
-  },
-  oauth_cyber_risk: {
-    label: 'OAuth CYB',
-    title: '发现 OAuth 漏放',
-    description: '实际由受保护 OAuth 账号发起的请求触发了上游 cyber_policy，请优先复盘路由信号。',
-    tone: 'bad',
-  },
-  route_invariant_violation: {
-    label: '路由越界',
-    title: 'Relay 隔离约束被破坏',
-    description: '存在 Relay 意图却落到错误账号类型、缺少分组或审计字段冲突的请求。',
-    tone: 'bad',
-  },
-  relay_quality_issue: {
-    label: 'Relay 质量',
-    title: 'Relay 服务商出现策略拦截',
-    description: '该信号不计入 OAuth 漏放，但说明 Relay 供应商本身需要关注。',
-    tone: 'warn',
-  },
-  operational_issue: {
-    label: '运行异常',
-    title: 'Relay 路由或服务运行存在异常',
-    description: '存在 Relay 不可用、上游 5xx 或其他运行故障。',
-    tone: 'bad',
-  },
-}
-
 const chartTooltipStyle = {
   background: 'hsl(var(--popover))',
   border: '1px solid hsl(var(--border))',
@@ -244,12 +212,26 @@ export default function CodexAudit() {
   const report = data.report
   const health = data.health
   const accounts = data.accounts ?? []
-  const meta = verdictMeta[report?.verdict || 'normal'] || {
-    label: report?.verdict || '-',
-    title: '巡检状态待确认',
-    description: '当前结论来自后台聚合结果，请结合样本和趋势判断。',
-    tone: 'warn' as Tone,
-  }
+  const guardianStatus = health?.guardian?.status ?? ''
+  const relayConfigured = health?.relay?.configured ?? 0
+  const relaySchedulable = health?.relay?.schedulable ?? 0
+  const relayCapacityUnavailable = relayConfigured > 0 && relaySchedulable === 0
+  const guardianDegraded = Boolean(guardianStatus && !['healthy', 'ok', 'disabled'].includes(guardianStatus))
+  const liveHealthTone: Tone = health?.status !== 'ok' || relayCapacityUnavailable ? 'bad' : guardianDegraded ? 'warn' : 'ok'
+  const meta = getCodexAuditPresentation({
+    verdict: report?.verdict,
+    relayRequests: report?.summary.relay_requests ?? 0,
+    relayRouteFailures: report?.summary.relay_route_failures ?? 0,
+    oauthCyberAttempts: report?.summary.oauth_cyber_miss_attempts ?? 0,
+    relayCyberAttempts: report?.summary.relay_cyber_attempts ?? 0,
+    routeInvariantViolations: report?.summary.route_invariant_violations ?? 0,
+    sessionBleed: report?.summary.session_bleed ?? 0,
+    healthStatus: health?.status,
+    guardianStatus,
+    relayConfigured,
+    relaySchedulable,
+    timeline: report?.timeline,
+  })
 
   const timeline = useMemo(() => (report?.timeline || []).map((point) => ({
     ...point,
@@ -270,7 +252,7 @@ export default function CodexAudit() {
     <>
       <PageHeader
         title="审计"
-        description="查看请求为何进入 OAuth 或 Relay、上游是否成功，以及是否出现安全策略拦截或会话异常。"
+        description="查看路由、上游质量与安全策略事件。"
         actions={
           <div className="grid w-full min-w-0 gap-2 sm:w-auto sm:grid-cols-[164px_164px_auto] sm:items-end">
             <HeaderControl label="巡检范围">
@@ -305,26 +287,36 @@ export default function CodexAudit() {
                       <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">{meta.description}</p>
                     </div>
                   </div>
-                  <div className="grid min-w-0 gap-2 sm:grid-cols-3 xl:w-[720px]">
-                    <WindowLine label="历史筛选窗口" value={`${formatBeijingTime(report.window_start)} 至 ${formatBeijingTime(report.window_end)}`} />
+                  <div className="grid min-w-0 gap-2 sm:grid-cols-2 xl:w-[760px]">
+                    <WindowLine label="筛选窗口" value={`${formatBeijingTime(report.window_start)} 至 ${formatBeijingTime(report.window_end)}`} />
+                    <WindowLine
+                      label="Relay 健康分"
+                      value={`${formatHealthScore(meta.healthScore)} / 100 · 失败 ${formatNumber(report.summary.relay_route_failures)}/${formatNumber(report.summary.relay_requests)}`}
+                      tone={meta.healthScore >= 99.5 ? 'ok' : meta.healthScore >= 95 ? 'warn' : 'bad'}
+                      title={getRelayWindowHealthStandard().description}
+                    />
                     <WindowLine label="报表生成" value={formatBeijingTime(report.generated_at)} />
-                    <WindowLine label="运行健康 · 实时" value={`${health?.status || '-'} · 不受时间筛选`} tone={health?.status === 'ok' ? 'ok' : 'warn'} />
+                    <WindowLine
+                      label="运行健康 · 实时"
+                      value={`${healthStatusLabel(health?.status)} · Relay ${relaySchedulable}/${relayConfigured}${guardianStatus ? ` · Guardian ${guardianHealthLabel(guardianStatus)}` : ''}`}
+                      tone={liveHealthTone}
+                    />
                   </div>
                 </div>
 
                 <div className="grid min-w-0 grid-cols-2 gap-3 p-3 sm:grid-cols-3 sm:p-4 xl:grid-cols-6">
                   <AuditMetricGuide />
-                  <SignalTile label="请求数（去重）" value={formatNumber(report.usage.requests)} detail={`上游调用 ${formatNumber(report.usage.upstream_attempts)} 次（含重试）· 最终错误 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
-                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`最终由 Relay 处理 · 占比 ${formatPercent(relayRate)} · 固定 ${formatNumber(report.summary.relay_pinned)} · 续接 ${formatNumber(report.summary.relay_continuation || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
-                  <SignalTile label="规则命中 → Relay" value={formatNumber(report.summary.relay_direct)} detail="本轮完整请求命中本地规则，只改变账号池" icon={<Gauge />} tone="ok" />
-                  <SignalTile label="探针分流" value={formatNumber(report.summary.relay_probe || 0)} detail="识别为探针请求，直接交由 Relay" icon={<Zap />} tone="ok" />
-                  <SignalTile label="OAuth 容量分流" value={formatNumber(report.summary.relay_overflow || 0)} detail="OAuth 暂无可用并发时，改由 Relay 处理" icon={<BarChart3 />} tone="neutral" />
+                  <SignalTile label="请求数（去重）" value={formatNumber(report.usage.requests)} detail={`上游调用 ${formatNumber(report.usage.upstream_attempts)} · 最终错误 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
+                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · 固定 ${formatNumber(report.summary.relay_pinned)} · 续接 ${formatNumber(report.summary.relay_continuation || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="规则命中 → Relay" value={formatNumber(report.summary.relay_direct)} detail="完整请求命中本地分流规则" icon={<Gauge />} tone="ok" />
+                  <SignalTile label="探针分流" value={formatNumber(report.summary.relay_probe || 0)} detail="探针统一交由 Relay" icon={<Zap />} tone="ok" />
+                  <SignalTile label="OAuth 容量分流" value={formatNumber(report.summary.relay_overflow || 0)} detail="OAuth 并发不足时转交 Relay" icon={<BarChart3 />} tone="neutral" />
                   <SignalTile label="Relay 成功率" value={formatPercent(relaySuccessRate)} detail={`最终成功 ${formatNumber(relaySuccesses)} / Relay 请求 ${formatNumber(report.summary.relay_requests)}`} icon={<CheckCircle2 />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
                   <SignalTile label="Relay 自动换号" value={formatNumber(report.summary.relay_failovers || 0)} detail={`换号后成功 ${formatNumber(report.summary.relay_failover_successes || 0)} · 成功率 ${formatPercent(relayFailoverSuccessRate)}`} icon={<RefreshCw />} tone={report.summary.relay_failover_failures ? 'warn' : 'ok'} />
                   <SignalTile label="上游 5xx 已吸收" value={formatNumber(report.summary.relay_absorbed_5xx || 0)} detail={`首个 Relay 账号失败，但备用账号接管成功 · 全池失败 ${formatNumber(report.summary.relay_failover_failures || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_failover_failures ? 'warn' : 'ok'} />
                   <SignalTile label="OAuth 安全拦截" value={formatNumber(report.summary.oauth_cyber_miss_attempts)} detail={`${formatNumber(report.summary.oauth_cyber_miss_requests)} 个请求进入 OAuth 后被上游策略拦截`} icon={<AlertTriangle />} tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'} />
                   <SignalTile label="Relay 安全拦截" value={formatNumber(report.summary.relay_cyber_attempts)} detail={`${formatNumber(report.summary.relay_cyber_requests)} 个请求被 Relay 上游策略拦截，不计 OAuth 漏放`} icon={<ShieldAlert />} tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'} />
-                  <SignalTile label="路由异常" value={formatNumber(report.summary.relay_route_failures)} detail={`含 Relay 不可用或 5xx · 落错账号池 ${formatNumber(report.summary.route_invariant_violations)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
+                  <SignalTile label="Relay 最终失败" value={formatNumber(report.summary.relay_route_failures)} detail={`仅统计 Relay 路由 · 落错账号池 ${formatNumber(report.summary.route_invariant_violations)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
                   <SignalTile label="会话串扰" value={formatNumber(report.summary.session_bleed)} detail={report.summary.session_bleed ? '上游响应标识不一致，需立即排查' : '未发现其他请求的响应混入当前会话'} icon={<ShieldAlert />} tone={report.summary.session_bleed ? 'bad' : 'ok'} />
                   <SignalTile label="首字延迟 P95" value={formatMS(report.usage.first_token_p95_ms)} detail={`95% 的有效样本在该时间内收到首个响应 · ${formatNumber(report.usage.first_token_samples)} 个样本`} icon={<Clock3 />} tone={firstTokenTone} />
                   <SignalTile label="WebSocket 占比" value={formatPercent(report.usage.websocket_ratio || 0)} detail={`${formatNumber(report.usage.websocket_requests)} 个请求通过 WebSocket 连接上游`} icon={<Zap />} tone={(report.usage.websocket_ratio || 0) >= 0.85 ? 'ok' : 'warn'} />
@@ -340,6 +332,7 @@ export default function CodexAudit() {
               start={report.window_start}
               end={report.window_end}
               refreshToken={report.generated_at}
+              accounts={accounts}
             />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-2">
@@ -784,50 +777,20 @@ function SignalTile({ label, value, detail, icon, tone, className }: { label: st
 }
 
 function AuditMetricGuide() {
-  const items = [
-    {
-      title: '请求数 / 上游调用',
-      body: '请求数按客户端发起的一轮调用去重，自动重试仍算同一个请求；上游调用是实际请求账号的次数，所以可能更多。',
-    },
-    {
-      title: 'Relay 分流',
-      body: '最终由 Relay 账号处理的请求总数，包括规则命中、探针、OAuth 容量分流、响应续接和会话固定。',
-    },
-    {
-      title: '自动换号 / 已吸收 5xx',
-      body: '自动换号表示同一逻辑请求先后使用了不同 Relay 账号；已吸收 5xx 表示前一账号返回服务端错误，但备用账号接管后最终成功。',
-    },
-    {
-      title: '规则命中 → Relay',
-      body: '当前完整请求（system、skills、tools 和用户输入）命中本地规则后选择 Relay。只改变账号池，不代表违规，也不是本地拦截。',
-    },
-    {
-      title: '安全拦截 / 路由异常',
-      body: '安全拦截表示上游返回 cyber_policy；路由异常表示 Relay 不可用、返回 5xx，或请求落入了错误账号池。',
-    },
-  ]
-
   return (
-    <div className="col-span-full rounded-xl border border-primary/20 bg-primary/[0.04] p-3.5 sm:p-4">
-      <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
-        <CircleHelp className="size-4 text-primary" />
-        这些数字怎么读
-      </div>
-      <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        {items.map((item) => (
-          <div key={item.title} className="min-w-0">
-            <div className="text-xs font-semibold text-foreground">{item.title}</div>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">{item.body}</p>
-          </div>
-        ))}
-      </div>
+    <div className="col-span-full flex items-start gap-2 rounded-xl border border-primary/20 bg-primary/[0.04] px-3.5 py-3 text-xs leading-5 text-muted-foreground">
+      <CircleHelp className="mt-0.5 size-4 shrink-0 text-primary" />
+      <p>
+        <strong className="font-medium text-foreground">统计口径：</strong>
+        请求数按客户端一轮去重；上游调用含自动重试；本地规则只分流；安全拦截来自上游。Relay 健康分 ≥99.5 稳定，95–99.4 需关注，低于 95 为窗口质量异常。
+      </p>
     </div>
   )
 }
 
-function WindowLine({ label, value, tone = 'neutral' }: { label: string; value: ReactNode; tone?: Tone }) {
+function WindowLine({ label, value, tone = 'neutral', title }: { label: string; value: ReactNode; tone?: Tone; title?: string }) {
   return (
-    <div className="flex min-w-0 flex-col gap-1 rounded-md border border-border/70 bg-background/70 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+    <div className="flex min-w-0 flex-col gap-1 rounded-md border border-border/70 bg-background/70 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-4" title={title}>
       <span className="shrink-0 text-xs text-muted-foreground">{label}</span>
       <span className={`min-w-0 truncate text-xs font-medium sm:text-right ${toneTextClass(tone)}`}>{value}</span>
     </div>
@@ -1039,6 +1002,23 @@ function toneTextClass(tone: Tone) {
 
 function formatNumber(value?: number) {
   return new Intl.NumberFormat('zh-CN').format(value || 0)
+}
+
+function formatHealthScore(value: number) {
+  if (value > 99.9 && value < 100) return value.toFixed(2)
+  return value.toFixed(1)
+}
+
+function healthStatusLabel(status?: string) {
+  if (status === 'ok') return '正常'
+  return status || '-'
+}
+
+function guardianHealthLabel(status: string) {
+  if (status === 'healthy' || status === 'ok') return '正常'
+  if (status === 'degraded') return '检测到波动'
+  if (status === 'disabled') return '已关闭'
+  return status || '-'
 }
 
 function formatPercent(value?: number) {

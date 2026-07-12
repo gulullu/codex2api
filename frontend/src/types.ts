@@ -504,6 +504,22 @@ export interface HealthResponse {
   status: 'ok' | string
   available: number
   total: number
+  guardian?: {
+    enabled: boolean
+    mode: RelayGuardianMode
+    status: 'healthy' | 'degraded' | 'disabled' | string
+    heartbeat_at?: ISODateString | null
+    scan_interval_seconds: number
+    reasons?: string[]
+  }
+  relay?: {
+    configured: number
+    enabled: number
+    schedulable: number
+    quarantined: number
+    probation: number
+    degraded: number
+  }
 }
 
 export interface SiteBranding {

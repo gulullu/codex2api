@@ -14,12 +14,17 @@ import { useToast } from '../hooks/useToast'
 import {
   getRelayGuardianActionAvailability,
   getRelayGuardianEventLabel,
+  getRelayGuardianReasonLabel,
   getRelayGuardianShadowActionMeta,
   getRelayGuardianStateMeta,
+  getRelayGuardianTriggerLabel,
+  resolveRelayGuardianAccountName,
   resolveRelayGuardianState,
+  summarizeRelayGuardianEventDetails,
   type RelayGuardianTone,
 } from '../lib/relayGuardian'
 import type {
+  AccountRow,
   RelayGuardianAccountStatus,
   RelayGuardianEvent,
   RelayGuardianEventsResponse,
@@ -37,10 +42,12 @@ export default function RelayGuardianPanel({
   start,
   end,
   refreshToken,
+  accounts,
 }: {
   start: string
   end: string
   refreshToken: string
+  accounts: AccountRow[]
 }) {
   const [status, setStatus] = useState<RelayGuardianStatusResponse | null>(null)
   const [statusLoading, setStatusLoading] = useState(false)
@@ -117,6 +124,10 @@ export default function RelayGuardianPanel({
     () => (status?.accounts ?? []).filter((account) => account.last_resort).length,
     [status?.accounts],
   )
+  const currentAccountName = useCallback(
+    (accountID: number, recordedName?: string | null) => resolveRelayGuardianAccountName(accountID, accounts, recordedName),
+    [accounts],
+  )
 
   const updateStatusAccount = useCallback((next: RelayGuardianAccountStatus) => {
     setStatus((current) => current ? {
@@ -143,7 +154,7 @@ export default function RelayGuardianPanel({
       title: '解除 Guardian 运行态？',
       description: (
         <div className="space-y-2">
-          <p>将清除 <strong>{account.account_name || `#${account.account_id}`}</strong> 当前由 Guardian 创建的临时隔离或恢复阶段。</p>
+          <p>将清除 <strong>{currentAccountName(account.account_id, account.account_name)}</strong> 当前由 Guardian 创建的临时隔离或恢复阶段。</p>
           <p className="text-sm text-muted-foreground">不会修改账号的启用开关；若上游仍失败，后续请求仍可能再次触发临时隔离。</p>
         </div>
       ),
@@ -163,14 +174,14 @@ export default function RelayGuardianPanel({
     } finally {
       finishAccountAction(account.account_id)
     }
-  }, [beginAccountAction, confirm, finishAccountAction, loadStatus, showToast, updateStatusAccount])
+  }, [beginAccountAction, confirm, currentAccountName, finishAccountAction, loadStatus, showToast, updateStatusAccount])
 
   const handleBypass = useCallback(async (account: RelayGuardianAccountStatus) => {
     const accepted = await confirm({
       title: '临时旁路 10 分钟？',
       description: (
         <div className="space-y-2">
-          <p><strong>{account.account_name || `#${account.account_id}`}</strong> 将在 10 分钟内绕过 Guardian 自动临时隔离。</p>
+          <p><strong>{currentAccountName(account.account_id, account.account_name)}</strong> 将在 10 分钟内绕过 Guardian 自动临时隔离。</p>
           <p className="text-sm text-muted-foreground">原账号启用开关和快熔断仍然生效；这是应急操作，不会改变账号启用开关，也不会形成永久放行。</p>
         </div>
       ),
@@ -190,7 +201,7 @@ export default function RelayGuardianPanel({
     } finally {
       finishAccountAction(account.account_id)
     }
-  }, [beginAccountAction, confirm, finishAccountAction, loadStatus, showToast, updateStatusAccount])
+  }, [beginAccountAction, confirm, currentAccountName, finishAccountAction, loadStatus, showToast, updateStatusAccount])
 
   const totalPages = Math.max(1, Math.ceil((events?.total ?? 0) / pageSize))
 
@@ -211,7 +222,7 @@ export default function RelayGuardianPanel({
                   </Badge>
                 </div>
                 <p className="mt-1 max-w-3xl text-sm leading-6 text-muted-foreground">
-                  按账号聚合慢性上游故障，并通过临时隔离、恢复探测和试运行保护 Relay 可用性；不复用账号启用开关。
+                  识别持续故障，并管理临时隔离与渐进恢复。
                 </p>
               </div>
             </div>
@@ -227,12 +238,7 @@ export default function RelayGuardianPanel({
               {operationMode === 'off' ? (
                 <span><strong>Guardian 已关闭。</strong> 当前不执行慢性故障判断，也没有可解除或临时旁路的运行态。</span>
               ) : (
-                <span>
-                  <strong>监控模式：只记录不执行。</strong> “本应临时隔离”表示执行模式会暂时停用该账号；
-                  “本应降为最后兜底”表示容量不足时只降低优先级并限制并发；
-                  “Relay 池级关联故障”表示多个账号同时出现同类故障，只告警、不批量隔离。
-                  当前不会改变任何账号调度。
-                </span>
+                <span><strong>监控模式：</strong>只记录建议动作，不改变账号调度。</span>
               )}
             </div>
           ) : null}
@@ -242,10 +248,10 @@ export default function RelayGuardianPanel({
           ) : null}
 
           <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <GuardianSummary label="受管 Relay 账号" value={status?.accounts.length ?? 0} detail={`扫描间隔 ${status?.scan_interval_seconds ?? '-'} 秒`} />
-            <GuardianSummary label="需关注" value={(stateCounts.get('suspect') ?? 0) + (stateCounts.get('would_quarantine') ?? 0)} detail={`观察中 ${stateCounts.get('suspect') ?? 0} · 本应临时隔离 ${stateCounts.get('would_quarantine') ?? 0}`} tone="warn" />
-            <GuardianSummary label="恢复流程" value={(stateCounts.get('quarantined') ?? 0) + (stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)} detail={`临时隔离 ${stateCounts.get('quarantined') ?? 0} · 探测/试运行 ${(stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)}`} tone="info" />
-            <GuardianSummary label="最后兜底" value={lastResortCount} detail="容量不足时保留可用性；账号只在普通 Relay 无法承接时参与" tone={lastResortCount ? 'warn' : 'neutral'} />
+            <GuardianSummary label="受管账号" value={status?.accounts.length ?? 0} detail={`${status?.scan_interval_seconds ?? '-'} 秒扫描一次`} />
+            <GuardianSummary label="需关注" value={(stateCounts.get('suspect') ?? 0) + (stateCounts.get('would_quarantine') ?? 0)} detail={`观察 ${stateCounts.get('suspect') ?? 0} · 建议隔离 ${stateCounts.get('would_quarantine') ?? 0}`} tone="warn" />
+            <GuardianSummary label="恢复中" value={(stateCounts.get('quarantined') ?? 0) + (stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)} detail={`隔离 ${stateCounts.get('quarantined') ?? 0} · 探测/试运行 ${(stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)}`} tone="info" />
+            <GuardianSummary label="最后兜底" value={lastResortCount} detail="仅在普通账号不可用时参与" tone={lastResortCount ? 'warn' : 'neutral'} />
           </div>
 
           <div className="mt-4 grid min-w-0 gap-3 md:grid-cols-2 2xl:grid-cols-3">
@@ -253,6 +259,7 @@ export default function RelayGuardianPanel({
               <GuardianAccountCard
                 key={account.account_id}
                 account={account}
+                accountName={currentAccountName(account.account_id, account.account_name)}
                 mode={operationMode}
                 busy={actionAccountIDs.has(account.account_id)}
                 onRelease={() => void handleRelease(account)}
@@ -267,7 +274,7 @@ export default function RelayGuardianPanel({
           <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t border-border/70 pt-3 text-[11px] text-muted-foreground">
             <span>状态生成：{status?.generated_at ? formatBeijingTime(status.generated_at) : '-'}</span>
             <span>Guardian 心跳：{status?.heartbeat_at ? formatBeijingTime(status.heartbeat_at) : '-'}</span>
-            <span>人工禁用始终优先，Guardian 只管理自身运行态。</span>
+            <span>人工禁用优先。</span>
           </div>
         </CardContent>
       </Card>
@@ -278,9 +285,8 @@ export default function RelayGuardianPanel({
             <div className="min-w-0">
               <h2 className="text-base font-semibold text-foreground">Guardian 事件</h2>
               <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                展示当前审计页时间筛选内的判断、临时隔离和恢复动作；切换右上角巡检范围会同时筛选本列表。
+                当前筛选窗口内的判断与恢复动作。
               </p>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">人工操作刚完成时，请点击页面顶部“刷新”推进审计窗口；本列表不会越过当前页面筛选结束时间。</p>
               <p className="mt-1 text-xs text-muted-foreground">{formatBeijingTime(start)} 至 {formatBeijingTime(end)}</p>
             </div>
             <Button variant="outline" size="sm" className="self-start" onClick={() => setEventsRefresh((value) => value + 1)} disabled={eventsLoading}>
@@ -294,7 +300,7 @@ export default function RelayGuardianPanel({
           ) : null}
 
           <div className="mt-4 space-y-2">
-            {(events?.items ?? []).map((event) => <GuardianEventRow key={event.id} event={event} />)}
+            {(events?.items ?? []).map((event) => <GuardianEventRow key={event.id} event={event} accounts={accounts} />)}
             {!eventsLoading && !eventsError && (events?.items.length ?? 0) === 0 ? (
               <div className="rounded-xl border border-border/60 bg-muted/20 p-6 text-center text-sm text-muted-foreground">当前筛选窗口内暂无 Guardian 事件</div>
             ) : null}
@@ -330,12 +336,14 @@ function GuardianSummary({ label, value, detail, tone = 'neutral' }: { label: st
 
 function GuardianAccountCard({
   account,
+  accountName,
   mode,
   busy,
   onRelease,
   onBypass,
 }: {
   account: RelayGuardianAccountStatus
+  accountName: string
   mode: string
   busy: boolean
   onRelease: () => void
@@ -357,13 +365,13 @@ function GuardianAccountCard({
     <article className={`flex min-w-0 flex-col rounded-xl border p-3.5 ${tonePanelClass(meta.tone)}`}>
       <div className="flex min-w-0 items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-foreground" title={account.account_name}>{account.account_name || `#${account.account_id}`}</div>
-          <div className="mt-0.5 text-[11px] text-muted-foreground">账号 #{account.account_id} · 第 {account.generation} 代运行态</div>
+          <div className="truncate text-sm font-semibold text-foreground" title={accountName}>{accountName}</div>
+          <div className="mt-0.5 text-[11px] text-muted-foreground">运行态第 {account.generation} 代</div>
         </div>
         <Badge className={toneBadgeClass(meta.tone)}>{meta.label}</Badge>
       </div>
 
-      <p className="mt-3 min-h-10 text-xs leading-5 text-muted-foreground">{account.reason || meta.description}</p>
+      <p className="mt-3 text-xs leading-5 text-muted-foreground">{account.reason ? getRelayGuardianReasonLabel(account.reason) : meta.description}</p>
 
       {shadow ? (
         <div className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-2.5 py-2 text-xs leading-5 text-amber-800 dark:text-amber-300">
@@ -384,7 +392,7 @@ function GuardianAccountCard({
 
       <div className="mt-3 flex flex-wrap gap-1.5 text-[10px] text-muted-foreground">
         <span className="rounded bg-background/70 px-1.5 py-0.5">当前{account.effective_schedulable ? '可调度' : '不可调度'}</span>
-        <span className="rounded bg-background/70 px-1.5 py-0.5">触发源 {account.trigger_source || '-'}</span>
+        <span className="rounded bg-background/70 px-1.5 py-0.5">触发源 {getRelayGuardianTriggerLabel(account.trigger_source)}</span>
         <span className="rounded bg-background/70 px-1.5 py-0.5">快熔断 {account.circuit_state || '-'}</span>
       </div>
 
@@ -411,12 +419,11 @@ function GuardianField({ label, value, wide = false }: { label: string; value: s
   )
 }
 
-function GuardianEventRow({ event }: { event: RelayGuardianEvent }) {
+function GuardianEventRow({ event, accounts }: { event: RelayGuardianEvent; accounts: AccountRow[] }) {
   const from = getRelayGuardianStateMeta(event.from_state)
   const to = getRelayGuardianStateMeta(event.to_state)
-  const details = formatEventDetails(event.details)
-  const poolEvent = event.account_id <= 0
-  const accountLabel = poolEvent ? 'Relay 池' : (event.account_name || `#${event.account_id}`)
+  const details = summarizeRelayGuardianEventDetails(event.details)
+  const accountLabel = resolveRelayGuardianAccountName(event.account_id, accounts, event.account_name)
   const hasTransition = Boolean(event.from_state?.trim() || event.to_state?.trim())
   return (
     <article className="min-w-0 rounded-xl border border-border/60 bg-muted/15 p-3.5">
@@ -427,7 +434,7 @@ function GuardianEventRow({ event }: { event: RelayGuardianEvent }) {
             <span className="truncate text-sm font-semibold text-foreground">{accountLabel}</span>
             {hasTransition ? <span className="text-xs text-muted-foreground">{from.label} → {to.label}</span> : null}
           </div>
-          <p className="mt-2 text-xs leading-5 text-muted-foreground">{event.reason || '未记录原因'}</p>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">{getRelayGuardianReasonLabel(event.reason)}</p>
         </div>
         <time className="shrink-0 text-[11px] text-muted-foreground">{formatBeijingTime(event.created_at)}</time>
       </div>
@@ -441,12 +448,22 @@ function GuardianEventRow({ event }: { event: RelayGuardianEvent }) {
 
       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
         <span>操作者 {actorLabel(event.actor)}</span>
-        <span>触发源 {event.trigger_source || '-'}</span>
+        <span>触发源 {getRelayGuardianTriggerLabel(event.trigger_source)}</span>
         <span>隔离时长 {event.quarantine_seconds ? formatDuration(event.quarantine_seconds) : '-'}</span>
         <span>代次 {event.generation}</span>
         {(event.logical_request_ids?.length ?? 0) > 0 ? <span title={event.logical_request_ids?.join('\n')}>关联请求 {event.logical_request_ids?.length}</span> : null}
       </div>
-      {details ? <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-background/70 p-2.5 text-[10px] leading-4 text-muted-foreground">{details}</pre> : null}
+      {details.summary ? (
+        <div className="mt-2 rounded-lg border border-border/50 bg-background/70 px-2.5 py-2 text-xs leading-5 text-foreground">
+          {details.summary}
+        </div>
+      ) : null}
+      {details.raw && details.raw !== details.summary ? (
+        <details className="mt-2 rounded-lg border border-border/50 bg-background/50 px-2.5 py-2 text-[11px] text-muted-foreground">
+          <summary className="cursor-pointer select-none font-medium">高级详情（原始数据）</summary>
+          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-4">{details.raw}</pre>
+        </details>
+      ) : null}
     </article>
   )
 }
@@ -463,16 +480,6 @@ function formatDuration(seconds: number) {
   if (seconds % 3600 === 0) return `${seconds / 3600} 小时`
   if (seconds % 60 === 0) return `${seconds / 60} 分钟`
   return `${seconds} 秒`
-}
-
-function formatEventDetails(details: unknown) {
-  if (details === null || details === undefined || details === '') return ''
-  if (typeof details === 'string') return details
-  try {
-    return JSON.stringify(details, null, 2)
-  } catch {
-    return String(details)
-  }
 }
 
 function toneBadgeClass(tone: RelayGuardianTone) {

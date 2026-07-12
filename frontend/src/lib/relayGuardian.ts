@@ -202,3 +202,166 @@ export function getRelayGuardianEventLabel(eventType: string) {
   }
   return labels[eventType] || eventType || 'Guardian 事件'
 }
+
+export function resolveRelayGuardianAccountName(
+  accountID: number,
+  currentAccounts: Array<Pick<AccountRow, 'id' | 'name' | 'email'>>,
+  recordedName?: string | null,
+) {
+  if (accountID <= 0) return 'Relay 池'
+  const current = currentAccounts.find((account) => account.id === accountID)
+  const currentName = current?.name?.trim() || current?.email?.trim()
+  if (currentName) return currentName
+  const historical = (recordedName || '').trim()
+  if (historical && !/^relay-\d+$/i.test(historical)) return historical
+  return `账号 #${accountID}`
+}
+
+export function getRelayGuardianReasonLabel(reason?: string | null) {
+  const value = (reason || '').trim()
+  const labels: Record<string, string> = {
+    periodic_summary: '周期状态汇总',
+    hourly_full_audit: '每小时完整复核',
+    pool_wide_failure_guard: '多个账号出现同类故障，已启用池级保护',
+    one_quarantine_per_scan_guard: '本轮已隔离其他账号，当前账号降为最后兜底',
+    shadow_quarantine: '已达到临时隔离条件（监控模式未执行）',
+    runtime_state_unavailable: 'Guardian 运行态暂不可用',
+    mode_transition: 'Guardian 运行模式已切换',
+  }
+  if (labels[value]) return labels[value]
+  const upstream = value.match(/^upstream_http_(\d{3})$/)
+  if (upstream) return `上游返回 HTTP ${upstream[1]}`
+  const recovery = value.match(/^recovery_upstream_http_(\d{3})$/)
+  if (recovery) return `恢复探测返回 HTTP ${recovery[1]}`
+  return value || '未记录原因'
+}
+
+export function getRelayGuardianTriggerLabel(trigger?: string | null) {
+  const value = (trigger || '').trim()
+  const labels: Record<string, string> = {
+    '5m': '5 分钟周期汇总',
+    '1h': '1 小时完整复核',
+    user_visible_10m: '10 分钟内用户可见失败',
+    user_visible_60m: '60 分钟内用户可见失败',
+    strong_gateway_5m: '5 分钟内强网关失败',
+    recovery_failure: '恢复阶段再次失败',
+  }
+  return labels[value] || value.replace(/_/g, ' ') || '-'
+}
+
+type GuardianDetails = Record<string, unknown>
+
+function parseGuardianDetails(details: unknown): { value: GuardianDetails | null; raw: string } {
+  if (details === null || details === undefined || details === '') return { value: null, raw: '' }
+  if (typeof details === 'string') {
+    const raw = details.trim()
+    if (!raw) return { value: null, raw: '' }
+    try {
+      const parsed = JSON.parse(raw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return { value: parsed as GuardianDetails, raw: JSON.stringify(parsed, null, 2) }
+      }
+    } catch {
+      return { value: null, raw }
+    }
+    return { value: null, raw }
+  }
+  try {
+    const raw = JSON.stringify(details, null, 2)
+    return {
+      value: details && typeof details === 'object' && !Array.isArray(details) ? details as GuardianDetails : null,
+      raw,
+    }
+  } catch {
+    return { value: null, raw: String(details) }
+  }
+}
+
+function detailNumber(value: unknown) {
+  const number = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(number) ? number : 0
+}
+
+function formatDetailTime(value: unknown) {
+  if (!value) return ''
+  const date = new Date(String(value))
+  if (Number.isNaN(date.getTime())) return String(value)
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(date)
+}
+
+function formatWindowID(value: unknown) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  const token = text.includes('/') ? text.slice(text.lastIndexOf('/') + 1) : text
+  const match = token.match(/^(\d+)(m|h|s)$/i)
+  if (!match) return text
+  const unit = match[2].toLowerCase() === 'h' ? '小时' : match[2].toLowerCase() === 'm' ? '分钟' : '秒'
+  return `${match[1]} ${unit}`
+}
+
+function modeLabel(value: unknown) {
+  if (value === 'monitor') return '监控（只记录，不调整调度）'
+  if (value === 'enforce') return '执行'
+  if (value === 'off') return '关闭'
+  return value ? String(value) : ''
+}
+
+function countSummary(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const counts = value as GuardianDetails
+  const configured = detailNumber(counts.configured)
+  const healthy = detailNumber(counts.healthy)
+  const parts = [`共 ${configured} 个账号`, `健康 ${healthy}`]
+  const labels: Array<[string, string]> = [
+    ['suspect', '观察中'],
+    ['would_quarantine', '本应隔离'],
+    ['quarantined', '已隔离'],
+    ['half_open', '恢复探测'],
+    ['probation', '试运行'],
+    ['last_resort', '最后兜底'],
+    ['manual_disabled', '人工禁用'],
+    ['unknown', '状态未知'],
+  ]
+  for (const [key, label] of labels) {
+    const count = detailNumber(counts[key])
+    if (count > 0) parts.push(`${label} ${count}`)
+  }
+  return parts.join('，')
+}
+
+export function summarizeRelayGuardianEventDetails(details: unknown) {
+  const parsed = parseGuardianDetails(details)
+  const value = parsed.value
+  if (!value) return { summary: parsed.raw, raw: parsed.raw }
+  const parts: string[] = []
+  const counts = countSummary(value.counts)
+  if (counts) parts.push(`账号状态：${counts}`)
+  const mode = modeLabel(value.mode)
+  if (mode) parts.push(`运行模式：${mode}`)
+  const affected = detailNumber(value.affected)
+  const enabled = detailNumber(value.enabled)
+  if (affected > 0 || enabled > 0) parts.push(`同类故障影响：${affected}/${enabled} 个账号`)
+  const auditRows = detailNumber(value.audit_rows)
+  const incrementalRows = detailNumber(value.incremental_rows)
+  if (auditRows > 0 || incrementalRows > 0) parts.push(`扫描记录：增量 ${incrementalRows} 条，小时复核 ${auditRows} 条`)
+  const probationPercent = detailNumber(value.probation_percent)
+  if (probationPercent > 0) parts.push(`试运行流量：${probationPercent}%`)
+  const shadow = getRelayGuardianShadowActionMeta(String(value.shadow_action || ''))
+  if (value.shadow_action) parts.push(`监控结论：${shadow.label}`)
+  const protectedUntil = formatDetailTime(value.protected_until)
+  if (protectedUntil) parts.push(`池级保护至：${protectedUntil}`)
+  const quarantineUntil = formatDetailTime(value.quarantine_until)
+  if (quarantineUntil && !String(value.quarantine_until).startsWith('0001-')) parts.push(`临时隔离至：${quarantineUntil}`)
+  const window = formatWindowID(value.window_id)
+  if (window) parts.push(`统计周期：${window}`)
+  return { summary: parts.join('；') || '已记录 Guardian 运行详情', raw: parsed.raw }
+}
