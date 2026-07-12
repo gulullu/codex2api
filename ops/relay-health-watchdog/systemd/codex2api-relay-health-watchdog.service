@@ -1,0 +1,39 @@
+[Unit]
+Description=Read-only codex2api Relay health watchdog
+Documentation=file:/usr/local/share/doc/codex2api-relay-health-watchdog/README.md
+Requisite=docker.service
+After=docker.service network-online.target
+AssertPathExists=/var/run/docker.sock
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HEALTH_URL=http://127.0.0.1:8090/health
+Environment=LOCK_FILE=/run/codex2api-relay-health-watchdog/watchdog.lock
+Environment=BRIDGE_ACCOUNT_ID=7692
+RuntimeDirectory=codex2api-relay-health-watchdog
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/codex2api-relay-health-watchdog
+ExecStart=/usr/bin/timeout --signal=TERM --kill-after=5s 45s /usr/local/libexec/codex2api-relay-health-watchdog
+TimeoutStartSec=50s
+TimeoutStopSec=5s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codex2api-relay-health-watchdog
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+UMask=0077

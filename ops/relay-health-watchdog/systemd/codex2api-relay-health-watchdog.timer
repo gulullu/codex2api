@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the codex2api Relay health watchdog every two minutes
+Documentation=file:/usr/local/share/doc/codex2api-relay-health-watchdog/README.md
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+Persistent=true
+RandomizedDelaySec=10s
+AccuracySec=15s
+Unit=codex2api-relay-health-watchdog.service
+
+[Install]
+WantedBy=timers.target
