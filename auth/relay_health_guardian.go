@@ -440,13 +440,16 @@ func relayGuardianRuntimeKey(groupID, accountID int64) string {
 }
 
 // relayGuardianSchedulingHint is the single adapter between the Guardian state
-// machine and the scheduler's atomic runtime hint. The scheduler slice replaces
-// this no-op body with Account.setRelayGuardianSchedulingHint.
+// machine and the scheduler's atomic runtime hint.
 func relayGuardianSchedulingHint(account *Account, lastResort bool, hardCap int64, percent int) {
-	_ = account
-	_ = lastResort
-	_ = hardCap
-	_ = percent
+	if account == nil {
+		return
+	}
+	if !lastResort && hardCap <= 0 && percent <= 0 {
+		account.clearRelayGuardianSchedulingHint()
+		return
+	}
+	account.setRelayGuardianSchedulingHint(lastResort, hardCap, percent)
 }
 
 func relayGuardianLastResortCap(level int) int {
