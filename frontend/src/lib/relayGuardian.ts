@@ -192,6 +192,7 @@ export function getRelayGuardianEventLabel(eventType: string) {
     healthy: '恢复健康',
     release: '人工解除',
     manual_release: '人工解除',
+    bypass: '临时旁路',
     temporary_bypass: '临时旁路',
     bypass_expired: '临时旁路到期',
     temporary_bypass_expired: '临时旁路到期',
@@ -227,6 +228,9 @@ export function getRelayGuardianReasonLabel(reason?: string | null) {
     shadow_quarantine: '已达到临时隔离条件（监控模式未执行）',
     runtime_state_unavailable: 'Guardian 运行态暂不可用',
     mode_transition: 'Guardian 运行模式已切换',
+    last_available_relay: '仅剩当前 Relay 账号，无法安全隔离',
+    capacity_warmup: '容量基线预热中，暂不自动隔离',
+    insufficient_remaining_capacity: '隔离后剩余并发不足，已降为最后兜底',
   }
   if (labels[value]) return labels[value]
   const upstream = value.match(/^upstream_http_(\d{3})$/)
@@ -245,8 +249,17 @@ export function getRelayGuardianTriggerLabel(trigger?: string | null) {
     user_visible_60m: '60 分钟内用户可见失败',
     strong_gateway_5m: '5 分钟内强网关失败',
     recovery_failure: '恢复阶段再次失败',
+    user_visible_2_in_10m: '10 分钟内 2 个用户可见失败',
+    strong_gateway_3_in_5m: '5 分钟内 3 个强网关失败',
+    user_visible_4_in_60m: '60 分钟内 4 个用户可见失败',
+    probation_complete: '试运行完成',
+    manual_release: '管理员手动解除',
+    temporary_bypass: '管理员临时旁路',
   }
-  return labels[value] || value.replace(/_/g, ' ') || '-'
+  if (labels[value]) return labels[value]
+  const recovery = value.match(/^recovery_failure_(\d{3})$/)
+  if (recovery) return `恢复阶段再次收到 HTTP ${recovery[1]}`
+  return value.replace(/_/g, ' ') || '-'
 }
 
 type GuardianDetails = Record<string, unknown>
@@ -327,6 +340,7 @@ function countSummary(value: unknown) {
     ['quarantined', '已隔离'],
     ['half_open', '恢复探测'],
     ['probation', '试运行'],
+    ['temporary_bypass', '临时旁路'],
     ['last_resort', '最后兜底'],
     ['manual_disabled', '人工禁用'],
     ['unknown', '状态未知'],

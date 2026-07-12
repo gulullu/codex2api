@@ -5,6 +5,8 @@ import ts from 'typescript'
 
 const sourceURL = new URL('../src/lib/relayGuardian.ts', import.meta.url)
 const source = await readFile(sourceURL, 'utf8')
+const panelSource = await readFile(new URL('../src/components/RelayGuardianPanel.tsx', import.meta.url), 'utf8')
+const auditPageSource = await readFile(new URL('../src/pages/CodexAudit.tsx', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, {
   compilerOptions: {
     module: ts.ModuleKind.ES2022,
@@ -140,6 +142,7 @@ test('event query carries the audit window and pagination exactly', () => {
 test('core guardian event names have operator-friendly Chinese labels', () => {
   assert.equal(getRelayGuardianEventLabel('quarantined'), '临时隔离')
   assert.equal(getRelayGuardianEventLabel('manual_release'), '人工解除')
+  assert.equal(getRelayGuardianEventLabel('bypass'), '临时旁路')
   assert.equal(getRelayGuardianEventLabel('probation_10'), '试运行 10%')
   assert.equal(getRelayGuardianEventLabel('probation_50'), '试运行 50%')
   assert.equal(getRelayGuardianEventLabel('temporary_bypass_expired'), '临时旁路到期')
@@ -191,6 +194,14 @@ test('periodic summary details are converted to operator-friendly Chinese', () =
   assert.match(result.raw, /"configured": 3/)
 })
 
+test('periodic summary includes temporary bypass accounts', () => {
+  const result = summarizeRelayGuardianEventDetails({
+    counts: { configured: 3, healthy: 2, temporary_bypass: 1 },
+    window_id: '2026-07-13T01:25:00Z/5m',
+  })
+  assert.match(result.summary, /临时旁路 1/)
+})
+
 test('hourly audit and pool correlation fields receive readable summaries', () => {
   const audit = summarizeRelayGuardianEventDetails({ audit_rows: 81, incremental_rows: 5, window_id: '2026-07-13T01:00:00Z/1h' })
   assert.match(audit.summary, /增量 5 条，小时复核 81 条/)
@@ -204,5 +215,20 @@ test('hourly audit and pool correlation fields receive readable summaries', () =
 test('known guardian reasons and triggers are translated', () => {
   assert.equal(getRelayGuardianReasonLabel('periodic_summary'), '周期状态汇总')
   assert.equal(getRelayGuardianReasonLabel('upstream_http_502'), '上游返回 HTTP 502')
-  assert.equal(getRelayGuardianTriggerLabel('strong_gateway_5m'), '5 分钟内强网关失败')
+  assert.equal(getRelayGuardianReasonLabel('last_available_relay'), '仅剩当前 Relay 账号，无法安全隔离')
+  assert.equal(getRelayGuardianReasonLabel('capacity_warmup'), '容量基线预热中，暂不自动隔离')
+  assert.equal(getRelayGuardianReasonLabel('insufficient_remaining_capacity'), '隔离后剩余并发不足，已降为最后兜底')
+  assert.equal(getRelayGuardianTriggerLabel('user_visible_2_in_10m'), '10 分钟内 2 个用户可见失败')
+  assert.equal(getRelayGuardianTriggerLabel('strong_gateway_3_in_5m'), '5 分钟内 3 个强网关失败')
+  assert.equal(getRelayGuardianTriggerLabel('user_visible_4_in_60m'), '60 分钟内 4 个用户可见失败')
+  assert.equal(getRelayGuardianTriggerLabel('recovery_failure_502'), '恢复阶段再次收到 HTTP 502')
+  assert.equal(getRelayGuardianTriggerLabel('probation_complete'), '试运行完成')
+  assert.equal(getRelayGuardianTriggerLabel('manual_release'), '管理员手动解除')
+  assert.equal(getRelayGuardianTriggerLabel('temporary_bypass'), '管理员临时旁路')
+})
+
+test('guardian refresh controls delegate to the parent audit reload', () => {
+  assert.match(panelSource, /onRefresh: \(\) => void \| Promise<unknown>/)
+  assert.match(panelSource, /await onRefresh\(\)/)
+  assert.match(auditPageSource, /<RelayGuardianPanel[\s\S]*?onRefresh=\{reload\}/)
 })

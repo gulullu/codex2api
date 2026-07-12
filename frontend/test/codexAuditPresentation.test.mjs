@@ -14,15 +14,20 @@ const compiled = ts.transpileModule(source, {
 })
 const moduleURL = `data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`
 const {
+  calculateOperationalWindowHealthScore,
   calculateRelayWindowHealthScore,
+  final5xxWindowRecentlyRecovered,
   getCodexAuditPresentation,
   getRelayWindowHealthStandard,
+  operationalWindowRecentlyRecovered,
   relayWindowRecentlyRecovered,
 } = await import(moduleURL)
 
 function presentation(overrides = {}) {
   return getCodexAuditPresentation({
     verdict: 'normal',
+    totalRequests: 1000,
+    final5xx: 0,
     relayRequests: 1000,
     relayRouteFailures: 0,
     healthStatus: 'ok',
@@ -46,17 +51,56 @@ test('health score remains bounded when legacy counts are inconsistent', () => {
   assert.deepEqual(calculateRelayWindowHealthScore(1, 2), { healthScore: 0, failureRate: 1 })
 })
 
-test('recent recovery requires two active clean buckets', () => {
+test('operational health score uses the worse of relay failures and site-wide final 5xx', () => {
+  assert.deepEqual(calculateOperationalWindowHealthScore(1000, 20, 500, 5), {
+    healthScore: 98,
+    relayFailureRate: 0.01,
+    final5xxRate: 0.02,
+    worstFailureRate: 0.02,
+  })
+  assert.equal(calculateOperationalWindowHealthScore(1000, 2, 100, 4).healthScore, 96)
+})
+
+test('recent relay recovery requires two relay-active clean buckets', () => {
   assert.equal(relayWindowRecentlyRecovered([
-    { requests: 3, relay_route_failures: 1 },
-    { requests: 0, relay_route_failures: 0 },
-    { requests: 8, relay_route_failures: 0 },
+    { requests: 3, relay_direct: 3, relay_route_failures: 1 },
+    { requests: 0, relay_direct: 0, relay_route_failures: 0 },
+    { requests: 8, relay_direct: 8, relay_route_failures: 0 },
   ]), false)
   assert.equal(relayWindowRecentlyRecovered([
-    { requests: 3, relay_route_failures: 1 },
+    { requests: 3, relay_direct: 3, relay_route_failures: 1 },
+    { requests: 8, relay_probe: 8, relay_route_failures: 0 },
+    { requests: 9, relay_overflow: 9, relay_route_failures: 0 },
+  ]), true)
+})
+
+test('OAuth-only clean buckets cannot prove relay recovery', () => {
+  const timeline = [
+    { requests: 3, relay_direct: 3, relay_route_failures: 1 },
     { requests: 8, relay_route_failures: 0 },
     { requests: 9, relay_route_failures: 0 },
-  ]), true)
+  ]
+  assert.equal(relayWindowRecentlyRecovered(timeline), false)
+  assert.equal(operationalWindowRecentlyRecovered(timeline, 1, 0), false)
+})
+
+test('a relay failure bucket cannot disappear when its source counters are incomplete', () => {
+  assert.equal(relayWindowRecentlyRecovered([
+    { requests: 4, relay_direct: 4, relay_route_failures: 0 },
+    { requests: 5, relay_probe: 5, relay_route_failures: 0 },
+    { requests: 6, relay_route_failures: 1 },
+  ]), false)
+})
+
+test('site-wide final 5xx recovery requires two globally active clean buckets', () => {
+  const timeline = [
+    { requests: 4, errors_5xx: 1 },
+    { requests: 0, errors_5xx: 0 },
+    { requests: 8, errors_5xx: 0 },
+    { requests: 9, errors_5xx: 0 },
+  ]
+  assert.equal(final5xxWindowRecentlyRecovered(timeline), true)
+  assert.equal(operationalWindowRecentlyRecovered(timeline, 0, 1), true)
 })
 
 test('an obsolete operational verdict cannot turn non-relay failures into a relay incident', () => {
@@ -70,9 +114,9 @@ test('a recovered relay incident is shown as recovered instead of permanently re
     relayRequests: 100,
     relayRouteFailures: 8,
     timeline: [
-      { requests: 20, relay_route_failures: 8 },
-      { requests: 20, relay_route_failures: 0 },
-      { requests: 20, relay_route_failures: 0 },
+      { requests: 20, relay_direct: 20, relay_route_failures: 8 },
+      { requests: 20, relay_direct: 20, relay_route_failures: 0 },
+      { requests: 20, relay_direct: 20, relay_route_failures: 0 },
     ],
   })
   assert.equal(result.label, '已恢复')
@@ -85,6 +129,15 @@ test('a moderate relay failure ratio is a warning with a numeric score', () => {
   assert.equal(result.label, '需关注')
   assert.equal(result.tone, 'warn')
   assert.equal(result.healthScore, 97)
+})
+
+test('site-wide final 5xx can make the window unhealthy even when relay is clean', () => {
+  const result = presentation({ totalRequests: 100, final5xx: 6, relayRequests: 80, relayRouteFailures: 0 })
+  assert.equal(result.label, '运行异常')
+  assert.equal(result.tone, 'bad')
+  assert.equal(result.healthScore, 94)
+  assert.match(result.description, /Relay 最终失败 0\/80/)
+  assert.match(result.description, /全站最终 5xx 6\/100/)
 })
 
 test('a poor active window remains red until clean recent buckets prove recovery', () => {
@@ -134,11 +187,24 @@ test('zero schedulable relay capacity is a current red incident', () => {
   assert.match(result.description, /没有可调度账号/)
 })
 
+test('present relay health with no configured account is red and says unconfigured', () => {
+  const result = presentation({ relayConfigured: 0, relaySchedulable: 0 })
+  assert.equal(result.label, '当前异常')
+  assert.equal(result.tone, 'bad')
+  assert.match(result.description, /未配置 Relay 账号/)
+})
+
+test('present relay health with zero schedulable is red even without a configured count', () => {
+  const result = presentation({ relaySchedulable: 0 })
+  assert.equal(result.label, '当前异常')
+  assert.equal(result.tone, 'bad')
+})
+
 test('clean recent buckets turn green only after guardian degradation clears', () => {
   const timeline = [
-    { requests: 10, relay_route_failures: 2 },
-    { requests: 10, relay_route_failures: 0 },
-    { requests: 10, relay_route_failures: 0 },
+    { requests: 10, relay_direct: 10, relay_route_failures: 2 },
+    { requests: 10, relay_direct: 10, relay_route_failures: 0 },
+    { requests: 10, relay_direct: 10, relay_route_failures: 0 },
   ]
   assert.equal(presentation({ relayRequests: 30, relayRouteFailures: 2, timeline, guardianStatus: 'degraded', relayConfigured: 3, relaySchedulable: 3 }).tone, 'bad')
   assert.equal(presentation({ relayRequests: 30, relayRouteFailures: 2, timeline, guardianStatus: 'healthy', relayConfigured: 3, relaySchedulable: 3 }).label, '已恢复')
@@ -161,6 +227,6 @@ test('health score standards are explicit and stable', () => {
   assert.deepEqual(getRelayWindowHealthStandard(), {
     stableScore: 99.5,
     attentionScore: 95,
-    description: '健康分按 100 ×（1 − Relay 最终失败数 ÷ Relay 请求数）计算；99.5 分及以上稳定，95–99.4 分需关注，低于 95 分为窗口质量异常。',
+    description: '运行健康分按 Relay 最终失败率与全站最终 5xx 率中较高者计算；99.5 分及以上稳定，95–99.4 分需关注，低于 95 分为窗口质量异常。',
   })
 })

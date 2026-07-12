@@ -215,11 +215,18 @@ export default function CodexAudit() {
   const guardianStatus = health?.guardian?.status ?? ''
   const relayConfigured = health?.relay?.configured ?? 0
   const relaySchedulable = health?.relay?.schedulable ?? 0
-  const relayCapacityUnavailable = relayConfigured > 0 && relaySchedulable === 0
+  const relayCapacityUnavailable = Boolean(health?.relay) && relaySchedulable === 0
   const guardianDegraded = Boolean(guardianStatus && !['healthy', 'ok', 'disabled'].includes(guardianStatus))
   const liveHealthTone: Tone = health?.status !== 'ok' || relayCapacityUnavailable ? 'bad' : guardianDegraded ? 'warn' : 'ok'
+  const relayRealtimeLabel = !health?.relay
+    ? 'Relay 状态未知'
+    : relayConfigured === 0
+      ? 'Relay 未配置'
+      : `Relay ${relaySchedulable}/${relayConfigured}`
   const meta = getCodexAuditPresentation({
     verdict: report?.verdict,
+    totalRequests: report?.usage.requests ?? 0,
+    final5xx: report?.usage.errors_5xx ?? 0,
     relayRequests: report?.summary.relay_requests ?? 0,
     relayRouteFailures: report?.summary.relay_route_failures ?? 0,
     oauthCyberAttempts: report?.summary.oauth_cyber_miss_attempts ?? 0,
@@ -228,8 +235,8 @@ export default function CodexAudit() {
     sessionBleed: report?.summary.session_bleed ?? 0,
     healthStatus: health?.status,
     guardianStatus,
-    relayConfigured,
-    relaySchedulable,
+    relayConfigured: health?.relay?.configured,
+    relaySchedulable: health?.relay?.schedulable,
     timeline: report?.timeline,
   })
 
@@ -290,15 +297,15 @@ export default function CodexAudit() {
                   <div className="grid min-w-0 gap-2 sm:grid-cols-2 xl:w-[760px]">
                     <WindowLine label="筛选窗口" value={`${formatBeijingTime(report.window_start)} 至 ${formatBeijingTime(report.window_end)}`} />
                     <WindowLine
-                      label="Relay 健康分"
-                      value={`${formatHealthScore(meta.healthScore)} / 100 · 失败 ${formatNumber(report.summary.relay_route_failures)}/${formatNumber(report.summary.relay_requests)}`}
+                      label="运行健康分"
+                      value={`${formatHealthScore(meta.healthScore)} / 100 · Relay 最终失败 ${formatNumber(report.summary.relay_route_failures)}/${formatNumber(report.summary.relay_requests)} · 全站最终 5xx ${formatNumber(report.usage.errors_5xx)}/${formatNumber(report.usage.requests)}`}
                       tone={meta.healthScore >= 99.5 ? 'ok' : meta.healthScore >= 95 ? 'warn' : 'bad'}
                       title={getRelayWindowHealthStandard().description}
                     />
                     <WindowLine label="报表生成" value={formatBeijingTime(report.generated_at)} />
                     <WindowLine
                       label="运行健康 · 实时"
-                      value={`${healthStatusLabel(health?.status)} · Relay ${relaySchedulable}/${relayConfigured}${guardianStatus ? ` · Guardian ${guardianHealthLabel(guardianStatus)}` : ''}`}
+                      value={`${healthStatusLabel(health?.status)} · ${relayRealtimeLabel}${guardianStatus ? ` · Guardian ${guardianHealthLabel(guardianStatus)}` : ''}`}
                       tone={liveHealthTone}
                     />
                   </div>
@@ -333,6 +340,7 @@ export default function CodexAudit() {
               end={report.window_end}
               refreshToken={report.generated_at}
               accounts={accounts}
+              onRefresh={reload}
             />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-2">

@@ -43,11 +43,13 @@ export default function RelayGuardianPanel({
   end,
   refreshToken,
   accounts,
+  onRefresh,
 }: {
   start: string
   end: string
   refreshToken: string
   accounts: AccountRow[]
+  onRefresh: () => void | Promise<unknown>
 }) {
   const [status, setStatus] = useState<RelayGuardianStatusResponse | null>(null)
   const [statusLoading, setStatusLoading] = useState(false)
@@ -55,9 +57,9 @@ export default function RelayGuardianPanel({
   const [events, setEvents] = useState<RelayGuardianEventsResponse | null>(null)
   const [eventsLoading, setEventsLoading] = useState(false)
   const [eventsError, setEventsError] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
-  const [eventsRefresh, setEventsRefresh] = useState(0)
   const [actionAccountIDs, setActionAccountIDs] = useState<Set<number>>(() => new Set())
   const actionAccountIDsRef = useRef(new Set<number>())
   const statusRequestIDRef = useRef(0)
@@ -108,7 +110,17 @@ export default function RelayGuardianPanel({
     return () => {
       cancelled = true
     }
-  }, [start, end, page, pageSize, refreshToken, eventsRefresh])
+  }, [start, end, page, pageSize, refreshToken])
+
+  const refreshAuditWindow = useCallback(async () => {
+    if (refreshing) return
+    setRefreshing(true)
+    try {
+      await onRefresh()
+    } finally {
+      setRefreshing(false)
+    }
+  }, [onRefresh, refreshing])
 
   const operationMode = status?.enabled === false ? 'off' : (status?.mode ?? 'monitor')
   const isEnforce = operationMode === 'enforce'
@@ -226,8 +238,8 @@ export default function RelayGuardianPanel({
                 </p>
               </div>
             </div>
-            <Button variant="outline" size="sm" className="self-start" onClick={() => void loadStatus()} disabled={statusLoading}>
-              <RefreshCw className={statusLoading ? 'size-3.5 animate-spin' : 'size-3.5'} />
+            <Button variant="outline" size="sm" className="self-start" onClick={() => void refreshAuditWindow()} disabled={statusLoading || refreshing}>
+              <RefreshCw className={statusLoading || refreshing ? 'size-3.5 animate-spin' : 'size-3.5'} />
               刷新状态
             </Button>
           </div>
@@ -289,8 +301,8 @@ export default function RelayGuardianPanel({
               </p>
               <p className="mt-1 text-xs text-muted-foreground">{formatBeijingTime(start)} 至 {formatBeijingTime(end)}</p>
             </div>
-            <Button variant="outline" size="sm" className="self-start" onClick={() => setEventsRefresh((value) => value + 1)} disabled={eventsLoading}>
-              <RefreshCw className={eventsLoading ? 'size-3.5 animate-spin' : 'size-3.5'} />
+            <Button variant="outline" size="sm" className="self-start" onClick={() => void refreshAuditWindow()} disabled={eventsLoading || refreshing}>
+              <RefreshCw className={eventsLoading || refreshing ? 'size-3.5 animate-spin' : 'size-3.5'} />
               刷新事件
             </Button>
           </div>

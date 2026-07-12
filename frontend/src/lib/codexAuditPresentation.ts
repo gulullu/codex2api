@@ -2,6 +2,8 @@ export type CodexAuditTone = 'ok' | 'warn' | 'bad' | 'neutral'
 
 export interface CodexAuditOperationalInput {
   verdict?: string | null
+  totalRequests: number
+  final5xx: number
   relayRequests: number
   relayRouteFailures: number
   oauthCyberAttempts?: number
@@ -14,6 +16,14 @@ export interface CodexAuditOperationalInput {
   relaySchedulable?: number
   timeline?: Array<{
     requests?: number
+    errors_5xx?: number
+    relay_requests?: number
+    relay_direct?: number
+    relay_pinned?: number
+    relay_probe?: number
+    relay_overflow?: number
+    relay_continuation?: number
+    relay_legacy_unknown?: number
     relay_route_failures?: number
   }>
 }
@@ -25,6 +35,8 @@ export interface CodexAuditPresentation {
   tone: CodexAuditTone
   healthScore: number
   relayFailureRate: number
+  final5xxRate: number
+  worstFailureRate: number
   recentRecovered: boolean
 }
 
@@ -57,32 +69,105 @@ export function calculateRelayWindowHealthScore(relayRequests: number, relayRout
   return { healthScore, failureRate }
 }
 
+export function calculateOperationalWindowHealthScore(
+  totalRequests: number,
+  final5xx: number,
+  relayRequests: number,
+  relayRouteFailures: number,
+) {
+  const { failureRate: relayFailureRate } = calculateRelayWindowHealthScore(relayRequests, relayRouteFailures)
+  const finalFailures = finiteCount(final5xx)
+  const requests = Math.max(finiteCount(totalRequests), finalFailures, 1)
+  const final5xxRate = Math.min(1, finalFailures / requests)
+  const worstFailureRate = Math.max(relayFailureRate, final5xxRate)
+  const healthScore = Math.round((100 - worstFailureRate * 100) * 100) / 100
+  return { healthScore, relayFailureRate, final5xxRate, worstFailureRate }
+}
+
+function timelineRelayRequests(point: NonNullable<CodexAuditOperationalInput['timeline']>[number]) {
+  const explicit = finiteCount(point.relay_requests)
+  if (explicit > 0) return explicit
+  return finiteCount(point.relay_direct)
+    + finiteCount(point.relay_pinned)
+    + finiteCount(point.relay_probe)
+    + finiteCount(point.relay_overflow)
+    + finiteCount(point.relay_continuation)
+    + finiteCount(point.relay_legacy_unknown)
+}
+
+function hasCleanActiveBuckets(
+  timeline: CodexAuditOperationalInput['timeline'],
+  active: (point: NonNullable<CodexAuditOperationalInput['timeline']>[number]) => boolean,
+  failed: (point: NonNullable<CodexAuditOperationalInput['timeline']>[number]) => boolean,
+  requiredBuckets: number,
+) {
+  if (!timeline || requiredBuckets <= 0) return false
+  const activeBuckets = timeline.filter(active)
+  if (activeBuckets.length < requiredBuckets) return false
+  return activeBuckets.slice(-requiredBuckets).every((point) => !failed(point))
+}
+
 export function relayWindowRecentlyRecovered(
   timeline: CodexAuditOperationalInput['timeline'],
   requiredBuckets = 2,
 ) {
-  if (!timeline || requiredBuckets <= 0) return false
-  const activeBuckets = timeline.filter((point) => finiteCount(point.requests) > 0)
-  if (activeBuckets.length < requiredBuckets) return false
-  return activeBuckets
-    .slice(-requiredBuckets)
-    .every((point) => finiteCount(point.relay_route_failures) === 0)
+  return hasCleanActiveBuckets(
+    timeline,
+    (point) => timelineRelayRequests(point) > 0 || finiteCount(point.relay_route_failures) > 0,
+    (point) => finiteCount(point.relay_route_failures) > 0,
+    requiredBuckets,
+  )
+}
+
+export function final5xxWindowRecentlyRecovered(
+  timeline: CodexAuditOperationalInput['timeline'],
+  requiredBuckets = 2,
+) {
+  return hasCleanActiveBuckets(
+    timeline,
+    (point) => finiteCount(point.requests) > 0 || finiteCount(point.errors_5xx) > 0,
+    (point) => finiteCount(point.errors_5xx) > 0,
+    requiredBuckets,
+  )
+}
+
+export function operationalWindowRecentlyRecovered(
+  timeline: CodexAuditOperationalInput['timeline'],
+  relayRouteFailures: number,
+  final5xx: number,
+  requiredBuckets = 2,
+) {
+  const needsRelayRecovery = finiteCount(relayRouteFailures) > 0
+  const needsFinal5xxRecovery = finiteCount(final5xx) > 0
+  if (!needsRelayRecovery && !needsFinal5xxRecovery) return false
+  return (!needsRelayRecovery || relayWindowRecentlyRecovered(timeline, requiredBuckets))
+    && (!needsFinal5xxRecovery || final5xxWindowRecentlyRecovered(timeline, requiredBuckets))
 }
 
 export function getCodexAuditPresentation(input: CodexAuditOperationalInput): CodexAuditPresentation {
   const relayFailures = finiteCount(input.relayRouteFailures)
   const relayRequests = finiteCount(input.relayRequests)
-  const { healthScore, failureRate: relayFailureRate } = calculateRelayWindowHealthScore(relayRequests, relayFailures)
-  const recentRecovered = relayFailures > 0 && relayWindowRecentlyRecovered(input.timeline)
+  const final5xx = finiteCount(input.final5xx)
+  const totalRequests = finiteCount(input.totalRequests)
+  const { healthScore, relayFailureRate, final5xxRate, worstFailureRate } = calculateOperationalWindowHealthScore(
+    totalRequests,
+    final5xx,
+    relayRequests,
+    relayFailures,
+  )
+  const hasWindowFailures = relayFailures > 0 || final5xx > 0
+  const recentRecovered = hasWindowFailures && operationalWindowRecentlyRecovered(input.timeline, relayFailures, final5xx)
   const liveStatus = (input.healthStatus || '').trim().toLowerCase()
   const liveHealthy = liveStatus === 'ok'
   const guardianStatus = (input.guardianStatus || '').trim().toLowerCase()
   const guardianDegraded = Boolean(guardianStatus && !['healthy', 'ok', 'disabled'].includes(guardianStatus))
+  const relayHealthPresent = input.relayConfigured !== undefined || input.relaySchedulable !== undefined
   const relayConfigured = finiteCount(input.relayConfigured)
   const relaySchedulable = finiteCount(input.relaySchedulable)
-  const relayCapacityUnavailable = relayConfigured > 0 && relaySchedulable === 0
+  const relayCapacityUnavailable = relayHealthPresent && relaySchedulable === 0
   const liveUnhealthy = Boolean(liveStatus && !liveHealthy) || relayCapacityUnavailable
-  const base = { healthScore, relayFailureRate, recentRecovered }
+  const base = { healthScore, relayFailureRate, final5xxRate, worstFailureRate, recentRecovered }
+  const measurements = `Relay 最终失败 ${relayFailures}/${relayRequests}（${percent(relayFailureRate)}）；全站最终 5xx ${final5xx}/${totalRequests}（${percent(final5xxRate)}）；运行健康分 ${scoreLabel(healthScore)}。`
 
   if (finiteCount(input.oauthCyberAttempts) > 0) {
     return {
@@ -113,24 +198,25 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
   }
   if (liveUnhealthy) {
     const liveReason = relayCapacityUnavailable
-      ? `当前 ${relayConfigured} 个 Relay 账号中没有可调度账号`
+      ? relayConfigured === 0
+        ? '当前未配置 Relay 账号'
+        : `当前 ${relayConfigured} 个 Relay 账号中没有可调度账号`
       : `实时健康检查为 ${liveStatus}`
     return {
       ...base,
       label: '当前异常',
       title: '服务当前未处于健康状态',
-      description: `${liveReason}；窗口 Relay 失败 ${relayFailures}/${relayRequests}，健康分 ${scoreLabel(healthScore)}。`,
+      description: `${liveReason}；${measurements}`,
       tone: 'bad',
     }
   }
-  if (relayFailures > 0) {
-    const measurements = `窗口 Relay 失败 ${relayFailures}/${relayRequests}（${percent(relayFailureRate)}），健康分 ${scoreLabel(healthScore)}。`
+  if (hasWindowFailures) {
     if (liveHealthy && recentRecovered && !guardianDegraded) {
       return {
         ...base,
         label: '已恢复',
-        title: 'Relay 历史波动已恢复',
-        description: `${measurements} 最近两个有请求的时间段未再出现 Relay 失败，实时健康正常。`,
+        title: '窗口历史波动已恢复',
+        description: `${measurements} 相应来源最近两个活跃时间段均无同类失败，实时健康正常。`,
         tone: 'ok',
       }
     }
@@ -139,7 +225,7 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
         ...base,
         label: '检测到波动',
         title: 'Guardian 检测到 Relay 波动',
-        description: `${measurements}当前仍有 ${relaySchedulable}/${relayConfigured} 个 Relay 账号可调度，服务容量尚在。`,
+        description: `${measurements} 当前仍有 ${relaySchedulable}/${relayConfigured} 个 Relay 账号可调度，服务容量尚在。`,
         tone: 'warn',
       }
     }
@@ -147,7 +233,7 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
       return {
         ...base,
         label: '轻微波动',
-        title: liveHealthy ? 'Relay 当前正常，窗口内有轻微波动' : 'Relay 窗口内有轻微波动',
+        title: liveHealthy ? '服务当前正常，窗口内有轻微波动' : '窗口内有轻微波动',
         description: `${measurements}${liveHealthy ? ' 实时健康正常。' : ''}`,
         tone: 'ok',
       }
@@ -156,7 +242,7 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
       return {
         ...base,
         label: '需关注',
-        title: liveHealthy ? 'Relay 当前正常，窗口质量需关注' : 'Relay 窗口质量需关注',
+        title: liveHealthy ? '服务当前正常，窗口质量需关注' : '窗口质量需关注',
         description: `${measurements}${liveHealthy ? ' 实时健康正常。' : ''}`,
         tone: 'warn',
       }
@@ -164,7 +250,7 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
     return {
       ...base,
       label: '运行异常',
-      title: 'Relay 窗口质量异常',
+      title: '窗口运行质量异常',
       description: `${measurements}${liveHealthy ? ' 实时接口仍可用，但失败率已超过红色阈值。' : ''}`,
       tone: 'bad',
     }
@@ -201,6 +287,6 @@ export function getRelayWindowHealthStandard() {
   return {
     stableScore: operationalThresholds.stableScore,
     attentionScore: operationalThresholds.attentionScore,
-    description: '健康分按 100 ×（1 − Relay 最终失败数 ÷ Relay 请求数）计算；99.5 分及以上稳定，95–99.4 分需关注，低于 95 分为窗口质量异常。',
+    description: '运行健康分按 Relay 最终失败率与全站最终 5xx 率中较高者计算；99.5 分及以上稳定，95–99.4 分需关注，低于 95 分为窗口质量异常。',
   }
 }
