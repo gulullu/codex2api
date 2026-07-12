@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile codex-pro failover every 30 seconds
+Documentation=file:/usr/local/share/doc/codex2api-sub2-codex-pro-failover/README.md
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=30s
+Persistent=true
+RandomizedDelaySec=5s
+AccuracySec=5s
+Unit=codex2api-sub2-codex-pro-failover.service
+
+[Install]
+WantedBy=timers.target

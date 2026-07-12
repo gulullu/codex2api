@@ -1,0 +1,43 @@
+[Unit]
+Description=Codex2API to sub2api codex-pro failover controller
+Documentation=file:/usr/local/share/doc/codex2api-sub2-codex-pro-failover/README.md
+Requisite=docker.service
+After=docker.service network-online.target
+AssertPathExists=/var/run/docker.sock
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=HEALTH_URL=http://127.0.0.1:8090/health
+Environment=SUB2_ADMIN_BASE_URL=http://127.0.0.1:18082
+Environment=GROUP_NAME=codex-pro
+Environment=BRIDGE_ACCOUNT_ID=7692
+Environment=RECOVERY_CONFIRMATIONS=3
+LoadCredential=sub2api_admin_key:/root/.sub2api_admin.key
+StateDirectory=codex2api-sub2-codex-pro-failover
+StateDirectoryMode=0700
+RuntimeDirectory=codex2api-sub2-codex-pro-failover
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/timeout --signal=TERM --kill-after=5s 175s /usr/local/libexec/codex2api-sub2-codex-pro-failover reconcile
+TimeoutStartSec=180s
+TimeoutStopSec=5s
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codex2api-sub2-codex-pro-failover
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+UMask=0077
