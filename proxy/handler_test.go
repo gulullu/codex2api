@@ -850,6 +850,61 @@ func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 	}
 }
 
+func TestResponsesHTTPEndpointsNormalizeEmptyFunctionCallHistory(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(auth.NewStore(nil, nil, nil), nil, nil, nil)
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"before"},
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_bad","output":"stale"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	tests := []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+	}{
+		{name: "responses", path: "/v1/responses", handler: handler.Responses},
+		{name: "responses compact", path: "/v1/responses/compact", handler: handler.ResponsesCompact},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = req
+
+			test.handler(ginCtx)
+
+			storedBody, ok := rawRequestBodyFromContext(ginCtx)
+			if !ok {
+				t.Fatal("normalized request body was not written back to context")
+			}
+			if strings.Contains(string(storedBody), "call_bad") || strings.Contains(string(storedBody), "stale") {
+				t.Fatalf("context retained malformed pre-normalization body: %s", storedBody)
+			}
+			if !strings.Contains(string(storedBody), "continue") {
+				t.Fatalf("context lost current user input: %s", storedBody)
+			}
+			if recorder.Code == http.StatusBadRequest && strings.Contains(recorder.Body.String(), "input[1].name") {
+				t.Fatalf("empty historical function name was not normalized: %s", recorder.Body.String())
+			}
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d after normalization passes; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+			}
+			assertNoAvailableAccountResponse(t, recorder.Body.Bytes())
+		})
+	}
+}
+
 func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2742,6 +2797,64 @@ func TestResponsesWebSocketStripsInjectedImageTool(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for upstream request")
+	}
+}
+
+func TestResponsesWebSocketNormalizesEmptyFunctionCallHistory(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	bodyCh := make(chan []byte, 1)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		bodyCh <- append([]byte(nil), requestBody...)
+		sse := `data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}` + "\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_bad","output":"stale"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+	if err := conn.WriteMessage(websocket.TextMessage, body); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case gotBody := <-bodyCh:
+		if strings.Contains(string(gotBody), "call_bad") || strings.Contains(string(gotBody), "stale") {
+			t.Fatalf("websocket upstream body retained malformed history: %s", gotBody)
+		}
+		if !strings.Contains(string(gotBody), "continue") {
+			t.Fatalf("websocket upstream body lost current user input: %s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for websocket upstream request")
 	}
 }
 

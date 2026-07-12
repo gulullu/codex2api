@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"bytes"
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -1384,6 +1386,133 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(out)
+}
+
+type responsesFunctionCallHistoryRepair struct {
+	DroppedCalls   int
+	DroppedOutputs int
+}
+
+var (
+	responsesFunctionCallLiteral = []byte("function_call")
+	jsonUnicodeEscapePrefix      = []byte(`\u`)
+)
+
+func responsesInputHasEmptyFunctionCallName(rawBody []byte) bool {
+	// The common path is a large request with no function-call history. Keep it
+	// allocation-free. A semantically equivalent escaped spelling (for example
+	// function\u005fcall or n\u0061me) necessarily contains a JSON \u escape, so
+	// it still falls through to the gjson check instead of becoming a false
+	// negative.
+	if !bytes.Contains(rawBody, responsesFunctionCallLiteral) && !bytes.Contains(rawBody, jsonUnicodeEscapePrefix) {
+		return false
+	}
+
+	input := gjson.GetBytes(rawBody, "input")
+	if !input.IsArray() {
+		return false
+	}
+	found := false
+	input.ForEach(func(_, item gjson.Result) bool {
+		if !item.IsObject() {
+			return true
+		}
+		itemType := item.Get("type")
+		if itemType.Type != gjson.String || strings.TrimSpace(itemType.String()) != "function_call" {
+			return true
+		}
+		name := item.Get("name")
+		if !name.Exists() || name.Type != gjson.String || strings.TrimSpace(name.String()) == "" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// normalizeResponsesFunctionCallHistory removes incomplete historical
+// function_call items whose name is blank. A function name cannot be inferred
+// safely from call_id or the current tools list, so the matching historical
+// output is removed as well instead of inventing a name and misattributing a
+// tool result. Empty function tool definitions remain validation errors.
+func normalizeResponsesFunctionCallHistory(rawBody []byte) ([]byte, responsesFunctionCallHistoryRepair) {
+	if !responsesInputHasEmptyFunctionCallName(rawBody) {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+
+	var body map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(rawBody))
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+	inputItems, ok := body["input"].([]any)
+	if !ok || len(inputItems) == 0 {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+
+	invalidIndexes := make(map[int]struct{})
+	invalidCallIDs := make(map[string]struct{})
+	validCallIDs := make(map[string]struct{})
+	for itemIdx, rawItem := range inputItems {
+		item, ok := rawItem.(map[string]any)
+		if !ok || strings.TrimSpace(firstNonEmptyAnyString(item["type"])) != "function_call" {
+			continue
+		}
+		callID := strings.TrimSpace(firstNonEmptyAnyString(item["call_id"]))
+		if strings.TrimSpace(firstNonEmptyAnyString(item["name"])) == "" {
+			invalidIndexes[itemIdx] = struct{}{}
+			if callID != "" {
+				invalidCallIDs[callID] = struct{}{}
+			}
+			continue
+		}
+		if callID != "" {
+			validCallIDs[callID] = struct{}{}
+		}
+	}
+	if len(invalidIndexes) == 0 {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+
+	out := make([]any, 0, len(inputItems))
+	repair := responsesFunctionCallHistoryRepair{}
+	for itemIdx, rawItem := range inputItems {
+		if _, drop := invalidIndexes[itemIdx]; drop {
+			repair.DroppedCalls++
+			continue
+		}
+
+		item, ok := rawItem.(map[string]any)
+		if ok && strings.TrimSpace(firstNonEmptyAnyString(item["type"])) == "function_call_output" {
+			callID := strings.TrimSpace(firstNonEmptyAnyString(item["call_id"]))
+			_, matchesInvalidCall := invalidCallIDs[callID]
+			_, matchesValidCall := validCallIDs[callID]
+			if callID != "" && matchesInvalidCall && !matchesValidCall {
+				repair.DroppedOutputs++
+				continue
+			}
+		}
+		out = append(out, rawItem)
+	}
+
+	// Do not turn a malformed tool-only request into an empty request. Keeping
+	// the original body lets the existing validator return a precise 400.
+	if len(out) == 0 {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+
+	body["input"] = out
+	normalized, err := json.Marshal(body)
+	if err != nil {
+		return rawBody, responsesFunctionCallHistoryRepair{}
+	}
+	return normalized, repair
 }
 
 func invalidFunctionNameError(path string) error {

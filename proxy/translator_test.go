@@ -1626,6 +1626,253 @@ func TestValidateResponsesFunctionNamesRejectsEmptyInputName(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponsesFunctionCallHistoryDropsMalformedPair(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"before"},
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_bad","output":"stale"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if repair.DroppedCalls != 1 || repair.DroppedOutputs != 1 {
+		t.Fatalf("repair = %+v, want one dropped call and output", repair)
+	}
+	if count := int(gjson.GetBytes(got, "input.#").Int()); count != 2 {
+		t.Fatalf("input count = %d, want 2; body=%s", count, got)
+	}
+	if strings.Contains(string(got), "call_bad") || strings.Contains(string(got), "stale") {
+		t.Fatalf("malformed tool history survived normalization: %s", got)
+	}
+	if text := gjson.GetBytes(got, "input.1.content").String(); text != "continue" {
+		t.Fatalf("current user message = %q, want continue; body=%s", text, got)
+	}
+	if err := ValidateResponsesFunctionNames(got); err != nil {
+		t.Fatalf("normalized body should pass function-name validation: %v", err)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryPreservesLargeIntegers(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"large_integer":9007199254740993,
+		"input":[
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"message","role":"user","content":"continue","sequence":9007199254740995}
+		]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if repair.DroppedCalls != 1 {
+		t.Fatalf("repair = %+v, want one dropped call", repair)
+	}
+	if value := gjson.GetBytes(got, "large_integer").Raw; value != "9007199254740993" {
+		t.Fatalf("large_integer = %s, want exact 9007199254740993; body=%s", value, got)
+	}
+	if value := gjson.GetBytes(got, "input.0.sequence").Raw; value != "9007199254740995" {
+		t.Fatalf("nested sequence = %s, want exact 9007199254740995; body=%s", value, got)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryDetectsUnicodeEscapes(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"in\u0070ut":[
+			{"t\u0079pe":"function\u005fcall","call_id":"call_bad","n\u0061me":"\u0020","arguments":"{}"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if repair.DroppedCalls != 1 {
+		t.Fatalf("unicode-escaped empty function name was not repaired: repair=%+v body=%s", repair, got)
+	}
+	if strings.Contains(string(got), "call_bad") {
+		t.Fatalf("unicode-escaped malformed call survived normalization: %s", got)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryFastPathsReturnOriginalBuffer(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "no function call candidate",
+			input: `{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"continue"}],"padding":"` + strings.Repeat("x", 150<<10) + `"}`,
+		},
+		{
+			name:  "valid function call candidate",
+			input: `{"model":"gpt-5.4","input":[{"type":"function_call","call_id":"call_ok","name":"lookup","arguments":"{}"},{"type":"message","role":"user","content":"continue"}],"padding":"` + strings.Repeat("x", 150<<10) + `"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(tc.input)
+			got, repair := normalizeResponsesFunctionCallHistory(raw)
+			if repair.DroppedCalls != 0 || repair.DroppedOutputs != 0 {
+				t.Fatalf("legal payload was modified: repair=%+v", repair)
+			}
+			if len(got) != len(raw) || &got[0] != &raw[0] {
+				t.Fatal("legal payload should return the original buffer without a decode/rewrite")
+			}
+		})
+	}
+}
+
+func BenchmarkNormalizeResponsesFunctionCallHistoryLargeNoCandidate(b *testing.B) {
+	raw := []byte(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":"continue"}],"padding":"` + strings.Repeat("x", 150<<10) + `"}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got, repair := normalizeResponsesFunctionCallHistory(raw)
+		if repair.DroppedCalls != 0 || len(got) != len(raw) || &got[0] != &raw[0] {
+			b.Fatal("legal no-candidate payload was modified")
+		}
+	}
+}
+
+func BenchmarkNormalizeResponsesFunctionCallHistoryLargeValidCall(b *testing.B) {
+	raw := []byte(`{"model":"gpt-5.4","input":[{"type":"function_call","call_id":"call_ok","name":"lookup","arguments":"{}"},{"type":"message","role":"user","content":"continue"}],"padding":"` + strings.Repeat("x", 150<<10) + `"}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got, repair := normalizeResponsesFunctionCallHistory(raw)
+		if repair.DroppedCalls != 0 || len(got) != len(raw) || &got[0] != &raw[0] {
+			b.Fatal("legal function-call payload was modified")
+		}
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryRejectsTrailingJSONValue(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.4","input":[{"type":"function_call","name":""},{"type":"message","role":"user","content":"continue"}]} {"extra":true}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if string(got) != string(raw) || repair.DroppedCalls != 0 || repair.DroppedOutputs != 0 {
+		t.Fatalf("multiple JSON values must remain untouched; repair=%+v body=%s", repair, got)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryDropsUnpairedMalformedCall(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"call_bad","name":"  ","arguments":"{}"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if repair.DroppedCalls != 1 || repair.DroppedOutputs != 0 {
+		t.Fatalf("repair = %+v, want one dropped call and no output", repair)
+	}
+	if strings.Contains(string(got), "call_bad") {
+		t.Fatalf("malformed function_call survived normalization: %s", got)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryPreservesOutputForValidSharedCallID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"call_shared","name":"","arguments":"{}"},
+			{"type":"function_call","call_id":"call_shared","name":"lookup","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_shared","output":"ok"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if repair.DroppedCalls != 1 || repair.DroppedOutputs != 0 {
+		t.Fatalf("repair = %+v, want only the malformed duplicate dropped", repair)
+	}
+	if name := gjson.GetBytes(got, `input.#(type=="function_call").name`).String(); name != "lookup" {
+		t.Fatalf("valid call name = %q, want lookup; body=%s", name, got)
+	}
+	if output := gjson.GetBytes(got, `input.#(type=="function_call_output").output`).String(); output != "ok" {
+		t.Fatalf("valid call output = %q, want ok; body=%s", output, got)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryKeepsToolOnlyFailureExplicit(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_bad","output":"stale"}
+		]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if string(got) != string(raw) || repair.DroppedCalls != 0 || repair.DroppedOutputs != 0 {
+		t.Fatalf("tool-only invalid request should remain unchanged for explicit validation; repair=%+v body=%s", repair, got)
+	}
+	if err := ValidateResponsesFunctionNames(got); err == nil {
+		t.Fatal("tool-only invalid request should still be rejected")
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryKeepsEmptyToolDefinitionExplicit(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":"hello"}],
+		"tools":[{"type":"function","name":"","parameters":{"type":"object"}}]
+	}`)
+
+	got, repair := normalizeResponsesFunctionCallHistory(raw)
+
+	if string(got) != string(raw) || repair.DroppedCalls != 0 || repair.DroppedOutputs != 0 {
+		t.Fatalf("empty tool definition should not be normalized; repair=%+v body=%s", repair, got)
+	}
+	if err := ValidateResponsesFunctionNames(got); err == nil || !strings.Contains(err.Error(), "tools[0].name") {
+		t.Fatalf("empty tool definition should remain a precise validation error, got %v", err)
+	}
+}
+
+func TestNormalizeResponsesFunctionCallHistoryFeedsCodexRelayAndWebSocketBodies(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"function_call","call_id":"call_bad","name":"","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_bad","output":"stale"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+	normalized, repair := normalizeResponsesFunctionCallHistory(raw)
+	if repair.DroppedCalls != 1 || repair.DroppedOutputs != 1 {
+		t.Fatalf("repair = %+v, want one dropped call and output", repair)
+	}
+
+	codexBody, _ := PrepareResponsesBody(normalized)
+	relayBody := PrepareOpenAIResponsesBody(normalized)
+	websocketBody, _ := PrepareResponsesWebSocketBody(normalized)
+	compactBody, _ := PrepareCompactResponsesBody(normalized)
+	for name, body := range map[string][]byte{
+		"codex": codexBody, "relay": relayBody, "websocket": websocketBody, "compact": compactBody,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if strings.Contains(string(body), "call_bad") || strings.Contains(string(body), "stale") {
+				t.Fatalf("%s body retained malformed history: %s", name, body)
+			}
+			if !strings.Contains(string(body), "continue") {
+				t.Fatalf("%s body lost current user input: %s", name, body)
+			}
+		})
+	}
+}
+
 func TestValidateResponsesFunctionNamesRejectsEmptyToolName(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

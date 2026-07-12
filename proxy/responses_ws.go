@@ -177,6 +177,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	promptDecision, _ := promptRiskDecisionFromContext(c)
 
 	rawBody = normalizeServiceTierField(rawBody)
+	rawBody, historyRepair := normalizeResponsesFunctionCallHistory(rawBody)
+	c.Set("raw_body", rawBody)
+	if historyRepair.DroppedCalls > 0 {
+		log.Printf("已清理 Responses 历史空函数名项 (endpoint=/v1/responses websocket calls=%d outputs=%d)", historyRepair.DroppedCalls, historyRepair.DroppedOutputs)
+	}
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
 		apiErr = api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest)
 		_ = writeResponsesWSError(conn, apiErr)

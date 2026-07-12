@@ -1776,6 +1776,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	rawBody = normalizeServiceTierField(rawBody)
+	rawBody, historyRepair := normalizeResponsesFunctionCallHistory(rawBody)
+	setRawRequestBody(c, rawBody)
+	if historyRepair.DroppedCalls > 0 {
+		log.Printf("已清理 Responses 历史空函数名项 (endpoint=/v1/responses calls=%d outputs=%d)", historyRepair.DroppedCalls, historyRepair.DroppedOutputs)
+	}
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -3051,6 +3056,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	promptDecision, _ := promptRiskDecisionFromContext(c)
 
 	rawBody = normalizeServiceTierField(rawBody)
+	rawBody, historyRepair := normalizeResponsesFunctionCallHistory(rawBody)
+	setRawRequestBody(c, rawBody)
+	if historyRepair.DroppedCalls > 0 {
+		log.Printf("已清理 Responses 历史空函数名项 (endpoint=/v1/responses/compact calls=%d outputs=%d)", historyRepair.DroppedCalls, historyRepair.DroppedOutputs)
+	}
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
