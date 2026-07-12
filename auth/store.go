@@ -2341,6 +2341,8 @@ type Store struct {
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
 	promptFilterConfig    atomic.Value // promptfilter.Config
 	cybRelayConfig        atomic.Value // CybRelayConfig
+	relayCircuitOnce      sync.Once
+	relayCircuit          *relayCircuitBreaker
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
 
@@ -2862,7 +2864,9 @@ func (s *Store) configureFastScheduler(scheduler *FastScheduler) {
 	if s == nil || scheduler == nil {
 		return
 	}
-	scheduler.SetGroupCheck(s.APIKeyAllowsAccount)
+	scheduler.SetGroupCheck(func(apiKeyID int64, account *Account) bool {
+		return s.APIKeyAllowsAccount(apiKeyID, account) && s.RelayCircuitSelectable(account)
+	})
 	scheduler.SetAcquireFunc(func(acc *Account, concurrencyLimit int64) bool {
 		return s.tryAcquireAccount(acc, concurrencyLimit, false)
 	})
@@ -5400,7 +5404,9 @@ func (s *Store) accountAllowedForAPIKey(acc *Account, apiKeyID int64) bool {
 	if acc == nil {
 		return false
 	}
-	return acc.AllowsAPIKey(apiKeyID) && s.APIKeyAllowsAccount(apiKeyID, acc)
+	return acc.AllowsAPIKey(apiKeyID) &&
+		s.APIKeyAllowsAccount(apiKeyID, acc) &&
+		s.RelayCircuitSelectable(acc)
 }
 
 func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, models []string, modelMapping, codexClientMetadataMode, proxyURL string) bool {
