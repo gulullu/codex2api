@@ -1515,8 +1515,7 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 // unchanged because image generation also uses it and must not be replayed
 // implicitly.
 func shouldRetryTextHTTPStatus(statusCode int, account *auth.Account, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
-	if account != nil && account.IsOpenAIResponsesAPI() &&
-		(statusCode == http.StatusBadGateway || statusCode == http.StatusGatewayTimeout) {
+	if account != nil && account.IsOpenAIResponsesAPI() && auth.IsRelayStrongGatewayFailureStatus(statusCode) {
 		if generalRetries == nil || *generalRetries >= maxGeneralRetries {
 			return false
 		}
@@ -1626,6 +1625,9 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 	case http.StatusServiceUnavailable, http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout:
 		return "server"
 	default:
+		if statusCode >= 500 {
+			return "server"
+		}
 		if statusCode >= 400 {
 			return "client"
 		}
@@ -1821,6 +1823,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	lastFailureWasRelay := false
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
 	forceHTTPAfterWSMessageTooBig := false
@@ -1836,13 +1839,17 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
 				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
 				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
+				return
+			}
+			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
@@ -1932,7 +1939,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				if !stickyRetry {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				}
@@ -2028,7 +2035,7 @@ func (h *Handler) Responses(c *gin.Context) {
 							UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 							ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 						})
-						h.store.Release(account)
+						circuitAttempt.Release(h.store, account)
 						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
 					}
@@ -2037,7 +2044,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
-				h.store.Release(account)
+				circuitAttempt.Failure(resp.StatusCode)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 
@@ -2072,6 +2080,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
@@ -2115,7 +2124,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 					})
 					resp.Body.Close()
-					h.store.Release(account)
+					circuitAttempt.Release(h.store, account)
 					return
 				}
 				streamWriter := newStreamFlushWriter(c.Writer, flusher)
@@ -2230,6 +2239,10 @@ func (h *Handler) Responses(c *gin.Context) {
 					ActualServiceTier:    actualServiceTier,
 					Attempt:              attempt,
 				}, outcome)
+				if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+					lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
+					lastFailureWasRelay = true
+				}
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -2238,7 +2251,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 				}
 				resp.Body.Close()
-				h.store.Release(account)
+				circuitAttempt.Failure(outcome.logStatusCode)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
 				if !isFirstTokenTimeoutOutcome(outcome) && !h.waitBeforeRetry(c.Request.Context()) {
@@ -2323,7 +2337,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ConfirmResponsesAvailable(account)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
-			h.store.Release(account)
+			if outcome.logStatusCode == http.StatusOK {
+				circuitAttempt.Success()
+			} else {
+				circuitAttempt.Failure(outcome.logStatusCode)
+			}
+			circuitAttempt.Release(h.store, account)
 			return
 		}
 
@@ -2370,7 +2389,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
 				}, reqErr, false)
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
 			}
@@ -2384,7 +2403,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			if !stickyRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
@@ -2478,7 +2497,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 					})
-					h.store.Release(account)
+					circuitAttempt.Release(h.store, account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
 				}
@@ -2488,7 +2507,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
@@ -2523,6 +2542,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
@@ -2572,7 +2592,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 				})
 				resp.Body.Close()
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				return
 			}
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
@@ -2806,7 +2826,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				Attempt:              attempt,
 			}, outcome)
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
@@ -2827,6 +2847,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
+			if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+				lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
+				lastFailureWasRelay = true
+			}
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -2835,7 +2859,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
 			if !isFirstTokenTimeoutOutcome(outcome) && !h.waitBeforeRetry(c.Request.Context()) {
@@ -2931,7 +2955,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.ConfirmResponsesAvailable(account)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
-		h.store.Release(account)
+		circuitAttempt.Release(h.store, account)
 		return
 	}
 }
@@ -3051,18 +3075,23 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	lastFailureWasRelay := false
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
 	invalidEncryptedContentRetried := false
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
 				h.logRouteSelectionError(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt, routeErr, spec)
 				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
+				return
+			}
+			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
@@ -3109,7 +3138,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if kind := classifyTransportFailure(reqErr); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 
@@ -3168,7 +3197,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 							UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 							ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 						})
-						h.store.Release(account)
+						circuitAttempt.Release(h.store, account)
 						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
 					}
@@ -3177,7 +3206,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
-				h.store.Release(account)
+				circuitAttempt.Failure(resp.StatusCode)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 
@@ -3209,6 +3239,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
@@ -3228,7 +3259,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					kind = "transport"
 				}
 				h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 
@@ -3257,6 +3288,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(fmt.Sprintf("Failed to read upstream response: %v", readErr))
+					lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 					continue
 				}
 				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
@@ -3306,7 +3338,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 			})
 
-			h.store.Release(account)
+			circuitAttempt.Success()
+			circuitAttempt.Release(h.store, account)
 			contentType := resp.Header.Get("Content-Type")
 			if contentType == "" {
 				contentType = "application/json"
@@ -3325,7 +3358,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
@@ -3384,7 +3417,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 					})
-					h.store.Release(account)
+					circuitAttempt.Release(h.store, account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
 				}
@@ -3394,7 +3427,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
@@ -3426,6 +3459,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
@@ -3447,7 +3481,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 			h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
@@ -3476,6 +3510,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = http.StatusBadGateway
 				lastBody = []byte(fmt.Sprintf("Failed to read upstream response: %v", readErr))
+				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 				continue
 			}
 			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
@@ -3522,7 +3557,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		})
 
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
-		h.store.Release(account)
+		circuitAttempt.Release(h.store, account)
 		c.Data(http.StatusOK, "application/json", respBody)
 		return
 	}
@@ -3630,6 +3665,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	lastFailureWasRelay := false
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
 	forceHTTPAfterWSMessageTooBig := false
@@ -3644,13 +3680,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
 				h.logRouteSelectionError(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
 				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
+				return
+			}
+			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
@@ -3754,7 +3794,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
 				}, reqErr, false)
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
 			}
@@ -3768,7 +3808,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			if !stickyRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
@@ -3835,7 +3875,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Failure(resp.StatusCode)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
@@ -3870,6 +3911,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
@@ -3921,7 +3963,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					"error": gin.H{"message": "streaming not supported", "type": "server_error"},
 				})
 				resp.Body.Close()
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				return
 			}
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
@@ -4098,7 +4140,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				Attempt:              attempt,
 			}, outcome)
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
@@ -4119,6 +4162,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
+			if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+				lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
+				lastFailureWasRelay = true
+			}
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -4127,7 +4174,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
 			if !isFirstTokenTimeoutOutcome(outcome) && !h.waitBeforeRetry(c.Request.Context()) {
@@ -4221,7 +4269,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
-		h.store.Release(account)
+		if outcome.logStatusCode == http.StatusOK {
+			circuitAttempt.Success()
+		} else {
+			circuitAttempt.Failure(outcome.logStatusCode)
+		}
+		circuitAttempt.Release(h.store, account)
 		return
 	}
 }

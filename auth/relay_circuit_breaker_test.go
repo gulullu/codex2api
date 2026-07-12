@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -76,6 +77,25 @@ func TestRelayCircuitStrongFailureOpensImmediately(t *testing.T) {
 	}
 	if _, ok := breaker.begin(51); ok {
 		t.Fatal("request was allowed while circuit is open")
+	}
+}
+
+func TestRelayCircuitCloudflareGatewayFailuresAreStrong(t *testing.T) {
+	for _, statusCode := range []int{520, 521, 522, 523, 524, 525, 526, 527, 530} {
+		t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			breaker := newRelayCircuitTestBreaker(clock)
+			permit, ok := breaker.begin(51)
+			if !ok {
+				t.Fatal("initial request permit denied")
+			}
+			if !breaker.reportFailure(permit, statusCode) {
+				t.Fatalf("status %d did not immediately open circuit", statusCode)
+			}
+			if snapshot := breaker.snapshot(51); snapshot.State != RelayCircuitOpen || snapshot.LastStatusCode != statusCode {
+				t.Fatalf("status %d snapshot=%+v", statusCode, snapshot)
+			}
+		})
 	}
 }
 

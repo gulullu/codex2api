@@ -323,15 +323,25 @@ func (b *relayCircuitBreaker) clearAccountPermitsLocked(accountID int64) {
 	}
 }
 
+// IsRelayStrongGatewayFailureStatus is the shared definition used by both the
+// breaker and proxy retry policy. Cloudflare's non-standard gateway/origin
+// failures must behave like 502/504; otherwise a dead Relay path can remain the
+// highest-priority account for minutes.
+func IsRelayStrongGatewayFailureStatus(statusCode int) bool {
+	return statusCode == 502 || statusCode == 504 ||
+		(statusCode >= 520 && statusCode <= 527) || statusCode == 530
+}
+
+// IsRelayCircuitFailureStatus reports every HTTP status owned by this breaker.
+func IsRelayCircuitFailureStatus(statusCode int) bool {
+	return IsRelayStrongGatewayFailureStatus(statusCode) || statusCode == 500 || statusCode == 503
+}
+
 func relayCircuitFailure(statusCode int) (strong bool, weak bool) {
-	switch statusCode {
-	case 502, 504:
+	if IsRelayStrongGatewayFailureStatus(statusCode) {
 		return true, false
-	case 500, 503:
-		return false, true
-	default:
-		return false, false
 	}
+	return false, statusCode == 500 || statusCode == 503
 }
 
 func relayCircuitReason(statusCode int) string {
@@ -706,7 +716,8 @@ func (s *Store) BeginRelayCircuitRequest(account *Account) (RelayCircuitPermit, 
 }
 
 // ReportRelayCircuitFailure records only the Relay server statuses owned by
-// this breaker: 502/504 open immediately; 500/503 open after 3 failures in 30s.
+// this breaker: gateway failures (502/504, Cloudflare 520-527/530) open
+// immediately; 500/503 open after 3 failures in 30s.
 // It returns true when this report transitions the circuit to open.
 func (s *Store) ReportRelayCircuitFailure(permit RelayCircuitPermit, statusCode int) bool {
 	if s == nil {

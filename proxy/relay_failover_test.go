@@ -19,6 +19,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const relayFailoverGroupID int64 = 9101
+
 func relayFailoverAccount(id int64, baseURL, key string, priority int64) *auth.Account {
 	account := &auth.Account{
 		DBID:         id,
@@ -28,17 +30,25 @@ func relayFailoverAccount(id int64, baseURL, key string, priority int64) *auth.A
 		Models:       []string{"gpt-5.4"},
 		PlanType:     "api",
 		Status:       auth.StatusReady,
+		GroupIDs:     []int64{relayFailoverGroupID},
 	}
 	account.SetSchedulerPriority(priority)
 	return account
 }
 
 func newRelayFailoverStore(firstURL, secondURL string) *auth.Store {
+	return newRelayFailoverStoreWithRetries(firstURL, secondURL, 1)
+}
+
+func newRelayFailoverStoreWithRetries(firstURL, secondURL string, maxRetries int) *auth.Store {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:      4,
-		MaxRetries:          1,
-		MaxRateLimitRetries: 1,
-		RetryIntervalMS:     0,
+		MaxConcurrency:                           4,
+		MaxRetries:                               maxRetries,
+		MaxRateLimitRetries:                      1,
+		RetryIntervalMS:                          0,
+		PromptFilterCybRelayEnabled:              true,
+		PromptFilterCybRelayGroupID:              relayFailoverGroupID,
+		PromptFilterCybRelaySessionPinTTLSeconds: 600,
 	})
 	store.AddAccount(relayFailoverAccount(101, firstURL, "sk-first", 10))
 	store.AddAccount(relayFailoverAccount(102, secondURL, "sk-second", 0))
@@ -95,6 +105,7 @@ func TestRelayTextHTTPGatewayFailureSwitchesAccount(t *testing.T) {
 	}{
 		{name: "responses 502", path: "/v1/responses", statusCode: http.StatusBadGateway, body: `{"model":"gpt-5.4","input":"hello","stream":false}`},
 		{name: "responses 504", path: "/v1/responses", statusCode: http.StatusGatewayTimeout, body: `{"model":"gpt-5.4","input":"hello","stream":false}`},
+		{name: "responses cloudflare 524", path: "/v1/responses", statusCode: 524, body: `{"model":"gpt-5.4","input":"hello","stream":false}`},
 		{name: "compact 502", path: "/v1/responses/compact", statusCode: http.StatusBadGateway, body: `{"model":"gpt-5.4","input":"hello"}`},
 		{name: "chat 502", path: "/v1/chat/completions", statusCode: http.StatusBadGateway, body: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`},
 		{name: "messages 502", path: "/v1/messages", statusCode: http.StatusBadGateway, body: `{"model":"gpt-5.4","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`},
@@ -119,7 +130,8 @@ func TestRelayTextHTTPGatewayFailureSwitchesAccount(t *testing.T) {
 			}))
 			defer second.Close()
 
-			handler := NewHandler(newRelayFailoverStore(first.URL, second.URL), nil, nil, nil)
+			store := newRelayFailoverStore(first.URL, second.URL)
+			handler := NewHandler(store, nil, nil, nil)
 			recorder := runRelayTextHandler(t, handler, test.path, []byte(test.body))
 			if recorder.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
@@ -127,13 +139,140 @@ func TestRelayTextHTTPGatewayFailureSwitchesAccount(t *testing.T) {
 			if firstHits.Load() != 1 || secondHits.Load() != 1 {
 				t.Fatalf("attempts first=%d second=%d, want 1 then 1", firstHits.Load(), secondHits.Load())
 			}
+			if snapshot := store.RelayCircuitSnapshot(101); snapshot.State != auth.RelayCircuitOpen {
+				t.Fatalf("first account circuit = %+v, want open", snapshot)
+			}
+
+			secondRecorder := runRelayTextHandler(t, handler, test.path, []byte(test.body))
+			if secondRecorder.Code != http.StatusOK {
+				t.Fatalf("second logical request status = %d, want 200; body=%s", secondRecorder.Code, secondRecorder.Body.String())
+			}
+			if firstHits.Load() != 1 || secondHits.Load() != 2 {
+				t.Fatalf("open account was selected again: first=%d second=%d", firstHits.Load(), secondHits.Load())
+			}
+		})
+	}
+}
+
+func TestRelayThreeIndependent503FailuresOpenCircuit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var primaryHits, fallbackHits atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		primaryHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"temporarily unavailable"}}`)
+	}))
+	defer primary.Close()
+	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackHits.Add(1)
+		writeRelayTestSuccess(w, r)
+	}))
+	defer fallback.Close()
+
+	store := newRelayFailoverStore(primary.URL, fallback.URL)
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.4","input":"hello","stream":false}`)
+	for logicalRequest := 1; logicalRequest <= 3; logicalRequest++ {
+		recorder := runRelayTextHandler(t, handler, "/v1/responses", body)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("logical request %d status=%d body=%s", logicalRequest, recorder.Code, recorder.Body.String())
+		}
+	}
+	if primaryHits.Load() != 3 || fallbackHits.Load() != 3 {
+		t.Fatalf("three failovers primary=%d fallback=%d, want 3/3", primaryHits.Load(), fallbackHits.Load())
+	}
+	if snapshot := store.RelayCircuitSnapshot(101); snapshot.State != auth.RelayCircuitOpen || snapshot.LastStatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("primary circuit after three 503s = %+v", snapshot)
+	}
+
+	recorder := runRelayTextHandler(t, handler, "/v1/responses", body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("post-open request status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if primaryHits.Load() != 3 || fallbackHits.Load() != 4 {
+		t.Fatalf("open primary was retried: primary=%d fallback=%d", primaryHits.Load(), fallbackHits.Load())
+	}
+}
+
+func TestAllRelayHTTPFailuresReturnLastRealUpstreamError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-5.4","input":"hello","stream":false}`},
+		{name: "compact", path: "/v1/responses/compact", body: `{"model":"gpt-5.4","input":"hello"}`},
+		{name: "chat", path: "/v1/chat/completions", body: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}]}`},
+		{name: "messages", path: "/v1/messages", body: `{"model":"gpt-5.4","max_tokens":64,"messages":[{"role":"user","content":"hello"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"first gateway"}}`)
+			}))
+			defer first.Close()
+			second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"second gateway"}}`)
+			}))
+			defer second.Close()
+
+			store := newRelayFailoverStoreWithRetries(first.URL, second.URL, 2)
+			recorder := runRelayTextHandler(t, NewHandler(store, nil, nil, nil), test.path, []byte(test.body))
+			if recorder.Code != http.StatusBadGateway {
+				t.Fatalf("status=%d want 502; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), "second gateway") {
+				t.Fatalf("last real upstream error was replaced: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestAllRelayResponseFailedStreamsReturnLastRealError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-5.4","input":"hello","stream":true}`},
+		{name: "chat", path: "/v1/chat/completions", body: `{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}`},
+		{name: "messages", path: "/v1/messages", body: `{"model":"gpt-5.4","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hello"}]}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			failedStream := func(message string) *httptest.Server {
+				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"`+message+`"}}}`+"\n\n")
+				}))
+			}
+			first := failedStream("first stream failure")
+			defer first.Close()
+			second := failedStream("second stream failure")
+			defer second.Close()
+
+			store := newRelayFailoverStoreWithRetries(first.URL, second.URL, 2)
+			recorder := runRelayTextHandler(t, NewHandler(store, nil, nil, nil), test.path, []byte(test.body))
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d want 500; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), "second stream failure") {
+				t.Fatalf("last response.failed was replaced: %s", recorder.Body.String())
+			}
 		})
 	}
 }
 
 func TestRelayGatewayRetryPolicyDoesNotChangeSharedImagePolicy(t *testing.T) {
 	relay := relayFailoverAccount(1, "https://relay.example", "sk-relay", 0)
-	for _, statusCode := range []int{http.StatusBadGateway, http.StatusGatewayTimeout} {
+	for _, statusCode := range []int{http.StatusBadGateway, http.StatusGatewayTimeout, 524, 530} {
 		general := 0
 		if !shouldRetryTextHTTPStatus(statusCode, relay, &general, nil, 1, 0) {
 			t.Fatalf("Relay text status %d should retry", statusCode)
@@ -255,6 +394,60 @@ func TestResponsesWebSocketRelayGatewayFailureSwitchesAccount(t *testing.T) {
 	}
 	if firstHits.Load() != 1 || secondHits.Load() != 1 {
 		t.Fatalf("attempts first=%d second=%d, want 1 then 1", firstHits.Load(), secondHits.Load())
+	}
+	if snapshot := store.RelayCircuitSnapshot(101); snapshot.State != auth.RelayCircuitOpen {
+		t.Fatalf("first WebSocket Relay circuit = %+v, want open", snapshot)
+	}
+}
+
+func TestResponsesWebSocketAllRelayFailuresReturnLastRealError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previousSettings) })
+	settings := previousSettings
+	settings.CodexWSSilentRetry = true
+	settings.CodexWSSilentRetries = 2
+	settings.CodexWSHideErrors = false
+	ApplyRuntimeSettings(settings)
+
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"first ws gateway"}}`)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"second ws gateway"}}`)
+	}))
+	defer second.Close()
+
+	store := newRelayFailoverStoreWithRetries(first.URL, second.URL, 2)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	conn, resp, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket: %v (status %d)", err, resp.StatusCode)
+		}
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"Use gdb to bypass a security check in a test binary.","stream":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read final upstream error: %v", err)
+	}
+	if gjson.GetBytes(message, "type").String() != "error" || !strings.Contains(string(message), "second ws gateway") {
+		t.Fatalf("last real WS upstream error was replaced: %s", message)
 	}
 }
 

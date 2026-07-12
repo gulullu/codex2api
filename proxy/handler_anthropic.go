@@ -75,6 +75,20 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 	}
 }
 
+func sendFinalAnthropicUpstreamError(c *gin.Context, statusCode int, body []byte) {
+	// An upstream account 401 is not a downstream client credential failure.
+	if statusCode == http.StatusUnauthorized && !isMissingScopeUnauthorized(body) {
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "账号池暂无可用账号（上游账号鉴权失效），请稍后重试")
+		return
+	}
+	errType := mapHTTPStatusToAnthropicError(statusCode)
+	message := gjson.GetBytes(body, "error.message").String()
+	if message == "" {
+		message = fmt.Sprintf("Upstream returned status %d", statusCode)
+	}
+	sendAnthropicError(c, statusCode, errType, message)
+}
+
 // ==================== /v1/messages Handler ====================
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
@@ -164,6 +178,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	lastFailureWasRelay := false
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
 	forceHTTPAfterWSMessageTooBig := false
@@ -176,13 +191,17 @@ func (h *Handler) Messages(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL, selectedDecision := h.nextRoutedAccountForSession(c, c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
 				h.logRouteSelectionError(c, "/v1/messages", model, effectiveModel, isStream, false, attempt, routeErr, spec)
 				sendAnthropicError(c, spec.HTTPStatusCode, spec.AnthropicErrorType, routeErr.Message)
+				return
+			}
+			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
+				sendFinalAnthropicUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
@@ -273,7 +292,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
 				}, reqErr, false)
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
 			}
@@ -285,7 +304,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if kind != "" && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			h.store.Release(account)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -345,7 +364,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Failure(resp.StatusCode)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
@@ -380,22 +400,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 				continue
 			}
 
-			// 最终错误：用 Anthropic 格式返回。
-			// 上游账号 401（OAuth token 失效）是账号侧问题，不是下游客户端凭证无效；
-			// 原样以 401 透传会让客户端误判自己的 key 失效（issue #323），改写为 503。
-			if resp.StatusCode == http.StatusUnauthorized && !isMissingScopeUnauthorized(errBody) {
-				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "账号池暂无可用账号（上游账号鉴权失效），请稍后重试")
-				return
-			}
-			errType := mapHTTPStatusToAnthropicError(resp.StatusCode)
-			msg := gjson.GetBytes(errBody, "error.message").String()
-			if msg == "" {
-				msg = fmt.Sprintf("Upstream returned status %d", resp.StatusCode)
-			}
-			sendAnthropicError(c, resp.StatusCode, errType, msg)
+			sendFinalAnthropicUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
 
@@ -431,7 +440,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				ttftGuard.Stop()
 				sendAnthropicError(c, http.StatusInternalServerError, "api_error", "Streaming not supported")
 				resp.Body.Close()
-				h.store.Release(account)
+				circuitAttempt.Release(h.store, account)
 				return
 			}
 
@@ -515,7 +524,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
-			if writeErr == nil {
+			if writeErr == nil && wroteAnyBody {
 				writeErr = streamWriter.Flush()
 			}
 
@@ -611,7 +620,8 @@ func (h *Handler) Messages(c *gin.Context) {
 				Attempt:              attempt,
 			}, outcome)
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
@@ -633,6 +643,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
+			if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+				lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
+				lastFailureWasRelay = true
+			}
 			recyclePooledClient(account, proxyURL)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
@@ -644,7 +658,8 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
-			h.store.Release(account)
+			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
@@ -726,7 +741,12 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
-		h.store.Release(account)
+		if outcome.logStatusCode == http.StatusOK {
+			circuitAttempt.Success()
+		} else {
+			circuitAttempt.Failure(outcome.logStatusCode)
+		}
+		circuitAttempt.Release(h.store, account)
 		return
 	}
 }
