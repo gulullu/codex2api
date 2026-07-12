@@ -349,6 +349,19 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
 				log.Printf("Responses WebSocket upstream request frame too large; falling back to HTTP (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
 				forceHTTPAfterWSMessageTooBig = true
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               true,
+					ViaWebsocket:         true,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
@@ -370,6 +383,19 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("Responses WebSocket upstream first token timeout, retrying with another account (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               true,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, true)
 				continue
 			}
 			if !timedOut && !stickyRetry {
@@ -388,6 +414,19 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				if stickyRetry {
 					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, ws)", account.ID(), attempt+1, maxRetries+1)
 				}
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               true,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return errResponsesWSClientGone
 				}
@@ -417,6 +456,22 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 						expandedInputRaw = responsesInputRaw(codexBody)
 					}
 					log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
+					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						StatusCode:           resp.StatusCode,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     "/v1/responses",
+						Stream:               true,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
+						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+					})
 					h.store.Release(account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
@@ -673,12 +728,42 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
 	}
 	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/responses",
+			Model:                model,
+			EffectiveModel:       logEffectiveModel,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               true,
+			ViaWebsocket:         viaWebsocket,
+			RequestedServiceTier: serviceTier,
+			ActualServiceTier:    actualServiceTier,
+			Attempt:              attempt,
+		}, outcome)
 		resp.Body.Close()
 		h.store.Release(account)
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
 	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+		h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+			AccountID:            account.ID(),
+			Endpoint:             "/v1/responses",
+			Model:                model,
+			EffectiveModel:       logEffectiveModel,
+			DurationMs:           totalDuration,
+			FirstTokenMs:         firstTokenMs,
+			ReasoningEffort:      reasoningEffort,
+			UpstreamEndpoint:     "/v1/responses",
+			Stream:               true,
+			ViaWebsocket:         viaWebsocket,
+			RequestedServiceTier: serviceTier,
+			ActualServiceTier:    actualServiceTier,
+			Attempt:              attempt,
+		}, outcome)
 		resp.Body.Close()
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)

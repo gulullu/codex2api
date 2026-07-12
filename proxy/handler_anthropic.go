@@ -260,6 +260,19 @@ func (h *Handler) Messages(c *gin.Context) {
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
 				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/messages): %v", attempt+1, account.ID(), reqErr)
 				forceHTTPAfterWSMessageTooBig = true
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/messages",
+					Model:                model,
+					EffectiveModel:       attemptEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         true,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
@@ -277,6 +290,19 @@ func (h *Handler) Messages(c *gin.Context) {
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/messages): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/messages",
+					Model:                model,
+					EffectiveModel:       attemptEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, true)
 				continue
 			}
 			if !timedOut {
@@ -290,6 +316,19 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d, /v1/messages): %v", attempt+1, reqErr)
 			if shouldRetry {
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/messages",
+					Model:                model,
+					EffectiveModel:       attemptEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				continue
 			}
 			sendAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream request failed")
@@ -556,6 +595,21 @@ func (h *Handler) Messages(c *gin.Context) {
 			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/messages): %s",
 				attempt+1, account.ID(), outcome.failureMessage)
 			forceHTTPAfterWSMessageTooBig = true
+			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/messages",
+				Model:                model,
+				EffectiveModel:       attemptEffectiveModel,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     upstreamEndpoint,
+				Stream:               isStream,
+				ViaWebsocket:         true,
+				RequestedServiceTier: serviceTier,
+				ActualServiceTier:    actualServiceTier,
+				Attempt:              attempt,
+			}, outcome)
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -564,6 +618,21 @@ func (h *Handler) Messages(c *gin.Context) {
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/messages",
+				Model:                model,
+				EffectiveModel:       attemptEffectiveModel,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     upstreamEndpoint,
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				RequestedServiceTier: serviceTier,
+				ActualServiceTier:    actualServiceTier,
+				Attempt:              attempt,
+			}, outcome)
 			recyclePooledClient(account, proxyURL)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)

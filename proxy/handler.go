@@ -1939,6 +1939,19 @@ func (h *Handler) Responses(c *gin.Context) {
 				if timedOut && shouldRetry {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+					h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     upstreamEndpoint,
+						Stream:               isStream,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+					}, reqErr, true)
 					continue
 				}
 				if !timedOut && !stickyRetry {
@@ -1955,6 +1968,19 @@ func (h *Handler) Responses(c *gin.Context) {
 					if stickyRetry {
 						log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d)", account.ID(), attempt+1, maxRetries+1)
 					}
+					h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     upstreamEndpoint,
+						Stream:               isStream,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+					}, reqErr, false)
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
@@ -1986,6 +2012,22 @@ func (h *Handler) Responses(c *gin.Context) {
 							expandedInputRaw = responsesInputRaw(codexBody)
 						}
 						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+							AccountID:            account.ID(),
+							Endpoint:             "/v1/responses",
+							Model:                logModel,
+							EffectiveModel:       attemptLogEffectiveModel,
+							StatusCode:           resp.StatusCode,
+							DurationMs:           durationMs,
+							ReasoningEffort:      reasoningEffort,
+							UpstreamEndpoint:     upstreamEndpoint,
+							Stream:               isStream,
+							ViaWebsocket:         useWebsocket,
+							RequestedServiceTier: serviceTier,
+							Attempt:              attempt,
+							UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
+							ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+						})
 						h.store.Release(account)
 						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
@@ -2173,6 +2215,21 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+				h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           totalDuration,
+					FirstTokenMs:         firstTokenMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					ActualServiceTier:    actualServiceTier,
+					Attempt:              attempt,
+				}, outcome)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -2300,6 +2357,19 @@ func (h *Handler) Responses(c *gin.Context) {
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
 				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
 				forceHTTPAfterWSMessageTooBig = true
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               isStream,
+					ViaWebsocket:         true,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
@@ -2321,6 +2391,19 @@ func (h *Handler) Responses(c *gin.Context) {
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/responses): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, true)
 				continue
 			}
 			if !timedOut && !stickyRetry {
@@ -2338,6 +2421,19 @@ func (h *Handler) Responses(c *gin.Context) {
 				if stickyRetry {
 					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, /v1/responses)", account.ID(), attempt+1, maxRetries+1)
 				}
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
@@ -2366,6 +2462,22 @@ func (h *Handler) Responses(c *gin.Context) {
 						expandedInputRaw = responsesInputRaw(codexBody)
 					}
 					log.Printf("上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       logEffectiveModel,
+						StatusCode:           resp.StatusCode,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     "/v1/responses",
+						Stream:               isStream,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
+						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+					})
 					h.store.Release(account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
@@ -2678,6 +2790,21 @@ func (h *Handler) Responses(c *gin.Context) {
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %s", attempt+1, account.ID(), outcome.failureMessage)
 			forceHTTPAfterWSMessageTooBig = true
+			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ViaWebsocket:         true,
+				RequestedServiceTier: serviceTier,
+				ActualServiceTier:    actualServiceTier,
+				Attempt:              attempt,
+			}, outcome)
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2685,6 +2812,21 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       logEffectiveModel,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				RequestedServiceTier: serviceTier,
+				ActualServiceTier:    actualServiceTier,
+				Attempt:              attempt,
+			}, outcome)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -2978,6 +3120,17 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 				log.Printf("OpenAI Responses compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+					h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses/compact",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     upstreamEndpoint,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+					}, reqErr, false)
 					continue
 				}
 				ErrorToGinResponse(c, reqErr)
@@ -3001,6 +3154,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 							codexBody = strippedCodexBody
 						}
 						log.Printf("OpenAI Responses compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+							AccountID:            account.ID(),
+							Endpoint:             "/v1/responses/compact",
+							Model:                logModel,
+							EffectiveModel:       attemptLogEffectiveModel,
+							StatusCode:           resp.StatusCode,
+							DurationMs:           durationMs,
+							ReasoningEffort:      reasoningEffort,
+							UpstreamEndpoint:     upstreamEndpoint,
+							RequestedServiceTier: serviceTier,
+							Attempt:              attempt,
+							UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
+							ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+						})
 						h.store.Release(account)
 						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
@@ -3169,6 +3336,17 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 			log.Printf("compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses/compact",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses/compact",
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -3192,6 +3370,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 						codexBody = strippedCodexBody
 					}
 					log.Printf("compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses/compact",
+						Model:                logModel,
+						EffectiveModel:       logEffectiveModel,
+						StatusCode:           resp.StatusCode,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     "/v1/responses/compact",
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
+						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+					})
 					h.store.Release(account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
@@ -3549,6 +3741,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
 				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %v", attempt+1, account.ID(), reqErr)
 				forceHTTPAfterWSMessageTooBig = true
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/chat/completions",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         true,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
@@ -3570,6 +3775,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/chat/completions): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/chat/completions",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, true)
 				continue
 			}
 			if !timedOut && !stickyRetry {
@@ -3587,6 +3805,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if stickyRetry {
 					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, /v1/chat/completions)", account.ID(), attempt+1, maxRetries+1)
 				}
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/chat/completions",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+				}, reqErr, false)
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
@@ -3851,6 +4082,21 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %s", attempt+1, account.ID(), outcome.failureMessage)
 			forceHTTPAfterWSMessageTooBig = true
+			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/chat/completions",
+				Model:                logModel,
+				EffectiveModel:       attemptLogEffectiveModel,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     upstreamEndpoint,
+				Stream:               isStream,
+				ViaWebsocket:         true,
+				RequestedServiceTier: serviceTier,
+				ActualServiceTier:    actualServiceTier,
+				Attempt:              attempt,
+			}, outcome)
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -3858,6 +4104,21 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/chat/completions",
+				Model:                logModel,
+				EffectiveModel:       attemptLogEffectiveModel,
+				DurationMs:           totalDuration,
+				FirstTokenMs:         firstTokenMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     upstreamEndpoint,
+				Stream:               isStream,
+				ViaWebsocket:         useWebsocket,
+				RequestedServiceTier: serviceTier,
+				ActualServiceTier:    actualServiceTier,
+				Attempt:              attempt,
+			}, outcome)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
