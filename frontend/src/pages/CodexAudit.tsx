@@ -16,7 +16,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import Pagination from '../components/Pagination'
 import RelayGuardianPanel from '../components/RelayGuardianPanel'
-import { useDataLoader } from '../hooks/useDataLoader'
+import { useLatestDataLoader } from '../hooks/useLatestDataLoader'
 import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import type { AccountRow, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
@@ -225,7 +225,7 @@ export default function CodexAudit() {
     return { report, health, accounts: accountsResp.accounts ?? [] }
   }, [rangeHours])
 
-  const { data, loading, error, reload } = useDataLoader<AuditData>({
+  const { data, loading, error, reload } = useLatestDataLoader<AuditData>({
     initialData: { report: null, health: null, accounts: [] },
     load: loadData,
   })
