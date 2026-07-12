@@ -56,9 +56,8 @@ function percent(value: number) {
   return `${percentage >= 10 ? percentage.toFixed(1) : percentage.toFixed(2)}%`
 }
 
-function scoreLabel(value: number) {
-  if (value > 99.9 && value < 100) return value.toFixed(2)
-  return Number.isInteger(value) ? String(value) : value.toFixed(1)
+export function formatCodexAuditHealthScore(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
 }
 
 export function calculateRelayWindowHealthScore(relayRequests: number, relayRouteFailures: number) {
@@ -167,7 +166,7 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
   const relayCapacityUnavailable = relayHealthPresent && relaySchedulable === 0
   const liveUnhealthy = Boolean(liveStatus && !liveHealthy) || relayCapacityUnavailable
   const base = { healthScore, relayFailureRate, final5xxRate, worstFailureRate, recentRecovered }
-  const measurements = `Relay 最终失败 ${relayFailures}/${relayRequests}（${percent(relayFailureRate)}）；全站最终 5xx ${final5xx}/${totalRequests}（${percent(final5xxRate)}）；运行健康分 ${scoreLabel(healthScore)}。`
+  const measurements = `Relay 最终失败 ${relayFailures}/${relayRequests}（${percent(relayFailureRate)}）；全站最终 5xx ${final5xx}/${totalRequests}（${percent(final5xxRate)}）；运行健康分 ${formatCodexAuditHealthScore(healthScore)}。`
 
   if (finiteCount(input.oauthCyberAttempts) > 0) {
     return {

@@ -20,7 +20,7 @@ import { useLatestDataLoader } from '../hooks/useLatestDataLoader'
 import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import type { AccountRow, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
-import { getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
+import { formatCodexAuditHealthScore, getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -298,7 +298,7 @@ export default function CodexAudit() {
                     <WindowLine label="筛选窗口" value={`${formatBeijingTime(report.window_start)} 至 ${formatBeijingTime(report.window_end)}`} />
                     <WindowLine
                       label="运行健康分"
-                      value={`${formatHealthScore(meta.healthScore)} / 100 · Relay 最终失败 ${formatNumber(report.summary.relay_route_failures)}/${formatNumber(report.summary.relay_requests)} · 全站最终 5xx ${formatNumber(report.usage.errors_5xx)}/${formatNumber(report.usage.requests)}`}
+                      value={`${formatCodexAuditHealthScore(meta.healthScore)} / 100 · Relay 最终失败 ${formatNumber(report.summary.relay_route_failures)}/${formatNumber(report.summary.relay_requests)} · 全站最终 5xx ${formatNumber(report.usage.errors_5xx)}/${formatNumber(report.usage.requests)}`}
                       tone={meta.healthScore >= 99.5 ? 'ok' : meta.healthScore >= 95 ? 'warn' : 'bad'}
                       title={getRelayWindowHealthStandard().description}
                     />
@@ -1010,11 +1010,6 @@ function toneTextClass(tone: Tone) {
 
 function formatNumber(value?: number) {
   return new Intl.NumberFormat('zh-CN').format(value || 0)
-}
-
-function formatHealthScore(value: number) {
-  if (value > 99.9 && value < 100) return value.toFixed(2)
-  return value.toFixed(1)
 }
 
 function healthStatusLabel(status?: string) {

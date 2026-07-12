@@ -17,11 +17,18 @@ const {
   calculateOperationalWindowHealthScore,
   calculateRelayWindowHealthScore,
   final5xxWindowRecentlyRecovered,
+  formatCodexAuditHealthScore,
   getCodexAuditPresentation,
   getRelayWindowHealthStandard,
   operationalWindowRecentlyRecovered,
   relayWindowRecentlyRecovered,
 } = await import(moduleURL)
+
+test('health score formatting preserves threshold precision', () => {
+  assert.equal(formatCodexAuditHealthScore(99.49), '99.49')
+  assert.equal(formatCodexAuditHealthScore(94.99), '94.99')
+  assert.equal(formatCodexAuditHealthScore(100), '100')
+})
 
 function presentation(overrides = {}) {
   return getCodexAuditPresentation({
