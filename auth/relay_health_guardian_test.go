@@ -274,6 +274,79 @@ func TestRelayGuardianRedisRestartRestoresQuarantine(t *testing.T) {
 	}
 }
 
+func TestRelayGuardianRedisRestartRestoresPoolIncidentProtection(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	tokenCache := cache.NewMemory(10)
+	defer tokenCache.Close()
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 50, 53, 51)
+	store.tokenCache = tokenCache
+	guardian.cache = tokenCache
+	for _, accountID := range []int64{50, 53, 51} {
+		guardian.ensureLoaded(accountID)
+	}
+
+	guardian.observe(guardianObservation(50, "peer-a", 524, false, clock.Now()))
+	clock.Advance(30 * time.Second)
+	guardian.observe(guardianObservation(50, "peer-b", 524, false, clock.Now()))
+	clock.Advance(3 * time.Minute)
+	guardian.observe(guardianObservation(53, "candidate-a", 524, false, clock.Now()))
+	clock.Advance(30 * time.Second)
+	guardian.observe(guardianObservation(53, "candidate-b", 524, false, clock.Now()))
+
+	guardian.mu.Lock()
+	wantUntil := guardian.poolWideUntil
+	guardian.mu.Unlock()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		payload, ok, _ := tokenCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 53))
+		var persisted relayGuardianRuntimeRecord
+		if ok && json.Unmarshal(payload, &persisted) == nil && !persisted.PoolWideReportedAt.IsZero() && persisted.Reason == "pool_wide_failure_guard" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pool incident state was not persisted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	store2, guardian2 := newGuardianTestStore(t, RelayGuardianMonitor, clock, 50, 53, 51)
+	store2.tokenCache = tokenCache
+	guardian2.cache = tokenCache
+	for _, accountID := range []int64{50, 53, 51} {
+		store2.relayCircuitManager().ensureLoaded(accountID)
+		guardian2.ensureLoaded(accountID)
+	}
+	guardian2.mu.Lock()
+	gotUntil := guardian2.poolWideUntil
+	guardian2.mu.Unlock()
+	if !gotUntil.Equal(wantUntil) {
+		t.Fatalf("restored pool deadline=%s want=%s", gotUntil, wantUntil)
+	}
+
+	clock.Advance(2 * time.Minute)
+	guardian2.observe(guardianObservation(53, "later-transport", 598, false, clock.Now()))
+	status, ok := store2.RelayGuardianAccountStatus(53)
+	if !ok || status.State == RelayGuardianQuarantined || status.ShadowAction != "pool_alert" || status.Reason != "pool_wide_failure_guard" {
+		t.Fatalf("restart lost pool protection: %+v ok=%t", status, ok)
+	}
+
+	clock.Advance(11 * time.Minute)
+	guardian2.mu.Lock()
+	guardian2.capacitySamples = []relayGuardianCapacitySample{
+		{At: clock.Now().Add(-2 * RelayGuardianScanInterval)},
+		{At: clock.Now().Add(-RelayGuardianScanInterval)},
+		{At: clock.Now()},
+	}
+	guardian2.mu.Unlock()
+	guardian2.observe(guardianObservation(53, "independent-a", 500, false, clock.Now()))
+	clock.Advance(time.Second)
+	guardian2.observe(guardianObservation(53, "independent-b", 500, false, clock.Now()))
+	status, ok = store2.RelayGuardianAccountStatus(53)
+	if !ok || status.State != RelayGuardianWouldQuarantine || status.ShadowAction != "quarantine" || status.Reason != "shadow_quarantine" {
+		t.Fatalf("new incident remained protected after restored deadline: %+v ok=%t", status, ok)
+	}
+}
+
 func TestRelayGuardianRedisOldModeClearsAllExecutionState(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	tokenCache := cache.NewMemory(10)

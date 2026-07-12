@@ -661,6 +661,11 @@ func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
 	if state.LastResort && state.LastResortFailureID == "" {
 		state.LastResortFailureID = relayGuardianLatestFailureID(state)
 	}
+	if currentMode != RelayGuardianOff {
+		if until := relayGuardianRestoredPoolUntil(state, now); until.After(g.poolWideUntil) {
+			g.poolWideUntil = until
+		}
+	}
 	relayGuardianApplySchedulingHint(account, state)
 }
 
@@ -945,6 +950,37 @@ func relayGuardianTriggerCategory(trigger string) string {
 	default:
 		return trigger
 	}
+}
+
+func relayGuardianTriggerWindow(trigger string) time.Duration {
+	switch {
+	case strings.Contains(trigger, "60m"):
+		return 60 * time.Minute
+	case strings.Contains(trigger, "10m"):
+		return 10 * time.Minute
+	case strings.HasPrefix(trigger, "strong_gateway_"), strings.HasPrefix(trigger, "recovery_"):
+		return 5 * time.Minute
+	default:
+		return 0
+	}
+}
+
+func relayGuardianRestoredPoolUntil(state *relayGuardianAccountState, now time.Time) time.Time {
+	if state == nil || state.PoolWideReportedAt.IsZero() || state.Reason != "pool_wide_failure_guard" {
+		return time.Time{}
+	}
+	window := time.Duration(state.WindowSeconds) * time.Second
+	if minimum := relayGuardianTriggerWindow(state.TriggerSource); minimum > window {
+		window = minimum
+	}
+	if window < 5*time.Minute {
+		window = 5 * time.Minute
+	}
+	until := state.PoolWideReportedAt.Add(window)
+	if !until.After(now) {
+		return time.Time{}
+	}
+	return until
 }
 
 type relayGuardianPoolFailureSignature struct {
