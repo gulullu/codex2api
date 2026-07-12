@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
@@ -17,16 +18,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func guardianAdminTestStore(t *testing.T) *auth.Store {
+func guardianAdminTestStore(t *testing.T) (*auth.Store, cache.TokenCache) {
 	t.Helper()
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 100, TestConcurrency: 1, TestModel: "gpt-5.4", RelayGuardianMode: "enforce", PromptFilterCybRelayEnabled: true, PromptFilterCybRelayGroupID: 7})
+	tokenCache := cache.NewMemory(4)
+	record, err := json.Marshal(map[string]any{
+		"mode":             "enforce",
+		"scope_group_id":   7,
+		"state":            "quarantined",
+		"generation":       2,
+		"quarantine_until": time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tokenCache.SetRuntime(context.Background(), "relay-health-guardian", "group:7:account:51", record, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewStore(nil, tokenCache, &database.SystemSettings{MaxConcurrency: 100, TestConcurrency: 1, TestModel: "gpt-5.4", RelayGuardianMode: "enforce", PromptFilterCybRelayEnabled: true, PromptFilterCybRelayGroupID: 7})
 	for _, id := range []int64{51, 50} {
 		store.AddAccount(&auth.Account{DBID: id, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example/v1", APIKey: "key", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy, GroupIDs: []int64{7}, Email: "relay"})
 	}
-	for _, logicalID := range []string{"u-1", "u-2"} {
-		store.ObserveRelayGuardianUsage(&database.UsageLogInput{AccountID: 51, LogicalRequestID: logicalID, StatusCode: 500, RouteClass: "cyb_relay", RouteGroupID: 7, UpstreamAccountType: auth.UpstreamOpenAIResponses})
-	}
-	return store
+	return store, tokenCache
 }
 
 func guardianSettingsTestHandler(t *testing.T, db *database.DB) (*Handler, *auth.Store, cache.TokenCache) {
@@ -56,7 +68,8 @@ func invokeGuardianModeUpdate(handler *Handler, mode string) *httptest.ResponseR
 
 func TestRelayGuardianReleaseReturnsSingleAccountSnapshot(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	store := guardianAdminTestStore(t)
+	store, tokenCache := guardianAdminTestStore(t)
+	defer tokenCache.Close()
 	before, ok := store.RelayGuardianAccountStatus(51)
 	if !ok || before.State != auth.RelayGuardianQuarantined {
 		t.Fatalf("setup status=%+v", before)

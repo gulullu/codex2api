@@ -401,11 +401,13 @@ func TestRelayCircuitRestoresOpenFenceFromRuntimeCache(t *testing.T) {
 
 	first := newRelayCircuitBreaker(tokenCache)
 	first.now = clock.Now
+	first.ensureLoaded(51)
 	permit, _ := first.begin(51)
 	first.reportFailure(permit, 502)
 
 	restarted := newRelayCircuitBreaker(tokenCache)
 	restarted.now = clock.Now
+	restarted.ensureLoaded(51)
 	if _, ok := restarted.begin(51); ok {
 		t.Fatal("restart lost the cached open fence")
 	}
@@ -423,12 +425,14 @@ func TestRelayCircuitRestoreRetriesAndFailsClosedAfterCacheError(t *testing.T) {
 
 	first := newRelayCircuitBreaker(base)
 	first.now = clock.Now
+	first.ensureLoaded(51)
 	permit, _ := first.begin(51)
 	first.reportFailure(permit, 502)
 
 	flaky := &relayCircuitFlakyRuntimeCache{TokenCache: base, failures: 1}
 	restarted := newRelayCircuitBreaker(flaky)
 	restarted.now = clock.Now
+	restarted.ensureLoaded(51)
 	if restarted.selectable(51) {
 		t.Fatal("account was selectable while runtime fence restore was unresolved")
 	}
@@ -436,6 +440,7 @@ func TestRelayCircuitRestoreRetriesAndFailsClosedAfterCacheError(t *testing.T) {
 		t.Fatal("request permit was issued while runtime fence restore was unresolved")
 	}
 	clock.Advance(time.Second)
+	restarted.ensureLoaded(51)
 	if restarted.selectable(51) {
 		t.Fatal("restored open circuit became selectable before its deadline")
 	}

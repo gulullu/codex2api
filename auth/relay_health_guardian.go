@@ -151,6 +151,7 @@ type relayHealthGuardian struct {
 	cache                         cache.TokenCache
 	db                            *database.DB
 	mu                            sync.Mutex
+	loadMu                        sync.Mutex
 	persistMu                     sync.Mutex
 	states                        map[int64]*relayGuardianAccountState
 	loaded                        map[int64]bool
@@ -292,6 +293,7 @@ func (g *relayHealthGuardian) modeChanged(previous, current RelayGuardianMode) {
 	g.lastShadowQuarantineAccountID = 0
 	g.poolWideUntil = time.Time{}
 	g.poolEvents = make(map[string]time.Time)
+	g.capacitySamples = nil
 	g.lastSummary = time.Time{}
 	g.lastAudit = time.Time{}
 	for accountID, state := range g.states {
@@ -308,14 +310,22 @@ func (g *relayHealthGuardian) relayConfigChanged(previous, current CybRelayConfi
 	if g == nil || (previous.Enabled == current.Enabled && previous.GroupID == current.GroupID) {
 		return
 	}
+	g.loadMu.Lock()
+	defer g.loadMu.Unlock()
+	g.persistMu.Lock()
+	defer g.persistMu.Unlock()
 	now := g.nowTime()
 	ids := make(map[int64]struct{}, len(accounts))
 	for _, account := range accounts {
 		if account == nil {
 			continue
 		}
-		ids[account.DBID] = struct{}{}
 		relayGuardianSchedulingHint(account, false, 0, 0)
+		if account.IsOpenAIResponsesAPI() &&
+			((previous.GroupID > 0 && account.HasGroupID(previous.GroupID)) ||
+				(current.GroupID > 0 && account.HasGroupID(current.GroupID))) {
+			ids[account.DBID] = struct{}{}
+		}
 	}
 	g.mu.Lock()
 	for accountID := range g.states {
@@ -332,21 +342,40 @@ func (g *relayHealthGuardian) relayConfigChanged(previous, current CybRelayConfi
 	g.lastShadowQuarantineAccountID = 0
 	g.poolWideUntil = time.Time{}
 	g.poolEvents = make(map[string]time.Time)
+	g.capacitySamples = nil
 	g.lastSummary = time.Time{}
 	g.lastAudit = time.Time{}
 	g.mu.Unlock()
-	if g.cache == nil || previous.GroupID <= 0 {
+	if g.cache == nil {
 		return
 	}
+	groups := make(map[int64]struct{}, 2)
+	if previous.GroupID > 0 {
+		groups[previous.GroupID] = struct{}{}
+	}
+	if current.GroupID > 0 {
+		groups[current.GroupID] = struct{}{}
+	}
 	for accountID := range ids {
-		accountID := accountID
-		go func() {
+		for groupID := range groups {
 			ctx, cancel := relayGuardianCacheContext()
-			defer cancel()
-			if err := g.cache.DeleteRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(previous.GroupID, accountID)); err != nil {
+			err := g.cache.DeleteRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, accountID))
+			cancel()
+			if err != nil {
+				record := relayGuardianRuntimeRecord{Mode: g.store.GetRelayGuardianMode(), ScopeGroupID: groupID, State: RelayGuardianHealthy, Generation: 1, UpdatedAt: now}
+				payload, marshalErr := json.Marshal(record)
+				if marshalErr == nil {
+					ctx, cancel = relayGuardianCacheContext()
+					setErr := g.cache.SetRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, accountID), payload, relayGuardianRuntimeTTL)
+					cancel()
+					if setErr == nil {
+						continue
+					}
+					err = fmt.Errorf("delete failed: %v; healthy overwrite failed: %w", err, setErr)
+				}
 				log.Printf("[Relay guardian account=%d] clear old scope failed: %v", accountID, err)
 			}
-		}()
+		}
 	}
 }
 
@@ -485,13 +514,96 @@ func relayGuardianApplySchedulingHint(account *Account, state *relayGuardianAcco
 	relayGuardianSchedulingHint(account, false, 0, 0)
 }
 
+// replaySchedulingHint re-derives the runtime-only scheduler overlay from the
+// already loaded Guardian state. It never performs cache or database I/O and is
+// safe for account enable/replacement hooks after their Store locks are gone.
+func (g *relayHealthGuardian) replaySchedulingHint(account *Account) {
+	if g == nil || account == nil || g.store.GetRelayGuardianMode() != RelayGuardianEnforce ||
+		!g.store.isConfiguredRelayCircuitAccount(account) || !relayGuardianManualEnabled(account) {
+		relayGuardianSchedulingHint(account, false, 0, 0)
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.loaded[account.DBID] {
+		relayGuardianSchedulingHint(account, false, 0, 0)
+		return
+	}
+	relayGuardianApplySchedulingHint(account, g.states[account.DBID])
+}
+
+// preloadAndReplay is for startup/reconcile/admin update paths only. Request
+// selection and attempt paths must remain memory-only.
+func (g *relayHealthGuardian) preloadAndReplay(account *Account) {
+	if g == nil || account == nil {
+		return
+	}
+	g.ensureLoaded(account.DBID)
+	g.replaySchedulingHint(account)
+}
+
+// forgetAccountRuntime is the membership-boundary fence. It serializes with
+// both cache restore and persistence so an in-flight old revision cannot
+// recreate the state after the account has left the Relay group.
+func (g *relayHealthGuardian) forgetAccountRuntime(account *Account, groupID int64) {
+	if g == nil || account == nil {
+		return
+	}
+	relayGuardianSchedulingHint(account, false, 0, 0)
+	g.loadMu.Lock()
+	defer g.loadMu.Unlock()
+	g.persistMu.Lock()
+	defer g.persistMu.Unlock()
+	now := g.nowTime()
+	g.mu.Lock()
+	delete(g.states, account.DBID)
+	delete(g.loaded, account.DBID)
+	delete(g.loading, account.DBID)
+	delete(g.retryLoad, account.DBID)
+	// Do not let the fallback scanner replay rows from the membership that
+	// just ended if the account is immediately added back.
+	g.incidentEpoch = now
+	g.lastScan = now
+	g.mu.Unlock()
+	if g.cache == nil || groupID <= 0 {
+		return
+	}
+	ctx, cancel := relayGuardianCacheContext()
+	err := g.cache.DeleteRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, account.DBID))
+	cancel()
+	if err == nil {
+		return
+	}
+	// A failed delete must not leave a known-bad quarantine/probation record
+	// behind. Best-effort overwrite it with an explicit healthy tombstone.
+	record := relayGuardianRuntimeRecord{
+		Mode:         g.store.GetRelayGuardianMode(),
+		ScopeGroupID: groupID,
+		State:        RelayGuardianHealthy,
+		Generation:   1,
+		UpdatedAt:    now,
+	}
+	payload, marshalErr := json.Marshal(record)
+	if marshalErr == nil {
+		ctx, cancel = relayGuardianCacheContext()
+		setErr := g.cache.SetRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, account.DBID), payload, relayGuardianRuntimeTTL)
+		cancel()
+		if setErr == nil {
+			return
+		}
+		err = fmt.Errorf("delete failed: %v; healthy overwrite failed: %w", err, setErr)
+	}
+	log.Printf("[Relay guardian account=%d] invalidate removed account state failed: %v", account.DBID, err)
+}
+
 func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
 	if g == nil || accountID <= 0 {
 		return
 	}
+	g.loadMu.Lock()
+	defer g.loadMu.Unlock()
 	now := g.nowTime()
 	groupID := g.store.GetCybRelayConfig().GroupID
-	account := g.store.FindByID(accountID)
 	g.mu.Lock()
 	if g.loaded[accountID] || g.loading[accountID] || g.retryLoad[accountID].After(now) {
 		g.mu.Unlock()
@@ -504,6 +616,7 @@ func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
 	}
 	g.loading[accountID] = true
 	g.mu.Unlock()
+	account := g.store.FindByID(accountID)
 	ctx, cancel := relayGuardianCacheContext()
 	payload, ok, err := g.cache.GetRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, accountID))
 	cancel()
@@ -681,11 +794,11 @@ func (g *relayHealthGuardian) observe(obs RelayGuardianObservation) {
 	}
 
 	accounts := g.store.configuredRelayGuardianAccounts()
-	for _, candidate := range accounts {
-		g.ensureLoaded(candidate.DBID)
-	}
 	capacity := g.capacityInputs(accounts)
 	g.mu.Lock()
+	if !g.loaded[obs.AccountID] && g.cache == nil {
+		g.loaded[obs.AccountID] = true
+	}
 	if !g.loaded[obs.AccountID] {
 		g.mu.Unlock()
 		return
@@ -768,8 +881,8 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 	if len(enabled) < 2 {
 		return false
 	}
-	candidateSignature := relayGuardianFailureSignature(g.states[candidateID], trigger, now)
-	if candidateSignature == "" {
+	candidateSignature, ok := relayGuardianCandidatePoolSignature(g.states[candidateID], trigger, now)
+	if !ok {
 		return false
 	}
 	affected := 0
@@ -778,7 +891,7 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 		if state == nil {
 			continue
 		}
-		if relayGuardianFailureSignature(state, trigger, now) == candidateSignature {
+		if relayGuardianStateHasPoolSignature(state, candidateSignature, now) {
 			affected++
 		}
 	}
@@ -786,16 +899,10 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 	if !guarded {
 		return false
 	}
-	window := 10 * time.Minute
-	if category := relayGuardianTriggerCategory(trigger); category == "strong_gateway" || category == "recovery" {
-		window = 5 * time.Minute
-	}
-	if strings.Contains(trigger, "60m") {
-		window = 60 * time.Minute
-	}
+	window := candidateSignature.window
 	windowStart := now.UTC().Truncate(window)
 	windowID := windowStart.Format(time.RFC3339) + "/" + window.String()
-	eventKey := candidateSignature + ":" + windowID
+	eventKey := candidateSignature.key() + ":" + windowID
 	for key, at := range g.poolEvents {
 		if now.Sub(at) > 2*time.Hour {
 			delete(g.poolEvents, key)
@@ -808,7 +915,7 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 			state.PoolWideReportedAt = now
 		}
 		g.recordSystemEvent(now, RelayGuardianEventPoolWide, "pool_wide_failure_guard", trigger, map[string]any{
-			"signature": candidateSignature, "affected": affected, "enabled": len(enabled), "window_id": windowID,
+			"signature": candidateSignature.key(), "affected": affected, "enabled": len(enabled), "window_id": windowID,
 		})
 	}
 	return true
@@ -827,9 +934,22 @@ func relayGuardianTriggerCategory(trigger string) string {
 	}
 }
 
-func relayGuardianFailureSignature(state *relayGuardianAccountState, trigger string, now time.Time) string {
-	if state == nil || trigger == "" {
+type relayGuardianPoolFailureSignature struct {
+	category   string
+	statusCode int
+	window     time.Duration
+}
+
+func (signature relayGuardianPoolFailureSignature) key() string {
+	if signature.category == "" || signature.statusCode == 0 {
 		return ""
+	}
+	return signature.category + ":" + strconv.Itoa(signature.statusCode)
+}
+
+func relayGuardianCandidatePoolSignature(state *relayGuardianAccountState, trigger string, now time.Time) (relayGuardianPoolFailureSignature, bool) {
+	if state == nil || trigger == "" {
+		return relayGuardianPoolFailureSignature{}, false
 	}
 	category := relayGuardianTriggerCategory(trigger)
 	window := 10 * time.Minute
@@ -845,17 +965,52 @@ func relayGuardianFailureSignature(state *relayGuardianAccountState, trigger str
 		if failure.At.Before(cutoff) {
 			continue
 		}
-		if category == "user_visible" && failure.UserVisible {
-			return category + ":" + strconv.Itoa(failure.StatusCode)
+		matches := (category == "user_visible" && failure.UserVisible) ||
+			(category == "strong_gateway" && failure.StrongGateway) ||
+			(category == "recovery" && failure.Recovery)
+		if !matches {
+			continue
 		}
-		if category == "strong_gateway" && failure.StrongGateway {
-			return category + ":" + strconv.Itoa(failure.StatusCode)
+		if IsRelayStrongGatewayFailureStatus(failure.StatusCode) {
+			if failure.At.Before(now.Add(-5 * time.Minute)) {
+				return relayGuardianPoolFailureSignature{}, false
+			}
+			return relayGuardianPoolFailureSignature{category: "strong_gateway", statusCode: failure.StatusCode, window: 5 * time.Minute}, true
 		}
-		if category == "recovery" && failure.Recovery {
-			return category + ":" + strconv.Itoa(failure.StatusCode)
+		return relayGuardianPoolFailureSignature{category: category, statusCode: failure.StatusCode, window: window}, true
+	}
+	return relayGuardianPoolFailureSignature{}, false
+}
+
+func relayGuardianStateHasPoolSignature(state *relayGuardianAccountState, signature relayGuardianPoolFailureSignature, now time.Time) bool {
+	if state == nil || signature.key() == "" || signature.window <= 0 {
+		return false
+	}
+	cutoff := now.Add(-signature.window)
+	for index := len(state.Failures) - 1; index >= 0; index-- {
+		failure := state.Failures[index]
+		if failure.At.Before(cutoff) {
+			continue
+		}
+		if failure.StatusCode != signature.statusCode {
+			continue
+		}
+		switch signature.category {
+		case "strong_gateway":
+			if failure.StrongGateway {
+				return true
+			}
+		case "user_visible":
+			if failure.UserVisible {
+				return true
+			}
+		case "recovery":
+			if failure.Recovery {
+				return true
+			}
 		}
 	}
-	return ""
+	return false
 }
 
 func (g *relayHealthGuardian) capacityInputs(accounts []*Account) []relayGuardianCapacityAccount {
@@ -924,11 +1079,32 @@ func (g *relayHealthGuardian) capacityAllowsLocked(accounts []relayGuardianCapac
 	if otherHealthy == 0 {
 		return false, "last_available_relay"
 	}
+	if !g.capacityWarmLocked(now) {
+		return false, "capacity_warmup"
+	}
 	required := g.requiredCapacityLocked(now)
 	if remaining < required {
 		return false, "insufficient_remaining_capacity"
 	}
 	return true, ""
+}
+
+func (g *relayHealthGuardian) capacityWarmLocked(now time.Time) bool {
+	g.requiredCapacityLocked(now)
+	if len(g.capacitySamples) < 3 {
+		return false
+	}
+	oldest := g.capacitySamples[0].At
+	newest := oldest
+	for _, sample := range g.capacitySamples[1:] {
+		if sample.At.Before(oldest) {
+			oldest = sample.At
+		}
+		if sample.At.After(newest) {
+			newest = sample.At
+		}
+	}
+	return newest.Sub(oldest) >= 2*RelayGuardianScanInterval
 }
 
 func (g *relayHealthGuardian) requiredCapacityLocked(now time.Time) int64 {
@@ -1214,9 +1390,11 @@ func (g *relayHealthGuardian) selectable(account *Account) bool {
 	if g == nil || account == nil || g.store.GetRelayGuardianMode() != RelayGuardianEnforce {
 		return true
 	}
-	g.ensureLoaded(account.DBID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if !g.loaded[account.DBID] && g.cache == nil {
+		g.loaded[account.DBID] = true
+	}
 	if !g.loaded[account.DBID] {
 		return false
 	}
@@ -1236,9 +1414,11 @@ func (g *relayHealthGuardian) begin(account *Account) (RelayGuardianPermit, bool
 	if g == nil || account == nil || g.store.GetRelayGuardianMode() != RelayGuardianEnforce {
 		return RelayGuardianPermit{}, true
 	}
-	g.ensureLoaded(account.DBID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if !g.loaded[account.DBID] && g.cache == nil {
+		g.loaded[account.DBID] = true
+	}
 	if !g.loaded[account.DBID] {
 		return RelayGuardianPermit{}, false
 	}
@@ -1287,9 +1467,6 @@ func (g *relayHealthGuardian) finishFailure(permit RelayGuardianPermit, statusCo
 		return
 	}
 	accounts := g.store.configuredRelayGuardianAccounts()
-	for _, candidate := range accounts {
-		g.ensureLoaded(candidate.DBID)
-	}
 	capacity := g.capacityInputs(accounts)
 	g.mu.Lock()
 	if !g.loaded[permit.AccountID] {
@@ -1342,7 +1519,6 @@ func (g *relayHealthGuardian) finishSuccess(permit RelayGuardianPermit) {
 	if account == nil {
 		return
 	}
-	g.ensureLoaded(permit.AccountID)
 	g.mu.Lock()
 	if !g.loaded[permit.AccountID] {
 		g.mu.Unlock()
@@ -1415,7 +1591,6 @@ func (g *relayHealthGuardian) abandon(permit RelayGuardianPermit) {
 	if g == nil || !permit.Active {
 		return
 	}
-	g.ensureLoaded(permit.AccountID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.loaded[permit.AccountID] {
@@ -1526,6 +1701,7 @@ func (g *relayHealthGuardian) reconcile(ctx context.Context) {
 		currentIDs[account.DBID] = struct{}{}
 	}
 	for _, account := range accounts {
+		g.store.relayCircuitManager().ensureLoaded(account.DBID)
 		g.ensureLoaded(account.DBID)
 	}
 	capacity := g.capacityInputs(accounts)
@@ -1558,6 +1734,10 @@ func (g *relayHealthGuardian) reconcile(ctx context.Context) {
 			g.persistState(account.DBID, state)
 			continue
 		}
+		// Manual re-enable and same-DBID Account replacement both create a
+		// zero-valued Account hint. Re-derive it every reconcile from the
+		// authoritative in-memory state before making further transitions.
+		relayGuardianApplySchedulingHint(account, state)
 		if mode == RelayGuardianEnforce && state.State != RelayGuardianQuarantined && state.State != RelayGuardianHalfOpen && state.State != RelayGuardianProbation && state.State != RelayGuardianTemporaryBypass {
 			trigger, window, finals, gateways := g.triggerLocked(state, now)
 			if trigger != "" {
@@ -1845,6 +2025,51 @@ func (s *Store) configuredRelayGuardianAccounts() []*Account {
 		}
 	}
 	return result
+}
+
+// preloadRelayRuntimeAccount is used only after startup or an account/admin
+// mutation, never from scheduler selection. It restores both runtime fences,
+// then replays the Guardian scheduler overlay onto the current Account object.
+func (s *Store) preloadRelayRuntimeAccount(account *Account) {
+	if s == nil || account == nil {
+		return
+	}
+	if !s.isConfiguredRelayCircuitAccount(account) {
+		relayGuardianSchedulingHint(account, false, 0, 0)
+		return
+	}
+	s.relayCircuitManager().ensureLoaded(account.DBID)
+	s.relayGuardianManager().preloadAndReplay(account)
+}
+
+func (s *Store) relayGuardianAccountAvailabilityChanged(account *Account) {
+	if account == nil {
+		return
+	}
+	if !relayGuardianManualEnabled(account) {
+		// Manual disable always wins immediately; the Guardian state remains so
+		// an explicit re-enable can safely replay its probation/last-resort cap.
+		relayGuardianSchedulingHint(account, false, 0, 0)
+		return
+	}
+	s.preloadRelayRuntimeAccount(account)
+}
+
+func (s *Store) relayGuardianAccountMembershipChanged(account *Account, wasRelay, isRelay bool) {
+	if account == nil || wasRelay == isRelay {
+		return
+	}
+	if !isRelay {
+		// The hint lives on Account, not on a group bucket, so it must be cleared
+		// synchronously before another group can schedule this account. Drop the
+		// authoritative state too, so immediate leave/rejoin starts healthy.
+		s.relayGuardianManager().forgetAccountRuntime(account, s.GetCybRelayConfig().GroupID)
+		return
+	}
+	// A join is a new membership epoch. Delete any stale runtime key left by
+	// an older process/config cycle before loading the new healthy state.
+	s.relayGuardianManager().forgetAccountRuntime(account, s.GetCybRelayConfig().GroupID)
+	s.preloadRelayRuntimeAccount(account)
 }
 
 func (s *Store) relayGuardianManager() *relayHealthGuardian {

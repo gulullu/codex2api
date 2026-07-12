@@ -15,6 +15,9 @@ const (
 	relayGuardianHintHardCapMask   uint64 = (1 << 31) - 1
 	relayGuardianHintPercentShift         = 32
 	relayGuardianHintPercentMask   uint64 = (1 << 7) - 1
+	relayGuardianHintVersionShift         = 39
+	relayGuardianHintVersionMask   uint64 = (1 << 25) - 1
+	relayGuardianHintPayloadMask   uint64 = (1 << relayGuardianHintVersionShift) - 1
 )
 
 // relayGuardianSchedulingHintSnapshot is the decoded in-memory scheduler overlay.
@@ -84,14 +87,35 @@ func (a *Account) setRelayGuardianSchedulingHint(lastResort bool, hardCap int64,
 	if a == nil {
 		return
 	}
-	a.relayGuardianSchedulingHint.Store(encodeRelayGuardianSchedulingHint(lastResort, hardCap, percent))
+	payload := encodeRelayGuardianSchedulingHint(lastResort, hardCap, percent) & relayGuardianHintPayloadMask
+	for {
+		current := a.relayGuardianSchedulingHint.Load()
+		if current&relayGuardianHintPayloadMask == payload {
+			return
+		}
+		version := ((current >> relayGuardianHintVersionShift) + 1) & relayGuardianHintVersionMask
+		next := payload | version<<relayGuardianHintVersionShift
+		if a.relayGuardianSchedulingHint.CompareAndSwap(current, next) {
+			return
+		}
+	}
 }
 
 func (a *Account) clearRelayGuardianSchedulingHint() {
 	if a == nil {
 		return
 	}
-	a.relayGuardianSchedulingHint.Store(0)
+	a.setRelayGuardianSchedulingHint(false, 0, 0)
+}
+
+// relayGuardianSchedulingToken returns one atomic value containing both the
+// hint payload and its change version. FastScheduler uses it to reject a
+// candidate if Guardian changes its class while group checks are in progress.
+func (a *Account) relayGuardianSchedulingToken() uint64 {
+	if a == nil {
+		return 0
+	}
+	return a.relayGuardianSchedulingHint.Load()
 }
 
 func (a *Account) relayGuardianSchedulingHintSnapshot() relayGuardianSchedulingHintSnapshot {

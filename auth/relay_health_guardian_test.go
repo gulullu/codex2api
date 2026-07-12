@@ -54,6 +54,11 @@ func newGuardianTestStore(t *testing.T, mode RelayGuardianMode, clock *relayCirc
 	guardian.now = clock.Now
 	guardian.incidentEpoch = clock.Now()
 	guardian.lastScan = clock.Now()
+	guardian.capacitySamples = []relayGuardianCapacitySample{
+		{At: clock.Now().Add(-2 * RelayGuardianScanInterval)},
+		{At: clock.Now().Add(-RelayGuardianScanInterval)},
+		{At: clock.Now()},
+	}
 	store.relayGuardian = guardian
 	return store, guardian
 }
@@ -234,6 +239,10 @@ func TestRelayGuardianRedisRestartRestoresQuarantine(t *testing.T) {
 	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 	store.tokenCache = tokenCache
 	guardian.cache = tokenCache
+	store.relayCircuitManager().ensureLoaded(51)
+	store.relayCircuitManager().ensureLoaded(50)
+	guardian.ensureLoaded(51)
+	guardian.ensureLoaded(50)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
 	guardian.mu.Lock()
@@ -259,6 +268,7 @@ func TestRelayGuardianRedisRestartRestoresQuarantine(t *testing.T) {
 	store2, guardian2 := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 	store2.tokenCache = tokenCache
 	guardian2.cache = tokenCache
+	guardian2.ensureLoaded(51)
 	if guardian2.selectable(store2.accountsByID[51]) {
 		t.Fatal("quarantined account became selectable after restart")
 	}
@@ -443,6 +453,13 @@ func TestRelayGuardianProbationFailureReopensWithBackoff(t *testing.T) {
 	if !probation.Active || !probation.Probation {
 		t.Fatal("probation permit missing")
 	}
+	guardian.mu.Lock()
+	guardian.capacitySamples = []relayGuardianCapacitySample{
+		{At: clock.Now().Add(-2 * RelayGuardianScanInterval)},
+		{At: clock.Now().Add(-RelayGuardianScanInterval)},
+		{At: clock.Now()},
+	}
+	guardian.mu.Unlock()
 	guardian.finishFailure(probation, 500)
 	guardian.mu.Lock()
 	state := guardian.stateLocked(51)

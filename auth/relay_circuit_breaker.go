@@ -109,6 +109,7 @@ type relayCircuitBreaker struct {
 	persistMu sync.Mutex
 	states    map[int64]*relayCircuitAccountState
 	loaded    map[int64]bool
+	loading   map[int64]bool
 	retryLoad map[int64]time.Time
 	permits   map[uint64]RelayCircuitPermit
 	nextLease uint64
@@ -120,6 +121,7 @@ func newRelayCircuitBreaker(tc cache.TokenCache) *relayCircuitBreaker {
 	return &relayCircuitBreaker{
 		states:    make(map[int64]*relayCircuitAccountState),
 		loaded:    make(map[int64]bool),
+		loading:   make(map[int64]bool),
 		retryLoad: make(map[int64]time.Time),
 		permits:   make(map[uint64]RelayCircuitPermit),
 		cache:     tc,
@@ -151,33 +153,37 @@ func (b *relayCircuitBreaker) stateLocked(accountID int64) *relayCircuitAccountS
 	return state
 }
 
-// ensureLoaded performs a single best-effort cache read per account. The lock
-// deliberately remains held during this one-time read: after a process restart
-// no concurrent request may slip through before an existing open fence has
-// been restored. Redis is not the concurrency authority because TokenCache has
-// no compare-and-swap primitive; the confirmed production topology is one
-// scheduler process, and the in-process mutex remains authoritative.
+// ensureLoaded is called only by startup/reconcile/admin-safe preload paths.
+// The cache read stays outside b.mu so request selection can immediately fail
+// closed while restoration is in flight instead of waiting behind Redis I/O.
 func (b *relayCircuitBreaker) ensureLoaded(accountID int64) {
 	if b == nil || accountID == 0 {
 		return
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.loaded[accountID] {
+	if b.loaded[accountID] || b.loading[accountID] {
+		b.mu.Unlock()
 		return
 	}
 	now := b.nowTime()
 	if retryAt := b.retryLoad[accountID]; retryAt.After(now) {
+		b.mu.Unlock()
 		return
 	}
 	if b.cache == nil {
 		b.loaded[accountID] = true
+		b.mu.Unlock()
 		return
 	}
+	b.loading[accountID] = true
+	b.mu.Unlock()
 
 	ctx, cancel := relayCircuitCacheContext()
-	defer cancel()
 	payload, ok, err := b.cache.GetRuntime(ctx, relayCircuitRuntimeCacheNamespace, relayCircuitRuntimeKey(accountID))
+	cancel()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.loading, accountID)
 	if err != nil {
 		// A transient cache error must not permanently disable restart fencing.
 		// Throttle retries so a cache outage cannot add 300 ms to every scheduler
@@ -226,10 +232,12 @@ func (b *relayCircuitBreaker) selectable(accountID int64) bool {
 	if b == nil || accountID == 0 {
 		return true
 	}
-	b.ensureLoaded(accountID)
 	now := b.nowTime()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.loaded[accountID] && b.cache == nil {
+		b.loaded[accountID] = true
+	}
 	if !b.loaded[accountID] {
 		// The restart fence could not be restored yet. Fail closed for this
 		// account until the throttled cache retry succeeds.
@@ -249,10 +257,12 @@ func (b *relayCircuitBreaker) begin(accountID int64) (RelayCircuitPermit, bool) 
 	if b == nil || accountID == 0 {
 		return RelayCircuitPermit{}, false
 	}
-	b.ensureLoaded(accountID)
 	now := b.nowTime()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.loaded[accountID] && b.cache == nil {
+		b.loaded[accountID] = true
+	}
 	if !b.loaded[accountID] {
 		return RelayCircuitPermit{}, false
 	}
@@ -394,13 +404,16 @@ func (b *relayCircuitBreaker) reportFailure(permit RelayCircuitPermit, statusCod
 	if b == nil || !permit.Active || permit.AccountID == 0 || (!strong && !weak) {
 		return false
 	}
-	b.ensureLoaded(permit.AccountID)
 	now := b.nowTime()
 	var revision uint64
 	var record relayCircuitRuntimeRecord
 	persist := false
 
 	b.mu.Lock()
+	if !b.loaded[permit.AccountID] {
+		b.mu.Unlock()
+		return false
+	}
 	state := b.stateLocked(permit.AccountID)
 	if !b.consumePermitLocked(permit) {
 		b.mu.Unlock()
@@ -461,7 +474,6 @@ func (b *relayCircuitBreaker) reportSuccess(permit RelayCircuitPermit) bool {
 	if b == nil || !permit.Active || permit.AccountID == 0 {
 		return false
 	}
-	b.ensureLoaded(permit.AccountID)
 	now := b.nowTime()
 	var revision uint64
 	var record relayCircuitRuntimeRecord
@@ -469,6 +481,10 @@ func (b *relayCircuitBreaker) reportSuccess(permit RelayCircuitPermit) bool {
 	var persist bool
 
 	b.mu.Lock()
+	if !b.loaded[permit.AccountID] {
+		b.mu.Unlock()
+		return false
+	}
 	state := b.stateLocked(permit.AccountID)
 	if !b.consumePermitLocked(permit) {
 		b.mu.Unlock()
@@ -532,12 +548,15 @@ func (b *relayCircuitBreaker) abandon(permit RelayCircuitPermit) bool {
 	if b == nil || !permit.Active || permit.AccountID == 0 {
 		return false
 	}
-	b.ensureLoaded(permit.AccountID)
 	now := b.nowTime()
 	var revision uint64
 	var record relayCircuitRuntimeRecord
 
 	b.mu.Lock()
+	if !b.loaded[permit.AccountID] {
+		b.mu.Unlock()
+		return false
+	}
 	state := b.stateLocked(permit.AccountID)
 	if !b.consumePermitLocked(permit) {
 		b.mu.Unlock()
@@ -643,9 +662,11 @@ func (b *relayCircuitBreaker) snapshot(accountID int64) RelayCircuitSnapshot {
 	if b == nil || accountID == 0 {
 		return relayCircuitSnapshotFromState(accountID, nil)
 	}
-	b.ensureLoaded(accountID)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.loaded[accountID] && b.cache == nil {
+		b.loaded[accountID] = true
+	}
 	if !b.loaded[accountID] {
 		return RelayCircuitSnapshot{
 			AccountID:       accountID,

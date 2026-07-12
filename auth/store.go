@@ -4812,13 +4812,19 @@ func (s *Store) SetCybRelayConfig(cfg CybRelayConfig) {
 	}
 	previous := s.GetCybRelayConfig()
 	normalized := NormalizeCybRelayConfig(cfg)
+	changed := previous.Enabled != normalized.Enabled || previous.GroupID != normalized.GroupID
 	var accounts []*Account
-	if s.relayGuardian != nil && (previous.Enabled != normalized.Enabled || previous.GroupID != normalized.GroupID) {
+	if s.relayGuardian != nil && changed {
 		accounts = s.Accounts()
 	}
 	s.cybRelayConfig.Store(normalized)
 	if s.relayGuardian != nil {
 		s.relayGuardian.relayConfigChanged(previous, normalized, accounts)
+	}
+	if changed && normalized.Enabled && normalized.GroupID > 0 {
+		for _, account := range accounts {
+			s.preloadRelayRuntimeAccount(account)
+		}
 	}
 }
 
@@ -4993,32 +4999,37 @@ func (s *Store) AddAccount(acc *Account) {
 		atomic.StoreInt64(&acc.AddedAt, time.Now().UnixNano())
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	acc.mu.Lock()
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
 	s.rebuildAccountIndex()
+	s.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	s.preloadRelayRuntimeAccount(acc)
 }
 
 // RemoveAccount 从内存池移除账号
 func (s *Store) RemoveAccount(dbID int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	removed := false
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
 			s.rebuildAccountIndex()
-			s.fastSchedulerRemove(dbID)
-			// 清理 RefreshScheduler 中可能残留的任务
-			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
-				scheduler.CancelTask(dbID)
-			}
-			return
+			removed = true
+			break
 		}
+	}
+	s.mu.Unlock()
+	if !removed {
+		return
+	}
+	s.fastSchedulerRemove(dbID)
+	// 清理 RefreshScheduler 中可能残留的任务。
+	if scheduler := s.GetRefreshScheduler(); scheduler != nil {
+		scheduler.CancelTask(dbID)
 	}
 }
 
@@ -5187,10 +5198,13 @@ func (s *Store) ApplyAccountGroups(dbID int64, groupIDs []int64) bool {
 	if acc == nil {
 		return false
 	}
+	wasRelay := s.isConfiguredRelayCircuitAccount(acc)
 	acc.mu.Lock()
 	acc.GroupIDs = cloneInt64Slice(groupIDs)
 	acc.recomputeEffectiveAutoPause(s)
 	acc.mu.Unlock()
+	isRelay := s.isConfiguredRelayCircuitAccount(acc)
+	s.relayGuardianAccountMembershipChanged(acc, wasRelay, isRelay)
 	s.fastSchedulerUpdate(acc)
 	return true
 }
@@ -5222,10 +5236,13 @@ func (s *Store) UpdateAccountCredit(dbID int64, creditEnabled, creditSkipUsageWi
 
 func (s *Store) ApplyAccountGroupMemberships(memberships map[int64][]int64) {
 	for _, acc := range s.Accounts() {
+		wasRelay := s.isConfiguredRelayCircuitAccount(acc)
 		acc.mu.Lock()
 		acc.GroupIDs = cloneInt64Slice(memberships[acc.DBID])
 		acc.recomputeEffectiveAutoPause(s)
 		acc.mu.Unlock()
+		isRelay := s.isConfiguredRelayCircuitAccount(acc)
+		s.relayGuardianAccountMembershipChanged(acc, wasRelay, isRelay)
 		s.fastSchedulerUpdate(acc)
 	}
 }
@@ -5508,6 +5525,7 @@ func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
 	} else {
 		atomic.StoreInt32(&acc.DispatchPaused, 1)
 	}
+	s.relayGuardianAccountAvailabilityChanged(acc)
 	s.fastSchedulerUpdate(acc)
 	return true
 }
@@ -5799,6 +5817,7 @@ func (s *Store) ClearCooldown(acc *Account) {
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
+	s.relayGuardianAccountAvailabilityChanged(acc)
 	s.fastSchedulerUpdate(acc)
 	s.deleteCachedAccountCooldown(acc.DBID)
 
@@ -5898,6 +5917,7 @@ func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
+	s.relayGuardianAccountAvailabilityChanged(acc)
 	s.fastSchedulerUpdate(acc)
 	s.deleteCachedAccountCooldown(acc.DBID)
 
@@ -6501,14 +6521,12 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		removeSet[id] = struct{}{}
 	}
 
+	removedIDs := make([]int64, 0, len(removeSet))
 	s.mu.Lock()
 	kept := s.accounts[:0]
 	for _, acc := range s.accounts {
 		if _, remove := removeSet[acc.DBID]; remove {
-			s.fastSchedulerRemove(acc.DBID)
-			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
-				scheduler.CancelTask(acc.DBID)
-			}
+			removedIDs = append(removedIDs, acc.DBID)
 		} else {
 			kept = append(kept, acc)
 		}
@@ -6516,6 +6534,12 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 	s.accounts = kept
 	s.rebuildAccountIndex()
 	s.mu.Unlock()
+	for _, dbID := range removedIDs {
+		s.fastSchedulerRemove(dbID)
+		if scheduler := s.GetRefreshScheduler(); scheduler != nil {
+			scheduler.CancelTask(dbID)
+		}
+	}
 }
 
 func (s *Store) parallelProbeUsage(ctx context.Context) {
@@ -6647,6 +6671,8 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 						log.Printf("[账号 %d] 恢复探测成功！已从 banned 升级到 warm", account.DBID)
 					}
 					account.mu.Unlock()
+					s.relayGuardianAccountAvailabilityChanged(account)
+					s.fastSchedulerUpdate(account)
 					// 清理数据库冷却状态
 					s.deleteCachedAccountCooldown(account.DBID)
 					if s.db != nil {

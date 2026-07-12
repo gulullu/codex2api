@@ -393,7 +393,11 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 		ordinal := 0
 		for idx := rangeStart; idx < rangeEnd; idx++ {
 			entry := bucket[idx]
-			if entry.acc == nil || entry.acc.relayGuardianLastResort() != expectedLastResort {
+			if entry.acc == nil {
+				continue
+			}
+			hintToken := entry.acc.relayGuardianSchedulingToken()
+			if (hintToken&relayGuardianHintLastResortBit != 0) != expectedLastResort {
 				continue
 			}
 			inPass := (pass == 0 && ordinal >= startOrdinal) || (pass == 1 && ordinal < startOrdinal)
@@ -408,6 +412,14 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 				continue
 			}
 			if s.groupCheck != nil && !s.groupCheck(apiKeyID, entry.acc) {
+				continue
+			}
+			// groupCheck may run concurrently with reconcile or an admin update.
+			// Never dispatch a candidate under a class/cap snapshot that changed
+			// while the check was in progress; the next scan will classify it from
+			// the new atomic token.
+			if current := entry.acc.relayGuardianSchedulingToken(); current != hintToken ||
+				(current&relayGuardianHintLastResortBit != 0) != expectedLastResort {
 				continue
 			}
 			if filter != nil && !filter(entry.acc) {
@@ -426,7 +438,16 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 			if !available || effectiveLimit <= 0 || load >= effectiveLimit {
 				continue
 			}
+			if entry.acc.relayGuardianSchedulingToken() != hintToken {
+				continue
+			}
 			if !s.tryAcquireAccount(entry.acc, limit) {
+				continue
+			}
+			if entry.acc.relayGuardianSchedulingToken() != hintToken {
+				// The hint changed in the final CAS window. Roll back only the
+				// concurrency reservation; no upstream request has started yet.
+				atomic.AddInt64(&entry.acc.ActiveRequests, -1)
 				continue
 			}
 			return entry.acc, false
