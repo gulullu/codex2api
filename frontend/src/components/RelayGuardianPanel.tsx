@@ -36,7 +36,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 
-const PAGE_SIZE_OPTIONS = [10, 20, 50]
+const PAGE_SIZE_OPTIONS = [1, 5, 10, 20, 50]
 
 export default function RelayGuardianPanel({
   start,
@@ -59,7 +59,7 @@ export default function RelayGuardianPanel({
   const [eventsError, setEventsError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(10)
+  const [pageSize, setPageSize] = useState(5)
   const [actionAccountIDs, setActionAccountIDs] = useState<Set<number>>(() => new Set())
   const actionAccountIDsRef = useRef(new Set<number>())
   const statusRequestIDRef = useRef(0)

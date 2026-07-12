@@ -130,13 +130,18 @@ test('event query carries the audit window and pagination exactly', () => {
     start: '2026-07-12T17:00:00+08:00',
     end: '2026-07-12T18:00:00+08:00',
     page: 3,
-    pageSize: 20,
+    pageSize: 5,
   }))
 
   assert.equal(query.get('start'), '2026-07-12T17:00:00+08:00')
   assert.equal(query.get('end'), '2026-07-12T18:00:00+08:00')
   assert.equal(query.get('page'), '3')
-  assert.equal(query.get('page_size'), '20')
+  assert.equal(query.get('page_size'), '5')
+})
+
+test('guardian event pagination defaults to five and keeps compact and larger choices', () => {
+  assert.match(panelSource, /const PAGE_SIZE_OPTIONS = \[1, 5, 10, 20, 50\]/)
+  assert.match(panelSource, /const \[pageSize, setPageSize\] = useState\(5\)/)
 })
 
 test('core guardian event names have operator-friendly Chinese labels', () => {
