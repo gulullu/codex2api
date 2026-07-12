@@ -895,22 +895,26 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 	if len(enabled) < 2 {
 		return false
 	}
-	candidateSignature, ok := relayGuardianCandidatePoolSignature(g.states[candidateID], trigger, now)
-	if !ok {
+	candidateSignatures := relayGuardianCandidatePoolSignatures(g.states[candidateID], trigger, now)
+	if len(candidateSignatures) == 0 {
 		return false
 	}
+	var candidateSignature relayGuardianPoolFailureSignature
 	affected := 0
-	for _, account := range enabled {
-		state := g.states[account.DBID]
-		if state == nil {
-			continue
+	for _, signature := range candidateSignatures {
+		matched := 0
+		for _, account := range enabled {
+			state := g.states[account.DBID]
+			if state != nil && relayGuardianStateHasPoolSignature(state, signature, now) {
+				matched++
+			}
 		}
-		if relayGuardianStateHasPoolSignature(state, candidateSignature, now) {
-			affected++
+		if matched >= 2 && matched*2 >= len(enabled) && matched > affected {
+			candidateSignature = signature
+			affected = matched
 		}
 	}
-	guarded := affected >= 2 && affected*2 >= len(enabled)
-	if !guarded {
+	if affected == 0 {
 		return false
 	}
 	window := candidateSignature.window
@@ -996,9 +1000,9 @@ func (signature relayGuardianPoolFailureSignature) key() string {
 	return signature.category + ":" + strconv.Itoa(signature.statusCode)
 }
 
-func relayGuardianCandidatePoolSignature(state *relayGuardianAccountState, trigger string, now time.Time) (relayGuardianPoolFailureSignature, bool) {
+func relayGuardianCandidatePoolSignatures(state *relayGuardianAccountState, trigger string, now time.Time) []relayGuardianPoolFailureSignature {
 	if state == nil || trigger == "" {
-		return relayGuardianPoolFailureSignature{}, false
+		return nil
 	}
 	category := relayGuardianTriggerCategory(trigger)
 	window := 10 * time.Minute
@@ -1009,6 +1013,8 @@ func relayGuardianCandidatePoolSignature(state *relayGuardianAccountState, trigg
 		window = 60 * time.Minute
 	}
 	cutoff := now.Add(-window)
+	seen := make(map[string]struct{})
+	result := make([]relayGuardianPoolFailureSignature, 0)
 	for index := len(state.Failures) - 1; index >= 0; index-- {
 		failure := state.Failures[index]
 		if failure.At.Before(cutoff) {
@@ -1020,15 +1026,21 @@ func relayGuardianCandidatePoolSignature(state *relayGuardianAccountState, trigg
 		if !matches {
 			continue
 		}
+		signature := relayGuardianPoolFailureSignature{category: category, statusCode: failure.StatusCode, window: window}
 		if IsRelayStrongGatewayFailureStatus(failure.StatusCode) {
 			if failure.At.Before(now.Add(-5 * time.Minute)) {
-				return relayGuardianPoolFailureSignature{}, false
+				continue
 			}
-			return relayGuardianPoolFailureSignature{category: "strong_gateway", statusCode: failure.StatusCode, window: 5 * time.Minute}, true
+			signature.category = "strong_gateway"
+			signature.window = 5 * time.Minute
 		}
-		return relayGuardianPoolFailureSignature{category: category, statusCode: failure.StatusCode, window: window}, true
+		if _, duplicate := seen[signature.key()]; duplicate {
+			continue
+		}
+		seen[signature.key()] = struct{}{}
+		result = append(result, signature)
 	}
-	return relayGuardianPoolFailureSignature{}, false
+	return result
 }
 
 func relayGuardianStateHasPoolSignature(state *relayGuardianAccountState, signature relayGuardianPoolFailureSignature, now time.Time) bool {

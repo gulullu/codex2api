@@ -189,6 +189,22 @@ func TestRelayGuardianPoolWideCategoryGuard(t *testing.T) {
 	guardian.mu.Unlock()
 }
 
+func TestRelayGuardianPoolGuardFindsSharedSignatureBehindNewerSingleFailure(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	_, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 50, 53, 51)
+	guardian.observe(guardianObservation(50, "peer-shared-524", 524, false, clock.Now()))
+	guardian.observe(guardianObservation(53, "candidate-shared-524", 524, false, clock.Now()))
+	clock.Advance(time.Minute)
+	guardian.observe(guardianObservation(53, "candidate-single-500", 500, false, clock.Now()))
+
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	state := guardian.stateLocked(53)
+	if state.State == RelayGuardianQuarantined || !state.LastResort || state.Reason != "pool_wide_failure_guard" {
+		t.Fatalf("newer single 500 hid shared 524 pool signature: %+v", state)
+	}
+}
+
 func TestRelayGuardianReleaseAndBypassValidateStateAndGeneration(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
