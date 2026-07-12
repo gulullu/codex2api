@@ -30,6 +30,7 @@ import type {
   AccountGroup,
   SystemSettings,
   RecycleBinAccountRow,
+  RelayGuardianStatusResponse,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -39,6 +40,12 @@ import {
   buildOpenAIResponsesCopyDraft,
 } from "../lib/openAIResponsesCopy";
 import { formatLongUsageWindowLabel } from "../lib/usageFormat";
+import {
+  getRelayGuardianStateMeta,
+  mergeRelayGuardianAccounts,
+  resolveRelayGuardianState,
+  type RelayGuardianTone,
+} from "../lib/relayGuardian";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -1401,6 +1408,7 @@ export default function Accounts() {
       groupsResponse,
       settings,
       healthBars,
+      guardianStatus,
     ] =
       await Promise.all([
         api.getAccounts(),
@@ -1414,13 +1422,16 @@ export default function Accounts() {
           .getAccountHealthBars()
           .then((res) => res.buckets)
           .catch((): Record<string, AccountHealthBucket[]> | null => null),
+        api
+          .getRelayGuardianStatus()
+          .catch((): RelayGuardianStatusResponse | null => null),
       ]);
     if (settings) {
       lazyModeRef.current = settings.lazy_mode;
     }
     setAllGroups(groupsResponse.groups ?? []);
     return {
-      accounts: accountsResponse.accounts ?? [],
+      accounts: mergeRelayGuardianAccounts(accountsResponse.accounts ?? [], guardianStatus),
       apiKeys: apiKeysResponse.keys ?? [],
       opsOverview,
       lazyMode: lazyModeRef.current ?? false,
@@ -4979,6 +4990,7 @@ export default function Accounts() {
                                       errorMessage={account.error_message}
                                     />
                                     <AccountStatusCountdown account={account} />
+                                    <AccountGuardianBadge account={account} />
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
                                         className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400"
@@ -10195,6 +10207,7 @@ function AccountMobileCard({
                     Responses API
                   </span>
                 )}
+                <AccountGuardianBadge account={account} />
                 {account.enabled === false && (
                   <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
                     <PowerOff className="mr-0.5 size-2.5" />
@@ -10460,6 +10473,7 @@ function AccountMobileCard({
                 Responses API
               </span>
             )}
+            <AccountGuardianBadge account={account} />
             {account.enabled === false && (
               <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
                 <PowerOff className="mr-0.5 size-2.5" />
@@ -11486,6 +11500,59 @@ function BilledCell({ account }: { account: AccountRow }) {
       {d7 !== null ? `${longLabel}: $${d7}` : `${longLabel}: -`}
     </span>
   );
+}
+
+function AccountGuardianBadge({ account }: { account: AccountRow }) {
+  if (!account.openai_responses_api || !account.relay_guardian) return null;
+
+  const state = resolveRelayGuardianState(
+    account.relay_guardian,
+    account.enabled !== false,
+  );
+  const meta = getRelayGuardianStateMeta(state);
+  const className = guardianAccountBadgeClass(meta.tone);
+  const status = account.relay_guardian;
+  const title = [
+    meta.description,
+    status?.reason,
+    status?.quarantine_until
+      ? `临时隔离至 ${formatBeijingTime(status.quarantine_until)}`
+      : "",
+    status?.last_resort
+      ? `最后兜底，并发上限 ${status.last_resort_cap || "-"}`
+      : "",
+    status?.shadow_action ? `监控结论 ${status.shadow_action}` : "",
+    status?.last_action_at
+      ? `最近动作 ${formatBeijingTime(status.last_action_at)}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return (
+    <span
+      className={`inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset ${className}`}
+      title={title}
+    >
+      Guardian · {meta.label}
+    </span>
+  );
+}
+
+function guardianAccountBadgeClass(tone: RelayGuardianTone) {
+  if (tone === "ok") {
+    return "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20";
+  }
+  if (tone === "warn") {
+    return "bg-amber-50 text-amber-700 ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20";
+  }
+  if (tone === "bad") {
+    return "bg-red-50 text-red-700 ring-red-600/20 dark:bg-red-950 dark:text-red-400 dark:ring-red-400/20";
+  }
+  if (tone === "info") {
+    return "bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-950 dark:text-sky-400 dark:ring-sky-400/20";
+  }
+  return "bg-zinc-100 text-zinc-700 ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20";
 }
 
 function getAccountStatusCountdownUntil(

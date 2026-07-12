@@ -15,6 +15,7 @@ import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import Pagination from '../components/Pagination'
+import RelayGuardianPanel from '../components/RelayGuardianPanel'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
@@ -334,6 +335,12 @@ export default function CodexAudit() {
                 </div>
               </CardContent>
             </Card>
+
+            <RelayGuardianPanel
+              start={report.window_start}
+              end={report.window_end}
+              refreshToken={report.generated_at}
+            />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-2">
               <CyberPolicyPanel

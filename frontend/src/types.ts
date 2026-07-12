@@ -9,6 +9,88 @@ export interface ToastState {
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 
+export type RelayGuardianMode = 'off' | 'monitor' | 'enforce' | string
+
+export type RelayGuardianState =
+  | 'healthy'
+  | 'suspect'
+  | 'would_quarantine'
+  | 'quarantined'
+  | 'half_open'
+  | 'probation'
+  | 'temporary_bypass'
+  | 'manual_disabled'
+
+export interface RelayGuardianAccountStatus {
+  account_id: number
+  account_name: string
+  manual_enabled: boolean
+  state: RelayGuardianState
+  effective_schedulable: boolean
+  reason: string
+  trigger_source: string
+  generation: number
+  window_seconds: number
+  failure_count: number
+  user_visible_failures: number
+  strong_gateway_failures: number
+  would_quarantine: boolean
+  quarantine_until?: ISODateString | null
+  backoff_level: number
+  last_resort?: boolean
+  last_resort_cap?: number
+  shadow_action?: 'quarantine' | 'last_resort' | 'pool_alert' | string
+  probation_percent: number
+  probation_successes: number
+  probation_required_successes: number
+  last_failure_at?: ISODateString | null
+  last_action_at?: ISODateString | null
+  last_scan_at?: ISODateString | null
+  circuit_state: 'closed' | 'open' | 'half_open' | string
+  circuit_open_until?: ISODateString | null
+  circuit_probe_successes: number
+  circuit_required_successes: number
+}
+
+export interface RelayGuardianStatusResponse {
+  enabled: boolean
+  mode: RelayGuardianMode
+  generated_at: ISODateString
+  heartbeat_at?: ISODateString | null
+  scan_interval_seconds: number
+  accounts: RelayGuardianAccountStatus[]
+}
+
+export interface RelayGuardianEvent {
+  id: number | string
+  created_at: ISODateString
+  account_id: number
+  account_name: string
+  event_type: string
+  from_state: RelayGuardianState | string
+  to_state: RelayGuardianState | string
+  actor: string
+  reason: string
+  trigger_source: string
+  window_seconds: number
+  failure_count: number
+  user_visible_failures: number
+  strong_gateway_failures: number
+  quarantine_seconds: number
+  generation: number
+  logical_request_ids?: string[] | null
+  details?: unknown
+}
+
+export interface RelayGuardianEventsResponse {
+  items: RelayGuardianEvent[]
+  total: number
+  page: number
+  page_size: number
+  start: ISODateString
+  end: ISODateString
+}
+
 export interface StatsResponse {
   total: number
   available: number
@@ -115,6 +197,7 @@ export interface AccountRow {
   relay_circuit_probe_in_flight?: boolean
   relay_circuit_probe_successes?: number
   relay_circuit_required_successes?: number
+  relay_guardian?: RelayGuardianAccountStatus
   model_cooldowns?: Array<{
     model: string
     reason: string

@@ -66,7 +66,11 @@ import type {
   BackgroundUploadResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
+  RelayGuardianAccountStatus,
+  RelayGuardianEventsResponse,
+  RelayGuardianStatusResponse,
 } from './types'
+import { buildRelayGuardianEventsQuery } from './lib/relayGuardian'
 
 const BASE = '/api/admin'
 export const ADMIN_AUTH_REQUIRED_EVENT = 'codex2api:admin-auth-required'
@@ -348,6 +352,20 @@ export const api = {
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return request<CodexAuditCasesResponse>(`/audit/codex2api/cases?${search.toString()}`)
   },
+  getRelayGuardianStatus: () =>
+    request<RelayGuardianStatusResponse>('/relay-guardian/status'),
+  getRelayGuardianEvents: (params: { start: string; end: string; page: number; pageSize: number }) =>
+    request<RelayGuardianEventsResponse>(`/relay-guardian/events?${buildRelayGuardianEventsQuery(params)}`),
+  releaseRelayGuardianAccount: (id: number, generation: number) =>
+    request<RelayGuardianAccountStatus>(`/relay-guardian/accounts/${id}/release`, {
+      method: 'POST',
+      body: JSON.stringify({ generation }),
+    }),
+  temporarilyBypassRelayGuardianAccount: (id: number, generation: number, minutes = 10) =>
+    request<RelayGuardianAccountStatus>(`/relay-guardian/accounts/${id}/temporary-bypass`, {
+      method: 'POST',
+      body: JSON.stringify({ minutes, generation }),
+    }),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
   getSystemUpdate: () => request<SystemUpdateInfo>('/system/update', { timeoutMs: 20_000 }),
