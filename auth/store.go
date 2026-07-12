@@ -189,6 +189,10 @@ type Account struct {
 	Locked         int32 // 原子标志，1 = 锁定，自动清理跳过此账号
 	DispatchPaused int32 // 原子标志，1 = 禁用调度选择，不影响刷新/探针/清理
 
+	// relayGuardianSchedulingHint 是 Guardian 的纯运行态调度提示。
+	// 它只影响选号顺序与并发上限，不写数据库，也不改变人工 enabled/Disabled 配置。
+	relayGuardianSchedulingHint atomic.Uint64
+
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
 	BaseConcurrencyOverride *int64
@@ -3859,8 +3863,12 @@ func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLi
 		return false
 	}
 	for {
+		effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
+		if effectiveLimit <= 0 {
+			return false
+		}
 		current := atomic.LoadInt64(&acc.ActiveRequests)
-		if current >= limit {
+		if current >= effectiveLimit {
 			return false
 		}
 		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
@@ -3904,6 +3912,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		s.mu.RLock()
 
 		var best *Account
+		bestLastResort := true
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
@@ -3927,18 +3936,25 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 
 			load := atomic.LoadInt64(&acc.ActiveRequests)
 			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
-			if limit <= 0 || load >= limit {
+			effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
+			if effectiveLimit <= 0 || load >= effectiveLimit {
 				continue
 			}
 
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			if schedulerPriority > bestSchedulerPriority ||
-				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
-					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
-						(dispatchScore == bestDispatchScore && load < bestLoad) ||
-						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+			lastResort := acc.relayGuardianLastResort()
+			// Guardian 兜底账号严格排在所有普通账号之后；只有普通账号均无余量时才使用。
+			// 在同一类别内继续遵循官方 scheduler_priority / 健康档位 / 分数排序。
+			sameClass := best != nil && lastResort == bestLastResort
+			if best == nil || (bestLastResort && !lastResort) || (sameClass &&
+				(schedulerPriority > bestSchedulerPriority ||
+					(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
+						(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+							(dispatchScore == bestDispatchScore && load < bestLoad) ||
+							(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))))) {
+				bestLastResort = lastResort
 				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
@@ -4071,6 +4087,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 
 		var best *Account
 		var metadataRefreshCandidate *Account
+		bestLastResort := true
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
@@ -4100,18 +4117,23 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 
 			load := atomic.LoadInt64(&acc.ActiveRequests)
 			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
-			if limit <= 0 || load >= limit {
+			effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
+			if effectiveLimit <= 0 || load >= effectiveLimit {
 				continue
 			}
 
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			if schedulerPriority > bestSchedulerPriority ||
-				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
-					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
-						(dispatchScore == bestDispatchScore && load < bestLoad) ||
-						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+			lastResort := acc.relayGuardianLastResort()
+			sameClass := best != nil && lastResort == bestLastResort
+			if best == nil || (bestLastResort && !lastResort) || (sameClass &&
+				(schedulerPriority > bestSchedulerPriority ||
+					(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
+						(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+							(dispatchScore == bestDispatchScore && load < bestLoad) ||
+							(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))))) {
+				bestLastResort = lastResort
 				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore

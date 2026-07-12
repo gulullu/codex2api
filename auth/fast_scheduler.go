@@ -27,21 +27,33 @@ type fastSchedulerPosition struct {
 	index int
 }
 
+// fastSchedulerCursorKey isolates round-robin progress for every Guardian
+// priority class, scheduler-priority segment, and health tier. A scan of the
+// normal class or a failed higher-priority segment must never advance a
+// last-resort/lower-priority segment.
+type fastSchedulerCursorKey struct {
+	lastResort bool
+	priority   int64
+	tier       AccountHealthTier
+}
+
 // FastScheduler 是一个仅使用本地内存的调度器 POC。
 // 它不在请求热路径内重算全量 score，而是直接复用 Account 上已缓存的
 // HealthTier / DispatchScore / DynamicConcurrencyLimit。
 //
-// 调度策略：按健康层级分桶，桶内按调度分排序后 round-robin。
-// 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
+// 调度策略：Guardian 普通/兜底分层最外层，层内严格按账号调度优先级，
+// 再按健康层级与段内策略选择。验证过的账号只作为同分 tie-breaker，
+// 避免历史请求量盖过额度快重置优先级。
 type FastScheduler struct {
-	mu            sync.RWMutex
-	baseLimit     int64
-	schedulerMode string
-	buckets       map[AccountHealthTier][]fastSchedulerEntry
-	positions     map[int64]fastSchedulerPosition
-	cursors       [3]atomic.Uint64
-	groupCheck    func(apiKeyID int64, account *Account) bool
-	acquire       func(account *Account, concurrencyLimit int64) bool
+	mu             sync.RWMutex
+	baseLimit      int64
+	schedulerMode  string
+	buckets        map[AccountHealthTier][]fastSchedulerEntry
+	positions      map[int64]fastSchedulerPosition
+	priorities     []int64
+	segmentCursors map[fastSchedulerCursorKey]uint64
+	groupCheck     func(apiKeyID int64, account *Account) bool
+	acquire        func(account *Account, concurrencyLimit int64) bool
 }
 
 func NewFastScheduler(baseLimit int64, schedulerMode string) *FastScheduler {
@@ -59,7 +71,8 @@ func NewFastScheduler(baseLimit int64, schedulerMode string) *FastScheduler {
 			HealthTierWarm:    nil,
 			HealthTierRisky:   nil,
 		},
-		positions: map[int64]fastSchedulerPosition{},
+		positions:      map[int64]fastSchedulerPosition{},
+		segmentCursors: map[fastSchedulerCursorKey]uint64{},
 	}
 }
 
@@ -173,6 +186,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		HealthTierRisky:   nil,
 	}
 	s.positions = make(map[int64]fastSchedulerPosition, len(accounts))
+	s.segmentCursors = make(map[fastSchedulerCursorKey]uint64)
 
 	// 批量插入：先全部放入桶中，不逐条排序
 	now := time.Now()
@@ -234,6 +248,7 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		s.buckets[tier] = entries
 		s.rebuildPositionsLocked(tier)
 	}
+	s.rebuildPriorityOrderLocked()
 }
 
 func (s *FastScheduler) Update(acc *Account) {
@@ -291,41 +306,40 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	defer s.mu.Unlock()
 
 	baseLimit := s.baseLimit
-	var zeroCursor atomic.Uint64
 	for {
 		changed := false
-		for tierIdx, tier := range fastSchedulerTierOrder {
-			bucket := s.buckets[tier]
-			if len(bucket) == 0 {
-				continue
-			}
+		// Ordering is strict and matches the slow/lazy scheduler:
+		// Guardian class -> scheduler_priority -> health tier -> in-segment policy.
+		// Reading Guardian class from the account keeps hint changes immediately
+		// visible without a rebuild.
+		for _, expectedLastResort := range [...]bool{false, true} {
+			for _, priority := range s.priorities {
+				for _, tier := range fastSchedulerTierOrder {
+					segStart, segEnd := fastSchedulerPriorityRange(s.buckets[tier], priority)
+					if segStart == segEnd {
+						continue
+					}
 
-			cursor := &s.cursors[tierIdx]
-			if s.schedulerMode == "remaining_quota" {
-				zeroCursor.Store(0)
-				cursor = &zeroCursor
-			}
-			// 桶内按调度优先级降序排列：相同优先级为一段，段内 round-robin，
-			// 高优先级段拿不到账号才轮到下一段（issue #358）。
-			segStart := 0
-			stale := false
-			for segStart < len(bucket) {
-				segEnd := segStart + 1
-				for segEnd < len(bucket) && bucket[segEnd].priority == bucket[segStart].priority {
-					segEnd++
+					cursor := uint64(0)
+					if s.schedulerMode != "remaining_quota" {
+						key := fastSchedulerCursorKey{lastResort: expectedLastResort, priority: priority, tier: tier}
+						cursor = s.segmentCursors[key]
+						s.segmentCursors[key] = cursor + 1
+					}
+					acc, segStale := s.scanRangeLocked(tier, expectedLastResort, segStart, segEnd, cursor, baseLimit, now, apiKeyID, exclude, filter)
+					if acc != nil {
+						return acc
+					}
+					if segStale {
+						changed = true
+						break
+					}
 				}
-				acc, segStale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, now, apiKeyID, exclude, filter)
-				if acc != nil {
-					return acc
-				}
-				if segStale {
-					stale = true
+				if changed {
 					break
 				}
-				segStart = segEnd
 			}
-			if stale {
-				changed = true
+			if changed {
 				break
 			}
 		}
@@ -335,47 +349,88 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	}
 }
 
+// fastSchedulerPriorityRange returns the contiguous range for priority in a
+// bucket sorted by descending scheduler priority.
+func fastSchedulerPriorityRange(bucket []fastSchedulerEntry, priority int64) (int, int) {
+	start := sort.Search(len(bucket), func(i int) bool {
+		return bucket[i].priority <= priority
+	})
+	if start >= len(bucket) || bucket[start].priority != priority {
+		return start, start
+	}
+	end := sort.Search(len(bucket), func(i int) bool {
+		return bucket[i].priority < priority
+	})
+	return start, end
+}
+
 // scanRangeLocked 在 bucket[start:end) 范围内 round-robin 扫描可用账号。
 // 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
-func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
+func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expectedLastResort bool, rangeStart, rangeEnd int, cursor uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
 	bucket := s.buckets[expectedTier]
-	rangeLen := rangeEnd - rangeStart
-	if rangeLen <= 0 {
+	if rangeEnd <= rangeStart {
 		return nil, false
 	}
-	start := int(cursor.Add(1)-1) % rangeLen
-	for offset := 0; offset < rangeLen; offset++ {
-		entry := bucket[rangeStart+(start+offset)%rangeLen]
-		if entry.acc == nil {
-			continue
+
+	// The physical priority segment may contain both live Guardian classes.
+	// Count only the requested class so its cursor advances over its own
+	// accounts, not over entries skipped by the other class.
+	classLen := 0
+	for idx := rangeStart; idx < rangeEnd; idx++ {
+		entry := bucket[idx]
+		if entry.acc != nil && entry.acc.relayGuardianLastResort() == expectedLastResort {
+			classLen++
 		}
-		if exclude != nil && exclude[entry.dbID] {
-			continue
-		}
-		if !entry.acc.AllowsAPIKey(apiKeyID) {
-			continue
-		}
-		if s.groupCheck != nil && !s.groupCheck(apiKeyID, entry.acc) {
-			continue
-		}
-		if filter != nil && !filter(entry.acc) {
-			continue
-		}
-		tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
-		if tier != expectedTier || proven != entry.proven || math.Abs(dispatchScore-entry.dispatchScore) >= 1 {
-			s.removeLocked(entry.dbID)
-			if available && limit > 0 {
-				s.insertLocked(entry.acc, now)
+	}
+	if classLen == 0 {
+		return nil, false
+	}
+	startOrdinal := int(cursor % uint64(classLen))
+
+	// Two linear passes implement a circular scan without allocating an index
+	// slice on the request hot path.
+	for pass := 0; pass < 2; pass++ {
+		ordinal := 0
+		for idx := rangeStart; idx < rangeEnd; idx++ {
+			entry := bucket[idx]
+			if entry.acc == nil || entry.acc.relayGuardianLastResort() != expectedLastResort {
+				continue
 			}
-			return nil, true
+			inPass := (pass == 0 && ordinal >= startOrdinal) || (pass == 1 && ordinal < startOrdinal)
+			ordinal++
+			if !inPass {
+				continue
+			}
+			if exclude != nil && exclude[entry.dbID] {
+				continue
+			}
+			if !entry.acc.AllowsAPIKey(apiKeyID) {
+				continue
+			}
+			if s.groupCheck != nil && !s.groupCheck(apiKeyID, entry.acc) {
+				continue
+			}
+			if filter != nil && !filter(entry.acc) {
+				continue
+			}
+			tier, dispatchScore, limit, proven, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+			if tier != expectedTier || proven != entry.proven || math.Abs(dispatchScore-entry.dispatchScore) >= 1 {
+				s.removeLocked(entry.dbID)
+				if available && limit > 0 {
+					s.insertLocked(entry.acc, now)
+				}
+				return nil, true
+			}
+			effectiveLimit := entry.acc.relayGuardianConcurrencyLimit(limit)
+			load := atomic.LoadInt64(&entry.acc.ActiveRequests)
+			if !available || effectiveLimit <= 0 || load >= effectiveLimit {
+				continue
+			}
+			if !s.tryAcquireAccount(entry.acc, limit) {
+				continue
+			}
+			return entry.acc, false
 		}
-		if !available || limit <= 0 {
-			continue
-		}
-		if !s.tryAcquireAccount(entry.acc, limit) {
-			continue
-		}
-		return entry.acc, false
 	}
 	return nil, false
 }
@@ -480,6 +535,7 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 	}
 	s.buckets[tier] = entries
 	s.rebuildPositionsLocked(tier)
+	s.rebuildPriorityOrderLocked()
 }
 
 func (s *FastScheduler) removeLocked(dbID int64) {
@@ -499,6 +555,7 @@ func (s *FastScheduler) removeLocked(dbID int64) {
 	s.buckets[pos.tier] = entries
 	delete(s.positions, dbID)
 	s.rebuildPositionsLocked(pos.tier)
+	s.rebuildPriorityOrderLocked()
 }
 
 func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
@@ -506,6 +563,31 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 		s.positions[entry.dbID] = fastSchedulerPosition{
 			tier:  tier,
 			index: idx,
+		}
+	}
+}
+
+func (s *FastScheduler) rebuildPriorityOrderLocked() {
+	seen := make(map[int64]struct{})
+	for _, tier := range fastSchedulerTierOrder {
+		for _, entry := range s.buckets[tier] {
+			seen[entry.priority] = struct{}{}
+		}
+	}
+	priorities := make([]int64, 0, len(seen))
+	for priority := range seen {
+		priorities = append(priorities, priority)
+	}
+	sort.Slice(priorities, func(i, j int) bool { return priorities[i] > priorities[j] })
+	s.priorities = priorities
+
+	if s.segmentCursors == nil {
+		s.segmentCursors = make(map[fastSchedulerCursorKey]uint64)
+		return
+	}
+	for key := range s.segmentCursors {
+		if _, ok := seen[key.priority]; !ok {
+			delete(s.segmentCursors, key)
 		}
 	}
 }
@@ -572,8 +654,12 @@ func tryAcquireAccount(acc *Account, limit int64) bool {
 	}
 
 	for {
+		effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
+		if effectiveLimit <= 0 {
+			return false
+		}
 		current := atomic.LoadInt64(&acc.ActiveRequests)
-		if current >= limit {
+		if current >= effectiveLimit {
 			return false
 		}
 		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {

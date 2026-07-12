@@ -9,6 +9,23 @@ const (
 	maxSchedulerPriority int64 = 100
 )
 
+const (
+	relayGuardianHintLastResortBit uint64 = 1
+	relayGuardianHintHardCapShift         = 1
+	relayGuardianHintHardCapMask   uint64 = (1 << 31) - 1
+	relayGuardianHintPercentShift         = 32
+	relayGuardianHintPercentMask   uint64 = (1 << 7) - 1
+)
+
+// relayGuardianSchedulingHintSnapshot is the decoded in-memory scheduler overlay.
+// lastResort affects ordering only. hardCap and percent independently constrain
+// concurrency; when both are set, the smaller effective cap wins.
+type relayGuardianSchedulingHintSnapshot struct {
+	lastResort bool
+	hardCap    int64
+	percent    int
+}
+
 func normalizeSchedulerPriority(priority int64) int64 {
 	switch {
 	case priority < minSchedulerPriority:
@@ -18,6 +35,100 @@ func normalizeSchedulerPriority(priority int64) int64 {
 	default:
 		return priority
 	}
+}
+
+func normalizeRelayGuardianHardCap(cap int64) int64 {
+	if cap <= 0 {
+		return 0
+	}
+	if uint64(cap) > relayGuardianHintHardCapMask {
+		return int64(relayGuardianHintHardCapMask)
+	}
+	return cap
+}
+
+func normalizeRelayGuardianRecoveryPercent(percent int) int {
+	if percent <= 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+func encodeRelayGuardianSchedulingHint(lastResort bool, hardCap int64, percent int) uint64 {
+	var encoded uint64
+	if lastResort {
+		encoded |= relayGuardianHintLastResortBit
+	}
+	capValue := uint64(normalizeRelayGuardianHardCap(hardCap))
+	encoded |= (capValue & relayGuardianHintHardCapMask) << relayGuardianHintHardCapShift
+	percentValue := uint64(normalizeRelayGuardianRecoveryPercent(percent))
+	encoded |= (percentValue & relayGuardianHintPercentMask) << relayGuardianHintPercentShift
+	return encoded
+}
+
+func decodeRelayGuardianSchedulingHint(encoded uint64) relayGuardianSchedulingHintSnapshot {
+	return relayGuardianSchedulingHintSnapshot{
+		lastResort: encoded&relayGuardianHintLastResortBit != 0,
+		hardCap:    int64((encoded >> relayGuardianHintHardCapShift) & relayGuardianHintHardCapMask),
+		percent:    int((encoded >> relayGuardianHintPercentShift) & relayGuardianHintPercentMask),
+	}
+}
+
+// setRelayGuardianSchedulingHint atomically replaces the runtime-only hint.
+// It deliberately does not alter account configuration, enabled/Disabled, or
+// any persisted scheduler fields.
+func (a *Account) setRelayGuardianSchedulingHint(lastResort bool, hardCap int64, percent int) {
+	if a == nil {
+		return
+	}
+	a.relayGuardianSchedulingHint.Store(encodeRelayGuardianSchedulingHint(lastResort, hardCap, percent))
+}
+
+func (a *Account) clearRelayGuardianSchedulingHint() {
+	if a == nil {
+		return
+	}
+	a.relayGuardianSchedulingHint.Store(0)
+}
+
+func (a *Account) relayGuardianSchedulingHintSnapshot() relayGuardianSchedulingHintSnapshot {
+	if a == nil {
+		return relayGuardianSchedulingHintSnapshot{}
+	}
+	return decodeRelayGuardianSchedulingHint(a.relayGuardianSchedulingHint.Load())
+}
+
+func (a *Account) relayGuardianLastResort() bool {
+	if a == nil {
+		return false
+	}
+	return a.relayGuardianSchedulingHint.Load()&relayGuardianHintLastResortBit != 0
+}
+
+func (a *Account) relayGuardianConcurrencyLimit(limit int64) int64 {
+	if a == nil || limit <= 0 {
+		return 0
+	}
+	hint := decodeRelayGuardianSchedulingHint(a.relayGuardianSchedulingHint.Load())
+	effective := limit
+	if hint.hardCap > 0 && hint.hardCap < effective {
+		effective = hint.hardCap
+	}
+	if hint.percent > 0 && hint.percent < 100 {
+		// Round up and keep at least one recovery slot for small account limits.
+		percent := int64(hint.percent)
+		percentCap := (limit/100)*percent + ((limit%100)*percent+99)/100
+		if percentCap < 1 {
+			percentCap = 1
+		}
+		if percentCap < effective {
+			effective = percentCap
+		}
+	}
+	return effective
 }
 
 func (a *Account) SetSchedulerPriority(priority int64) {
