@@ -2748,7 +2748,7 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
-// 分批处理以避免 PostgreSQL 65535 参数限制（每行 49 个参数）。
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行 50 个参数）。
 func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
@@ -2760,7 +2760,7 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	}
 	defer tx.Rollback()
 
-	// 49 * 1337 = 65513，保持在 PostgreSQL 65535 参数上限以内。
+	// 50 * 1310 = 65500，保持在 PostgreSQL 65535 参数上限以内。
 	const maxRowsPerBatch = 1310
 
 	// 分批处理
