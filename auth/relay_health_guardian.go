@@ -109,6 +109,7 @@ type relayGuardianRuntimeRecord struct {
 	LastResort           bool                   `json:"last_resort,omitempty"`
 	LastResortCap        int                    `json:"last_resort_cap,omitempty"`
 	LastResortLevel      int                    `json:"last_resort_level,omitempty"`
+	LastResortFailureID  string                 `json:"last_resort_failure_id,omitempty"`
 	ShadowAction         string                 `json:"shadow_action,omitempty"`
 	HealthySince         time.Time              `json:"healthy_since,omitempty"`
 	PoolWideReportedAt   time.Time              `json:"pool_wide_reported_at,omitempty"`
@@ -370,6 +371,7 @@ func (g *relayHealthGuardian) resetForModeLocked(state *relayGuardianAccountStat
 	state.LastResort = false
 	state.LastResortCap = 0
 	state.LastResortLevel = 0
+	state.LastResortFailureID = ""
 	state.ShadowAction = ""
 	state.HealthySince = time.Time{}
 	state.PoolWideReportedAt = time.Time{}
@@ -540,6 +542,12 @@ func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
 	state.halfOpenLeaseID = 0
 	state.permits = make(map[uint64]RelayGuardianPermit)
 	g.trimLocked(state, now)
+	// Runtime records written before LastResortFailureID existed already
+	// consumed their latest incident. Seed the marker during restore so the
+	// first reconcile cannot replay that historical row as a fresh escalation.
+	if state.LastResort && state.LastResortFailureID == "" {
+		state.LastResortFailureID = relayGuardianLatestFailureID(state)
+	}
 	relayGuardianApplySchedulingHint(account, state)
 }
 
@@ -1007,7 +1015,11 @@ func (g *relayHealthGuardian) activateLastResortLocked(account *Account, state *
 	}
 	from := state.State
 	activated := false
-	if !state.LastResort || state.Reason != reason || state.TriggerSource != trigger || now.Sub(state.LastActionAt) >= maxDuration(window, RelayGuardianScanInterval) {
+	failureID := relayGuardianLatestFailureID(state)
+	newCycle := !state.LastResort
+	newFailure := failureID != "" && failureID != state.LastResortFailureID
+	scanAdvanced := state.LastActionAt.IsZero() || now.Sub(state.LastActionAt) >= RelayGuardianScanInterval
+	if newCycle || (newFailure && scanAdvanced) {
 		state.LastResortLevel++
 		if state.LastResortLevel < 1 {
 			state.LastResortLevel = 1
@@ -1015,6 +1027,12 @@ func (g *relayHealthGuardian) activateLastResortLocked(account *Account, state *
 		state.Generation++
 		state.LastActionAt = now
 		activated = true
+	}
+	// Always consume the latest deduplicated failure ID. If several rows from
+	// one scan arrive inside the 60s fence, they may update the diagnosis but
+	// cannot be replayed by a later reconcile to raise the level again.
+	if newFailure || newCycle {
+		state.LastResortFailureID = failureID
 	}
 	state.State = RelayGuardianSuspect
 	state.ShadowAction = ""
@@ -1037,11 +1055,16 @@ func (g *relayHealthGuardian) activateLastResortLocked(account *Account, state *
 	}
 }
 
-func maxDuration(left, right time.Duration) time.Duration {
-	if left > right {
-		return left
+func relayGuardianLatestFailureID(state *relayGuardianAccountState) string {
+	if state == nil {
+		return ""
 	}
-	return right
+	for index := len(state.Failures) - 1; index >= 0; index-- {
+		if logicalID := strings.TrimSpace(state.Failures[index].LogicalRequestID); logicalID != "" {
+			return logicalID
+		}
+	}
+	return ""
 }
 
 func (g *relayHealthGuardian) quarantineLocked(account *Account, state *relayGuardianAccountState, trigger string, window time.Duration, finals, gateways int, now time.Time, recoveryFailure bool) {
@@ -1062,6 +1085,7 @@ func (g *relayHealthGuardian) quarantineLocked(account *Account, state *relayGua
 	state.ShadowAction = ""
 	state.LastResort = false
 	state.LastResortCap = 0
+	state.LastResortFailureID = ""
 	state.Generation++
 	state.QuarantineUntil = now.Add(duration)
 	state.LastActionAt = now
@@ -1443,6 +1467,7 @@ func (g *relayHealthGuardian) ageStateLocked(account *Account, state *relayGuard
 	state.WindowSeconds = 0
 	state.LastResort = false
 	state.LastResortCap = 0
+	state.LastResortFailureID = ""
 	state.ShadowAction = ""
 	if state.HealthySince.IsZero() {
 		state.HealthySince = now
