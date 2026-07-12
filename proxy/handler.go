@@ -1508,6 +1508,24 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 	return true
 }
 
+// shouldRetryTextHTTPStatus extends the common retry policy only for text
+// requests sent through an OpenAI Responses API (Relay) account. A gateway
+// returning 502/504 is an account/upstream-path failure, so retrying another
+// account in the already selected route is useful. Keep the shared policy
+// unchanged because image generation also uses it and must not be replayed
+// implicitly.
+func shouldRetryTextHTTPStatus(statusCode int, account *auth.Account, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+	if account != nil && account.IsOpenAIResponsesAPI() &&
+		(statusCode == http.StatusBadGateway || statusCode == http.StatusGatewayTimeout) {
+		if generalRetries == nil || *generalRetries >= maxGeneralRetries {
+			return false
+		}
+		*generalRetries++
+		return true
+	}
+	return shouldRetryHTTPStatus(statusCode, generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries)
+}
+
 func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries int) bool {
 	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
 		return false
@@ -1985,7 +2003,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -2003,7 +2021,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					RequestedServiceTier: usageTiers.RequestedServiceTier,
 					ActualServiceTier:    usageTiers.ActualServiceTier,
 					BillingServiceTier:   usageTiers.BillingServiceTier,
-					IsRetryAttempt:       shouldRetry,
+					IsRetryAttempt:       attempt > 0,
 					AttemptIndex:         attempt + 1,
 					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -2159,6 +2177,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if isFirstTokenTimeoutOutcome(outcome) {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				} else {
+					retryExclusions.MarkHard(account.ID())
 					h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 				}
 				resp.Body.Close()
@@ -2208,6 +2227,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           outcome.logStatusCode,
 				DurationMs:           totalDuration,
+				IsRetryAttempt:       attempt > 0,
+				AttemptIndex:         attempt + 1,
 				FirstTokenMs:         firstTokenMs,
 				ReasoningEffort:      reasoningEffort,
 				InboundEndpoint:      "/v1/responses",
@@ -2363,7 +2384,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2381,7 +2402,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -2668,6 +2689,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
+				retryExclusions.MarkHard(account.ID())
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
@@ -2728,6 +2750,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			EffectiveModel:       logEffectiveModel,
 			StatusCode:           logStatusCode,
 			DurationMs:           totalDuration,
+			IsRetryAttempt:       attempt > 0,
+			AttemptIndex:         attempt + 1,
 			FirstTokenMs:         firstTokenMs,
 			ReasoningEffort:      reasoningEffort,
 			InboundEndpoint:      "/v1/responses",
@@ -2993,7 +3017,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -3009,7 +3033,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					RequestedServiceTier: usageTiers.RequestedServiceTier,
 					ActualServiceTier:    usageTiers.ActualServiceTier,
 					BillingServiceTier:   usageTiers.BillingServiceTier,
-					IsRetryAttempt:       shouldRetry,
+					IsRetryAttempt:       attempt > 0,
 					AttemptIndex:         attempt + 1,
 					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -3057,7 +3081,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					RequestedServiceTier: usageTiers.RequestedServiceTier,
 					ActualServiceTier:    usageTiers.ActualServiceTier,
 					BillingServiceTier:   usageTiers.BillingServiceTier,
-					IsRetryAttempt:       shouldRetry,
+					IsRetryAttempt:       attempt > 0,
 					AttemptIndex:         attempt + 1,
 					UpstreamErrorKind:    kind,
 					ErrorMessage:         fmt.Sprintf("上游响应读取失败: %v", readErr),
@@ -3097,6 +3121,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				EffectiveModel:       attemptLogEffectiveModel,
 				StatusCode:           http.StatusOK,
 				DurationMs:           durationMs,
+				IsRetryAttempt:       attempt > 0,
+				AttemptIndex:         attempt + 1,
 				PromptTokens:         promptTokens,
 				CompletionTokens:     completionTokens,
 				TotalTokens:          totalTokens,
@@ -3183,7 +3209,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3199,7 +3225,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -3249,7 +3275,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    kind,
 				ErrorMessage:         fmt.Sprintf("上游响应读取失败: %v", readErr),
@@ -3285,6 +3311,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			EffectiveModel:       logEffectiveModel,
 			StatusCode:           http.StatusOK,
 			DurationMs:           totalDuration,
+			IsRetryAttempt:       attempt > 0,
+			AttemptIndex:         attempt + 1,
 			PromptTokens:         promptTokens,
 			CompletionTokens:     completionTokens,
 			TotalTokens:          totalTokens,
@@ -3584,7 +3612,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3602,7 +3630,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -3834,6 +3862,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
+				retryExclusions.MarkHard(account.ID())
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
@@ -3894,6 +3923,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			EffectiveModel:       attemptLogEffectiveModel,
 			StatusCode:           logStatusCode,
 			DurationMs:           totalDuration,
+			IsRetryAttempt:       attempt > 0,
+			AttemptIndex:         attempt + 1,
 			FirstTokenMs:         firstTokenMs,
 			ReasoningEffort:      reasoningEffort,
 			InboundEndpoint:      "/v1/chat/completions",

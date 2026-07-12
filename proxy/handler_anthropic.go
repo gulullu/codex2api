@@ -33,6 +33,13 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 
 // sendAnthropicStreamError 在流式模式中发送错误事件
 func sendAnthropicStreamError(c *gin.Context, errType, message string) {
+	fmt.Fprint(c.Writer, anthropicStreamErrorSSE(errType, message))
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func anthropicStreamErrorSSE(errType, message string) string {
 	payload, err := json.Marshal(gin.H{
 		"type": "error",
 		"error": gin.H{
@@ -43,10 +50,7 @@ func sendAnthropicStreamError(c *gin.Context, errType, message string) {
 	if err != nil {
 		payload = []byte(`{"type":"error","error":{"type":"api_error","message":"failed to encode stream error"}}`)
 	}
-	fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)
-	if flusher, ok := c.Writer.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	return fmt.Sprintf("event: error\ndata: %s\n\n", payload)
 }
 
 // mapHTTPStatusToAnthropicError 将 HTTP 状态码映射为 Anthropic 错误类型
@@ -310,7 +314,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -328,7 +332,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -425,6 +429,22 @@ func (h *Handler) Messages(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					if shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+						pendingFirstTokenEvents.Reset()
+						return false
+					}
+
+					// A failed Responses terminal event is never a successful Anthropic
+					// message_stop. If it cannot be transparently retried (or content
+					// was already emitted), terminate the Anthropic stream with an error.
+					pendingFirstTokenEvents.Reset()
+					failed := classifyResponseFailedOutcome(terminalFailurePayload)
+					if err := streamWriter.WriteString(anthropicStreamErrorSSE(mapHTTPStatusToAnthropicError(failed.logStatusCode), failed.failureMessage)); err != nil {
+						writeErr = err
+					} else {
+						wroteAnyBody = true
+					}
+					return false
 				}
 
 				// 翻译并写入
@@ -551,6 +571,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
+				retryExclusions.MarkHard(account.ID())
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
@@ -596,6 +617,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			EffectiveModel:       attemptEffectiveModel,
 			StatusCode:           logStatusCode,
 			DurationMs:           totalDuration,
+			IsRetryAttempt:       attempt > 0,
+			AttemptIndex:         attempt + 1,
 			FirstTokenMs:         firstTokenMs,
 			ReasoningEffort:      reasoningEffort,
 			InboundEndpoint:      "/v1/messages",

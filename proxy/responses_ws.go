@@ -437,7 +437,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			shouldRetry := false
 			if silentRetryEnabled && attempt < maxRetries {
-				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -456,7 +456,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
@@ -478,7 +478,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, attemptEffectiveModel, attemptLogEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, attemptEffectiveModel, attemptLogEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, attempt, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -532,6 +532,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	respCacheOwner string,
 	expandedInputRaw string,
 	start time.Time,
+	attempt int,
 	ttftGuard *firstTokenTimeoutGuard,
 	silentRetryEnabled bool,
 	hideUpstreamErrors bool,
@@ -710,6 +711,8 @@ func (h *Handler) streamResponsesWSUpstream(
 		EffectiveModel:       logEffectiveModel,
 		StatusCode:           outcome.logStatusCode,
 		DurationMs:           totalDuration,
+		IsRetryAttempt:       attempt > 0,
+		AttemptIndex:         attempt + 1,
 		FirstTokenMs:         firstTokenMs,
 		ReasoningEffort:      reasoningEffort,
 		InboundEndpoint:      "/v1/responses",

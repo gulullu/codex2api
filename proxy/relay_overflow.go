@@ -83,6 +83,15 @@ func (h *Handler) nextRoutedAccountForSession(
 			decision.Reason = "continued on the Relay account that owns previous_response_id"
 			decision.Signals = appendUniqueRouteSignal(decision.Signals, responseOwnerRouteSignal)
 		}
+		// A continuation cannot move to another account because the upstream
+		// owns previous_response_id state. Once that exact owner has failed in
+		// this logical request, fail explicitly instead of waiting 30 seconds
+		// for an account that the hard-exclusion set makes impossible to select.
+		if exclusions != nil && exclusions.IsHard(owner.AccountID) {
+			setRouteSelectionError(c, continuationOwnerUnavailable, "The account that owns previous_response_id is unavailable; retry later or resend full context")
+			h.setSelectedRouteDecision(c, decision)
+			return nil, "", decision
+		}
 		ownerBaseFilter := oauthOnlyAccountFilter(baseFilter)
 		if ownerIsRelay {
 			ownerBaseFilter = h.applyCybRelayAccountFilter(baseFilter, promptRiskDecision{Disposition: promptRiskDispositionRelay})

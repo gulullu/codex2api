@@ -28,6 +28,10 @@ func (r *retryAccountExclusions) MarkHard(accountID int64) {
 	delete(r.soft, accountID)
 }
 
+func (r *retryAccountExclusions) IsHard(accountID int64) bool {
+	return r != nil && accountID != 0 && r.hard[accountID]
+}
+
 func (r *retryAccountExclusions) MarkSoftFirstTokenTimeout(accountID int64) {
 	if r == nil || accountID == 0 {
 		return
