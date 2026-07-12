@@ -2,8 +2,10 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -335,6 +337,67 @@ func TestPromptFilterCyberScopeSeparatesOAuthAndIsolatedRelay(t *testing.T) {
 	}
 }
 
+func TestCodexAuditReportAggregatesSixRelayCyberCasesWithoutOAuthLeakage(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	usageRows := make([]*UsageLogInput, 0, 6)
+	for i := 0; i < 6; i++ {
+		logicalID := fmt.Sprintf("relay-cyber-%d", i)
+		usageRows = append(usageRows, &UsageLogInput{
+			LogicalRequestID:    logicalID,
+			AccountID:           500 + int64(i%2),
+			StatusCode:          400,
+			UpstreamErrorKind:   "cyber_policy",
+			RouteClass:          "cyb_relay",
+			RouteSource:         "direct",
+			RouteSignals:        `["local_threshold"]`,
+			RouteGroupID:        42,
+			UpstreamAccountType: "openai_responses",
+		})
+		if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
+			LogicalRequestID:    logicalID,
+			Source:              "upstream_cyber_policy",
+			Action:              "allow",
+			ErrorCode:           "cyber_policy",
+			RouteClass:          "cyb_relay",
+			RouteSource:         "direct",
+			RouteSignals:        `["local_threshold"]`,
+			RouteGroupID:        42,
+			UpstreamAccountType: "openai_responses",
+		}); err != nil {
+			t.Fatalf("insert relay cyber prompt %d: %v", i, err)
+		}
+	}
+	insertCodexAuditUsage(t, db, usageRows...)
+
+	report, err := db.BuildCodexAuditReport(ctx, CodexAuditQuery{
+		Start:         now.Add(-24 * time.Hour),
+		End:           now.Add(time.Minute),
+		BucketMinutes: 60,
+		Limit:         20,
+	})
+	if err != nil {
+		t.Fatalf("BuildCodexAuditReport: %v", err)
+	}
+	if report.Summary.OAuthCyberMissRequests != 0 || report.Summary.OAuthCyberMissAttempts != 0 || len(report.OAuthCyberCases) != 0 {
+		t.Fatalf("oauth cyber leaked from relay pool: requests=%d attempts=%d cases=%d",
+			report.Summary.OAuthCyberMissRequests, report.Summary.OAuthCyberMissAttempts, len(report.OAuthCyberCases))
+	}
+	if report.Summary.RelayCyberRequests != 6 || report.Summary.RelayCyberAttempts != 6 || len(report.RelayCyberCases) != 6 {
+		t.Fatalf("relay cyber report = requests:%d attempts:%d cases:%d, want 6/6/6",
+			report.Summary.RelayCyberRequests, report.Summary.RelayCyberAttempts, len(report.RelayCyberCases))
+	}
+	if report.LastOAuthCyberPolicyAt != nil || report.LastRelayCyberPolicyAt == nil {
+		t.Fatalf("last cyber timestamps = oauth:%v relay:%v, want nil/non-nil",
+			report.LastOAuthCyberPolicyAt, report.LastRelayCyberPolicyAt)
+	}
+	if report.Verdict != "relay_quality_issue" {
+		t.Fatalf("verdict = %q, want relay_quality_issue", report.Verdict)
+	}
+}
+
 func promptLogicalIDs(logs []*PromptFilterLog) []string {
 	result := make([]string, 0, len(logs))
 	for _, log := range logs {
@@ -447,6 +510,104 @@ func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
 	}
 	if !sort.SliceIsSorted(ids, func(i, j int) bool { return ids[i] > ids[j] }) {
 		t.Fatalf("case ids are not stably ordered descending: %v", ids)
+	}
+}
+
+func TestCodexAuditRelayCasesHighVolumePagesBeforePromptEnrichment(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO accounts (id, name, credentials) VALUES (500, 'bulk-relay', '{}')`); err != nil {
+		t.Fatalf("insert relay account: %v", err)
+	}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin bulk fixture: %v", err)
+	}
+	usageStmt, err := tx.PrepareContext(ctx, `INSERT INTO usage_logs
+		(logical_request_id, account_id, status_code, route_class, route_source, route_group_id, upstream_account_type, created_at)
+		VALUES ($1, 500, 200, $2, $3, 42, $4, $5)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("prepare usage fixture: %v", err)
+	}
+	promptStmt, err := tx.PrepareContext(ctx, `INSERT INTO prompt_filter_logs
+		(logical_request_id, source, action, full_text, route_class, route_source, route_group_id, upstream_account_type, created_at)
+		VALUES ($1, 'cyb_relay_routed', 'route', $2, 'cyb_relay', 'direct', 42, 'openai_responses', $3)`)
+	if err != nil {
+		_ = usageStmt.Close()
+		_ = tx.Rollback()
+		t.Fatalf("prepare prompt fixture: %v", err)
+	}
+	largePayload := strings.Repeat("payload-", 512)
+	const relayRows = 4000
+	const defaultRows = 4000
+	for i := 0; i < relayRows+defaultRows; i++ {
+		logicalID := fmt.Sprintf("bulk-%05d", i)
+		createdAt := now.Add(time.Duration(i) * time.Microsecond)
+		routeClass, routeSource, accountType := "default", "default", "oauth"
+		if i < relayRows {
+			routeClass, routeSource, accountType = "cyb_relay", "direct", "openai_responses"
+		}
+		if _, err := usageStmt.ExecContext(ctx, logicalID, routeClass, routeSource, accountType, db.timeArg(createdAt)); err != nil {
+			_ = promptStmt.Close()
+			_ = usageStmt.Close()
+			_ = tx.Rollback()
+			t.Fatalf("insert usage fixture %d: %v", i, err)
+		}
+		if i < relayRows {
+			if _, err := promptStmt.ExecContext(ctx, logicalID, largePayload, db.timeArg(createdAt)); err != nil {
+				_ = promptStmt.Close()
+				_ = usageStmt.Close()
+				_ = tx.Rollback()
+				t.Fatalf("insert prompt fixture %d: %v", i, err)
+			}
+		}
+	}
+	_ = promptStmt.Close()
+	_ = usageStmt.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit bulk fixture: %v", err)
+	}
+
+	// Keep the deadline generous enough for the race detector's SQLite
+	// instrumentation. Production PostgreSQL latency is guarded separately by
+	// the real-volume EXPLAIN regression used for this query shape.
+	queryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	page, err := db.ListCodexAuditCasesPage(queryCtx, CodexAuditCasesQuery{
+		Kind:     CodexAuditCaseRelayRoute,
+		Start:    now.Add(-time.Minute),
+		End:      now.Add(time.Minute),
+		Page:     1,
+		PageSize: 20,
+	})
+	if err != nil {
+		t.Fatalf("high-volume relay page: %v", err)
+	}
+	if page.Total != relayRows || len(page.Items) != 20 {
+		t.Fatalf("high-volume page = total:%d items:%d, want %d/20", page.Total, len(page.Items), relayRows)
+	}
+	for _, item := range page.Items {
+		if item.RouteClass != "cyb_relay" || item.AccountName != "bulk-relay" || item.FullText != largePayload {
+			t.Fatalf("page enrichment mismatch: id=%s route=%s account=%s payload_bytes=%d",
+				item.LogicalRequestID, item.RouteClass, item.AccountName, len(item.FullText))
+		}
+	}
+}
+
+func TestCodexAuditVerdictUsesRelayFailuresInsteadOfGlobal5xx(t *testing.T) {
+	report := &CodexAuditReport{
+		Usage:   CodexAuditUsageSummary{Errors5xx: 1},
+		Summary: CodexAuditSummary{},
+	}
+	if got := codexAuditVerdict(report); got != "normal" {
+		t.Fatalf("default-route 5xx verdict = %q, want normal", got)
+	}
+	report.Summary.RelayRouteFailures = 1
+	if got := codexAuditVerdict(report); got != "operational_issue" {
+		t.Fatalf("relay failure verdict = %q, want operational_issue", got)
 	}
 }
 

@@ -1144,7 +1144,7 @@ func codexAuditVerdict(report *CodexAuditReport) string {
 		return "oauth_cyber_risk"
 	case report.Summary.RouteInvariantViolations > 0:
 		return "route_invariant_violation"
-	case report.Summary.RelayRouteFailures > 0 || report.Usage.Errors5xx > 0:
+	case report.Summary.RelayRouteFailures > 0:
 		return "operational_issue"
 	case report.Summary.RelayCyberAttempts > 0:
 		return "relay_quality_issue"

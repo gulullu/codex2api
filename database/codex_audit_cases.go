@@ -194,14 +194,38 @@ func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID strin
 func (db *DB) listCodexAuditRelayCasesPage(ctx context.Context, start, end time.Time, page, pageSize int) (*CodexAuditCasesPage, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
 	var total int
-	if err := db.conn.QueryRowContext(ctx, codexAuditCanonicalUsageCTE+`
-		SELECT COUNT(*) FROM final_usage
-		WHERE COALESCE(route_class, '') = 'cyb_relay'
+	if err := db.conn.QueryRowContext(ctx, `WITH ranked_routes AS (
+		SELECT COALESCE(route_class, '') AS route_class,
+		       ROW_NUMBER() OVER (
+		         PARTITION BY COALESCE(NULLIF(logical_request_id, ''), 'legacy:' || CAST(id AS TEXT))
+		         ORDER BY id DESC
+		       ) AS audit_rn
+		FROM usage_logs
+		WHERE created_at >= $1 AND created_at <= $2
+	)
+		SELECT COUNT(*) FROM ranked_routes
+		WHERE audit_rn = 1 AND route_class = 'cyb_relay'
 	`, startArg, endArg).Scan(&total); err != nil {
 		return nil, err
 	}
 
-	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`, ranked_prompts AS (
+	// Page the canonical usage rows before enriching them with prompt payloads.
+	// Prompt full_text values are large (tens of MiB in a normal multi-hour
+	// window); joining the complete ranked prompt set before LIMIT caused
+	// PostgreSQL to compare every relay row with every prompt row and made the
+	// three-hour report hit its request deadline. The page boundary is also the
+	// contract boundary: prompt rows may enrich these selected cases, but can
+	// never influence which logical requests belong to the page.
+	rows, err := db.conn.QueryContext(ctx, codexAuditCanonicalUsageCTE+`, paged_usage AS MATERIALIZED (
+		SELECT * FROM final_usage
+		WHERE COALESCE(route_class, '') = 'cyb_relay'
+		ORDER BY created_at DESC, id DESC
+		LIMIT $3 OFFSET $4
+	), page_request_ids AS MATERIALIZED (
+		SELECT DISTINCT logical_request_id
+		FROM paged_usage
+		WHERE COALESCE(logical_request_id, '') <> ''
+	), ranked_prompts AS (
 		SELECT p.*,
 		       ROW_NUMBER() OVER (
 		         PARTITION BY p.logical_request_id
@@ -213,8 +237,8 @@ func (db *DB) listCodexAuditRelayCasesPage(ctx context.Context, start, end time.
 		                  p.id DESC
 		       ) AS prompt_rn
 		FROM prompt_filter_logs p
+		JOIN page_request_ids page_ids ON page_ids.logical_request_id = p.logical_request_id
 		WHERE p.created_at >= $1 AND p.created_at <= $2
-		  AND COALESCE(p.logical_request_id, '') <> ''
 		  AND COALESCE(p.source, '') IN ('cyb_relay_routed', 'local_filter')
 	)
 		SELECT u.id, u.created_at, 'cyb_relay_routed',
@@ -231,13 +255,11 @@ func (db *DB) listCodexAuditRelayCasesPage(ctx context.Context, start, end time.
 		       COALESCE(u.route_reason, ''), COALESCE(u.route_source, ''), COALESCE(u.route_signals, '[]'),
 		       COALESCE(u.pin_kind, ''), COALESCE(u.route_group_id, 0), COALESCE(u.route_pinned, false),
 		       COALESCE(u.upstream_account_type, '')
-		FROM final_usage u
+		FROM paged_usage u
 		LEFT JOIN ranked_prompts p
 		  ON p.logical_request_id = u.logical_request_id AND p.prompt_rn = 1
 		LEFT JOIN accounts a ON a.id = u.account_id
-		WHERE COALESCE(u.route_class, '') = 'cyb_relay'
 		ORDER BY u.created_at DESC, u.id DESC
-		LIMIT $3 OFFSET $4
 	`, startArg, endArg, pageSize, (page-1)*pageSize)
 	if err != nil {
 		return nil, err
