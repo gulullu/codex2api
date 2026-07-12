@@ -66,6 +66,10 @@ type CodexAuditSummary struct {
 	RelayLegacyUnknown         int64 `json:"relay_legacy_unknown"`
 	RelayRouteFailures         int64 `json:"relay_route_failures"`
 	RelayFallbackPrevented     int64 `json:"relay_fallback_prevented"`
+	RelayFailovers             int64 `json:"relay_failovers"`
+	RelayFailoverSuccesses     int64 `json:"relay_failover_successes"`
+	RelayFailoverFailures      int64 `json:"relay_failover_failures"`
+	RelayAbsorbed5xx           int64 `json:"relay_absorbed_5xx"`
 	OAuthCyberMissRequests     int64 `json:"oauth_cyber_miss_requests"`
 	OAuthCyberMissAttempts     int64 `json:"oauth_cyber_miss_attempts"`
 	RelayCyberRequests         int64 `json:"relay_cyber_requests"`
@@ -878,6 +882,17 @@ WITH ranked_usage AS (
 	WHERE u.created_at >= $1 AND u.created_at <= $2
 ), final_usage AS (
 	SELECT * FROM ranked_usage WHERE audit_rn = 1
+), request_attempts AS (
+	SELECT audit_request_id,
+	       COUNT(*) AS attempt_count,
+	       COUNT(DISTINCT CASE
+	         WHEN COALESCE(route_class, '') = 'cyb_relay' AND account_id > 0 THEN account_id
+	       END) AS relay_account_count,
+	       MAX(CASE WHEN audit_rn = 1 THEN status_code ELSE 0 END) AS final_status_code,
+	       MAX(CASE WHEN audit_rn = 1 AND COALESCE(route_class, '') = 'cyb_relay' THEN 1 ELSE 0 END) AS final_is_relay,
+	       MAX(CASE WHEN audit_rn <> 1 AND status_code >= 500 THEN 1 ELSE 0 END) AS had_prior_5xx
+	FROM ranked_usage
+	GROUP BY audit_request_id
 )
 `
 
@@ -895,6 +910,10 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation') THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND (status_code >= 500 OR COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay')) THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(upstream_error_kind, '') IN ('no_available_relay_account', 'relay_route_unavailable', 'relay_affinity_unavailable', 'route_switch_requires_replay') THEN 1 ELSE 0 END), 0),
+		  (SELECT COUNT(*) FROM request_attempts WHERE final_is_relay = 1 AND relay_account_count > 1),
+		  (SELECT COUNT(*) FROM request_attempts WHERE final_is_relay = 1 AND relay_account_count > 1 AND final_status_code BETWEEN 200 AND 299),
+		  (SELECT COUNT(*) FROM request_attempts WHERE final_is_relay = 1 AND relay_account_count > 1 AND final_status_code >= 400),
+		  (SELECT COUNT(*) FROM request_attempts WHERE final_is_relay = 1 AND relay_account_count > 1 AND final_status_code BETWEEN 200 AND 299 AND had_prior_5xx = 1),
 		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') = '' THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') <> '' AND (
 		      (COALESCE(route_class, '') = 'cyb_relay' AND account_id > 0 AND COALESCE(upstream_account_type, '') <> 'openai_responses') OR
@@ -933,6 +952,10 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		&summary.RelayLegacyUnknown,
 		&summary.RelayRouteFailures,
 		&summary.RelayFallbackPrevented,
+		&summary.RelayFailovers,
+		&summary.RelayFailoverSuccesses,
+		&summary.RelayFailoverFailures,
+		&summary.RelayAbsorbed5xx,
 		&summary.LegacyUsageRows,
 		&summary.RouteInvariantViolations,
 		&summary.OAuthCyberMissRequests,
@@ -957,6 +980,10 @@ func mergeCodexAuditRouteSummary(target *CodexAuditSummary, route CodexAuditSumm
 	target.RelayLegacyUnknown = route.RelayLegacyUnknown
 	target.RelayRouteFailures = route.RelayRouteFailures
 	target.RelayFallbackPrevented = route.RelayFallbackPrevented
+	target.RelayFailovers = route.RelayFailovers
+	target.RelayFailoverSuccesses = route.RelayFailoverSuccesses
+	target.RelayFailoverFailures = route.RelayFailoverFailures
+	target.RelayAbsorbed5xx = route.RelayAbsorbed5xx
 	target.OAuthCyberMissRequests = route.OAuthCyberMissRequests
 	target.OAuthCyberMissAttempts = route.OAuthCyberMissAttempts
 	target.RelayCyberRequests = route.RelayCyberRequests

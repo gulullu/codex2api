@@ -259,6 +259,9 @@ export default function CodexAudit() {
   const relayRate = report?.usage.requests ? report.summary.relay_requests / report.usage.requests : 0
   const relaySuccesses = (report?.relay_routes || []).reduce((sum, row) => sum + row.successes, 0)
   const relaySuccessRate = report?.summary.relay_requests ? relaySuccesses / report.summary.relay_requests : 0
+  const relayFailoverSuccessRate = report?.summary.relay_failovers
+    ? report.summary.relay_failover_successes / report.summary.relay_failovers
+    : 0
   const firstTokenTone: Tone = (report?.usage.first_token_p95_ms || 0) >= 3000 ? 'bad' : (report?.usage.first_token_p95_ms || 0) >= 1500 ? 'warn' : 'ok'
   const errorTone: Tone = errorRate >= 0.05 ? 'bad' : errorRate > 0 ? 'warn' : 'ok'
 
@@ -316,6 +319,8 @@ export default function CodexAudit() {
                   <SignalTile label="探针分流" value={formatNumber(report.summary.relay_probe || 0)} detail="识别为探针请求，直接交由 Relay" icon={<Zap />} tone="ok" />
                   <SignalTile label="OAuth 容量分流" value={formatNumber(report.summary.relay_overflow || 0)} detail="OAuth 暂无可用并发时，改由 Relay 处理" icon={<BarChart3 />} tone="neutral" />
                   <SignalTile label="Relay 成功率" value={formatPercent(relaySuccessRate)} detail={`最终成功 ${formatNumber(relaySuccesses)} / Relay 请求 ${formatNumber(report.summary.relay_requests)}`} icon={<CheckCircle2 />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="Relay 自动换号" value={formatNumber(report.summary.relay_failovers || 0)} detail={`换号后成功 ${formatNumber(report.summary.relay_failover_successes || 0)} · 成功率 ${formatPercent(relayFailoverSuccessRate)}`} icon={<RefreshCw />} tone={report.summary.relay_failover_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="上游 5xx 已吸收" value={formatNumber(report.summary.relay_absorbed_5xx || 0)} detail={`首个 Relay 账号失败，但备用账号接管成功 · 全池失败 ${formatNumber(report.summary.relay_failover_failures || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_failover_failures ? 'warn' : 'ok'} />
                   <SignalTile label="OAuth 安全拦截" value={formatNumber(report.summary.oauth_cyber_miss_attempts)} detail={`${formatNumber(report.summary.oauth_cyber_miss_requests)} 个请求进入 OAuth 后被上游策略拦截`} icon={<AlertTriangle />} tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'} />
                   <SignalTile label="Relay 安全拦截" value={formatNumber(report.summary.relay_cyber_attempts)} detail={`${formatNumber(report.summary.relay_cyber_requests)} 个请求被 Relay 上游策略拦截，不计 OAuth 漏放`} icon={<ShieldAlert />} tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'} />
                   <SignalTile label="路由异常" value={formatNumber(report.summary.relay_route_failures)} detail={`含 Relay 不可用或 5xx · 落错账号池 ${formatNumber(report.summary.route_invariant_violations)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
@@ -631,6 +636,7 @@ function AuditLogRow({ log }: { log: PromptFilterLog }) {
   const [open, setOpen] = useState(false)
   const full = (log.full_text || '').trim()
   const preview = (log.text_preview || '').trim()
+  const attempts = log.audit_attempts ?? []
   const badge = log.source === 'session_bleed'
     ? '会话串扰'
     : log.source === 'cyb_relay_routed'
@@ -665,6 +671,26 @@ function AuditLogRow({ log }: { log: PromptFilterLog }) {
             <span>分组 {log.route_group_id || '-'}</span>
             {log.route_signals ? <span>信号 {formatRouteSignals(log.route_signals)}</span> : null}
           </div>
+          {attempts.length > 1 ? (
+            <div className="mb-3 rounded-md border border-border/60 bg-muted/25 p-2.5">
+              <div className="mb-2 text-[11px] font-medium text-foreground">上游尝试链路</div>
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
+                {attempts.map((attempt, index) => {
+                  const ok = attempt.status_code >= 200 && attempt.status_code < 300
+                  return (
+                    <div key={`${attempt.account_id}-${attempt.created_at}-${index}`} className="contents">
+                      {index > 0 ? <span className="text-muted-foreground">→</span> : null}
+                      <span className={`inline-flex min-w-0 items-center gap-1 rounded border px-2 py-1 ${ok ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300' : 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300'}`}>
+                        <span className="max-w-40 truncate">{attempt.account_name || `#${attempt.account_id || '-'}`}</span>
+                        <span className="font-mono">{attempt.status_code || '-'}</span>
+                        <span className="text-[10px] opacity-75">第 {attempt.attempt_index || index + 1} 次</span>
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          ) : null}
           <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 text-[12px] leading-5 text-foreground">{full || '（无详情）'}</pre>
         </div>
       ) : null}
@@ -748,6 +774,10 @@ function AuditMetricGuide() {
     {
       title: 'Relay 分流',
       body: '最终由 Relay 账号处理的请求总数，包括规则命中、探针、OAuth 容量分流、响应续接和会话固定。',
+    },
+    {
+      title: '自动换号 / 已吸收 5xx',
+      body: '自动换号表示同一逻辑请求先后使用了不同 Relay 账号；已吸收 5xx 表示前一账号返回服务端错误，但备用账号接管后最终成功。',
     },
     {
       title: '规则命中 → Relay',

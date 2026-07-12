@@ -134,6 +134,23 @@ func TestCodexAuditLogicalRequestDedupAndDistinctWebSocketTurns(t *testing.T) {
 	}
 }
 
+func TestCodexAuditRelayFailoverSummary(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "relay-recovered", AccountID: 50, StatusCode: 502, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "openai_responses", UpstreamErrorKind: "server"},
+		&UsageLogInput{LogicalRequestID: "relay-recovered", AccountID: 53, StatusCode: 200, AttemptIndex: 2, IsRetryAttempt: true, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "relay-exhausted", AccountID: 50, StatusCode: 502, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "probe", RouteGroupID: 3, UpstreamAccountType: "openai_responses", UpstreamErrorKind: "server"},
+		&UsageLogInput{LogicalRequestID: "relay-exhausted", AccountID: 53, StatusCode: 504, AttemptIndex: 2, IsRetryAttempt: true, RouteClass: "cyb_relay", RouteSource: "probe", RouteGroupID: 3, UpstreamAccountType: "openai_responses", UpstreamErrorKind: "server"},
+		&UsageLogInput{LogicalRequestID: "relay-direct-success", AccountID: 53, StatusCode: 200, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+	)
+	report := buildCodexAuditTestReport(t, db)
+	if report.Summary.RelayFailovers != 2 || report.Summary.RelayFailoverSuccesses != 1 || report.Summary.RelayFailoverFailures != 1 || report.Summary.RelayAbsorbed5xx != 1 {
+		t.Fatalf("relay failovers = total:%d success:%d failure:%d absorbed:%d, want 2/1/1/1",
+			report.Summary.RelayFailovers, report.Summary.RelayFailoverSuccesses,
+			report.Summary.RelayFailoverFailures, report.Summary.RelayAbsorbed5xx)
+	}
+}
+
 func TestCodexAuditRouteCyberAndUnavailableAccounting(t *testing.T) {
 	db := newCodexAuditSQLiteTestDB(t)
 
@@ -411,6 +428,9 @@ func TestCodexAuditRelayCasesCanonicalPaginationAndStableWindow(t *testing.T) {
 			duplicateText = item.FullText
 			if item.RouteSource != "continuation" || item.AccountID != 105 || item.AccountName != "final-relay" || item.APIKeyID != 7 || item.APIKeyName != "case-key" {
 				t.Fatalf("final usage metadata was not authoritative: %+v", item)
+			}
+			if len(item.AuditAttempts) != 2 || item.AuditAttempts[0].AccountID != 104 || item.AuditAttempts[0].StatusCode != 502 || item.AuditAttempts[1].AccountID != 105 || item.AuditAttempts[1].StatusCode != 200 {
+				t.Fatalf("relay attempt timeline = %+v, want 104(502) -> 105(200)", item.AuditAttempts)
 			}
 		}
 		if item.LogicalRequestID == "outside-window" || item.Source != "cyb_relay_routed" {

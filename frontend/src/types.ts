@@ -813,6 +813,19 @@ export interface PromptFilterLog {
   route_group_id?: number
   route_pinned?: boolean
   upstream_account_type?: string
+  audit_attempts?: CodexAuditAttempt[]
+}
+
+export interface CodexAuditAttempt {
+  account_id: number
+  account_name: string
+  status_code: number
+  attempt_index: number
+  is_retry_attempt: boolean
+  upstream_error_kind: string
+  error_message: string
+  route_source: string
+  created_at: ISODateString
 }
 
 export interface PromptFilterLogsResponse {
@@ -893,6 +906,10 @@ export interface CodexAuditSummary {
   relay_legacy_unknown: number
   relay_route_failures: number
   relay_fallback_prevented: number
+  relay_failovers: number
+  relay_failover_successes: number
+  relay_failover_failures: number
+  relay_absorbed_5xx: number
   oauth_cyber_miss_requests: number
   oauth_cyber_miss_attempts: number
   relay_cyber_requests: number

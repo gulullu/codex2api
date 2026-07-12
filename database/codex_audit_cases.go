@@ -31,6 +31,18 @@ type CodexAuditCasesPage struct {
 	WindowEnd   time.Time          `json:"window_end"`
 }
 
+type CodexAuditAttempt struct {
+	AccountID         int64     `json:"account_id"`
+	AccountName       string    `json:"account_name"`
+	StatusCode        int       `json:"status_code"`
+	AttemptIndex      int       `json:"attempt_index"`
+	IsRetryAttempt    bool      `json:"is_retry_attempt"`
+	UpstreamErrorKind string    `json:"upstream_error_kind"`
+	ErrorMessage      string    `json:"error_message"`
+	RouteSource       string    `json:"route_source"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
 // ListCodexAuditCasesPage returns stable server-side pagination. Relay routing
 // cases are canonicalized to one record per logical request; event-style case
 // kinds keep every row. The time window is applied first so every page and the
@@ -141,6 +153,40 @@ func (db *DB) ListCodexAuditCasesPage(ctx context.Context, query CodexAuditCases
 	}, nil
 }
 
+func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID string, start, end time.Time) ([]CodexAuditAttempt, error) {
+	startArg, endArg := db.timeRangeArgs(start, end)
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT COALESCE(u.account_id, 0), COALESCE(a.name, ''), COALESCE(u.status_code, 0),
+		       COALESCE(u.attempt_index, 0), COALESCE(u.is_retry_attempt, false),
+		       COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
+		       COALESCE(u.route_source, ''), u.created_at
+		FROM usage_logs u
+		LEFT JOIN accounts a ON a.id = u.account_id
+		WHERE u.logical_request_id = $1 AND u.created_at >= $2 AND u.created_at <= $3
+		ORDER BY u.id ASC
+	`, logicalRequestID, startArg, endArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]CodexAuditAttempt, 0, 2)
+	for rows.Next() {
+		var item CodexAuditAttempt
+		var createdAtRaw any
+		if err := rows.Scan(&item.AccountID, &item.AccountName, &item.StatusCode, &item.AttemptIndex,
+			&item.IsRetryAttempt, &item.UpstreamErrorKind, &item.ErrorMessage, &item.RouteSource, &createdAtRaw); err != nil {
+			return nil, err
+		}
+		createdAt, err := parseDBTimeValue(createdAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		item.CreatedAt = createdAt
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
 // listCodexAuditRelayCasesPage uses the canonical final usage row as the
 // routing authority. Prompt-filter rows only enrich the case with the
 // redacted payload and classification that were captured before account
@@ -222,6 +268,19 @@ func (db *DB) listCodexAuditRelayCasesPage(ctx context.Context, start, end time.
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if strings.TrimSpace(item.LogicalRequestID) == "" {
+			continue
+		}
+		attempts, err := db.listCodexAuditAttempts(ctx, item.LogicalRequestID, start, end)
+		if err != nil {
+			return nil, err
+		}
+		item.AuditAttempts = attempts
 	}
 	return &CodexAuditCasesPage{
 		Items:       items,
