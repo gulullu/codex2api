@@ -20,24 +20,68 @@ func (h *Handler) GetRelayGuardianStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, h.store.RelayGuardianStatus())
 }
 
-func parseGuardianTime(raw string) time.Time {
+func parseGuardianTime(raw string) (time.Time, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return time.Time{}
+		return time.Time{}, errors.New("empty time")
 	}
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
 		if parsed, err := time.Parse(layout, raw); err == nil {
-			return parsed
+			return parsed, nil
 		}
 	}
-	return time.Time{}
+	return time.Time{}, errors.New("unsupported time format")
+}
+
+func parseGuardianTimeQuery(c *gin.Context, name string) (time.Time, error) {
+	raw, provided := c.GetQuery(name)
+	if !provided {
+		return time.Time{}, nil
+	}
+	return parseGuardianTime(raw)
+}
+
+func guardianSafePage(page, pageSize int) int {
+	if page <= 1 {
+		return page
+	}
+	effectivePageSize := pageSize
+	if effectivePageSize < 1 {
+		effectivePageSize = 20
+	} else if effectivePageSize > 200 {
+		effectivePageSize = 200
+	}
+	maxInt := int(^uint(0) >> 1)
+	if page-1 > maxInt/effectivePageSize {
+		// Pass an invalid value through to the DB layer, which owns pagination
+		// normalization. This prevents its OFFSET multiplication from overflowing.
+		return 0
+	}
+	return page
 }
 
 func (h *Handler) ListRelayGuardianEvents(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "Relay Guardian 事件存储未初始化")
+		return
+	}
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	start := parseGuardianTime(c.Query("start"))
-	end := parseGuardianTime(c.Query("end"))
+	page = guardianSafePage(page, pageSize)
+	start, err := parseGuardianTimeQuery(c, "start")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "start 时间格式无效")
+		return
+	}
+	end, err := parseGuardianTimeQuery(c, "end")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "end 时间格式无效")
+		return
+	}
+	if !start.IsZero() && !end.IsZero() && start.After(end) {
+		writeError(c, http.StatusBadRequest, "start 不能晚于 end")
+		return
+	}
 	result, err := h.db.ListRelayGuardianEvents(c.Request.Context(), page, pageSize, start, end)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "读取 Relay Guardian 事件失败: "+err.Error())
