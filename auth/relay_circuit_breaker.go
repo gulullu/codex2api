@@ -192,19 +192,29 @@ func (b *relayCircuitBreaker) ensureLoaded(accountID int64) {
 		log.Printf("[Relay circuit account=%d] restore runtime fence failed: %v", accountID, err)
 		return
 	}
-	b.loaded[accountID] = true
-	delete(b.retryLoad, accountID)
 	if !ok || len(payload) == 0 {
+		b.loaded[accountID] = true
+		delete(b.retryLoad, accountID)
 		return
 	}
 	var record relayCircuitRuntimeRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
+		b.retryLoad[accountID] = now.Add(5 * time.Second)
 		log.Printf("[Relay circuit account=%d] decode runtime fence failed: %v", accountID, err)
 		return
 	}
-	if record.State != RelayCircuitOpen && record.State != RelayCircuitHalfOpen {
+	if record.State == RelayCircuitClosed {
+		b.loaded[accountID] = true
+		delete(b.retryLoad, accountID)
 		return
 	}
+	if record.State != RelayCircuitOpen && record.State != RelayCircuitHalfOpen {
+		b.retryLoad[accountID] = now.Add(5 * time.Second)
+		log.Printf("[Relay circuit account=%d] invalid runtime fence state %q", accountID, record.State)
+		return
+	}
+	b.loaded[accountID] = true
+	delete(b.retryLoad, accountID)
 
 	state := b.stateLocked(accountID)
 	state.state = record.State

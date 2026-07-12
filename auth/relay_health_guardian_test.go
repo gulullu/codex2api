@@ -388,6 +388,78 @@ func TestRelayGuardianStatusOmitsZeroTimes(t *testing.T) {
 	}
 }
 
+func TestRelayGuardianHealthReportsCorruptCircuitRuntimeAsUnavailable(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	tokenCache := cache.NewMemory(4)
+	defer tokenCache.Close()
+	if err := tokenCache.SetRuntime(context.Background(), relayCircuitRuntimeCacheNamespace, relayCircuitRuntimeKey(51), json.RawMessage(`{"state":`), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
+	store.tokenCache = tokenCache
+	guardian.cache = tokenCache
+	guardian.ensureLoaded(51)
+	store.relayCircuit = newRelayCircuitBreaker(tokenCache)
+	store.relayCircuit.now = clock.Now
+	store.relayCircuit.ensureLoaded(51)
+
+	health, relay := store.RelayGuardianHealth()
+	if relay.Enabled != 1 || relay.Schedulable != 0 || relay.Degraded != 1 {
+		t.Fatalf("relay summary=%+v", relay)
+	}
+	if !containsString(health.Reasons, "circuit_runtime_state_unavailable") {
+		t.Fatalf("health did not report corrupt circuit runtime: %+v", health)
+	}
+}
+
+func TestRelayGuardianHealthReportsCircuitRecoveryWithoutDoubleCounting(t *testing.T) {
+	tests := []struct {
+		name             string
+		state            RelayCircuitState
+		openUntil        time.Time
+		probe            bool
+		guardianDegraded bool
+		wantSchedulable  int
+		wantDegraded     int
+		wantReason       string
+	}{
+		{name: "active_open", state: RelayCircuitOpen, openUntil: time.Now().Add(time.Minute), wantDegraded: 1, wantReason: "relay_circuit_open"},
+		{name: "expired_open_probe_available", state: RelayCircuitOpen, openUntil: time.Now().Add(-time.Minute), wantSchedulable: 1},
+		{name: "half_open_available", state: RelayCircuitHalfOpen, wantSchedulable: 1, wantDegraded: 1, wantReason: "relay_circuit_half_open"},
+		{name: "half_open_probe_in_flight", state: RelayCircuitHalfOpen, probe: true, wantDegraded: 1, wantReason: "relay_circuit_half_open"},
+		{name: "guardian_and_circuit_degraded_once", state: RelayCircuitOpen, openUntil: time.Now().Add(time.Minute), guardianDegraded: true, wantDegraded: 1, wantReason: "relay_circuit_open"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
+			guardian.mu.Lock()
+			guardian.loaded[51] = true
+			if tt.guardianDegraded {
+				guardian.stateLocked(51).State = RelayGuardianSuspect
+			}
+			guardian.mu.Unlock()
+			breaker := newRelayCircuitBreaker(nil)
+			breaker.mu.Lock()
+			breaker.loaded[51] = true
+			state := breaker.stateLocked(51)
+			state.state = tt.state
+			state.openUntil = tt.openUntil
+			state.probeInFlight = tt.probe
+			breaker.mu.Unlock()
+			store.relayCircuit = breaker
+
+			health, relay := store.RelayGuardianHealth()
+			if relay.Schedulable != tt.wantSchedulable || relay.Degraded != tt.wantDegraded {
+				t.Fatalf("relay summary=%+v", relay)
+			}
+			if tt.wantReason != "" && !containsString(health.Reasons, tt.wantReason) {
+				t.Fatalf("health=%+v missing %q", health, tt.wantReason)
+			}
+		})
+	}
+}
+
 func TestRelayGuardianStatusNeverLeaksAccountCredentials(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	store, _ := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
@@ -621,6 +693,9 @@ func TestRelayGuardianMonitorRuntimeUnknownIsDegradedButDoesNotFenceTraffic(t *t
 	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
 	store.tokenCache = failing
 	guardian.cache = failing
+	// This case isolates Guardian monitor semantics. The Relay circuit has its own
+	// fail-closed runtime fence and is covered independently below.
+	store.relayCircuit = newRelayCircuitBreaker(nil)
 	guardian.reconcile(context.Background())
 	before := failing.gets.Load()
 	health, relay := store.RelayGuardianHealth()

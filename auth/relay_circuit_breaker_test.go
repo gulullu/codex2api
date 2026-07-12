@@ -448,3 +448,40 @@ func TestRelayCircuitRestoreRetriesAndFailsClosedAfterCacheError(t *testing.T) {
 		t.Fatalf("restored state = %q, want open", got)
 	}
 }
+
+func TestRelayCircuitCorruptRuntimeCacheFailsClosedUntilValidRetry(t *testing.T) {
+	tokenCache := cache.NewMemory(1)
+	defer tokenCache.Close()
+	clock := newRelayCircuitTestClock()
+	key := relayCircuitRuntimeKey(51)
+	if err := tokenCache.SetRuntime(context.Background(), relayCircuitRuntimeCacheNamespace, key, json.RawMessage(`{"state":`), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	breaker := newRelayCircuitBreaker(tokenCache)
+	breaker.now = clock.Now
+	breaker.ensureLoaded(51)
+	if breaker.selectable(51) {
+		t.Fatal("corrupt runtime fence failed open")
+	}
+	if _, ok := breaker.begin(51); ok {
+		t.Fatal("corrupt runtime fence issued a request permit")
+	}
+
+	record := relayCircuitRuntimeRecord{State: RelayCircuitOpen, Generation: 3, OpenUntil: clock.Now().Add(time.Minute), UpdatedAt: clock.Now()}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tokenCache.SetRuntime(context.Background(), relayCircuitRuntimeCacheNamespace, key, payload, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(5 * time.Second)
+	breaker.ensureLoaded(51)
+	if breaker.selectable(51) {
+		t.Fatal("valid retried open fence became selectable")
+	}
+	if got := breaker.snapshot(51).State; got != RelayCircuitOpen {
+		t.Fatalf("retried state=%q want open", got)
+	}
+}

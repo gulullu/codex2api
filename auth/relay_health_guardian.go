@@ -2271,8 +2271,13 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 		probe  bool
 	}
 	circuitStates := make(map[int64]circuitLocal)
+	circuitCacheBacked := false
 	if breaker := s.relayCircuitManager(); breaker != nil {
 		breaker.mu.Lock()
+		circuitCacheBacked = breaker.cache != nil
+		for accountID, loaded := range breaker.loaded {
+			circuitStates[accountID] = circuitLocal{loaded: loaded || breaker.cache == nil, state: RelayCircuitClosed}
+		}
 		for accountID, state := range breaker.states {
 			circuitStates[accountID] = circuitLocal{loaded: breaker.loaded[accountID] || breaker.cache == nil, state: state.state, until: state.openUntil, probe: state.probeInFlight}
 		}
@@ -2286,6 +2291,7 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 			continue
 		}
 		relay.Enabled++
+		accountDegraded := false
 		guardianState, knownGuardian := guardianStates[account.DBID]
 		if guardianState.state == RelayGuardianQuarantined || guardianState.state == RelayGuardianHalfOpen {
 			relay.Quarantined++
@@ -2294,13 +2300,13 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 			relay.Probation++
 		}
 		if guardianState.state == RelayGuardianSuspect || guardianState.state == RelayGuardianWouldQuarantine || guardianState.lastResort {
-			relay.Degraded++
+			accountDegraded = true
 			addReason("relay_account_degraded")
 		}
 		schedulable := account.IsAvailable()
 		guardianUnknown := !knownGuardian || !guardianState.loaded
 		if mode != RelayGuardianOff && guardianUnknown {
-			relay.Degraded++
+			accountDegraded = true
 			addReason("guardian_runtime_state_unavailable")
 		}
 		if mode == RelayGuardianEnforce {
@@ -2314,16 +2320,30 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 				schedulable = false
 			}
 		}
-		if circuitState, known := circuitStates[account.DBID]; known {
-			if !circuitState.loaded {
-				schedulable = false
+		circuitState, knownCircuit := circuitStates[account.DBID]
+		if circuitCacheBacked && (!knownCircuit || !circuitState.loaded) {
+			accountDegraded = true
+			addReason("circuit_runtime_state_unavailable")
+			schedulable = false
+		}
+		if knownCircuit && circuitState.loaded {
+			switch circuitState.state {
+			case RelayCircuitOpen:
+				if circuitState.until.IsZero() || circuitState.until.After(now) {
+					accountDegraded = true
+					addReason("relay_circuit_open")
+					schedulable = false
+				}
+			case RelayCircuitHalfOpen:
+				accountDegraded = true
+				addReason("relay_circuit_half_open")
+				if circuitState.probe {
+					schedulable = false
+				}
 			}
-			if circuitState.state == RelayCircuitOpen && (circuitState.until.IsZero() || circuitState.until.After(now)) {
-				schedulable = false
-			}
-			if circuitState.state == RelayCircuitHalfOpen && circuitState.probe {
-				schedulable = false
-			}
+		}
+		if accountDegraded {
+			relay.Degraded++
 		}
 		if schedulable {
 			relay.Schedulable++
