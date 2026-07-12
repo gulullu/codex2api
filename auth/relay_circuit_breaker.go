@@ -108,6 +108,8 @@ type relayCircuitBreaker struct {
 	persistMu sync.Mutex
 	states    map[int64]*relayCircuitAccountState
 	loaded    map[int64]bool
+	retryLoad map[int64]time.Time
+	permits   map[uint64]RelayCircuitPermit
 	nextLease uint64
 	cache     cache.TokenCache
 	now       func() time.Time
@@ -115,10 +117,12 @@ type relayCircuitBreaker struct {
 
 func newRelayCircuitBreaker(tc cache.TokenCache) *relayCircuitBreaker {
 	return &relayCircuitBreaker{
-		states: make(map[int64]*relayCircuitAccountState),
-		loaded: make(map[int64]bool),
-		cache:  tc,
-		now:    time.Now,
+		states:    make(map[int64]*relayCircuitAccountState),
+		loaded:    make(map[int64]bool),
+		retryLoad: make(map[int64]time.Time),
+		permits:   make(map[uint64]RelayCircuitPermit),
+		cache:     tc,
+		now:       time.Now,
 	}
 }
 
@@ -161,8 +165,12 @@ func (b *relayCircuitBreaker) ensureLoaded(accountID int64) {
 	if b.loaded[accountID] {
 		return
 	}
-	b.loaded[accountID] = true
+	now := b.nowTime()
+	if retryAt := b.retryLoad[accountID]; retryAt.After(now) {
+		return
+	}
 	if b.cache == nil {
+		b.loaded[accountID] = true
 		return
 	}
 
@@ -170,9 +178,15 @@ func (b *relayCircuitBreaker) ensureLoaded(accountID int64) {
 	defer cancel()
 	payload, ok, err := b.cache.GetRuntime(ctx, relayCircuitRuntimeCacheNamespace, relayCircuitRuntimeKey(accountID))
 	if err != nil {
+		// A transient cache error must not permanently disable restart fencing.
+		// Throttle retries so a cache outage cannot add 300 ms to every scheduler
+		// pass for the same account.
+		b.retryLoad[accountID] = now.Add(time.Second)
 		log.Printf("[Relay circuit account=%d] restore runtime fence failed: %v", accountID, err)
 		return
 	}
+	b.loaded[accountID] = true
+	delete(b.retryLoad, accountID)
 	if !ok || len(payload) == 0 {
 		return
 	}
@@ -185,7 +199,6 @@ func (b *relayCircuitBreaker) ensureLoaded(accountID int64) {
 		return
 	}
 
-	now := b.nowTime()
 	state := b.stateLocked(accountID)
 	state.state = record.State
 	if state.state == RelayCircuitOpen && !record.OpenUntil.After(now) {
@@ -212,9 +225,15 @@ func (b *relayCircuitBreaker) selectable(accountID int64) bool {
 	if b == nil || accountID == 0 {
 		return true
 	}
+	b.ensureLoaded(accountID)
 	now := b.nowTime()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.loaded[accountID] {
+		// The restart fence could not be restored yet. Fail closed for this
+		// account until the throttled cache retry succeeds.
+		return false
+	}
 	state := b.states[accountID]
 	if state == nil || state.state == RelayCircuitClosed {
 		return true
@@ -233,6 +252,9 @@ func (b *relayCircuitBreaker) begin(accountID int64) (RelayCircuitPermit, bool) 
 	now := b.nowTime()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.loaded[accountID] {
+		return RelayCircuitPermit{}, false
+	}
 	state := b.stateLocked(accountID)
 	if state.generation == 0 {
 		state.generation = 1
@@ -251,30 +273,53 @@ func (b *relayCircuitBreaker) begin(accountID int64) (RelayCircuitPermit, bool) 
 	case RelayCircuitHalfOpen:
 		// handled below
 	default:
-		return RelayCircuitPermit{
-			AccountID:  accountID,
-			Generation: state.generation,
-			Active:     true,
-		}, true
+		return b.issuePermitLocked(accountID, state.generation, false), true
 	}
 
 	if state.probeInFlight {
 		return RelayCircuitPermit{}, false
 	}
+	permit := b.issuePermitLocked(accountID, state.generation, true)
+	state.probeInFlight = true
+	state.probeLeaseID = permit.LeaseID
+	state.updatedAt = now
+	return permit, true
+}
+
+func (b *relayCircuitBreaker) issuePermitLocked(accountID int64, generation uint64, probe bool) RelayCircuitPermit {
 	b.nextLease++
 	if b.nextLease == 0 {
 		b.nextLease++
 	}
-	state.probeInFlight = true
-	state.probeLeaseID = b.nextLease
-	state.updatedAt = now
-	return RelayCircuitPermit{
+	permit := RelayCircuitPermit{
 		AccountID:  accountID,
-		Generation: state.generation,
-		LeaseID:    state.probeLeaseID,
-		Probe:      true,
+		Generation: generation,
+		LeaseID:    b.nextLease,
+		Probe:      probe,
 		Active:     true,
-	}, true
+	}
+	b.permits[permit.LeaseID] = permit
+	return permit
+}
+
+func (b *relayCircuitBreaker) consumePermitLocked(permit RelayCircuitPermit) bool {
+	if !permit.Active || permit.AccountID == 0 || permit.LeaseID == 0 {
+		return false
+	}
+	issued, ok := b.permits[permit.LeaseID]
+	if !ok || issued.AccountID != permit.AccountID || issued.Generation != permit.Generation || issued.Probe != permit.Probe {
+		return false
+	}
+	delete(b.permits, permit.LeaseID)
+	return true
+}
+
+func (b *relayCircuitBreaker) clearAccountPermitsLocked(accountID int64) {
+	for leaseID, permit := range b.permits {
+		if permit.AccountID == accountID {
+			delete(b.permits, leaseID)
+		}
+	}
 }
 
 func relayCircuitFailure(statusCode int) (strong bool, weak bool) {
@@ -295,7 +340,7 @@ func relayCircuitReason(statusCode int) string {
 	return "upstream_server_failure"
 }
 
-func (b *relayCircuitBreaker) openLocked(state *relayCircuitAccountState, now time.Time, statusCode int, recoveryFailure bool) {
+func (b *relayCircuitBreaker) openLocked(accountID int64, state *relayCircuitAccountState, now time.Time, statusCode int, recoveryFailure bool) {
 	duration := relayCircuitInitialOpen
 	if recoveryFailure {
 		idx := state.backoffLevel
@@ -313,6 +358,7 @@ func (b *relayCircuitBreaker) openLocked(state *relayCircuitAccountState, now ti
 		state.backoffLevel = 0
 	}
 	state.state = RelayCircuitOpen
+	b.clearAccountPermitsLocked(accountID)
 	state.generation++
 	if state.generation == 0 {
 		state.generation = 1
@@ -343,6 +389,10 @@ func (b *relayCircuitBreaker) reportFailure(permit RelayCircuitPermit, statusCod
 
 	b.mu.Lock()
 	state := b.stateLocked(permit.AccountID)
+	if !b.consumePermitLocked(permit) {
+		b.mu.Unlock()
+		return false
+	}
 	if permit.Generation != state.generation {
 		b.mu.Unlock()
 		return false
@@ -352,7 +402,7 @@ func (b *relayCircuitBreaker) reportFailure(permit RelayCircuitPermit, statusCod
 			b.mu.Unlock()
 			return false
 		}
-		b.openLocked(state, now, statusCode, true)
+		b.openLocked(permit.AccountID, state, now, statusCode, true)
 		revision, record = state.revision, relayCircuitRecordFromState(state)
 		persist = true
 		b.mu.Unlock()
@@ -365,7 +415,7 @@ func (b *relayCircuitBreaker) reportFailure(permit RelayCircuitPermit, statusCod
 	}
 
 	if strong {
-		b.openLocked(state, now, statusCode, false)
+		b.openLocked(permit.AccountID, state, now, statusCode, false)
 		revision, record = state.revision, relayCircuitRecordFromState(state)
 		persist = true
 	} else {
@@ -382,7 +432,7 @@ func (b *relayCircuitBreaker) reportFailure(permit RelayCircuitPermit, statusCod
 		state.reason = relayCircuitReason(statusCode)
 		state.updatedAt = now
 		if len(state.weakFailureTimes) >= relayCircuitWeakFailureLimit {
-			b.openLocked(state, now, statusCode, false)
+			b.openLocked(permit.AccountID, state, now, statusCode, false)
 			revision, record = state.revision, relayCircuitRecordFromState(state)
 			persist = true
 		}
@@ -407,6 +457,10 @@ func (b *relayCircuitBreaker) reportSuccess(permit RelayCircuitPermit) bool {
 
 	b.mu.Lock()
 	state := b.stateLocked(permit.AccountID)
+	if !b.consumePermitLocked(permit) {
+		b.mu.Unlock()
+		return false
+	}
 	if permit.Generation != state.generation {
 		b.mu.Unlock()
 		return false
@@ -440,6 +494,7 @@ func (b *relayCircuitBreaker) reportSuccess(permit RelayCircuitPermit) bool {
 		state.backoffLevel = 0
 		state.weakFailureTimes = nil
 		state.probeSuccesses = 0
+		b.clearAccountPermitsLocked(permit.AccountID)
 		closeCircuit = true
 	} else {
 		record = relayCircuitRecordFromState(state)
@@ -459,7 +514,7 @@ func (b *relayCircuitBreaker) reportSuccess(permit RelayCircuitPermit) bool {
 }
 
 func (b *relayCircuitBreaker) abandon(permit RelayCircuitPermit) bool {
-	if b == nil || !permit.Active || !permit.Probe || permit.AccountID == 0 {
+	if b == nil || !permit.Active || permit.AccountID == 0 {
 		return false
 	}
 	b.ensureLoaded(permit.AccountID)
@@ -469,6 +524,14 @@ func (b *relayCircuitBreaker) abandon(permit RelayCircuitPermit) bool {
 
 	b.mu.Lock()
 	state := b.stateLocked(permit.AccountID)
+	if !b.consumePermitLocked(permit) {
+		b.mu.Unlock()
+		return false
+	}
+	if !permit.Probe {
+		b.mu.Unlock()
+		return true
+	}
 	if permit.Generation != state.generation ||
 		state.state != RelayCircuitHalfOpen ||
 		!state.probeInFlight ||
@@ -565,8 +628,18 @@ func (b *relayCircuitBreaker) snapshot(accountID int64) RelayCircuitSnapshot {
 	if b == nil || accountID == 0 {
 		return relayCircuitSnapshotFromState(accountID, nil)
 	}
+	b.ensureLoaded(accountID)
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.loaded[accountID] {
+		return RelayCircuitSnapshot{
+			AccountID:       accountID,
+			State:           RelayCircuitOpen,
+			Reason:          "runtime_fence_restore_pending",
+			OpenUntil:       b.retryLoad[accountID],
+			RequiredSuccess: relayCircuitRecoverySuccesses,
+		}
+	}
 	return relayCircuitSnapshotFromState(accountID, b.states[accountID])
 }
 
@@ -604,17 +677,25 @@ func (s *Store) RelayCircuitSelectable(account *Account) bool {
 	if s == nil || account == nil {
 		return false
 	}
-	if !account.IsOpenAIResponsesAPI() {
+	if !s.isConfiguredRelayCircuitAccount(account) {
 		return true
 	}
 	return s.relayCircuitManager().selectable(account.DBID)
+}
+
+func (s *Store) isConfiguredRelayCircuitAccount(account *Account) bool {
+	if s == nil || account == nil || !account.IsOpenAIResponsesAPI() {
+		return false
+	}
+	cfg := s.GetCybRelayConfig()
+	return cfg.Enabled && cfg.GroupID > 0 && account.HasGroupID(cfg.GroupID)
 }
 
 // BeginRelayCircuitRequest acquires the attempt generation and, in half-open,
 // the process-wide single recovery-probe lease. A false result means the
 // caller must Release the selected account and choose another one.
 func (s *Store) BeginRelayCircuitRequest(account *Account) (RelayCircuitPermit, bool) {
-	if s == nil || account == nil || !account.IsOpenAIResponsesAPI() {
+	if !s.isConfiguredRelayCircuitAccount(account) {
 		return RelayCircuitPermit{}, false
 	}
 	return s.relayCircuitManager().begin(account.DBID)

@@ -720,6 +720,12 @@ type accountResponse struct {
 	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
 	CooldownReason           string                     `json:"cooldown_reason,omitempty"`
 	CooldownUntil            string                     `json:"cooldown_until,omitempty"`
+	RelayCircuitState        string                     `json:"relay_circuit_state,omitempty"`
+	RelayCircuitReason       string                     `json:"relay_circuit_reason,omitempty"`
+	RelayCircuitOpenUntil    string                     `json:"relay_circuit_open_until,omitempty"`
+	RelayCircuitProbe        bool                       `json:"relay_circuit_probe_in_flight,omitempty"`
+	RelayCircuitSuccesses    int                        `json:"relay_circuit_probe_successes,omitempty"`
+	RelayCircuitRequired     int                        `json:"relay_circuit_required_successes,omitempty"`
 	ModelCooldowns           []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
 	Enabled                  bool                       `json:"enabled"`
 	Locked                   bool                       `json:"locked"`
@@ -978,6 +984,17 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		}
 		if resp.DispatchScore == 0 {
 			resp.DispatchScore = dispatchScoreFallback(resp.SchedulerScore, resp.ScoreBiasEffective, resp.HealthTier, resp.Status)
+		}
+		if isOpenAIResponsesAccount {
+			snapshot := h.store.RelayCircuitSnapshot(row.ID)
+			resp.RelayCircuitState = string(snapshot.State)
+			resp.RelayCircuitReason = snapshot.Reason
+			resp.RelayCircuitProbe = snapshot.ProbeInFlight
+			resp.RelayCircuitSuccesses = snapshot.ProbeSuccesses
+			resp.RelayCircuitRequired = snapshot.RequiredSuccess
+			if !snapshot.OpenUntil.IsZero() {
+				resp.RelayCircuitOpenUntil = snapshot.OpenUntil.Format(time.RFC3339)
+			}
 		}
 		if rc, ok := reqCounts[row.ID]; ok {
 			resp.SuccessRequests = rc.SuccessCount

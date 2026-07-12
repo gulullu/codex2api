@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8,6 +11,23 @@ import (
 
 	"github.com/codex2api/cache"
 )
+
+type relayCircuitFlakyRuntimeCache struct {
+	cache.TokenCache
+	mu       sync.Mutex
+	failures int
+}
+
+func (c *relayCircuitFlakyRuntimeCache) GetRuntime(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	c.mu.Lock()
+	if c.failures > 0 {
+		c.failures--
+		c.mu.Unlock()
+		return nil, false, errors.New("temporary runtime cache failure")
+	}
+	c.mu.Unlock()
+	return c.TokenCache.GetRuntime(ctx, namespace, key)
+}
 
 type relayCircuitTestClock struct {
 	mu  sync.Mutex
@@ -257,6 +277,7 @@ func relayCircuitSchedulerAccount(id int64, priority int64) *Account {
 		DynamicConcurrencyLimit:  100,
 		SchedulerPriority:        priority,
 		SkipWarmTier:             true,
+		GroupIDs:                 []int64{7},
 	}
 }
 
@@ -270,6 +291,7 @@ func newRelayCircuitSchedulerStore(fast bool, clock *relayCircuitTestClock) (*St
 		relayCircuit: breaker,
 	}
 	atomic.StoreInt64(&store.maxConcurrency, 100)
+	store.SetCybRelayConfig(CybRelayConfig{Enabled: true, GroupID: 7})
 	if fast {
 		store.fastSchedulerEnabled.Store(true)
 		store.rebuildFastScheduler()
@@ -324,6 +346,34 @@ func TestRelayCircuitDoesNotOverwriteAccountCooldownSlot(t *testing.T) {
 	}
 }
 
+func TestRelayCircuitPermitIsConsumedExactlyOnce(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	breaker := newRelayCircuitTestBreaker(clock)
+	permit, ok := breaker.begin(51)
+	if !ok {
+		t.Fatal("breaker permit denied")
+	}
+	if breaker.reportFailure(permit, 503) {
+		t.Fatal("first weak failure unexpectedly opened circuit")
+	}
+	if breaker.reportFailure(permit, 503) {
+		t.Fatal("duplicate permit unexpectedly opened circuit")
+	}
+	if got := breaker.snapshot(51).WeakFailures; got != 1 {
+		t.Fatalf("duplicate permit counted %d weak failures, want 1", got)
+	}
+	for i := 0; i < 2; i++ {
+		unique, uniqueOK := breaker.begin(51)
+		if !uniqueOK {
+			t.Fatalf("unique permit %d denied", i+1)
+		}
+		opened := breaker.reportFailure(unique, 503)
+		if opened != (i == 1) {
+			t.Fatalf("unique weak failure %d opened=%v", i+1, opened)
+		}
+	}
+}
+
 func TestRelayCircuitRestoresOpenFenceFromRuntimeCache(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	defer tokenCache.Close()
@@ -343,5 +393,33 @@ func TestRelayCircuitRestoresOpenFenceFromRuntimeCache(t *testing.T) {
 	probe, ok := restarted.begin(51)
 	if !ok || !probe.Probe {
 		t.Fatalf("expired restored fence did not enter half-open: permit=%+v ok=%v", probe, ok)
+	}
+}
+
+func TestRelayCircuitRestoreRetriesAndFailsClosedAfterCacheError(t *testing.T) {
+	base := cache.NewMemory(1)
+	defer base.Close()
+	clock := newRelayCircuitTestClock()
+
+	first := newRelayCircuitBreaker(base)
+	first.now = clock.Now
+	permit, _ := first.begin(51)
+	first.reportFailure(permit, 502)
+
+	flaky := &relayCircuitFlakyRuntimeCache{TokenCache: base, failures: 1}
+	restarted := newRelayCircuitBreaker(flaky)
+	restarted.now = clock.Now
+	if restarted.selectable(51) {
+		t.Fatal("account was selectable while runtime fence restore was unresolved")
+	}
+	if _, ok := restarted.begin(51); ok {
+		t.Fatal("request permit was issued while runtime fence restore was unresolved")
+	}
+	clock.Advance(time.Second)
+	if restarted.selectable(51) {
+		t.Fatal("restored open circuit became selectable before its deadline")
+	}
+	if got := restarted.snapshot(51).State; got != RelayCircuitOpen {
+		t.Fatalf("restored state = %q, want open", got)
 	}
 }

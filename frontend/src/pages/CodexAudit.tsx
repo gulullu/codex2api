@@ -708,8 +708,10 @@ function HeaderControl({ label, children }: { label: string; children: ReactNode
 }
 
 function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
-  const active = accounts.filter((a) => a.status === 'active' && a.enabled !== false)
-  const healthy = active.length > 0 && active.length === accounts.length
+  const relayAccounts = accounts.filter((a) => a.openai_responses_api)
+  const active = relayAccounts.filter((a) => a.status === 'active' && a.enabled !== false && a.relay_circuit_state !== 'open')
+  const circuitCount = relayAccounts.filter((a) => a.relay_circuit_state === 'open' || a.relay_circuit_state === 'half_open').length
+  const healthy = active.length > 0 && active.length === relayAccounts.length && circuitCount === 0
   return (
     <div className="min-w-0 rounded-xl border border-border/60 bg-background/75 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -719,21 +721,30 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
         </div>
         <div className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ${healthy ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'}`}>
           <span className={`size-1.5 rounded-full ${healthy ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-          {active.length}/{accounts.length} 活跃
+          {active.length}/{relayAccounts.length} 可调度{circuitCount ? ` · 熔断 ${circuitCount}` : ''}
         </div>
       </div>
       <div className="space-y-1.5">
-        {accounts.slice(0, 6).map((a) => {
+        {relayAccounts.slice(0, 6).map((a) => {
           const pct = Math.round(a.usage_percent_7d ?? 0)
           const busy = a.active_requests ?? 0
           const cap = a.base_concurrency_effective ?? 5
-          const isActive = a.status === 'active' && a.enabled !== false
+          const circuitState = a.relay_circuit_state || 'closed'
+          const isActive = a.status === 'active' && a.enabled !== false && circuitState !== 'open'
           const barColor = pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-500' : 'bg-emerald-500'
           return (
             <div key={a.id} className="flex items-center gap-2 text-xs">
               <span className={`size-1.5 shrink-0 rounded-full ${isActive ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`} />
               <span className="min-w-0 flex-1 truncate text-foreground">{a.email || a.name || `#${a.id}`}</span>
               <span className="hidden shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] uppercase text-muted-foreground sm:inline">{a.plan_type || '-'}</span>
+              {circuitState !== 'closed' ? (
+                <span
+                  className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${circuitState === 'open' ? 'bg-red-500/10 text-red-600 dark:text-red-400' : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'}`}
+                  title={[a.relay_circuit_reason, a.relay_circuit_open_until ? `至 ${formatBeijingTime(a.relay_circuit_open_until)}` : ''].filter(Boolean).join(' · ')}
+                >
+                  {circuitState === 'open' ? '熔断' : `恢复探测 ${a.relay_circuit_probe_successes || 0}/${a.relay_circuit_required_successes || 3}`}
+                </span>
+              ) : null}
               <div className="hidden h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted sm:block">
                 <div className={`h-full ${barColor}`} style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
               </div>
@@ -742,7 +753,7 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
             </div>
           )
         })}
-        {accounts.length === 0 ? <div className="py-3 text-center text-xs text-muted-foreground">加载中…</div> : null}
+        {relayAccounts.length === 0 ? <div className="py-3 text-center text-xs text-muted-foreground">暂无 Relay API 账号</div> : null}
       </div>
     </div>
   )

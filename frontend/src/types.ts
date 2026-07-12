@@ -109,6 +109,12 @@ export interface AccountRow {
   billed_7d?: number
   cooldown_until?: ISODateString
   cooldown_reason?: string
+  relay_circuit_state?: 'closed' | 'open' | 'half_open'
+  relay_circuit_reason?: string
+  relay_circuit_open_until?: ISODateString
+  relay_circuit_probe_in_flight?: boolean
+  relay_circuit_probe_successes?: number
+  relay_circuit_required_successes?: number
   model_cooldowns?: Array<{
     model: string
     reason: string
