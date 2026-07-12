@@ -939,6 +939,74 @@ func TestRelayGuardianMonitorShadowDecisionsMatchEnforceGuards(t *testing.T) {
 	})
 }
 
+func TestRelayGuardianPoolIncidentProtectionDoesNotDecayIntoAccountQuarantine(t *testing.T) {
+	for _, mode := range []RelayGuardianMode{RelayGuardianMonitor, RelayGuardianEnforce} {
+		t.Run(string(mode), func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, mode, clock, 50, 53, 51)
+
+			guardian.observe(guardianObservation(50, "peer-a", 524, false, clock.Now()))
+			clock.Advance(30 * time.Second)
+			guardian.observe(guardianObservation(50, "peer-b", 524, false, clock.Now()))
+			clock.Advance(3 * time.Minute)
+			guardian.observe(guardianObservation(53, "candidate-a", 524, false, clock.Now()))
+			clock.Advance(30 * time.Second)
+			guardian.observe(guardianObservation(53, "candidate-b", 524, false, clock.Now()))
+
+			guardian.mu.Lock()
+			incidentUntil := guardian.poolWideUntil
+			state := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(53).relayGuardianRuntimeRecord)
+			guardian.mu.Unlock()
+			if state.Reason != "pool_wide_failure_guard" || !incidentUntil.Equal(clock.Now().Add(10*time.Minute)) {
+				t.Fatalf("initial pool incident state=%+v until=%s now=%s", state, incidentUntil, clock.Now())
+			}
+
+			// The peer 524 evidence leaves the 5m signature window while the
+			// candidate's final 524 evidence still occupies the 10m trigger window.
+			// A later single 598 must remain part of the pool-safe incident rather
+			// than combining with the 524s into an account quarantine.
+			clock.Advance(2 * time.Minute)
+			guardian.reconcile(context.Background())
+			guardian.observe(guardianObservation(53, "later-transport", 598, false, clock.Now()))
+			guardian.mu.Lock()
+			state = cloneRelayGuardianRuntimeRecord(guardian.stateLocked(53).relayGuardianRuntimeRecord)
+			incidentAfterReconcile := guardian.poolWideUntil
+			guardian.mu.Unlock()
+			if state.State == RelayGuardianQuarantined || state.Reason != "pool_wide_failure_guard" {
+				t.Fatalf("pool incident decayed after peer window/598: %+v", state)
+			}
+			if !incidentAfterReconcile.Equal(incidentUntil) {
+				t.Fatalf("reconcile slid pool deadline: before=%s after=%s", incidentUntil, incidentAfterReconcile)
+			}
+
+			// After all old pool/transport evidence has expired, a new independent
+			// per-account incident is evaluated normally.
+			clock.Advance(11 * time.Minute)
+			guardian.mu.Lock()
+			guardian.capacitySamples = []relayGuardianCapacitySample{
+				{At: clock.Now().Add(-2 * RelayGuardianScanInterval)},
+				{At: clock.Now().Add(-RelayGuardianScanInterval)},
+				{At: clock.Now()},
+			}
+			guardian.mu.Unlock()
+			guardian.observe(guardianObservation(53, "independent-a", 500, false, clock.Now()))
+			clock.Advance(time.Second)
+			guardian.observe(guardianObservation(53, "independent-b", 500, false, clock.Now()))
+			status, ok := store.RelayGuardianAccountStatus(53)
+			if !ok {
+				t.Fatal("missing account 53 status")
+			}
+			if mode == RelayGuardianMonitor {
+				if status.State != RelayGuardianWouldQuarantine || status.ShadowAction != "quarantine" || status.Reason != "shadow_quarantine" {
+					t.Fatalf("new monitor incident remained pool-protected: %+v", status)
+				}
+			} else if status.State != RelayGuardianQuarantined {
+				t.Fatalf("new enforce incident remained pool-protected: %+v", status)
+			}
+		})
+	}
+}
+
 func TestRelayGuardianLockOrderRegression(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50, 53)

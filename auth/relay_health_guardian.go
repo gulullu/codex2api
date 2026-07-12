@@ -871,7 +871,16 @@ func (g *relayHealthGuardian) triggerLocked(state *relayGuardianAccountState, no
 	}
 }
 
-func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID int64, trigger string, now time.Time) bool {
+func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID int64, trigger string, triggerWindow time.Duration, now time.Time) bool {
+	// Once a correlated pool incident is established, keep every trigger inside
+	// that incident on the pool-safe path until the longest contributing trigger
+	// window has elapsed. This also prevents a later single transport failure
+	// from combining with already-classified pool evidence and decaying into an
+	// account quarantine. The deadline is only set when correlation is observed;
+	// reconcile calls never slide it forward.
+	if g.poolWideUntil.After(now) {
+		return true
+	}
 	enabled := make([]*Account, 0, len(accounts))
 	for _, account := range accounts {
 		if relayGuardianManualEnabled(account) {
@@ -900,6 +909,10 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 		return false
 	}
 	window := candidateSignature.window
+	if triggerWindow > window {
+		window = triggerWindow
+	}
+	g.poolWideUntil = now.Add(window)
 	windowStart := now.UTC().Truncate(window)
 	windowID := windowStart.Format(time.RFC3339) + "/" + window.String()
 	eventKey := candidateSignature.key() + ":" + windowID
@@ -910,12 +923,12 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 	}
 	if _, duplicate := g.poolEvents[eventKey]; !duplicate {
 		g.poolEvents[eventKey] = now
-		g.poolWideUntil = now.Add(window)
 		if state := g.states[candidateID]; state != nil {
 			state.PoolWideReportedAt = now
 		}
 		g.recordSystemEvent(now, RelayGuardianEventPoolWide, "pool_wide_failure_guard", trigger, map[string]any{
 			"signature": candidateSignature.key(), "affected": affected, "enabled": len(enabled), "window_id": windowID,
+			"protected_until": g.poolWideUntil, "signature_window_seconds": int(candidateSignature.window / time.Second), "trigger_window_seconds": int(triggerWindow / time.Second),
 		})
 	}
 	return true
@@ -1139,7 +1152,7 @@ func (g *relayHealthGuardian) applyTriggerLocked(account *Account, state *relayG
 		shadowAction := "quarantine"
 		shadowReason := "shadow_quarantine"
 		switch {
-		case g.poolGuardLocked(accounts, account.DBID, trigger, now):
+		case g.poolGuardLocked(accounts, account.DBID, trigger, window, now):
 			shadowAction, shadowReason = "pool_alert", "pool_wide_failure_guard"
 		case !g.lastShadowQuarantine.IsZero() && now.Sub(g.lastShadowQuarantine) < RelayGuardianScanInterval && g.lastShadowQuarantineAccountID != account.DBID:
 			shadowAction, shadowReason = "last_resort", "one_quarantine_per_scan_guard"
@@ -1170,7 +1183,7 @@ func (g *relayHealthGuardian) applyTriggerLocked(account *Account, state *relayG
 		g.persistState(account.DBID, state)
 		return
 	}
-	if g.poolGuardLocked(accounts, account.DBID, trigger, now) {
+	if g.poolGuardLocked(accounts, account.DBID, trigger, window, now) {
 		g.activateLastResortLocked(account, state, "pool_wide_failure_guard", trigger, window, finals, gateways, now)
 		return
 	}
@@ -1489,7 +1502,7 @@ func (g *relayHealthGuardian) finishFailure(permit RelayGuardianPermit, statusCo
 	if plannedBackoff < len(relayGuardianReopenDurations)-1 {
 		plannedBackoff++
 	}
-	if g.poolGuardLocked(accounts, account.DBID, trigger, now) {
+	if g.poolGuardLocked(accounts, account.DBID, trigger, 5*time.Minute, now) {
 		state.BackoffLevel = plannedBackoff
 		g.activateLastResortLocked(account, state, "pool_wide_failure_guard", trigger, 5*time.Minute, 0, 0, now)
 		g.mu.Unlock()
