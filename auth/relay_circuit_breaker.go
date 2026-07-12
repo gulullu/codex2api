@@ -270,6 +270,7 @@ func (b *relayCircuitBreaker) begin(accountID int64) (RelayCircuitPermit, bool) 
 		state.probeLeaseID = 0
 		state.updatedAt = now
 		state.revision++
+		log.Printf("[Relay circuit account=%d] entering half-open recovery", accountID)
 	case RelayCircuitHalfOpen:
 		// handled below
 	default:
@@ -374,6 +375,7 @@ func (b *relayCircuitBreaker) openLocked(accountID int64, state *relayCircuitAcc
 	state.probeInFlight = false
 	state.probeLeaseID = 0
 	state.probeSuccesses = 0
+	log.Printf("[Relay circuit account=%d] opened after HTTP %d; recovery_failure=%t open_until=%s generation=%d", accountID, statusCode, recoveryFailure, state.openUntil.Format(time.RFC3339), state.generation)
 }
 
 func (b *relayCircuitBreaker) reportFailure(permit RelayCircuitPermit, statusCode int) bool {
@@ -505,10 +507,12 @@ func (b *relayCircuitBreaker) reportSuccess(permit RelayCircuitPermit) bool {
 
 	if closeCircuit {
 		b.persistIfCurrent(permit.AccountID, revision, relayCircuitRuntimeRecord{}, true)
+		log.Printf("[Relay circuit account=%d] closed after %d successful recovery probes", permit.AccountID, relayCircuitRecoverySuccesses)
 		return true
 	}
 	if persist {
 		b.persistIfCurrent(permit.AccountID, revision, record, false)
+		log.Printf("[Relay circuit account=%d] recovery probe succeeded (%d/%d)", permit.AccountID, record.ProbeSuccesses, relayCircuitRecoverySuccesses)
 	}
 	return false
 }
