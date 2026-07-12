@@ -84,6 +84,32 @@ func TestRelayGuardianEventsPaginationAndTimeFilter(t *testing.T) {
 	}
 }
 
+func TestRelayGuardianEventsUseCurrentAccountNameAfterRename(t *testing.T) {
+	db, err := New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO accounts (id,name,platform,type,credentials,status,enabled)
+		VALUES (51,'old-relay','openai','responses_api','{}','active',true)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InsertRelayGuardianEvent(ctx, &RelayGuardianEvent{AccountID: 51, AccountName: "old-relay", EventType: "summary"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE accounts SET name='renamed-relay' WHERE id=51`); err != nil {
+		t.Fatal(err)
+	}
+	page, err := db.ListRelayGuardianEvents(ctx, 1, 20, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].AccountName != "renamed-relay" {
+		t.Fatalf("events did not follow current account name: %+v", page.Items)
+	}
+}
+
 func TestRelayGuardianEventUsesProvidedTimeAndRetentionDeletesOnlyOldRows(t *testing.T) {
 	db, err := New("sqlite", ":memory:")
 	if err != nil {

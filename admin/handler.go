@@ -2734,6 +2734,7 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 
 	h.store.AddAccount(&auth.Account{
 		DBID:                    id,
+		Name:                    name,
 		ProxyURL:                req.ProxyURL,
 		HealthTier:              auth.HealthTierHealthy,
 		UpstreamType:            auth.UpstreamOpenAIResponses,
@@ -2933,6 +2934,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, modelMapping, codexClientMetadataMode, req.ProxyURL)
+		h.store.ApplyAccountName(id, name)
 		h.store.ApplyAccountCustomHeaders(id, customHeaders)
 	}
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")

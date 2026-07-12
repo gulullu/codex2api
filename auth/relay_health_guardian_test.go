@@ -69,6 +69,23 @@ func guardianObservation(accountID int64, logicalID string, status int, attemptO
 		AttemptOnly: attemptOnly, ObservedAt: at}
 }
 
+func TestRelayGuardianStatusUsesOperatorNameAndTracksHotRename(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, _ := newGuardianTestStore(t, RelayGuardianMonitor, clock, 50)
+	if !store.ApplyAccountName(50, "cyb-relay-kedaya-0.1") {
+		t.Fatal("ApplyAccountName returned false")
+	}
+	status := store.RelayGuardianStatus()
+	if len(status.Accounts) != 1 || status.Accounts[0].AccountName != "cyb-relay-kedaya-0.1" {
+		t.Fatalf("status account name after apply = %+v", status.Accounts)
+	}
+	store.ApplyAccountName(50, "renamed-relay")
+	status = store.RelayGuardianStatus()
+	if status.Accounts[0].AccountName != "renamed-relay" {
+		t.Fatalf("status account name after hot rename = %q", status.Accounts[0].AccountName)
+	}
+}
+
 func TestRelayGuardianAccount51ReplayWouldQuarantineOnSecondVisible500(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50, 53)

@@ -39,6 +39,9 @@ func TestOpenAIResponsesCodexClientMetadataModeLifecycle(t *testing.T) {
 		t.Fatalf("decode add response: %v", err)
 	}
 	assertOpenAIResponsesMetadataMode(t, db, store, added.ID, auth.CodexClientMetadataModeAlways)
+	if got := store.FindByID(added.ID).DisplayName(); got != "responses-relay" {
+		t.Fatalf("runtime display name after add = %q, want responses-relay", got)
+	}
 
 	listRecorder := httptest.NewRecorder()
 	listContext, _ := gin.CreateTestContext(listRecorder)
@@ -69,7 +72,7 @@ func TestOpenAIResponsesCodexClientMetadataModeLifecycle(t *testing.T) {
 
 	mode = auth.CodexClientMetadataModeOff
 	offRecorder := invokeOpenAIResponsesJSONHandler(t, http.MethodPut, updatePath, params, addOpenAIResponsesAccountReq{
-		Name:                    "responses-relay",
+		Name:                    "responses-relay-renamed",
 		BaseURL:                 "https://relay.example.com",
 		Models:                  []string{"gpt-5.5"},
 		CodexClientMetadataMode: &mode,
@@ -78,6 +81,16 @@ func TestOpenAIResponsesCodexClientMetadataModeLifecycle(t *testing.T) {
 		t.Fatalf("off update status = %d, want %d: %s", offRecorder.Code, http.StatusOK, offRecorder.Body.String())
 	}
 	assertOpenAIResponsesMetadataMode(t, db, store, added.ID, auth.CodexClientMetadataModeOff)
+	if got := store.FindByID(added.ID).DisplayName(); got != "responses-relay-renamed" {
+		t.Fatalf("runtime display name after rename = %q, want responses-relay-renamed", got)
+	}
+	row, err := db.GetAccountByID(context.Background(), added.ID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after rename: %v", err)
+	}
+	if row.Name != "responses-relay-renamed" {
+		t.Fatalf("persisted name after rename = %q, want responses-relay-renamed", row.Name)
+	}
 }
 
 func TestAddOpenAIResponsesCodexClientMetadataModeDefaultsAndValidation(t *testing.T) {

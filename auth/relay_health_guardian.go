@@ -1378,7 +1378,7 @@ func (g *relayHealthGuardian) recordEventLocked(account *Account, eventType stri
 		windowID = eventTime.UTC().Truncate(window).Format(time.RFC3339) + "/" + window.String()
 	}
 	event := database.RelayGuardianEvent{
-		CreatedAt: eventTime, AccountID: account.DBID, AccountName: fmt.Sprintf("relay-%d", account.DBID), EventType: eventType,
+		CreatedAt: eventTime, AccountID: account.DBID, AccountName: account.DisplayName(), EventType: eventType,
 		FromState: string(from), ToState: string(state.State), Actor: actor,
 		Reason: state.Reason, TriggerSource: trigger, WindowSeconds: int(window / time.Second),
 		FailureCount: len(logical), UserVisibleFailures: finals, StrongGatewayFailures: gateways,
@@ -2022,7 +2022,7 @@ func (g *relayHealthGuardian) status() RelayGuardianStatus {
 			if !manual {
 				displayState = RelayGuardianManualDisabled
 			}
-			snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: fmt.Sprintf("relay-%d", account.DBID), ManualEnabled: manual, State: displayState, EffectiveSchedulable: manual && account.IsAvailable() && g.store.GetRelayGuardianMode() != RelayGuardianEnforce, Reason: "runtime_state_unavailable", ProbationRequiredSuccesses: relayGuardianProbationSuccesses}
+			snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: account.DisplayName(), ManualEnabled: manual, State: displayState, EffectiveSchedulable: manual && account.IsAvailable() && g.store.GetRelayGuardianMode() != RelayGuardianEnforce, Reason: "runtime_state_unavailable", ProbationRequiredSuccesses: relayGuardianProbationSuccesses}
 			g.mu.Unlock()
 			result.Accounts = append(result.Accounts, g.decorateCircuitSnapshot(snapshot, now))
 			continue
@@ -2047,7 +2047,7 @@ func (g *relayHealthGuardian) status() RelayGuardianStatus {
 			displayState = RelayGuardianManualDisabled
 		}
 		effective := manual && account.IsAvailable() && displayState != RelayGuardianQuarantined && (displayState != RelayGuardianHalfOpen || !state.halfOpenInFlight)
-		snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: fmt.Sprintf("relay-%d", account.DBID), ManualEnabled: manual, State: displayState, EffectiveSchedulable: effective, Reason: state.Reason, TriggerSource: state.TriggerSource, Generation: state.Generation, WindowSeconds: state.WindowSeconds, FailureCount: len(failureIDs), UserVisibleFailures: len(finalIDs), StrongGatewayFailures: len(strongIDs), WouldQuarantine: state.State == RelayGuardianWouldQuarantine, QuarantineUntil: relayGuardianTimePtr(state.QuarantineUntil), BackoffLevel: state.BackoffLevel, LastResort: state.LastResort, LastResortCap: state.LastResortCap, ShadowAction: state.ShadowAction, ProbationPercent: state.ProbationPercent, ProbationSuccesses: state.ProbationSuccesses, ProbationRequiredSuccesses: relayGuardianProbationSuccesses, LastFailureAt: relayGuardianTimePtr(state.LastFailureAt), LastActionAt: relayGuardianTimePtr(state.LastActionAt), LastScanAt: relayGuardianTimePtr(state.LastScanAt)}
+		snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: account.DisplayName(), ManualEnabled: manual, State: displayState, EffectiveSchedulable: effective, Reason: state.Reason, TriggerSource: state.TriggerSource, Generation: state.Generation, WindowSeconds: state.WindowSeconds, FailureCount: len(failureIDs), UserVisibleFailures: len(finalIDs), StrongGatewayFailures: len(strongIDs), WouldQuarantine: state.State == RelayGuardianWouldQuarantine, QuarantineUntil: relayGuardianTimePtr(state.QuarantineUntil), BackoffLevel: state.BackoffLevel, LastResort: state.LastResort, LastResortCap: state.LastResortCap, ShadowAction: state.ShadowAction, ProbationPercent: state.ProbationPercent, ProbationSuccesses: state.ProbationSuccesses, ProbationRequiredSuccesses: relayGuardianProbationSuccesses, LastFailureAt: relayGuardianTimePtr(state.LastFailureAt), LastActionAt: relayGuardianTimePtr(state.LastActionAt), LastScanAt: relayGuardianTimePtr(state.LastScanAt)}
 		g.mu.Unlock()
 		result.Accounts = append(result.Accounts, g.decorateCircuitSnapshot(snapshot, now))
 	}

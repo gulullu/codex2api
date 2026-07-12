@@ -88,6 +88,7 @@ func NormalizeTestContent(content string) string {
 type Account struct {
 	mu                      sync.RWMutex
 	DBID                    int64 // 数据库 ID
+	Name                    string
 	RefreshToken            string
 	SessionToken            string
 	AccessToken             string
@@ -316,6 +317,23 @@ type SchedulerDebugSnapshot struct {
 // ID 返回数据库 ID
 func (a *Account) ID() int64 {
 	return a.DBID
+}
+
+// DisplayName returns the operator-defined database account name. Guardian
+// surfaces use this instead of credential-derived fields such as Email or
+// BaseURL, which may contain sensitive relay connection details.
+func (a *Account) DisplayName() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.RLock()
+	name := strings.TrimSpace(a.Name)
+	id := a.DBID
+	a.mu.RUnlock()
+	if name != "" {
+		return name
+	}
+	return fmt.Sprintf("relay-%d", id)
 }
 
 // HasGroupID reports whether the account belongs to id while protecting the
@@ -3568,6 +3586,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 
 	account := &Account{
 		DBID:                    row.ID,
+		Name:                    strings.TrimSpace(row.Name),
 		RefreshToken:            rt,
 		SessionToken:            st,
 		ProxyURL:                strings.TrimSpace(row.ProxyURL),
@@ -5616,6 +5635,20 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+// ApplyAccountName hot-applies an operator-facing account rename. Keeping the
+// name in the runtime Account lets Guardian status and newly written events
+// reflect UI edits immediately without a restart.
+func (s *Store) ApplyAccountName(dbID int64, name string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	acc.Name = strings.TrimSpace(name)
+	acc.mu.Unlock()
 	return true
 }
 

@@ -97,21 +97,23 @@ func (db *DB) ListRelayGuardianEvents(ctx context.Context, page, pageSize int, s
 		where = append(where, fmt.Sprintf(clause, len(args)))
 	}
 	if !start.IsZero() {
-		add("created_at >= $%d", db.timeArg(start))
+		add("e.created_at >= $%d", db.timeArg(start))
 	}
 	if !end.IsZero() {
-		add("created_at <= $%d", db.timeArg(end))
+		add("e.created_at <= $%d", db.timeArg(end))
 	}
 	condition := strings.Join(where, " AND ")
 	var total int64
-	if err := db.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM relay_guardian_events WHERE "+condition, args...).Scan(&total); err != nil {
+	if err := db.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM relay_guardian_events e WHERE "+condition, args...).Scan(&total); err != nil {
 		return nil, err
 	}
 	args = append(args, pageSize, (page-1)*pageSize)
-	query := fmt.Sprintf(`SELECT id, created_at, account_id, account_name, event_type, from_state, to_state,
-		actor, reason, trigger_source, window_seconds, failure_count, user_visible_failures,
-		strong_gateway_failures, quarantine_seconds, generation, logical_request_ids, details
-		FROM relay_guardian_events WHERE %s ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d`, condition, len(args)-1, len(args))
+	query := fmt.Sprintf(`SELECT e.id, e.created_at, e.account_id,
+		COALESCE(NULLIF(a.name, ''), e.account_name), e.event_type, e.from_state, e.to_state,
+		e.actor, e.reason, e.trigger_source, e.window_seconds, e.failure_count, e.user_visible_failures,
+		e.strong_gateway_failures, e.quarantine_seconds, e.generation, e.logical_request_ids, e.details
+		FROM relay_guardian_events e LEFT JOIN accounts a ON a.id = e.account_id
+		WHERE %s ORDER BY e.created_at DESC, e.id DESC LIMIT $%d OFFSET $%d`, condition, len(args)-1, len(args))
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
