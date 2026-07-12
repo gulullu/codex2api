@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -35,9 +36,11 @@ type createAccountResponse struct {
 }
 
 type healthResponse struct {
-	Status    string `json:"status"`
-	Available int    `json:"available"`
-	Total     int    `json:"total"`
+	Status    string                          `json:"status"`
+	Available int                             `json:"available"`
+	Total     int                             `json:"total"`
+	Guardian  auth.RelayGuardianHealthSummary `json:"guardian"`
+	Relay     auth.RelayGuardianRelaySummary  `json:"relay"`
 }
 
 type usageLogsResponse struct {

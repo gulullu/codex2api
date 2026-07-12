@@ -5203,6 +5203,7 @@ func sqliteJSONSetKeySupported(key string) bool {
 }
 
 func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name string, credentials map[string]interface{}, proxyURL string) error {
+	name = strings.TrimSpace(name)
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err

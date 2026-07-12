@@ -110,6 +110,60 @@ func TestRelayGuardianEventsUseCurrentAccountNameAfterRename(t *testing.T) {
 	}
 }
 
+func TestRelayGuardianEventsUseSnapshotForBlankOrMissingAccountName(t *testing.T) {
+	db, err := New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	for _, account := range []struct {
+		id     int64
+		name   string
+		status string
+		error  string
+	}{
+		{id: 51, name: "   ", status: "active"},
+		{id: 52, name: "physical-current", status: "active"},
+		{id: 53, name: "  soft-deleted-current  ", status: "deleted", error: "deleted"},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO accounts (id,name,platform,type,credentials,status,error_message,enabled)
+			VALUES ($1,$2,'openai','responses_api','{}',$3,$4,true)`, account.id, account.name, account.status, account.error); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, event := range []RelayGuardianEvent{
+		{AccountID: 51, AccountName: "blank-name-snapshot", EventType: "summary"},
+		{AccountID: 52, AccountName: "physical-delete-snapshot", EventType: "summary"},
+		{AccountID: 53, AccountName: "soft-delete-snapshot", EventType: "summary"},
+	} {
+		if err := db.InsertRelayGuardianEvent(ctx, &event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM accounts WHERE id=52`); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := db.ListRelayGuardianEvents(ctx, 1, 20, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[int64]string, len(page.Items))
+	for _, event := range page.Items {
+		got[event.AccountID] = event.AccountName
+	}
+	if got[51] != "blank-name-snapshot" {
+		t.Fatalf("blank current name = %q, want snapshot", got[51])
+	}
+	if got[52] != "physical-delete-snapshot" {
+		t.Fatalf("missing account name = %q, want snapshot", got[52])
+	}
+	if got[53] != "soft-deleted-current" {
+		t.Fatalf("soft-deleted current name = %q, want current trimmed name", got[53])
+	}
+}
+
 func TestRelayGuardianEventUsesProvidedTimeAndRetentionDeletesOnlyOldRows(t *testing.T) {
 	db, err := New("sqlite", ":memory:")
 	if err != nil {

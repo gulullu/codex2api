@@ -597,14 +597,15 @@ func TestCodexAuditRelayCasesHighVolumePagesBeforePromptEnrichment(t *testing.T)
 	}
 }
 
-func TestCodexAuditVerdictUsesRelayFailuresInsteadOfGlobal5xx(t *testing.T) {
+func TestCodexAuditVerdictPreservesGlobal5xxCompatibility(t *testing.T) {
 	report := &CodexAuditReport{
 		Usage:   CodexAuditUsageSummary{Errors5xx: 1},
 		Summary: CodexAuditSummary{},
 	}
-	if got := codexAuditVerdict(report); got != "normal" {
-		t.Fatalf("default-route 5xx verdict = %q, want normal", got)
+	if got := codexAuditVerdict(report); got != "operational_issue" {
+		t.Fatalf("default-route 5xx verdict = %q, want operational_issue", got)
 	}
+	report.Usage.Errors5xx = 0
 	report.Summary.RelayRouteFailures = 1
 	if got := codexAuditVerdict(report); got != "operational_issue" {
 		t.Fatalf("relay failure verdict = %q, want operational_issue", got)

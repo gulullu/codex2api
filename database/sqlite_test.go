@@ -2681,6 +2681,41 @@ func TestInsertOpenAIResponsesAccountDefaultsAndAllowsConfiguredMaximum(t *testi
 	}
 }
 
+func TestOpenAIResponsesAccountNamesAreTrimmedOnInsertAndUpdate(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertOpenAIResponsesAccount(ctx, "  relay primary  ", map[string]interface{}{
+		"api_key":  "secret",
+		"base_url": "https://relay.example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert Responses account: %v", err)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID(insert): %v", err)
+	}
+	if row.Name != "relay primary" {
+		t.Fatalf("inserted name = %q, want %q", row.Name, "relay primary")
+	}
+
+	if err := db.UpdateOpenAIResponsesAccount(ctx, id, "\t relay renamed \n", nil, ""); err != nil {
+		t.Fatalf("update Responses account: %v", err)
+	}
+	row, err = db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID(update): %v", err)
+	}
+	if row.Name != "relay renamed" {
+		t.Fatalf("updated name = %q, want %q", row.Name, "relay renamed")
+	}
+}
+
 func TestInsertOpenAIResponsesAccountWithConfigRollsBackOnGroupFailure(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	db, err := New("sqlite", dbPath)

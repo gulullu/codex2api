@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -121,6 +122,16 @@ func TestHealthResponse(t *testing.T) {
 		Status:    "healthy",
 		Available: 8,
 		Total:     10,
+		Guardian: auth.RelayGuardianHealthSummary{
+			Enabled: true,
+			Mode:    auth.RelayGuardianMonitor,
+			Status:  "ok",
+		},
+		Relay: auth.RelayGuardianRelaySummary{
+			Configured:  3,
+			Enabled:     3,
+			Schedulable: 2,
+		},
 	}
 
 	if resp.Status != "healthy" {
@@ -128,6 +139,23 @@ func TestHealthResponse(t *testing.T) {
 	}
 	if resp.Available != 8 {
 		t.Errorf("Available = %d, want 8", resp.Available)
+	}
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("marshal health response: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal health response: %v", err)
+	}
+	guardian, ok := decoded["guardian"].(map[string]any)
+	if !ok || guardian["mode"] != "monitor" || guardian["status"] != "ok" {
+		t.Fatalf("guardian JSON = %#v", decoded["guardian"])
+	}
+	relay, ok := decoded["relay"].(map[string]any)
+	if !ok || relay["configured"] != float64(3) || relay["schedulable"] != float64(2) {
+		t.Fatalf("relay JSON = %#v", decoded["relay"])
 	}
 }
 

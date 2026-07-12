@@ -109,7 +109,7 @@ func (db *DB) ListRelayGuardianEvents(ctx context.Context, page, pageSize int, s
 	}
 	args = append(args, pageSize, (page-1)*pageSize)
 	query := fmt.Sprintf(`SELECT e.id, e.created_at, e.account_id,
-		COALESCE(NULLIF(a.name, ''), e.account_name), e.event_type, e.from_state, e.to_state,
+		COALESCE(NULLIF(TRIM(a.name), ''), e.account_name), e.event_type, e.from_state, e.to_state,
 		e.actor, e.reason, e.trigger_source, e.window_seconds, e.failure_count, e.user_visible_failures,
 		e.strong_gateway_failures, e.quarantine_seconds, e.generation, e.logical_request_ids, e.details
 		FROM relay_guardian_events e LEFT JOIN accounts a ON a.id = e.account_id

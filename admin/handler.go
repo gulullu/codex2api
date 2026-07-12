@@ -2595,7 +2595,7 @@ func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
 		return
 	}
 
-	req.Name = security.SanitizeInput(req.Name)
+	req.Name = strings.TrimSpace(security.SanitizeInput(req.Name))
 	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
 	req.APIKey = strings.TrimSpace(req.APIKey)
 	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
@@ -2831,7 +2831,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	req.Name = security.SanitizeInput(req.Name)
+	req.Name = strings.TrimSpace(security.SanitizeInput(req.Name))
 	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
 	req.APIKey = strings.TrimSpace(req.APIKey)
 
@@ -4915,10 +4915,13 @@ func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
 
 // GetHealth 系统健康检查（扩展版）
 func (h *Handler) GetHealth(c *gin.Context) {
+	guardian, relay := h.store.RelayGuardianHealth()
 	c.JSON(http.StatusOK, healthResponse{
 		Status:    "ok",
 		Available: h.store.AvailableCount(),
 		Total:     h.store.AccountCount(),
+		Guardian:  guardian,
+		Relay:     relay,
 	})
 }
 

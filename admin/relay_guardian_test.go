@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -54,6 +55,31 @@ func guardianSettingsTestHandler(t *testing.T, db *database.DB) (*Handler, *auth
 	tokenCache := cache.NewMemory(4)
 	store := auth.NewStore(db, tokenCache, settings)
 	return NewHandler(store, db, tokenCache, proxy.NewRateLimiter(0), "admin-secret"), store, tokenCache
+}
+
+func TestGetHealthIncludesRelayGuardianAggregation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store, tokenCache := guardianAdminTestStore(t)
+	defer tokenCache.Close()
+	wantGuardian, wantRelay := store.RelayGuardianHealth()
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/health", nil)
+	(&Handler{store: store}).GetHealth(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response healthResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(response.Guardian, wantGuardian) {
+		t.Fatalf("guardian=%+v, want %+v", response.Guardian, wantGuardian)
+	}
+	if !reflect.DeepEqual(response.Relay, wantRelay) {
+		t.Fatalf("relay=%+v, want %+v", response.Relay, wantRelay)
+	}
 }
 
 func invokeGuardianModeUpdate(handler *Handler, mode string) *httptest.ResponseRecorder {

@@ -24,6 +24,7 @@ type OpenAIResponsesAccountConfig struct {
 // memberships in one transaction. This keeps the add/copy flow from leaving a
 // partially configured account when the metadata write fails.
 func (db *DB) InsertOpenAIResponsesAccountWithConfig(ctx context.Context, name string, credentials map[string]interface{}, proxyURL string, config OpenAIResponsesAccountConfig) (int64, error) {
+	name = strings.TrimSpace(name)
 	if credentials == nil {
 		credentials = map[string]interface{}{}
 	}
