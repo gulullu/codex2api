@@ -132,11 +132,11 @@ func (a *Account) relayGuardianLastResort() bool {
 	return a.relayGuardianSchedulingHint.Load()&relayGuardianHintLastResortBit != 0
 }
 
-func (a *Account) relayGuardianConcurrencyLimit(limit int64) int64 {
-	if a == nil || limit <= 0 {
+func relayGuardianConcurrencyLimitForToken(limit int64, token uint64) int64 {
+	if limit <= 0 {
 		return 0
 	}
-	hint := decodeRelayGuardianSchedulingHint(a.relayGuardianSchedulingHint.Load())
+	hint := decodeRelayGuardianSchedulingHint(token)
 	effective := limit
 	if hint.hardCap > 0 && hint.hardCap < effective {
 		effective = hint.hardCap
@@ -153,6 +153,13 @@ func (a *Account) relayGuardianConcurrencyLimit(limit int64) int64 {
 		}
 	}
 	return effective
+}
+
+func (a *Account) relayGuardianConcurrencyLimit(limit int64) int64 {
+	if a == nil {
+		return 0
+	}
+	return relayGuardianConcurrencyLimitForToken(limit, a.relayGuardianSchedulingHint.Load())
 }
 
 func (a *Account) SetSchedulerPriority(priority int64) {

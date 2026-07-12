@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,35 @@ import (
 
 	"github.com/codex2api/cache"
 )
+
+type relayGuardianHintMutationCache struct {
+	cache.TokenCache
+	accountID int64
+	once      sync.Once
+	mutate    func()
+}
+
+func (c *relayGuardianHintMutationCache) GetRuntime(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	if c != nil && namespace == accountCooldownCacheNamespace && key == accountCooldownRuntimeKey(c.accountID) {
+		c.once.Do(func() {
+			if c.mutate != nil {
+				c.mutate()
+			}
+		})
+	}
+	return c.TokenCache.GetRuntime(ctx, namespace, key)
+}
+
+func installRelayGuardianHintMutationCache(t *testing.T, store *Store, accountID int64, mutate func()) {
+	t.Helper()
+	base := cache.NewMemory(4)
+	t.Cleanup(func() { _ = base.Close() })
+	store.tokenCache = &relayGuardianHintMutationCache{
+		TokenCache: base,
+		accountID:  accountID,
+		mutate:     mutate,
+	}
+}
 
 func waitForCondition(t *testing.T, description string, condition func() bool) {
 	t.Helper()
@@ -287,15 +317,18 @@ func TestFastSchedulerRejectsHintChangesDuringAndAfterAcquire(t *testing.T) {
 
 	t.Run("post_cas", func(t *testing.T) {
 		scheduler, preferred, normal := newScheduler()
+		preferred.SetDispatchCountLimit(1)
+		preferred.SetReset7dAt(time.Now().Add(time.Hour))
+		store := &Store{maxConcurrency: 1}
 		var once sync.Once
-		scheduler.SetAcquireFunc(func(account *Account, limit int64) bool {
-			if !tryAcquireAccount(account, limit) {
+		scheduler.SetAcquireFunc(func(account *Account, limit int64, expectedHintToken uint64) bool {
+			if !reserveAccountConcurrencyWithToken(account, limit, expectedHintToken) {
 				return false
 			}
 			if account == preferred {
 				once.Do(func() { preferred.setRelayGuardianSchedulingHint(true, 1, 0) })
 			}
-			return true
+			return store.commitAccountConcurrencyReservation(account, false, expectedHintToken)
 		})
 		if got := scheduler.Acquire(); got != normal {
 			t.Fatalf("Acquire=%+v, want normal account after post-CAS hint change", got)
@@ -303,7 +336,121 @@ func TestFastSchedulerRejectsHintChangesDuringAndAfterAcquire(t *testing.T) {
 		if active := atomic.LoadInt64(&preferred.ActiveRequests); active != 0 {
 			t.Fatalf("post-CAS rejection leaked ActiveRequests=%d", active)
 		}
+		if total := atomic.LoadInt64(&preferred.TotalRequests); total != 0 {
+			t.Fatalf("post-CAS rejection leaked TotalRequests=%d", total)
+		}
+		if lastUsed := atomic.LoadInt64(&preferred.LastUsedAt); lastUsed != 0 {
+			t.Fatalf("post-CAS rejection leaked LastUsedAt=%d", lastUsed)
+		}
+		if dispatch := preferred.GetDispatchCountSnapshot(); dispatch.Used != 0 || dispatch.Limited {
+			t.Fatalf("post-CAS rejection leaked dispatch reservation: %+v", dispatch)
+		}
+		preferred.mu.RLock()
+		status, cooldown := preferred.Status, preferred.CooldownUtil
+		preferred.mu.RUnlock()
+		if status == StatusCooldown || !cooldown.IsZero() {
+			t.Fatalf("post-CAS rejection leaked cooldown: status=%v until=%v", status, cooldown)
+		}
 	})
+}
+
+func requireNoAcquireSideEffects(t *testing.T, account *Account, expectedActive int64) {
+	t.Helper()
+	if active := atomic.LoadInt64(&account.ActiveRequests); active != expectedActive {
+		t.Fatalf("ActiveRequests=%d, want %d", active, expectedActive)
+	}
+	if total := atomic.LoadInt64(&account.TotalRequests); total != 0 {
+		t.Fatalf("TotalRequests=%d after rejected expected-token acquire, want 0", total)
+	}
+	if lastUsed := atomic.LoadInt64(&account.LastUsedAt); lastUsed != 0 {
+		t.Fatalf("LastUsedAt=%d after rejected expected-token acquire, want 0", lastUsed)
+	}
+	if dispatch := account.GetDispatchCountSnapshot(); dispatch.Used != 0 || dispatch.Limited {
+		t.Fatalf("dispatch reservation leaked after rejected expected-token acquire: %+v", dispatch)
+	}
+	account.mu.RLock()
+	status, cooldown := account.Status, account.CooldownUtil
+	account.mu.RUnlock()
+	if status == StatusCooldown || !cooldown.IsZero() {
+		t.Fatalf("cooldown leaked after rejected expected-token acquire: status=%v until=%v", status, cooldown)
+	}
+}
+
+func TestStoreSchedulersRejectNormalCandidateChangedToLastResort(t *testing.T) {
+	for _, mode := range []string{"slow", "lazy"} {
+		t.Run(mode, func(t *testing.T) {
+			preferred := newGuardianSchedulingAccount(1, "preferred", maxSchedulerPriority)
+			fallback := newGuardianSchedulingAccount(2, "fallback", minSchedulerPriority)
+			preferred.SetDispatchCountLimit(1)
+			preferred.SetReset7dAt(time.Now().Add(time.Hour))
+			store := &Store{accounts: []*Account{preferred, fallback}, maxConcurrency: 100}
+			if mode == "lazy" {
+				store.SetLazyMode(true)
+			}
+			installRelayGuardianHintMutationCache(t, store, preferred.DBID, func() {
+				preferred.setRelayGuardianSchedulingHint(true, 1, 0)
+			})
+
+			got := store.Next()
+			if got == nil || got.DBID != fallback.DBID {
+				t.Fatalf("Next()=%+v, want fallback account %d after preferred token changed", got, fallback.DBID)
+			}
+			store.Release(got)
+			requireNoAcquireSideEffects(t, preferred, 0)
+		})
+	}
+}
+
+func TestStoreSchedulersDoNotOvershootTightenedGuardianCap(t *testing.T) {
+	for _, mode := range []string{"slow", "lazy"} {
+		t.Run(mode, func(t *testing.T) {
+			account := newGuardianSchedulingAccount(1, "only", 0)
+			account.SetDispatchCountLimit(1)
+			account.SetReset7dAt(time.Now().Add(time.Hour))
+			atomic.StoreInt64(&account.ActiveRequests, 1)
+			store := &Store{accounts: []*Account{account}, maxConcurrency: 100}
+			if mode == "lazy" {
+				store.SetLazyMode(true)
+			}
+			installRelayGuardianHintMutationCache(t, store, account.DBID, func() {
+				account.setRelayGuardianSchedulingHint(true, 1, 0)
+			})
+
+			if got := store.Next(); got != nil {
+				store.Release(got)
+				t.Fatalf("Next()=%+v after cap tightened to active concurrency", got)
+			}
+			requireNoAcquireSideEffects(t, account, 1)
+			atomic.StoreInt64(&account.ActiveRequests, 0)
+		})
+	}
+}
+
+func TestTakeByIDRejectsAffinityCandidateAfterHintTokenChange(t *testing.T) {
+	for _, mode := range []string{"slow", "lazy"} {
+		t.Run(mode, func(t *testing.T) {
+			account := newGuardianSchedulingAccount(1, "affinity", 0)
+			account.SetDispatchCountLimit(1)
+			account.SetReset7dAt(time.Now().Add(time.Hour))
+			store := &Store{
+				accounts:       []*Account{account},
+				accountsByID:   map[int64]*Account{account.DBID: account},
+				maxConcurrency: 100,
+			}
+			if mode == "lazy" {
+				store.SetLazyMode(true)
+			}
+			installRelayGuardianHintMutationCache(t, store, account.DBID, func() {
+				account.setRelayGuardianSchedulingHint(true, 1, 0)
+			})
+
+			if got := store.takeByIDExcluding(account.DBID, 0, nil, nil); got != nil {
+				store.Release(got)
+				t.Fatalf("takeByIDExcluding()=%+v after affinity candidate token changed", got)
+			}
+			requireNoAcquireSideEffects(t, account, 0)
+		})
+	}
 }
 
 func TestRelayRuntimeCacheIsNotReadFromSchedulerHotPath(t *testing.T) {

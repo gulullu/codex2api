@@ -2875,8 +2875,8 @@ func (s *Store) configureFastScheduler(scheduler *FastScheduler) {
 	scheduler.SetGroupCheck(func(apiKeyID int64, account *Account) bool {
 		return s.APIKeyAllowsAccount(apiKeyID, account) && s.RelayCircuitSelectable(account)
 	})
-	scheduler.SetAcquireFunc(func(acc *Account, concurrencyLimit int64) bool {
-		return s.tryAcquireAccount(acc, concurrencyLimit, false)
+	scheduler.SetAcquireFunc(func(acc *Account, concurrencyLimit int64, expectedHintToken uint64) bool {
+		return s.tryAcquireAccountWithToken(acc, concurrencyLimit, false, expectedHintToken)
 	})
 }
 
@@ -3858,35 +3858,37 @@ func (s *Store) NextExcluding(apiKeyID int64, exclude map[int64]bool) *Account {
 	return s.NextExcludingWithFilter(apiKeyID, exclude, nil)
 }
 
-func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLimit bool) bool {
-	if acc == nil || limit <= 0 {
+func (s *Store) commitAccountConcurrencyReservation(acc *Account, updateSchedulerOnLimit bool, expectedHintToken uint64) bool {
+	if !validateAccountConcurrencyReservation(acc, expectedHintToken) {
 		return false
 	}
-	for {
-		effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
-		if effectiveLimit <= 0 {
-			return false
-		}
-		current := atomic.LoadInt64(&acc.ActiveRequests)
-		if current >= effectiveLimit {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
-			now := time.Now()
-			reservation := acc.reserveDispatchCount(now)
-			if !reservation.Allowed {
-				atomic.AddInt64(&acc.ActiveRequests, -1)
-				s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
-				return false
-			}
-			atomic.AddInt64(&acc.TotalRequests, 1)
-			atomic.StoreInt64(&acc.LastUsedAt, now.UnixNano())
-			if reservation.HitLimit {
-				s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
-			}
-			return true
-		}
+	now := time.Now()
+	reservation := acc.reserveDispatchCount(now)
+	if !reservation.Allowed {
+		atomic.AddInt64(&acc.ActiveRequests, -1)
+		s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
+		return false
 	}
+	atomic.AddInt64(&acc.TotalRequests, 1)
+	atomic.StoreInt64(&acc.LastUsedAt, now.UnixNano())
+	if reservation.HitLimit {
+		s.markDispatchCountLimitCooldown(acc, reservation.ResetAt, updateSchedulerOnLimit)
+	}
+	return true
+}
+
+func (s *Store) tryAcquireAccountWithToken(acc *Account, limit int64, updateSchedulerOnLimit bool, expectedHintToken uint64) bool {
+	if !reserveAccountConcurrencyWithToken(acc, limit, expectedHintToken) {
+		return false
+	}
+	return s.commitAccountConcurrencyReservation(acc, updateSchedulerOnLimit, expectedHintToken)
+}
+
+func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLimit bool) bool {
+	if acc == nil {
+		return false
+	}
+	return s.tryAcquireAccountWithToken(acc, limit, updateSchedulerOnLimit, acc.relayGuardianSchedulingToken())
 }
 
 // NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
@@ -3915,6 +3917,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		bestLastResort := true
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
+		var bestHintToken uint64
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
 		var bestLimit int64
@@ -3936,7 +3939,8 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 
 			load := atomic.LoadInt64(&acc.ActiveRequests)
 			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
-			effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
+			hintToken := acc.relayGuardianSchedulingToken()
+			effectiveLimit := relayGuardianConcurrencyLimitForToken(limit, hintToken)
 			if effectiveLimit <= 0 || load >= effectiveLimit {
 				continue
 			}
@@ -3944,7 +3948,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			lastResort := acc.relayGuardianLastResort()
+			lastResort := hintToken&relayGuardianHintLastResortBit != 0
 			// Guardian 兜底账号严格排在所有普通账号之后；只有普通账号均无余量时才使用。
 			// 在同一类别内继续遵循官方 scheduler_priority / 健康档位 / 分数排序。
 			sameClass := best != nil && lastResort == bestLastResort
@@ -3957,6 +3961,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				bestLastResort = lastResort
 				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
+				bestHintToken = hintToken
 				bestDispatchScore = dispatchScore
 				bestLoad = load
 				bestLimit = limit
@@ -3971,7 +3976,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		if s.accountHasCachedCooldown(best) {
 			continue
 		}
-		if s.tryAcquireAccount(best, bestLimit, true) {
+		if s.tryAcquireAccountWithToken(best, bestLimit, true, bestHintToken) {
 			return best
 		}
 	}
@@ -4070,7 +4075,7 @@ func (s *Store) lazyCanRefreshForMetadata(acc *Account) bool {
 		acc.healthTierLocked() != HealthTierBanned
 }
 
-func (s *Store) acquireLazyCandidate(acc *Account, maxConcurrency int64) bool {
+func (s *Store) acquireLazyCandidate(acc *Account, maxConcurrency int64, expectedHintToken uint64) bool {
 	if !s.ensureLazyDispatchReady(acc) {
 		return false
 	}
@@ -4078,7 +4083,7 @@ func (s *Store) acquireLazyCandidate(acc *Account, maxConcurrency int64) bool {
 	if limit <= 0 {
 		return false
 	}
-	return s.tryAcquireAccount(acc, limit, true)
+	return s.tryAcquireAccountWithToken(acc, limit, true, expectedHintToken)
 }
 
 func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
@@ -4090,6 +4095,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 		bestLastResort := true
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
+		var bestHintToken uint64
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
@@ -4117,7 +4123,8 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 
 			load := atomic.LoadInt64(&acc.ActiveRequests)
 			tier, _, dispatchScore, limit := acc.schedulerSnapshot(maxConcurrency)
-			effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
+			hintToken := acc.relayGuardianSchedulingToken()
+			effectiveLimit := relayGuardianConcurrencyLimitForToken(limit, hintToken)
 			if effectiveLimit <= 0 || load >= effectiveLimit {
 				continue
 			}
@@ -4125,7 +4132,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			lastResort := acc.relayGuardianLastResort()
+			lastResort := hintToken&relayGuardianHintLastResortBit != 0
 			sameClass := best != nil && lastResort == bestLastResort
 			if best == nil || (bestLastResort && !lastResort) || (sameClass &&
 				(schedulerPriority > bestSchedulerPriority ||
@@ -4136,6 +4143,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 				bestLastResort = lastResort
 				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
+				bestHintToken = hintToken
 				bestDispatchScore = dispatchScore
 				bestLoad = load
 				best = acc
@@ -4152,7 +4160,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 		if s.accountHasCachedCooldown(best) {
 			continue
 		}
-		if s.acquireLazyCandidate(best, maxConcurrency) {
+		if s.acquireLazyCandidate(best, maxConcurrency, bestHintToken) {
 			return best
 		}
 	}
@@ -4393,6 +4401,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	} else if !target.IsAvailable() {
 		return nil
 	}
+	expectedHintToken := target.relayGuardianSchedulingToken()
 	if s.accountHasCachedCooldown(target) {
 		return nil
 	}
@@ -4406,7 +4415,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	now := time.Now()
 	if s.GetLazyMode() {
-		if !s.acquireLazyCandidate(target, maxConcurrency) {
+		if !s.acquireLazyCandidate(target, maxConcurrency, expectedHintToken) {
 			return nil
 		}
 		return target
@@ -4416,7 +4425,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	if !available || limit <= 0 {
 		return nil
 	}
-	if !s.tryAcquireAccount(target, limit, true) {
+	if !s.tryAcquireAccountWithToken(target, limit, true, expectedHintToken) {
 		return nil
 	}
 	return target

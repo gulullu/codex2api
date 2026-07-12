@@ -53,7 +53,7 @@ type FastScheduler struct {
 	priorities     []int64
 	segmentCursors map[fastSchedulerCursorKey]uint64
 	groupCheck     func(apiKeyID int64, account *Account) bool
-	acquire        func(account *Account, concurrencyLimit int64) bool
+	acquire        func(account *Account, concurrencyLimit int64, expectedHintToken uint64) bool
 }
 
 func NewFastScheduler(baseLimit int64, schedulerMode string) *FastScheduler {
@@ -85,7 +85,7 @@ func (s *FastScheduler) SetGroupCheck(check func(apiKeyID int64, account *Accoun
 	s.mu.Unlock()
 }
 
-func (s *FastScheduler) SetAcquireFunc(acquire func(account *Account, concurrencyLimit int64) bool) {
+func (s *FastScheduler) SetAcquireFunc(acquire func(account *Account, concurrencyLimit int64, expectedHintToken uint64) bool) {
 	if s == nil {
 		return
 	}
@@ -433,7 +433,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 				}
 				return nil, true
 			}
-			effectiveLimit := entry.acc.relayGuardianConcurrencyLimit(limit)
+			effectiveLimit := relayGuardianConcurrencyLimitForToken(limit, hintToken)
 			load := atomic.LoadInt64(&entry.acc.ActiveRequests)
 			if !available || effectiveLimit <= 0 || load >= effectiveLimit {
 				continue
@@ -441,13 +441,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 			if entry.acc.relayGuardianSchedulingToken() != hintToken {
 				continue
 			}
-			if !s.tryAcquireAccount(entry.acc, limit) {
-				continue
-			}
-			if entry.acc.relayGuardianSchedulingToken() != hintToken {
-				// The hint changed in the final CAS window. Roll back only the
-				// concurrency reservation; no upstream request has started yet.
-				atomic.AddInt64(&entry.acc.ActiveRequests, -1)
+			if !s.tryAcquireAccount(entry.acc, limit, hintToken) {
 				continue
 			}
 			return entry.acc, false
@@ -463,11 +457,11 @@ func (s *FastScheduler) Release(acc *Account) {
 	atomic.AddInt64(&acc.ActiveRequests, -1)
 }
 
-func (s *FastScheduler) tryAcquireAccount(acc *Account, limit int64) bool {
+func (s *FastScheduler) tryAcquireAccount(acc *Account, limit int64, expectedHintToken uint64) bool {
 	if s != nil && s.acquire != nil {
-		return s.acquire(acc, limit)
+		return s.acquire(acc, limit, expectedHintToken)
 	}
-	return tryAcquireAccount(acc, limit)
+	return tryAcquireAccountWithToken(acc, limit, expectedHintToken)
 }
 
 func (s *FastScheduler) BucketSizes() map[AccountHealthTier]int {
@@ -665,18 +659,20 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	return tier, score, limit, proven, available
 }
 
-func tryAcquireAccount(acc *Account, limit int64) bool {
-	if acc == nil {
+// reserveAccountConcurrencyWithToken reserves one ActiveRequests slot using a
+// single Guardian hint token as the scheduling snapshot. The reservation is not
+// a committed dispatch until commitAccountConcurrencyReservation validates the
+// same token again; therefore no dispatch accounting may happen between them.
+func reserveAccountConcurrencyWithToken(acc *Account, limit int64, expectedHintToken uint64) bool {
+	if acc == nil || limit <= 0 || acc.relayGuardianSchedulingToken() != expectedHintToken {
 		return false
 	}
-
-	if limit <= 0 {
+	effectiveLimit := relayGuardianConcurrencyLimitForToken(limit, expectedHintToken)
+	if effectiveLimit <= 0 {
 		return false
 	}
-
 	for {
-		effectiveLimit := acc.relayGuardianConcurrencyLimit(limit)
-		if effectiveLimit <= 0 {
+		if acc.relayGuardianSchedulingToken() != expectedHintToken {
 			return false
 		}
 		current := atomic.LoadInt64(&acc.ActiveRequests)
@@ -684,9 +680,44 @@ func tryAcquireAccount(acc *Account, limit int64) bool {
 			return false
 		}
 		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
-			atomic.AddInt64(&acc.TotalRequests, 1)
-			atomic.StoreInt64(&acc.LastUsedAt, time.Now().UnixNano())
 			return true
 		}
 	}
+}
+
+// validateAccountConcurrencyReservation is the acquisition linearization
+// point. A later hint change is ordered after this accepted dispatch; a change
+// observed here releases only the uncommitted ActiveRequests reservation.
+func validateAccountConcurrencyReservation(acc *Account, expectedHintToken uint64) bool {
+	if acc == nil {
+		return false
+	}
+	if acc.relayGuardianSchedulingToken() == expectedHintToken {
+		return true
+	}
+	atomic.AddInt64(&acc.ActiveRequests, -1)
+	return false
+}
+
+func commitBasicAccountConcurrencyReservation(acc *Account, expectedHintToken uint64) bool {
+	if !validateAccountConcurrencyReservation(acc, expectedHintToken) {
+		return false
+	}
+	atomic.AddInt64(&acc.TotalRequests, 1)
+	atomic.StoreInt64(&acc.LastUsedAt, time.Now().UnixNano())
+	return true
+}
+
+func tryAcquireAccountWithToken(acc *Account, limit int64, expectedHintToken uint64) bool {
+	if !reserveAccountConcurrencyWithToken(acc, limit, expectedHintToken) {
+		return false
+	}
+	return commitBasicAccountConcurrencyReservation(acc, expectedHintToken)
+}
+
+func tryAcquireAccount(acc *Account, limit int64) bool {
+	if acc == nil {
+		return false
+	}
+	return tryAcquireAccountWithToken(acc, limit, acc.relayGuardianSchedulingToken())
 }
