@@ -189,6 +189,7 @@ if ! grep -Fq 'Requisite=docker.service' "$SERVICE_UNIT" \
   || ! grep -Fq 'RuntimeDirectoryPreserve=yes' "$SERVICE_UNIT" \
   || ! grep -Fq 'ReadWritePaths=/run/codex2api-relay-health-watchdog' "$SERVICE_UNIT" \
   || ! grep -Fq 'Environment=LOCK_FILE=/run/codex2api-relay-health-watchdog/watchdog.lock' "$SERVICE_UNIT" \
+  || ! grep -Fq 'Environment=DOCKER_CONFIG=/run/codex2api-relay-health-watchdog' "$SERVICE_UNIT" \
   || ! grep -Fq 'ProtectSystem=strict' "$SERVICE_UNIT"; then
   fail "systemd unit must not start Docker and must provide a writable lock directory"
 else
@@ -251,6 +252,19 @@ assert_contains "$healthy_output" '"check":"relay_pool","status":"ok"' "health R
 assert_contains "$healthy_output" '"check":"bridge_account","status":"ok"' "bridge 7692 is checked"
 assert_contains "$healthy_output" '"check":"summary","status":"ok"' "healthy final summary"
 assert_json_lines "$healthy_output" "all watchdog lines are valid JSON"
+
+nano_heartbeat="${recent_heartbeat%Z}.123456789Z"
+nano_json="{\"status\":\"ok\",\"available\":8,\"total\":9,\"guardian\":{\"enabled\":true,\"mode\":\"monitor\",\"status\":\"ok\",\"heartbeat_at\":\"$nano_heartbeat\",\"scan_interval_seconds\":60},\"relay\":{\"configured\":3,\"enabled\":2,\"schedulable\":2,\"quarantined\":0,\"probation\":0}}"
+set +e
+nano_output="$(run_watchdog "$nano_json" nanosecond-heartbeat)"
+nano_rc=$?
+set -e
+if (( nano_rc == 0 )); then
+  pass "RFC3339Nano Guardian heartbeat is accepted on Python 3.10"
+else
+  fail "RFC3339Nano Guardian heartbeat is accepted on Python 3.10"
+fi
+assert_contains "$nano_output" '"check":"guardian","status":"ok"' "nanosecond Guardian heartbeat stays healthy"
 
 legacy_json='{"status":"ok","available":8,"total":9}'
 set +e

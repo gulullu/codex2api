@@ -12,6 +12,9 @@ Group=root
 Environment=HEALTH_URL=http://127.0.0.1:8090/health
 Environment=LOCK_FILE=/run/codex2api-relay-health-watchdog/watchdog.lock
 Environment=BRIDGE_ACCOUNT_ID=7692
+# ProtectHome hides /root. Give Docker CLI a readable empty config directory
+# so warnings cannot contaminate machine-readable inspect output.
+Environment=DOCKER_CONFIG=/run/codex2api-relay-health-watchdog
 RuntimeDirectory=codex2api-relay-health-watchdog
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes

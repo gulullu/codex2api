@@ -378,9 +378,13 @@ if [[ "$health_ok" == "true" && "$guardian_enabled" != "__missing__" ]]; then
     else
       heartbeat_age="$("$PYTHON_BIN" -c '
 from datetime import datetime, timezone
+import re
 import sys
 
 raw = sys.argv[1].strip()
+# Go emits RFC3339Nano timestamps with up to nine fractional digits, while
+# Python 3.10 accepts at most six. Truncate only the excess precision.
+raw = re.sub(r"(\.\d{6})\d+(?=(?:Z|[+-]\d{2}:\d{2})$)", r"\1", raw)
 if raw.endswith("Z"):
     raw = raw[:-1] + "+00:00"
 stamp = datetime.fromisoformat(raw)
