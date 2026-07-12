@@ -237,7 +237,8 @@ check_container "$REDIS_CONTAINER" "true"
 check_container "$SUB2_CONTAINER" "true"
 check_container "$SUB2_POSTGRES_CONTAINER" "true"
 
-if "$DOCKER_BIN" exec "$POSTGRES_CONTAINER" pg_isready -q >/dev/null 2>&1; then
+if "$DOCKER_BIN" exec "$POSTGRES_CONTAINER" sh -lc \
+  'exec pg_isready -q -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
   record_event "postgres" "ok" "postgres_reachable" \
     "$(printf '{"container":%s}' "$(json_quote "$POSTGRES_CONTAINER")")"
 else

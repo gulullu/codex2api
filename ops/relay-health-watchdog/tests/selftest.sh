@@ -51,7 +51,7 @@ shift 2
 joined="$*"
 
 case "$container:$joined" in
-  codex2api-postgres:pg_isready*)
+  codex2api-postgres:*pg_isready*)
     exit 0
     ;;
   codex2api-redis:redis-cli*)

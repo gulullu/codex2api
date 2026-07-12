@@ -108,7 +108,7 @@ container="$2"
 shift 2
 joined="$*"
 case "$container:$joined" in
-  codex2api-postgres:pg_isready*) exit 0 ;;
+  codex2api-postgres:*pg_isready*) exit 0 ;;
   codex2api-redis:redis-cli*) printf '%s\n' "NOAUTH Authentication required."; exit 0 ;;
   codex2api-postgres:*psql*) printf '%s\n' '2|2|2'; exit 0 ;;
   sub2api-postgres:*psql*) printf '%s\n' '7692|active|t|t'; exit 0 ;;
