@@ -620,17 +620,19 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS account_groups (
-		id          SERIAL PRIMARY KEY,
-		name        VARCHAR(80) UNIQUE NOT NULL,
-		description TEXT DEFAULT '',
-		color       VARCHAR(20) DEFAULT '',
-		sort_order  INT DEFAULT 0,
-		created_at  TIMESTAMPTZ DEFAULT NOW(),
-		updated_at  TIMESTAMPTZ DEFAULT NOW()
+		id                        SERIAL PRIMARY KEY,
+		name                      VARCHAR(80) UNIQUE NOT NULL,
+		description               TEXT DEFAULT '',
+		color                     VARCHAR(20) DEFAULT '',
+		sort_order                INT DEFAULT 0,
+		base_concurrency_override INT NULL,
+		created_at                TIMESTAMPTZ DEFAULT NOW(),
+		updated_at                TIMESTAMPTZ DEFAULT NOW()
 	);
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS description TEXT DEFAULT '';
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS color VARCHAR(20) DEFAULT '';
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0;
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS base_concurrency_override INT NULL;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 
@@ -872,6 +874,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS relay_guardian_mode VARCHAR(16) DEFAULT 'off';
 
 	CREATE TABLE IF NOT EXISTS relay_guardian_events (
@@ -1556,6 +1560,10 @@ type SystemSettings struct {
 	CodexCLIVersionSyncEnabled bool
 	// CodexCLIVersionSyncIntervalHours 是定时同步间隔（小时，默认 12，范围 1-720）。
 	CodexCLIVersionSyncIntervalHours int
+	// AutoResetCreditsEnabled 控制 Plus/Pro 主动重置次数的临期自动消费（默认关闭）。
+	AutoResetCreditsEnabled bool
+	// AutoResetCreditsBeforeExpiryMin 是进入临期窗口的提前分钟数（默认 60，范围 10-10080）。
+	AutoResetCreditsBeforeExpiryMin int
 	// ModelPricingOverrides 是模型定价覆盖 JSON（model → ModelPricingOverride），
 	// custom/synced 覆盖代码默认；空为 "{}"。
 	ModelPricingOverrides string
@@ -1617,6 +1625,21 @@ func normalizeFirstTokenMode(mode string) string {
 	default:
 		return "strict"
 	}
+}
+
+// NormalizeAutoResetCreditsBeforeExpiryMinutes 将临期自动消费阈值限制在
+// 10 分钟到 7 天；非正值回退默认 60 分钟。
+func NormalizeAutoResetCreditsBeforeExpiryMinutes(minutes int) int {
+	if minutes <= 0 {
+		return 60
+	}
+	if minutes < 10 {
+		return 10
+	}
+	if minutes > 10080 {
+		return 10080
+	}
+	return minutes
 }
 
 // normalizeSmartPacingMinConcurrencyDB 归一化智能配速并发下限（1..1000，默认 1）。
@@ -1714,7 +1737,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_keepalive_enabled, false),
 			       COALESCE(codex_ws_keepalive_interval_sec, 60),
 			       COALESCE(codex_ws_hide_upstream_errors, true),
-			       COALESCE(codex_ws_silent_retry_enabled, true),
+		       COALESCE(codex_ws_silent_retry_enabled, true),
 		       COALESCE(codex_ws_silent_max_retries, 2),
 		       COALESCE(codex_continue_thinking_enabled, false),
 		       COALESCE(codex_continue_max_rounds, 8),
@@ -1747,7 +1770,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_cyb_relay_group_id, 0),
 		       COALESCE(prompt_filter_cyb_relay_session_pin_enabled, true),
 		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 600),
-		       COALESCE(NULLIF(TRIM(relay_guardian_mode), ''), 'off')
+		       COALESCE(NULLIF(TRIM(relay_guardian_mode), ''), 'off'),
+		       COALESCE(auto_reset_credits_enabled, false),
+		       COALESCE(auto_reset_credits_before_expiry_min, 60)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1812,6 +1837,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PromptFilterCybRelaySessionPinEnabled,
 		&s.PromptFilterCybRelaySessionPinTTLSeconds,
 		&s.RelayGuardianMode,
+		&s.AutoResetCreditsEnabled,
+		&s.AutoResetCreditsBeforeExpiryMin,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1838,10 +1865,13 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.PromptFilterSemanticReviewProviderPool = strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool)
 	s.PromptFilterCybRelaySessionPinTTLSeconds = normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds)
 	s.RelayGuardianMode = NormalizeRelayGuardianMode(s.RelayGuardianMode)
+	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
 	return s, err
 }
 
-// UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）
+// UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）。
+// codex_synced_cli_version 与 model_pricing_* 由各自的窄更新独立维护；冲突更新时
+// 保留数据库当前值，避免管理员保存其他设置时回滚后台同步刚写入的数据。
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	reasoningEffortModels := strings.TrimSpace(s.ReasoningEffortModels)
 	if reasoningEffortModels == "" {
@@ -1919,9 +1949,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					prompt_filter_cyb_relay_enabled,
 					prompt_filter_cyb_relay_group_id,
 					prompt_filter_cyb_relay_session_pin_enabled,
-					prompt_filter_cyb_relay_session_pin_ttl_seconds
+					prompt_filter_cyb_relay_session_pin_ttl_seconds,
+					auto_reset_credits_enabled,
+					auto_reset_credits_before_expiry_min
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2013,17 +2045,16 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					transport_retry_policy = EXCLUDED.transport_retry_policy,
 					codex_continue_thinking_enabled = EXCLUDED.codex_continue_thinking_enabled,
 					codex_continue_max_rounds = EXCLUDED.codex_continue_max_rounds,
-					codex_synced_cli_version = EXCLUDED.codex_synced_cli_version,
 					codex_cli_version_sync_enabled = EXCLUDED.codex_cli_version_sync_enabled,
 					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours,
-					model_pricing_overrides = EXCLUDED.model_pricing_overrides,
-					model_pricing_sync_url = EXCLUDED.model_pricing_sync_url,
 					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status,
 					prompt_filter_semantic_review_provider_pool = EXCLUDED.prompt_filter_semantic_review_provider_pool,
 					prompt_filter_cyb_relay_enabled = EXCLUDED.prompt_filter_cyb_relay_enabled,
 					prompt_filter_cyb_relay_group_id = EXCLUDED.prompt_filter_cyb_relay_group_id,
 					prompt_filter_cyb_relay_session_pin_enabled = EXCLUDED.prompt_filter_cyb_relay_session_pin_enabled,
-					prompt_filter_cyb_relay_session_pin_ttl_seconds = EXCLUDED.prompt_filter_cyb_relay_session_pin_ttl_seconds
+					prompt_filter_cyb_relay_session_pin_ttl_seconds = EXCLUDED.prompt_filter_cyb_relay_session_pin_ttl_seconds,
+					auto_reset_credits_enabled = EXCLUDED.auto_reset_credits_enabled,
+					auto_reset_credits_before_expiry_min = EXCLUDED.auto_reset_credits_before_expiry_min
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2052,7 +2083,33 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
 		s.IgnoreUsageLimitStatus, strings.TrimSpace(s.PromptFilterSemanticReviewProviderPool),
 		s.PromptFilterCybRelayEnabled, s.PromptFilterCybRelayGroupID, s.PromptFilterCybRelaySessionPinEnabled,
-		normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds))
+		normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds),
+		s.AutoResetCreditsEnabled,
+		NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin))
+	return err
+}
+
+// UpdateCodexSyncedCLIVersion 只更新后台同步得到的 Codex CLI 版本，避免用
+// 读取到的旧 SystemSettings 快照覆盖管理员刚保存的其他设置。
+func (db *DB) UpdateCodexSyncedCLIVersion(ctx context.Context, version string) error {
+	_, err := db.conn.ExecContext(ctx, `
+		INSERT INTO system_settings (id, codex_synced_cli_version)
+		VALUES (1, $1)
+		ON CONFLICT (id) DO UPDATE SET
+			codex_synced_cli_version = EXCLUDED.codex_synced_cli_version
+	`, strings.TrimSpace(version))
+	return err
+}
+
+// UpdateModelPricingSettings 原子更新模型定价覆盖及其同步来源，不回写整行设置。
+func (db *DB) UpdateModelPricingSettings(ctx context.Context, overridesJSON, syncURL string) error {
+	_, err := db.conn.ExecContext(ctx, `
+		INSERT INTO system_settings (id, model_pricing_overrides, model_pricing_sync_url)
+		VALUES (1, $1, $2)
+		ON CONFLICT (id) DO UPDATE SET
+			model_pricing_overrides = EXCLUDED.model_pricing_overrides,
+			model_pricing_sync_url = EXCLUDED.model_pricing_sync_url
+	`, normalizeModelPricingOverridesJSON(overridesJSON), strings.TrimSpace(syncURL))
 	return err
 }
 

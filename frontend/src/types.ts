@@ -378,6 +378,7 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  base_concurrency_override: number | null
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   created_at: ISODateString
@@ -393,6 +394,7 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -402,6 +404,7 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -710,6 +713,8 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_enabled: boolean
+  auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   codex_force_websocket: boolean

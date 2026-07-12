@@ -1190,6 +1190,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		CodexWSSilentRetryEnabled:                  true,
 		CodexWSSilentMaxRetries:                    4,
 		IgnoreUsageLimitStatus:                     true,
+		AutoResetCreditsEnabled:                    true,
+		AutoResetCreditsBeforeExpiryMin:            75,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1206,6 +1208,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if !settings.IgnoreUsageLimitStatus {
 		t.Fatal("IgnoreUsageLimitStatus = false, want true")
+	}
+	if !settings.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled = false, want true")
+	}
+	if settings.AutoResetCreditsBeforeExpiryMin != 75 {
+		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 75", settings.AutoResetCreditsBeforeExpiryMin)
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
@@ -1399,6 +1407,145 @@ func TestSystemSettingsNormalizeBlankBillingTierPolicy(t *testing.T) {
 	}
 }
 
+func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		AutoResetCreditsEnabled:         true,
+		AutoResetCreditsBeforeExpiryMin: 90,
+		ModelPricingOverrides:           `{"old":{"input":1}}`,
+		ModelPricingSyncURL:             "https://old.example/pricing.json",
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	if err := db.UpdateCodexSyncedCLIVersion(ctx, "9.9.9"); err != nil {
+		t.Fatalf("UpdateCodexSyncedCLIVersion: %v", err)
+	}
+	if err := db.UpdateModelPricingSettings(ctx, `{"new":{"input":2}}`, "https://new.example/pricing.json"); err != nil {
+		t.Fatalf("UpdateModelPricingSettings: %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSystemSettings returned nil")
+	}
+	// 模拟管理员从旧快照保存无关设置；后台刚写入的模型定价不能被回滚。
+	staleFullUpdate := *got
+	staleFullUpdate.SiteName = "Concurrent Admin Save"
+	staleFullUpdate.CodexSyncedCLIVersion = "0.0.1"
+	staleFullUpdate.ModelPricingOverrides = `{"old":{"input":1}}`
+	staleFullUpdate.ModelPricingSyncURL = "https://old.example/pricing.json"
+	if err := db.UpdateSystemSettings(ctx, &staleFullUpdate); err != nil {
+		t.Fatalf("UpdateSystemSettings(stale full update): %v", err)
+	}
+	got, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after stale full update: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSystemSettings after stale full update returned nil")
+	}
+	if !got.AutoResetCreditsEnabled || got.AutoResetCreditsBeforeExpiryMin != 90 {
+		t.Fatalf("auto reset settings = (%v,%d), want (true,90)", got.AutoResetCreditsEnabled, got.AutoResetCreditsBeforeExpiryMin)
+	}
+	if got.CodexSyncedCLIVersion != "9.9.9" {
+		t.Fatalf("CodexSyncedCLIVersion = %q, want 9.9.9", got.CodexSyncedCLIVersion)
+	}
+	if got.ModelPricingOverrides != `{"new":{"input":2}}` || got.ModelPricingSyncURL != "https://new.example/pricing.json" {
+		t.Fatalf("model pricing = %q / %q", got.ModelPricingOverrides, got.ModelPricingSyncURL)
+	}
+}
+
+func TestSQLiteMigratesAccountGroupBaseConcurrencyOverride(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open legacy sqlite 返回错误: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE account_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)`); err != nil {
+		legacy.Close()
+		t.Fatalf("创建旧 account_groups 表返回错误: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("关闭旧 SQLite 返回错误: %v", err)
+	}
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 迁移旧库返回错误: %v", err)
+	}
+	defer db.Close()
+
+	var columnCount int
+	if err := db.conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pragma_table_info('account_groups') WHERE name = 'base_concurrency_override'`).Scan(&columnCount); err != nil {
+		t.Fatalf("查询迁移列返回错误: %v", err)
+	}
+	if columnCount != 1 {
+		t.Fatalf("base_concurrency_override column count = %d, want 1", columnCount)
+	}
+}
+
+func TestAccountGroupBaseConcurrencyOverrideCRUD(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupID, err := db.CreateAccountGroup(ctx, "Concurrency", "", "", 0, 0, sql.NullInt64{Int64: 6, Valid: true})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
+	}
+
+	assertOverride := func(want sql.NullInt64) {
+		t.Helper()
+		groups, err := db.ListAccountGroups(ctx)
+		if err != nil {
+			t.Fatalf("ListAccountGroups 返回错误: %v", err)
+		}
+		if len(groups) != 1 || groups[0].ID != groupID {
+			t.Fatalf("groups = %#v, want group %d", groups, groupID)
+		}
+		got := groups[0].BaseConcurrencyOverride
+		if got.Valid != want.Valid || (got.Valid && got.Int64 != want.Int64) {
+			t.Fatalf("BaseConcurrencyOverride = %+v, want %+v", got, want)
+		}
+	}
+
+	assertOverride(sql.NullInt64{Int64: 6, Valid: true})
+	if err := db.UpdateAccountGroup(ctx, groupID, nil, nil, nil, &UpdateAccountGroupOpts{
+		BaseConcurrencyOverride: OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 3, Valid: true}},
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroup set override 返回错误: %v", err)
+	}
+	assertOverride(sql.NullInt64{Int64: 3, Valid: true})
+
+	name := "Concurrency renamed"
+	if err := db.UpdateAccountGroup(ctx, groupID, &name, nil, nil, nil); err != nil {
+		t.Fatalf("UpdateAccountGroup unrelated field 返回错误: %v", err)
+	}
+	assertOverride(sql.NullInt64{Int64: 3, Valid: true})
+
+	if err := db.UpdateAccountGroup(ctx, groupID, nil, nil, nil, &UpdateAccountGroupOpts{
+		BaseConcurrencyOverride: OptionalNullInt64{Set: true},
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroup clear override 返回错误: %v", err)
+	}
+	assertOverride(sql.NullInt64{})
+}
+
 func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1409,11 +1556,11 @@ func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0, 0, 0)
+	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0, 0, sql.NullInt64{}, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup A 返回错误: %v", err)
 	}
-	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 0, 0, 1)
+	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 0, 0, sql.NullInt64{}, 1)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup B 返回错误: %v", err)
 	}

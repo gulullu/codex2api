@@ -55,6 +55,7 @@ func TestCompareSystemVersions(t *testing.T) {
 		{a: "v2.4.3", b: "2.4.4", want: -1},
 		{a: "2.10.0", b: "2.9.9", want: 1},
 		{a: "2.4.3", b: "v2.4.3", want: 0},
+		{a: "v2.5.3+rb4", b: "v2.5.3", want: 0},
 		{a: "2.4", b: "2.4.1", want: -1},
 	}
 	for _, tt := range tests {

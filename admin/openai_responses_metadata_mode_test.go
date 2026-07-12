@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -147,7 +148,7 @@ func TestAddOpenAIResponsesCopiesSchedulerMetadataAtomically(t *testing.T) {
 	db := newTestAdminDB(t)
 	store := auth.NewStore(db, nil, nil)
 	handler := &Handler{db: db, store: store}
-	groupID, err := db.CreateAccountGroup(context.Background(), "relay", "", "#2563eb", 0, 0, 0)
+	groupID, err := db.CreateAccountGroup(context.Background(), "relay", "", "#2563eb", 0, 0, sql.NullInt64{})
 	if err != nil {
 		t.Fatalf("CreateAccountGroup: %v", err)
 	}

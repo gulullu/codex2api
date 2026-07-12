@@ -97,6 +97,9 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 	}
 
 	state := proxy.ApplyWhamUsage(h.store, account, usage)
+	// wham 不含订阅到期字段，按需从网页端 /subscriptions 补权威到期时间
+	// （带节流，best-effort，失败不影响探针结果）。(issue #360)
+	proxy.MaybeSyncSubscriptionExpiry(ctx, h.store, account, h.store.ResolveProxyForAccount(account))
 	if limited {
 		if state.UsageWindowLimitsIgnored {
 			// WHAM remains metadata-only in Responses-authoritative mode. It must

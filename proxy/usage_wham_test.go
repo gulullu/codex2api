@@ -263,6 +263,84 @@ func TestApplyWhamUsage_PersistsSubscriptionExpiresAtWhenMemoryAlreadyMatches(t 
 	}
 }
 
+// TestApplyWhamUsage_ClearsStaleSubscriptionExpiry 验证：wham 权威返回付费 plan_type
+// 而账号存储的订阅到期时间已过去（续费后 JWT 里的旧值）时，内存与 DB 的陈旧值被清理，
+// 不再显示「已过期」。(issue #360)
+func TestApplyWhamUsage_ClearsStaleSubscriptionExpiry(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	stale := time.Now().Add(-96 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAccountWithCredentials(ctx, "wham-stale-subscription", map[string]interface{}{
+		"plan_type":               "plus",
+		"subscription_expires_at": stale.Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: stale}
+	// 实测 wham/usage 不返回任何订阅到期字段，这里保持缺省以贴近真实响应。
+	usage := &WhamUsage{PlanType: "plus"}
+
+	ApplyWhamUsage(store, account, usage)
+
+	if !account.SubscriptionExpiresAt.IsZero() {
+		t.Fatalf("account.SubscriptionExpiresAt = %v, want zero after stale clear", account.SubscriptionExpiresAt)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("subscription_expires_at"); got != "" {
+		t.Fatalf("persisted subscription_expires_at = %q, want cleared", got)
+	}
+}
+
+// TestApplyWhamUsage_KeepsExpiredSubscriptionForFreePlan 验证：套餐真到期（wham 返回
+// free）时，已过去的订阅到期时间是准确信息，保留不清理。
+func TestApplyWhamUsage_KeepsExpiredSubscriptionForFreePlan(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	expired := time.Now().Add(-96 * time.Hour).UTC().Truncate(time.Second)
+	id, err := db.InsertAccountWithCredentials(ctx, "wham-real-expired", map[string]interface{}{
+		"plan_type":               "plus",
+		"subscription_expires_at": expired.Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: expired}
+	usage := &WhamUsage{PlanType: "free"}
+
+	ApplyWhamUsage(store, account, usage)
+
+	if !account.SubscriptionExpiresAt.Equal(expired) {
+		t.Fatalf("account.SubscriptionExpiresAt = %v, want unchanged %v", account.SubscriptionExpiresAt, expired)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("subscription_expires_at"); got != expired.Format(time.RFC3339) {
+		t.Fatalf("persisted subscription_expires_at = %q, want %q", got, expired.Format(time.RFC3339))
+	}
+}
+
 func TestWhamUsageSubscriptionExpiresAtFallbacks(t *testing.T) {
 	cases := []struct {
 		name string
@@ -707,10 +785,11 @@ func TestQueryWhamUsage_ParsesRateLimitResetCredits(t *testing.T) {
 // expires_at 的券，请求形态与 wham 查询一致（Bearer + chatgpt-account-id）。
 func TestQueryWhamResetCredits_ParsesAndFilters(t *testing.T) {
 	body := `{
-		"available_count": 2,
+		"available_count": 3,
 		"credits": [
 			{"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": "2026-07-19T00:42:09Z"},
 			{"id": "c2", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-07-01T00:00:00Z", "expires_at": "2026-07-21T08:00:00Z"},
+			{"id": "c6", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-07-02T00:00:00Z", "consumable_until": "2026-07-22T08:00:00Z"},
 			{"id": "c3", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-06-20T00:00:00Z", "expires_at": "2026-07-10T00:00:00Z"},
 			{"id": "c4", "reset_type": "other_type", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": "2026-07-19T00:00:00Z"},
 			{"id": "c5", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-06-29T00:00:00Z", "expires_at": ""}
@@ -745,19 +824,32 @@ func TestQueryWhamResetCredits_ParsesAndFilters(t *testing.T) {
 	if gotAccountID != "acc-1" {
 		t.Errorf("chatgpt-account-id = %q, want acc-1", gotAccountID)
 	}
-	if list.AvailableCount != 2 {
-		t.Errorf("AvailableCount = %d, want 2", list.AvailableCount)
+	if list.AvailableCount != 3 {
+		t.Errorf("AvailableCount = %d, want 3", list.AvailableCount)
 	}
 
 	credits := list.AvailableCodexCredits()
-	if len(credits) != 2 {
-		t.Fatalf("AvailableCodexCredits len = %d, want 2 (filter redeemed/other_type/no-expiry)", len(credits))
+	if len(credits) != 3 {
+		t.Fatalf("AvailableCodexCredits len = %d, want 3 (accept consumable_until; filter redeemed/other_type/no-expiry)", len(credits))
 	}
-	if credits[0].ID != "c1" || credits[1].ID != "c2" {
-		t.Errorf("credits ids = %s,%s, want c1,c2", credits[0].ID, credits[1].ID)
+	if credits[0].ID != "c1" || credits[1].ID != "c2" || credits[2].ID != "c6" {
+		t.Errorf("credits ids = %s,%s,%s, want c1,c2,c6", credits[0].ID, credits[1].ID, credits[2].ID)
 	}
 	if credits[0].ExpiresAt != "2026-07-19T00:42:09Z" {
 		t.Errorf("credits[0].ExpiresAt = %q", credits[0].ExpiresAt)
+	}
+	if credits[2].EffectiveConsumableUntil() != "2026-07-22T08:00:00Z" {
+		t.Errorf("credits[2].EffectiveConsumableUntil = %q", credits[2].EffectiveConsumableUntil())
+	}
+}
+
+func TestWhamResetCreditItemEffectiveConsumableUntilPrefersCanonicalField(t *testing.T) {
+	credit := WhamResetCreditItem{
+		ExpiresAt:       "2026-07-20T00:00:00Z",
+		ConsumableUntil: "2026-07-19T00:00:00Z",
+	}
+	if got := credit.EffectiveConsumableUntil(); got != "2026-07-19T00:00:00Z" {
+		t.Fatalf("EffectiveConsumableUntil() = %q, want consumable_until", got)
 	}
 }
 

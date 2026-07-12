@@ -3,6 +3,7 @@ package proxy
 import (
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -75,6 +76,10 @@ type RuntimeSettings struct {
 	CodexCLIVersionSyncEnabled bool
 	// CodexCLIVersionSyncIntervalHours 定时同步间隔（小时，默认 12，范围 1-720）。
 	CodexCLIVersionSyncIntervalHours int
+	// AutoResetCreditsEnabled 控制 Plus/Pro 主动重置次数的临期自动消费（默认 false）。
+	AutoResetCreditsEnabled bool
+	// AutoResetCreditsBeforeExpiryMin 是进入自动消费窗口的提前分钟数（默认 60）。
+	AutoResetCreditsBeforeExpiryMin int
 }
 
 // IsolateRequestsByDefault 返回是否对无显式会话的请求默认按每请求隔离上游身份。
@@ -83,7 +88,10 @@ func (s RuntimeSettings) IsolateRequestsByDefault() bool {
 	return NormalizeRequestIsolationMode(s.RequestIsolationMode) != RequestIsolationModePerAPIKey
 }
 
-var runtimeSettings atomic.Value // stores RuntimeSettings
+var (
+	runtimeSettings         atomic.Value // stores RuntimeSettings
+	runtimeSettingsUpdateMu sync.Mutex
+)
 
 func init() {
 	runtimeSettings.Store(DefaultRuntimeSettings())
@@ -106,6 +114,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		RequestIsolationMode:             defaultRequestIsolationMode(),
 		CodexCLIVersionSyncEnabled:       true,
 		CodexCLIVersionSyncIntervalHours: 12,
+		AutoResetCreditsBeforeExpiryMin:  60,
 	}
 }
 
@@ -213,10 +222,14 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexContinueMaxRounds > maxCodexContinueMaxRounds {
 		settings.CodexContinueMaxRounds = maxCodexContinueMaxRounds
 	}
+	settings.AutoResetCreditsBeforeExpiryMin = database.NormalizeAutoResetCreditsBeforeExpiryMinutes(settings.AutoResetCreditsBeforeExpiryMin)
 	return settings
 }
 
 func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSettings {
+	runtimeSettingsUpdateMu.Lock()
+	defer runtimeSettingsUpdateMu.Unlock()
+
 	next := DefaultRuntimeSettings()
 	if settings != nil {
 		next.ClientCompatMode = settings.ClientCompatMode
@@ -236,23 +249,46 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexSyncedCLIVersion = settings.CodexSyncedCLIVersion
 		next.CodexCLIVersionSyncEnabled = settings.CodexCLIVersionSyncEnabled
 		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
+		next.AutoResetCreditsEnabled = settings.AutoResetCreditsEnabled
+		next.AutoResetCreditsBeforeExpiryMin = settings.AutoResetCreditsBeforeExpiryMin
 	}
-	next = NormalizeRuntimeSettings(next)
-	runtimeSettings.Store(next)
-	return next
+	return storeRuntimeSettings(next)
 }
 
 func ApplyRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
-	settings = NormalizeRuntimeSettings(settings)
-	runtimeSettings.Store(settings)
-	return settings
+	runtimeSettingsUpdateMu.Lock()
+	defer runtimeSettingsUpdateMu.Unlock()
+	return storeRuntimeSettings(settings)
+}
+
+// UpdateRuntimeSettings 在与完整设置写入共享的临界区内更新运行时配置。
+// 后台任务应使用这个函数只修改自己拥有的字段，避免旧快照覆盖管理员刚保存的设置。
+func UpdateRuntimeSettings(update func(RuntimeSettings) RuntimeSettings) RuntimeSettings {
+	runtimeSettingsUpdateMu.Lock()
+	defer runtimeSettingsUpdateMu.Unlock()
+
+	next := currentRuntimeSettings()
+	if update != nil {
+		next = update(next)
+	}
+	return storeRuntimeSettings(next)
 }
 
 func CurrentRuntimeSettings() RuntimeSettings {
+	return currentRuntimeSettings()
+}
+
+func currentRuntimeSettings() RuntimeSettings {
 	if v, ok := runtimeSettings.Load().(RuntimeSettings); ok {
 		return NormalizeRuntimeSettings(v)
 	}
 	return DefaultRuntimeSettings()
+}
+
+func storeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
+	settings = NormalizeRuntimeSettings(settings)
+	runtimeSettings.Store(settings)
+	return settings
 }
 
 func currentStreamFlushInterval() time.Duration {

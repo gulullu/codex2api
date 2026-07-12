@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -24,7 +25,7 @@ func TestUpdateSettingsCybRelayPersistsNormalizedConfig(t *testing.T) {
 	tokenCache := cache.NewMemory(4)
 	defer tokenCache.Close()
 
-	groupID, err := db.CreateAccountGroup(context.Background(), "cyb-relay", "", "#ef4444", 0, 0, 0)
+	groupID, err := db.CreateAccountGroup(context.Background(), "cyb-relay", "", "#ef4444", 0, 0, sql.NullInt64{})
 	if err != nil {
 		t.Fatalf("CreateAccountGroup: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestDeleteAccountGroupRejectsEnabledCybRelayGroupEvenWithForce(t *testing.T
 	tokenCache := cache.NewMemory(4)
 	defer tokenCache.Close()
 
-	groupID, err := db.CreateAccountGroup(context.Background(), "cyb-relay", "", "#ef4444", 0, 0, 0)
+	groupID, err := db.CreateAccountGroup(context.Background(), "cyb-relay", "", "#ef4444", 0, 0, sql.NullInt64{})
 	if err != nil {
 		t.Fatalf("CreateAccountGroup: %v", err)
 	}

@@ -1162,6 +1162,8 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 	}
 
 	usageState := proxy.ApplyWhamUsage(h.store, acc, usage)
+	// wham 不含订阅到期字段，按需从网页端 /subscriptions 补权威到期时间。(issue #360)
+	proxy.MaybeSyncSubscriptionExpiry(ctx, h.store, acc, h.store.ResolveProxyForAccount(acc))
 	applyUsageLimitedTestState(h.store, acc, usageState)
 	if msg, limited := formatUsageLimitedTestError(usageState); limited {
 		return "rate_limited", msg, true

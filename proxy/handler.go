@@ -1692,13 +1692,15 @@ func (h *Handler) Responses(c *gin.Context) {
 	// 透传即正确；中转（OpenAI Responses API）账号的普通 /v1/responses 通常
 	// 不接受，会 400 或返回非压缩响应导致客户端报
 	// "expected exactly one compaction output item"。
-	// 处理：池中还有可用官方账号时，把这类请求钉在官方账号上保持原生透传；
-	// 官方账号全不可用（如纯中转部署）时整体提升到 compact 专用链路——
-	// 该链路对两类账号都能正确完成压缩。
-	pinBodySignalToCodexAccounts := requestBodyHasCompactionTrigger(rawBody)
+	// 处理：先用完整 payload 做本轮路由判断。合法且池中还有可用官方
+	// 账号时，把这类请求 pin 在官方账号上保持原生透传；应路由到 relay
+	// 或官方账号全不可用时，流式请求必须继续走 /responses SSE，否则
+	// ResponsesCompact 的一次性 JSON 会使客户端在 response.completed 前遇到 EOF
+	// (issue #361)。只有非流式请求才提升到 compact 专用链路。
+	bodySignalCompact := requestBodyHasCompactionTrigger(rawBody)
 	promptInspected := false
 	promptDecision := defaultPromptRiskDecision()
-	if pinBodySignalToCodexAccounts {
+	if bodySignalCompact {
 		if h.cybRelayConfig().Enabled {
 			earlyModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
 			if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", earlyModel) {
@@ -1706,19 +1708,28 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			promptDecision, _ = promptRiskDecisionFromContext(c)
 			promptInspected = true
-			if promptDecision.routesToCybRelay() || !h.storeHasAvailableCodexAccount() {
-				setNestedPromptRiskDecision(c, promptDecision)
-				h.ResponsesCompact(c)
-				return
-			}
-		} else if !h.storeHasAvailableCodexAccount() {
-			h.ResponsesCompact(c)
-			return
 		}
+	}
+	pinBodySignalToCodexAccounts := bodySignalCompact && h.storeHasAvailableCodexAccount() && !promptDecision.routesToCybRelay()
+	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
+	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
+		if promptInspected {
+			// ResponsesCompact 会再走一遍统一入口校验；传递已得出的本轮
+			// 路由决策，避免同一 payload 被二次检查后丢失直达/Pin 来源。
+			setNestedPromptRiskDecision(c, promptDecision)
+		}
+		h.ResponsesCompact(c)
+		return
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
-	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	var requestModel, mappedModel string
+	var mappingApplied bool
+	if streamingRelayBodySignal {
+		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
+	} else {
+		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	}
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -1812,7 +1823,13 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+	var accountFilter auth.AccountFilter
+	if streamingRelayBodySignal {
+		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+	} else {
+		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	if pinBodySignalToCodexAccounts && !promptDecision.routesToCybRelay() {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
@@ -1916,7 +1933,15 @@ func (h *Handler) Responses(c *gin.Context) {
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
 			upstreamBody := getOpenAIResponsesBody()
-			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+			var mappedBody []byte
+			var mappedModel string
+			var accountMappingApplied bool
+			if streamingRelayBodySignal {
+				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
+			} else {
+				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
+			}
+			if accountMappingApplied {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
@@ -4789,7 +4814,12 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 		return result
 	}
 	if store != nil {
-		store.UpdateAccountPlanType(account, resp.Header.Get("x-codex-plan-type"))
+		planHeader := resp.Header.Get("x-codex-plan-type")
+		store.UpdateAccountPlanType(account, planHeader)
+		// 权威付费 plan_type 与「订阅已过期」互斥，借每次响应校正陈旧到期时间。(issue #360)
+		if planHeader != "" {
+			store.ClearStaleSubscriptionExpiresAt(account)
+		}
 	}
 	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 

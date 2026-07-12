@@ -19,7 +19,7 @@ type fastSchedulerEntry struct {
 	dbID          int64
 	dispatchScore float64
 	proven        bool
-	priority      int64 // 账号调度优先级（issue #358）：桶内降序排列，高优先级段先被轮询
+	priority      int64 // 账号调度优先级（issue #358）：全局降序选择，同优先级内再按健康桶调度
 }
 
 type fastSchedulerPosition struct {

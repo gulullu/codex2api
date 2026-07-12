@@ -174,6 +174,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			description TEXT DEFAULT '',
 			color TEXT DEFAULT '',
 			sort_order INTEGER DEFAULT 0,
+			base_concurrency_override INTEGER NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
@@ -256,7 +257,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					prompt_filter_cyb_relay_group_id INTEGER DEFAULT 0,
 					prompt_filter_cyb_relay_session_pin_enabled INTEGER DEFAULT 1,
 					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 600,
-					relay_guardian_mode TEXT DEFAULT 'off'
+					relay_guardian_mode TEXT DEFAULT 'off',
+					auto_reset_credits_enabled INTEGER DEFAULT 0,
+					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60
 				);`,
 		`CREATE TABLE IF NOT EXISTS relay_guardian_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -451,6 +454,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"account_groups", "description", "TEXT DEFAULT ''"},
 		{"account_groups", "color", "TEXT DEFAULT ''"},
 		{"account_groups", "sort_order", "INTEGER DEFAULT 0"},
+		{"account_groups", "base_concurrency_override", "INTEGER NULL"},
 		{"account_groups", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
 		{"account_groups", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
 		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
@@ -489,6 +493,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "model_pricing_overrides", "TEXT DEFAULT '{}'"},
 		{"system_settings", "model_pricing_sync_url", "TEXT DEFAULT ''"},
 		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
+		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
