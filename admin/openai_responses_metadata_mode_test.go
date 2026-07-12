@@ -108,12 +108,18 @@ func TestAddOpenAIResponsesCodexClientMetadataModeDefaultsAndValidation(t *testi
 		if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != responsesAPIDefaultBaseConcurrency {
 			t.Fatalf("persisted base concurrency = %+v, want %d", row.BaseConcurrencyOverride, responsesAPIDefaultBaseConcurrency)
 		}
+		if row.SkipWarmTier {
+			t.Fatal("persisted skip_warm_tier = true, want false by default")
+		}
 		runtimeAccount := store.FindByID(added.ID)
 		if runtimeAccount == nil {
 			t.Fatalf("runtime account %d not found", added.ID)
 		}
 		if got, ok := runtimeAccount.GetBaseConcurrencyOverride(); !ok || got != responsesAPIDefaultBaseConcurrency {
 			t.Fatalf("runtime base concurrency = (%d, %t), want (%d, true)", got, ok, responsesAPIDefaultBaseConcurrency)
+		}
+		if runtimeAccount.SkipWarmTier {
+			t.Fatal("runtime skip_warm_tier = true, want false by default")
 		}
 	})
 

@@ -7,7 +7,7 @@ import (
 const (
 	defaultAccountBaseConcurrencyMax   int64 = 50
 	responsesAPIBaseConcurrencyMax     int64 = 10000
-	responsesAPIDefaultBaseConcurrency int64 = 10000
+	responsesAPIDefaultBaseConcurrency int64 = 100
 )
 
 func (h *Handler) baseConcurrencyMaxForTargets(ctx context.Context, ids []int64) (int64, error) {

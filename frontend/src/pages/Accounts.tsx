@@ -34,7 +34,10 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
-import { buildOpenAIResponsesCopyDraft } from "../lib/openAIResponsesCopy";
+import {
+  buildFreshOpenAIResponsesDraft,
+  buildOpenAIResponsesCopyDraft,
+} from "../lib/openAIResponsesCopy";
 import { formatLongUsageWindowLabel } from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -866,13 +869,7 @@ export default function Accounts() {
   // 允许重复添加：勾选后本次添加/导入跳过去重，强制新建（添加弹窗与导入弹窗共用）。
   const [allowDuplicate, setAllowDuplicate] = useState(false);
   const [openAIForm, setOpenAIForm] =
-    useState<AddOpenAIResponsesAccountRequest>({
-      base_url: "https://api.openai.com",
-      api_key: "",
-      models: [],
-      codex_client_metadata_mode: "auto",
-      proxy_url: "",
-    });
+    useState<AddOpenAIResponsesAccountRequest>(buildFreshOpenAIResponsesDraft);
   const [copySourceAccountName, setCopySourceAccountName] = useState("");
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
   const [openAIModelMappingMode, setOpenAIModelMappingMode] =
@@ -2065,13 +2062,7 @@ export default function Accounts() {
       });
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
-      setOpenAIForm({
-        base_url: "https://api.openai.com",
-        api_key: "",
-        models: [],
-        codex_client_metadata_mode: "auto",
-        proxy_url: "",
-      });
+      setOpenAIForm(buildFreshOpenAIResponsesDraft());
       setOpenAIModelDraft("");
       setOpenAIModelMappingText("");
       setOpenAIModelMappingMode("form");
@@ -2109,13 +2100,7 @@ export default function Accounts() {
   const openFreshAddModal = () => {
     setCopySourceAccountName("");
     setAddMethod("oauth");
-    setOpenAIForm({
-      base_url: "https://api.openai.com",
-      api_key: "",
-      models: [],
-      codex_client_metadata_mode: "auto",
-      proxy_url: "",
-    });
+    setOpenAIForm(buildFreshOpenAIResponsesDraft());
     setOpenAIModelDraft("");
     setOpenAIModelMappingText("");
     setOpenAIModelMappingMode("form");

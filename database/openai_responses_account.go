@@ -7,7 +7,10 @@ import (
 	"strings"
 )
 
-const DefaultOpenAIResponsesBaseConcurrency int64 = 10000
+const (
+	DefaultOpenAIResponsesBaseConcurrency int64 = 100
+	MaxOpenAIResponsesBaseConcurrency     int64 = 10000
+)
 
 type OpenAIResponsesAccountConfig struct {
 	ScoreBiasOverride       *int64
@@ -31,8 +34,8 @@ func (db *DB) InsertOpenAIResponsesAccountWithConfig(ctx context.Context, name s
 	if config.BaseConcurrencyOverride <= 0 {
 		config.BaseConcurrencyOverride = DefaultOpenAIResponsesBaseConcurrency
 	}
-	if config.BaseConcurrencyOverride > DefaultOpenAIResponsesBaseConcurrency {
-		return 0, fmt.Errorf("base_concurrency_override must be <= %d for responses_api accounts", DefaultOpenAIResponsesBaseConcurrency)
+	if config.BaseConcurrencyOverride > MaxOpenAIResponsesBaseConcurrency {
+		return 0, fmt.Errorf("base_concurrency_override must be <= %d for responses_api accounts", MaxOpenAIResponsesBaseConcurrency)
 	}
 	var scoreBias interface{}
 	if config.ScoreBiasOverride != nil {

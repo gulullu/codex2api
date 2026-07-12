@@ -2488,6 +2488,52 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestInsertOpenAIResponsesAccountDefaultsAndAllowsConfiguredMaximum(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	defaultID, err := db.InsertOpenAIResponsesAccountWithConfig(ctx, "default", nil, "", OpenAIResponsesAccountConfig{})
+	if err != nil {
+		t.Fatalf("insert default Responses account: %v", err)
+	}
+	defaultRow, err := db.GetAccountByID(ctx, defaultID)
+	if err != nil {
+		t.Fatalf("GetAccountByID(default): %v", err)
+	}
+	if !defaultRow.BaseConcurrencyOverride.Valid || defaultRow.BaseConcurrencyOverride.Int64 != DefaultOpenAIResponsesBaseConcurrency {
+		t.Fatalf("default base concurrency = %+v, want %d", defaultRow.BaseConcurrencyOverride, DefaultOpenAIResponsesBaseConcurrency)
+	}
+	if defaultRow.SkipWarmTier {
+		t.Fatal("default skip_warm_tier = true, want false")
+	}
+
+	maxID, err := db.InsertOpenAIResponsesAccountWithConfig(ctx, "maximum", nil, "", OpenAIResponsesAccountConfig{
+		BaseConcurrencyOverride: MaxOpenAIResponsesBaseConcurrency,
+	})
+	if err != nil {
+		t.Fatalf("insert maximum Responses account: %v", err)
+	}
+	maxRow, err := db.GetAccountByID(ctx, maxID)
+	if err != nil {
+		t.Fatalf("GetAccountByID(maximum): %v", err)
+	}
+	if !maxRow.BaseConcurrencyOverride.Valid || maxRow.BaseConcurrencyOverride.Int64 != MaxOpenAIResponsesBaseConcurrency {
+		t.Fatalf("maximum base concurrency = %+v, want %d", maxRow.BaseConcurrencyOverride, MaxOpenAIResponsesBaseConcurrency)
+	}
+
+	_, err = db.InsertOpenAIResponsesAccountWithConfig(ctx, "too-high", nil, "", OpenAIResponsesAccountConfig{
+		BaseConcurrencyOverride: MaxOpenAIResponsesBaseConcurrency + 1,
+	})
+	if err == nil {
+		t.Fatal("expected configured concurrency above maximum to fail")
+	}
+}
+
 func TestInsertOpenAIResponsesAccountWithConfigRollsBackOnGroupFailure(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	db, err := New("sqlite", dbPath)

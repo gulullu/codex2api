@@ -1,7 +1,19 @@
 import type { AccountRow, AddOpenAIResponsesAccountRequest } from '../types'
 import { filterCopiedCustomHeaders } from './sensitiveHeaders'
 
-const DEFAULT_RESPONSES_BASE_CONCURRENCY = 10000
+export const DEFAULT_RESPONSES_BASE_CONCURRENCY = 100
+
+export function buildFreshOpenAIResponsesDraft(): AddOpenAIResponsesAccountRequest {
+  return {
+    base_url: 'https://api.openai.com',
+    api_key: '',
+    models: [],
+    codex_client_metadata_mode: 'auto',
+    proxy_url: '',
+    base_concurrency_override: DEFAULT_RESPONSES_BASE_CONCURRENCY,
+    skip_warm_tier: false,
+  }
+}
 
 // Deliberately builds a create payload only from public account metadata.
 // Credentials and runtime/error/usage fields are never read or copied.
