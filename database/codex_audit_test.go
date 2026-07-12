@@ -136,6 +136,102 @@ func TestCodexAuditLogicalRequestDedupAndDistinctWebSocketTurns(t *testing.T) {
 	}
 }
 
+func TestCodexAuditModelsBatchFirstTokenPercentiles(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "model-a-1", Model: "model-a", EffectiveModel: "model-a", StatusCode: 200, FirstTokenMs: 10},
+		&UsageLogInput{LogicalRequestID: "model-a-2", Model: "model-a", EffectiveModel: "model-a", StatusCode: 200, FirstTokenMs: 20},
+		&UsageLogInput{LogicalRequestID: "model-a-3", Model: "model-a", EffectiveModel: "model-a", StatusCode: 200, FirstTokenMs: 30},
+		&UsageLogInput{LogicalRequestID: "model-b-1", Model: "requested-b", EffectiveModel: "model-b", StatusCode: 200, FirstTokenMs: 100},
+		&UsageLogInput{LogicalRequestID: "model-b-2", Model: "requested-b", EffectiveModel: "model-b", StatusCode: 200, FirstTokenMs: 200},
+		&UsageLogInput{LogicalRequestID: "model-c-1", Model: "model-c", EffectiveModel: "model-c", StatusCode: 200, FirstTokenMs: 999},
+	)
+
+	models, err := db.codexAuditModels(context.Background(), time.Now().Add(-time.Minute), time.Now().Add(time.Minute), 2)
+	if err != nil {
+		t.Fatalf("codexAuditModels returned error: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("models length = %d, want 2", len(models))
+	}
+	if models[0].Model != "model-a" || models[0].Requests != 3 || models[0].FirstTokenP95MS != 29 {
+		t.Fatalf("model-a = %+v, want requests=3 p95=29", models[0])
+	}
+	if models[1].Model != "model-b" || models[1].Requests != 2 || models[1].FirstTokenP95MS != 195 {
+		t.Fatalf("model-b = %+v, want requests=2 p95=195", models[1])
+	}
+}
+
+func TestCodexAuditTimelineAggregatesCanonicalRequestsAndAttemptCyber(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "relay-retry", AccountID: 50, StatusCode: 502, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses", UpstreamErrorKind: "server"},
+		&UsageLogInput{LogicalRequestID: "relay-retry", AccountID: 53, StatusCode: 200, AttemptIndex: 2, IsRetryAttempt: true, FirstTokenMs: 10, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "default-4xx", StatusCode: 400, FirstTokenMs: 20, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "default-ok", StatusCode: 200, FirstTokenMs: 30, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "oauth-cyber-retry", StatusCode: 400, AttemptIndex: 1, UpstreamErrorKind: "cyber_policy", UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "oauth-cyber-retry", StatusCode: 200, AttemptIndex: 2, IsRetryAttempt: true, FirstTokenMs: 40, UpstreamAccountType: "oauth"},
+	)
+
+	timeline, err := db.codexAuditTimeline(context.Background(), time.Now().Add(-time.Minute), time.Now().Add(time.Minute), 1440)
+	if err != nil {
+		t.Fatalf("codexAuditTimeline returned error: %v", err)
+	}
+	if len(timeline) != 1 {
+		t.Fatalf("timeline length = %d, want 1", len(timeline))
+	}
+	point := timeline[0]
+	if point.Requests != 4 || point.DefaultRequests != 3 || point.RelayDirect != 1 {
+		t.Fatalf("request counts = %+v, want requests=4 default=3 relay_direct=1", point)
+	}
+	if point.Errors4xx != 1 || point.Errors5xx != 0 || point.RelayRouteFailures != 0 {
+		t.Fatalf("error counts = %+v, want 4xx=1 5xx=0 relay_failures=0", point)
+	}
+	if point.FirstTokenP95MS != 39 {
+		t.Fatalf("first-token p95 = %d, want 39", point.FirstTokenP95MS)
+	}
+	if point.OAuthCyberAttempts != 1 || point.UpstreamCyberPolicy != 1 || point.RelayCyberAttempts != 0 {
+		t.Fatalf("cyber counts = %+v, want OAuth=1 Relay=0", point)
+	}
+}
+
+func TestCodexAuditTimelinePercentileEdgeCases(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	rows := []*UsageLogInput{{LogicalRequestID: "single-1", StatusCode: 200, FirstTokenMs: 123}}
+	for i := 1; i <= 21; i++ {
+		rows = append(rows, &UsageLogInput{LogicalRequestID: fmt.Sprintf("integer-%02d", i), StatusCode: 200, FirstTokenMs: i})
+	}
+	for i := 1; i <= 11; i++ {
+		rows = append(rows, &UsageLogInput{LogicalRequestID: fmt.Sprintf("half-%02d", i), StatusCode: 200, FirstTokenMs: i})
+	}
+	insertCodexAuditUsage(t, db, rows...)
+
+	base := time.Date(2026, time.January, 1, 0, 5, 0, 0, time.UTC)
+	for prefix, createdAt := range map[string]time.Time{
+		"single-%":  base,
+		"integer-%": base.Add(time.Hour),
+		"half-%":    base.Add(2 * time.Hour),
+	} {
+		if _, err := db.conn.ExecContext(context.Background(), "UPDATE usage_logs SET created_at = ? WHERE logical_request_id LIKE ?", sqliteTimeParam(createdAt), prefix); err != nil {
+			t.Fatalf("update %s created_at: %v", prefix, err)
+		}
+	}
+
+	timeline, err := db.codexAuditTimeline(context.Background(), base.Add(-time.Minute), base.Add(3*time.Hour), 60)
+	if err != nil {
+		t.Fatalf("codexAuditTimeline returned error: %v", err)
+	}
+	if len(timeline) != 3 {
+		t.Fatalf("timeline length = %d, want 3", len(timeline))
+	}
+	want := []int{123, 20, 11}
+	for i := range want {
+		if timeline[i].FirstTokenP95MS != want[i] {
+			t.Fatalf("bucket %d p95 = %d, want %d", i, timeline[i].FirstTokenP95MS, want[i])
+		}
+	}
+}
+
 func TestCodexAuditRelayFailoverSummary(t *testing.T) {
 	db := newCodexAuditSQLiteTestDB(t)
 	insertCodexAuditUsage(t, db,

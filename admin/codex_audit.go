@@ -46,7 +46,7 @@ func (h *Handler) GetCodexAuditReport(c *gin.Context) {
 
 	bucketMinutes := positiveQueryInt(c, "bucket_minutes", 5)
 	limit := positiveQueryInt(c, "limit", 20)
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 12*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), codexAuditReportTimeout(start, end))
 	defer cancel()
 	report, err := h.db.BuildCodexAuditReport(ctx, database.CodexAuditQuery{
 		Start:         start,
@@ -59,4 +59,11 @@ func (h *Handler) GetCodexAuditReport(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, report)
+}
+
+func codexAuditReportTimeout(start, end time.Time) time.Duration {
+	if end.Sub(start) > 24*time.Hour {
+		return 20 * time.Second
+	}
+	return 12 * time.Second
 }
