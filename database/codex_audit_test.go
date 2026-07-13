@@ -249,6 +249,252 @@ func TestCodexAuditRelayFailoverSummary(t *testing.T) {
 	}
 }
 
+func TestCodexAuditAssociatedHiddenRetryCountsAsAttemptNotRequest(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{
+			LogicalRequestID:    "hidden-relay-recovered",
+			AccountID:           50,
+			StatusCode:          502,
+			AttemptIndex:        1,
+			RouteClass:          "cyb_relay",
+			RouteSource:         "direct",
+			RouteSignals:        `["local_threshold"]`,
+			RouteGroupID:        3,
+			UpstreamAccountType: "openai_responses",
+			UpstreamErrorKind:   "server",
+			GuardianAttemptOnly: true,
+		},
+		&UsageLogInput{
+			LogicalRequestID:    "hidden-relay-recovered",
+			AccountID:           53,
+			StatusCode:          200,
+			AttemptIndex:        2,
+			IsRetryAttempt:      true,
+			FirstTokenMs:        40,
+			Model:               "gpt-final",
+			EffectiveModel:      "gpt-final",
+			RouteClass:          "cyb_relay",
+			RouteSource:         "direct",
+			RouteSignals:        `["local_threshold"]`,
+			RouteGroupID:        3,
+			UpstreamAccountType: "openai_responses",
+		},
+	)
+
+	report := buildCodexAuditTestReport(t, db)
+	if report.Usage.Requests != 1 || report.Usage.UpstreamAttempts != 2 || report.Usage.Errors5xx != 0 {
+		t.Fatalf("hidden retry usage = requests:%d attempts:%d final5xx:%d, want 1/2/0",
+			report.Usage.Requests, report.Usage.UpstreamAttempts, report.Usage.Errors5xx)
+	}
+	if report.Summary.RelayFailovers != 1 || report.Summary.RelayFailoverSuccesses != 1 || report.Summary.RelayFailoverFailures != 0 || report.Summary.RelayAbsorbed5xx != 1 {
+		t.Fatalf("hidden retry failover = total:%d success:%d failure:%d absorbed:%d, want 1/1/0/1",
+			report.Summary.RelayFailovers, report.Summary.RelayFailoverSuccesses,
+			report.Summary.RelayFailoverFailures, report.Summary.RelayAbsorbed5xx)
+	}
+	var routeRequests, routeAttempts, routeSuccesses int64
+	for _, row := range report.RelayRoutes {
+		routeRequests += row.Requests
+		routeAttempts += row.Attempts
+		routeSuccesses += row.Successes
+	}
+	if routeRequests != 1 || routeAttempts != 2 || routeSuccesses != 1 {
+		t.Fatalf("hidden retry route rows = requests:%d attempts:%d successes:%d, want 1/2/1",
+			routeRequests, routeAttempts, routeSuccesses)
+	}
+
+	page, err := db.ListCodexAuditCasesPage(context.Background(), CodexAuditCasesQuery{
+		Kind: CodexAuditCaseRelayRoute, Start: time.Now().Add(-time.Minute), End: time.Now().Add(time.Minute), Page: 1, PageSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListCodexAuditCasesPage returned error: %v", err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || len(page.Items[0].AuditAttempts) != 2 {
+		t.Fatalf("hidden retry case = total:%d items:%d attempts:%d, want 1/1/2",
+			page.Total, len(page.Items), len(page.Items[0].AuditAttempts))
+	}
+	if page.Items[0].AccountID != 53 || page.Items[0].AuditAttempts[0].AccountID != 50 || page.Items[0].AuditAttempts[0].StatusCode != 502 || page.Items[0].AuditAttempts[1].AccountID != 53 || page.Items[0].AuditAttempts[1].StatusCode != 200 {
+		t.Fatalf("hidden retry case authority/timeline = final:%d attempts:%+v, want final 53 and 50(502)->53(200)",
+			page.Items[0].AccountID, page.Items[0].AuditAttempts)
+	}
+}
+
+func TestCodexAuditAssociatedHiddenAttemptsPreserveSafetyFindings(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	ownerHit := `["encrypted_owner_hit"]`
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "hidden-wrong-pool", AccountID: 41, StatusCode: 502, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "oauth", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "hidden-wrong-pool", AccountID: 42, StatusCode: 200, AttemptIndex: 2, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "hidden-owner-conflict", AccountID: 43, StatusCode: 502, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "hidden-owner-conflict", AccountID: 44, StatusCode: 200, AttemptIndex: 2, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "hidden-metadata-conflict", AccountID: 45, StatusCode: 502, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "hidden-metadata-conflict", AccountID: 46, StatusCode: 200, AttemptIndex: 2, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+	)
+
+	report := buildCodexAuditTestReport(t, db)
+	if report.Summary.RoutePoolViolations != 1 || report.Summary.EncryptedOwnerViolations != 1 || report.Summary.RouteMetadataConflicts != 1 || report.Summary.RouteInvariantViolations != 2 {
+		t.Fatalf("hidden attempt safety = pool:%d owner:%d metadata:%d invariant:%d, want 1/1/1/2",
+			report.Summary.RoutePoolViolations, report.Summary.EncryptedOwnerViolations,
+			report.Summary.RouteMetadataConflicts, report.Summary.RouteInvariantViolations)
+	}
+	var pool, owner, metadata, invariant int64
+	for _, point := range report.Timeline {
+		pool += point.RoutePoolViolations
+		owner += point.EncryptedOwnerViolations
+		metadata += point.RouteMetadataConflicts
+		invariant += point.RouteInvariantViolations
+	}
+	if pool != 1 || owner != 1 || metadata != 1 || invariant != 2 {
+		t.Fatalf("hidden attempt timeline safety = pool:%d owner:%d metadata:%d invariant:%d, want 1/1/1/2",
+			pool, owner, metadata, invariant)
+	}
+}
+
+func TestCodexAuditExcludesStandaloneSyntheticAndLegacyHiddenAttempts(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "business-final", StatusCode: 200, FirstTokenMs: 100, Model: "business-model", EffectiveModel: "business-model", UpstreamAccountType: "oauth"},
+		// Reusing a real business ID is not sufficient: attempt_index=0 denotes
+		// synthetic Guardian activity and must never enter business audit totals.
+		&UsageLogInput{LogicalRequestID: "business-final", AccountID: 998, StatusCode: 503, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "oauth", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+		// A positive hidden attempt still requires a visible final in this window.
+		&UsageLogInput{LogicalRequestID: "guardian-only", AccountID: 997, StatusCode: 503, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "oauth", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+		// Empty legacy IDs remain distinct and can never associate hidden rows.
+		&UsageLogInput{StatusCode: 200, FirstTokenMs: 200, Model: "legacy-model", EffectiveModel: "legacy-model", UpstreamAccountType: "oauth"},
+		&UsageLogInput{AccountID: 996, StatusCode: 503, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "oauth", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+	)
+
+	report := buildCodexAuditTestReport(t, db)
+	if report.Usage.Requests != 2 || report.Usage.UpstreamAttempts != 2 || report.Usage.Errors5xx != 0 || report.Usage.FirstTokenSamples != 2 {
+		t.Fatalf("excluded hidden usage = requests:%d attempts:%d final5xx:%d ttft:%d, want 2/2/0/2",
+			report.Usage.Requests, report.Usage.UpstreamAttempts, report.Usage.Errors5xx, report.Usage.FirstTokenSamples)
+	}
+	if report.Summary.RelayRequests != 0 || report.Summary.RoutePoolViolations != 0 || report.Summary.OAuthCyberMissAttempts != 0 {
+		t.Fatalf("standalone/synthetic hidden activity leaked into summary: %+v", report.Summary)
+	}
+	page, err := db.ListCodexAuditCasesPage(context.Background(), CodexAuditCasesQuery{
+		Kind: CodexAuditCaseRelayRoute, Start: time.Now().Add(-time.Minute), End: time.Now().Add(time.Minute), Page: 1, PageSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListCodexAuditCasesPage returned error: %v", err)
+	}
+	if page.Total != 0 || len(page.Items) != 0 {
+		t.Fatalf("standalone/synthetic hidden relay cases = total:%d items:%d, want 0/0", page.Total, len(page.Items))
+	}
+}
+
+func TestCodexAuditLastCyberPolicyIncludesOnlyAssociatedHiddenAttempts(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "associated-oauth-cyber", AccountID: 201, StatusCode: 400, AttemptIndex: 1, UpstreamAccountType: "oauth", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "associated-oauth-cyber", AccountID: 202, StatusCode: 200, AttemptIndex: 2, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "associated-relay-cyber", AccountID: 301, StatusCode: 400, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "associated-relay-cyber", AccountID: 302, StatusCode: 200, AttemptIndex: 2, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "standalone-oauth-cyber", AccountID: 401, StatusCode: 400, AttemptIndex: 1, UpstreamAccountType: "oauth", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "standalone-relay-cyber", AccountID: 402, StatusCode: 400, AttemptIndex: 1, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "synthetic-oauth-cyber", AccountID: 501, StatusCode: 200, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "synthetic-oauth-cyber", AccountID: 502, StatusCode: 400, UpstreamAccountType: "oauth", UpstreamErrorKind: "cyber_policy", GuardianAttemptOnly: true},
+	)
+
+	base := time.Date(2026, time.July, 13, 12, 0, 0, 0, time.UTC)
+	setTime := func(logicalID string, hidden bool, ts time.Time) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(context.Background(), `UPDATE usage_logs SET created_at = $1 WHERE logical_request_id = $2 AND guardian_attempt_only = $3`, db.timeArg(ts), logicalID, hidden); err != nil {
+			t.Fatalf("set %s hidden=%t created_at: %v", logicalID, hidden, err)
+		}
+	}
+	setTime("associated-oauth-cyber", true, base)
+	setTime("associated-oauth-cyber", false, base.Add(5*time.Second))
+	setTime("associated-relay-cyber", true, base.Add(time.Minute))
+	setTime("associated-relay-cyber", false, base.Add(time.Minute+5*time.Second))
+	setTime("standalone-oauth-cyber", true, base.Add(10*time.Minute))
+	setTime("standalone-relay-cyber", true, base.Add(11*time.Minute))
+	setTime("synthetic-oauth-cyber", false, base.Add(15*time.Minute))
+	setTime("synthetic-oauth-cyber", true, base.Add(20*time.Minute))
+
+	start, end := base.Add(-time.Minute), base.Add(30*time.Minute)
+	summary, err := db.codexAuditRouteSummary(context.Background(), start, end)
+	if err != nil {
+		t.Fatalf("codexAuditRouteSummary returned error: %v", err)
+	}
+	if summary.OAuthCyberMissRequests != 1 || summary.OAuthCyberMissAttempts != 1 || summary.RelayCyberRequests != 1 || summary.RelayCyberAttempts != 1 {
+		t.Fatalf("associated hidden cyber summary = oauth:%d/%d relay:%d/%d, want 1/1 and 1/1",
+			summary.OAuthCyberMissRequests, summary.OAuthCyberMissAttempts,
+			summary.RelayCyberRequests, summary.RelayCyberAttempts)
+	}
+	policySamples, err := db.codexAuditPolicyErrorSamples(context.Background(), start, end, 20)
+	if err != nil {
+		t.Fatalf("policy error samples returned error: %v", err)
+	}
+	policyAccounts := map[int64]bool{}
+	for _, sample := range policySamples {
+		policyAccounts[sample.AccountID] = true
+	}
+	if len(policySamples) != 2 || !policyAccounts[201] || !policyAccounts[301] {
+		t.Fatalf("associated hidden policy samples = accounts:%v count:%d, want only 201 and 301", policyAccounts, len(policySamples))
+	}
+	oauthLast, err := db.codexAuditLastCyberPolicyAt(context.Background(), end, "oauth")
+	if err != nil {
+		t.Fatalf("last OAuth cyber query returned error: %v", err)
+	}
+	relayLast, err := db.codexAuditLastCyberPolicyAt(context.Background(), end, "relay")
+	if err != nil {
+		t.Fatalf("last Relay cyber query returned error: %v", err)
+	}
+	if oauthLast == nil || !oauthLast.Equal(base) {
+		t.Fatalf("last OAuth cyber = %v, want associated hidden attempt at %v", oauthLast, base)
+	}
+	wantRelay := base.Add(time.Minute)
+	if relayLast == nil || !relayLast.Equal(wantRelay) {
+		t.Fatalf("last Relay cyber = %v, want associated hidden attempt at %v", relayLast, wantRelay)
+	}
+}
+
+func TestCodexAuditThreeHourAttemptAssociationQueryShape(t *testing.T) {
+	for name, query := range map[string]string{
+		"canonical": codexAuditCanonicalUsageCTE,
+		"summary":   codexAuditRouteSummaryCTE,
+	} {
+		businessPos := strings.Index(query, "business_logical_ids AS MATERIALIZED")
+		attemptPos := strings.Index(query, "attempt_index, 0) > 0")
+		if businessPos < 0 || attemptPos < 0 || businessPos > attemptPos {
+			t.Fatalf("%s query does not materialize business IDs before hidden-attempt association", name)
+		}
+	}
+	if !strings.Contains(codexAuditRouteSummaryCTE, "MAX(CASE WHEN is_business_final = 1 THEN id END) AS final_id") {
+		t.Fatal("route summary no longer selects its canonical final from visible business rows")
+	}
+	if !strings.Contains(codexAuditEncryptedOwnerViolationSQL, "COALESCE(u.account_id, 0) = 0 AND COALESCE(u.status_code, 0) >= 400") {
+		t.Fatal("account-neutral encrypted failure safety exception was lost")
+	}
+
+	// Compile the optimized multi-hour summary shape through SQLite's planner.
+	// Correlated per-row lookups here would recreate the three-hour timeout that
+	// the materialized request-ID boundary is intended to prevent.
+	db := newCodexAuditSQLiteTestDB(t)
+	rows, err := db.conn.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+codexAuditRouteSummaryCTE+`SELECT COUNT(*) FROM canonical_requests`, db.timeArg(time.Now().Add(-3*time.Hour)), db.timeArg(time.Now()))
+	if err != nil {
+		t.Fatalf("three-hour route summary plan: %v", err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan three-hour route summary plan: %v", err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("three-hour route summary plan rows: %v", err)
+	}
+	if strings.Contains(strings.ToLower(plan.String()), "correlated") {
+		t.Fatalf("three-hour route summary regressed to correlated lookups:\n%s", plan.String())
+	}
+}
+
 func TestCodexAuditRouteCyberAndUnavailableAccounting(t *testing.T) {
 	db := newCodexAuditSQLiteTestDB(t)
 
@@ -455,6 +701,34 @@ func TestCodexAuditRelayCasesExcludeGuardianAttempts(t *testing.T) {
 	item := page.Items[0]
 	if item.AccountID != 101 || len(item.AuditAttempts) != 1 || item.AuditAttempts[0].AccountID != 101 {
 		t.Fatalf("relay case includes Guardian attempt: account=%d attempts=%+v", item.AccountID, item.AuditAttempts)
+	}
+}
+
+func TestCodexAuditEncryptedOwnerAccountNeutralFailureIsNotViolation(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	ownerHit := `["encrypted_owner_hit"]`
+	insertCodexAuditUsage(t, db,
+		// The final route-exhaustion row did not reach an upstream account. It
+		// keeps the owner metadata for diagnosis, but cannot be a cross-account
+		// ownership violation.
+		&UsageLogInput{LogicalRequestID: "owner-final-failure", StatusCode: 502, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "owner-valid", AccountID: 21, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "owner-invalid", AccountID: 22, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+	)
+
+	report := buildCodexAuditTestReport(t, db)
+	if report.Summary.EncryptedOwnerViolations != 1 || report.Summary.RouteInvariantViolations != 1 {
+		t.Fatalf("encrypted owner findings = owner:%d union:%d, want 1/1",
+			report.Summary.EncryptedOwnerViolations, report.Summary.RouteInvariantViolations)
+	}
+
+	var owner, invariant int64
+	for _, point := range report.Timeline {
+		owner += point.EncryptedOwnerViolations
+		invariant += point.RouteInvariantViolations
+	}
+	if owner != 1 || invariant != 1 {
+		t.Fatalf("timeline encrypted owner findings = owner:%d union:%d, want 1/1", owner, invariant)
 	}
 }
 

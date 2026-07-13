@@ -280,15 +280,28 @@ func (db *DB) codexAuditLastCyberPolicyAt(ctx context.Context, end time.Time, sc
 	routeClause := ""
 	if scope == "relay" {
 		accountType = "openai_responses"
-		routeClause = " AND COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) > 0"
+		routeClause = " AND COALESCE(u.route_class, '') = 'cyb_relay' AND COALESCE(u.route_group_id, 0) > 0"
 	}
 	var raw any
 	if err := db.conn.QueryRowContext(ctx, `
-		SELECT MAX(created_at) FROM usage_logs
-		WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
-		  AND COALESCE(upstream_account_type, '') = $3
-		  AND NOT COALESCE(guardian_attempt_only, FALSE)
-		  AND created_at >= $1 AND created_at <= $2`+routeClause,
+		SELECT MAX(u.created_at) FROM usage_logs u
+		WHERE LOWER(COALESCE(u.upstream_error_kind, '')) = 'cyber_policy'
+		  AND COALESCE(u.upstream_account_type, '') = $3
+		  AND u.created_at >= $1 AND u.created_at <= $2
+		  AND (
+			NOT COALESCE(u.guardian_attempt_only, FALSE)
+			OR (
+				COALESCE(u.guardian_attempt_only, FALSE)
+				AND COALESCE(u.attempt_index, 0) > 0
+				AND COALESCE(u.logical_request_id, '') <> ''
+				AND EXISTS (
+					SELECT 1 FROM usage_logs f
+					WHERE f.logical_request_id = u.logical_request_id
+					  AND f.created_at >= $1 AND f.created_at <= $2
+					  AND NOT COALESCE(f.guardian_attempt_only, FALSE)
+				)
+			)
+		  )`+routeClause,
 		startArg, endArg, accountType).Scan(&raw); err != nil {
 		return nil, err
 	}
@@ -421,15 +434,18 @@ const codexAuditRoutePoolViolationSQL = `(
 const codexAuditEncryptedOwnerViolationSQL = `(
 	COALESCE(u.pin_kind, '') = 'encrypted_content'
 	AND NOT (
-		COALESCE(u.account_id, 0) > 0
-		AND LOWER(COALESCE(u.route_signals, '')) LIKE '%"encrypted_owner_hit"%'
-		AND (
-			` + codexAuditEncryptedOAuthRouteShapeSQL + `
-			OR (
-				COALESCE(u.route_class, '') = 'cyb_relay'
-				AND COALESCE(u.route_source, '') IN ('pin', 'direct', 'probe')
-				AND COALESCE(u.upstream_account_type, '') = 'openai_responses'
-				AND COALESCE(u.route_group_id, 0) > 0
+		(COALESCE(u.account_id, 0) = 0 AND COALESCE(u.status_code, 0) >= 400)
+		OR (
+			COALESCE(u.account_id, 0) > 0
+			AND LOWER(COALESCE(u.route_signals, '')) LIKE '%"encrypted_owner_hit"%'
+			AND (
+				` + codexAuditEncryptedOAuthRouteShapeSQL + `
+				OR (
+					COALESCE(u.route_class, '') = 'cyb_relay'
+					AND COALESCE(u.route_source, '') IN ('pin', 'direct', 'probe')
+					AND COALESCE(u.upstream_account_type, '') = 'openai_responses'
+					AND COALESCE(u.route_group_id, 0) > 0
+				)
 			)
 		)
 	)
@@ -455,9 +471,13 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 	}
 	startArg, endArg := db.timeRangeArgs(start, end)
 	rows, err := db.conn.QueryContext(ctx, `
-		WITH timeline_scope AS MATERIALIZED (
+		WITH `+codexAuditBusinessLogicalIDsCTE+`,
+		timeline_scope AS MATERIALIZED (
 			SELECT u.id,
 			       COALESCE(NULLIF(u.logical_request_id, ''), 'legacy:' || CAST(u.id AS TEXT)) AS audit_request_id,
+			       CASE WHEN NOT COALESCE(u.guardian_attempt_only, FALSE)
+			                     AND (COALESCE(u.logical_request_id, '') = '' OR b.final_id = u.id)
+			            THEN 1 ELSE 0 END AS is_business_final,
 			       `+bucketExpression+` AS bucket_unix,
 			       COALESCE(u.status_code, 0) AS status_code,
 			       COALESCE(u.first_token_ms, 0) AS first_token_ms,
@@ -477,10 +497,12 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 			       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND `+codexAuditRouteMetadataConflictSQL+`
 			            THEN 1 ELSE 0 END AS attempt_route_metadata_conflict
 			FROM usage_logs u
+			LEFT JOIN business_logical_ids b ON b.logical_request_id = u.logical_request_id
 			WHERE u.created_at >= $1 AND u.created_at <= $2
-			  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
+			  AND `+codexAuditAssociatedAttemptWhereSQL+`
 		), request_rollup AS (
-			SELECT audit_request_id, MAX(id) AS final_id,
+			SELECT audit_request_id,
+			       MAX(CASE WHEN is_business_final = 1 THEN id END) AS final_id,
 			       MAX(attempt_route_pool_violation) AS route_pool_violation,
 			       MAX(attempt_encrypted_owner_violation) AS encrypted_owner_violation,
 			       MAX(attempt_route_metadata_conflict) AS route_metadata_conflict
@@ -899,7 +921,20 @@ func (db *DB) codexAuditPolicyErrorSamples(ctx context.Context, start, end time.
 		OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%cyber%'
 		OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%violat%'
 		OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%safety%'
-	) AND NOT COALESCE(u.guardian_attempt_only, FALSE)`
+	) AND (
+		NOT COALESCE(u.guardian_attempt_only, FALSE)
+		OR (
+			COALESCE(u.guardian_attempt_only, FALSE)
+			AND COALESCE(u.attempt_index, 0) > 0
+			AND COALESCE(u.logical_request_id, '') <> ''
+			AND EXISTS (
+				SELECT 1 FROM usage_logs f
+				WHERE f.logical_request_id = u.logical_request_id
+				  AND f.created_at >= $1 AND f.created_at <= $2
+				  AND NOT COALESCE(f.guardian_attempt_only, FALSE)
+			)
+		)
+	)`
 	limitArg := fmt.Sprintf("$%d", len(args)+1)
 	args = append(args, limit)
 
@@ -972,20 +1007,52 @@ func scanPromptFilterLogs(rows scannerRows) ([]*PromptFilterLog, error) {
 	return result, rows.Err()
 }
 
+// codexAuditBusinessLogicalIDsCTE deliberately materializes the finite set of
+// business request IDs in the requested window before hidden transport attempts
+// are associated with them. This prevents standalone Guardian probes from
+// becoming audit traffic and keeps the association bounded for multi-hour
+// PostgreSQL reports. Empty legacy IDs are intentionally absent: every visible
+// legacy row remains its own logical request and hidden legacy rows never join.
+const codexAuditBusinessLogicalIDsCTE = `business_logical_ids AS MATERIALIZED (
+	SELECT u.logical_request_id, MAX(u.id) AS final_id
+	FROM usage_logs u
+	WHERE u.created_at >= $1 AND u.created_at <= $2
+	  AND COALESCE(u.logical_request_id, '') <> ''
+	  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
+	GROUP BY u.logical_request_id
+)`
+
+// A Guardian-hidden row is a real upstream business attempt only when rb12
+// assigned it a positive attempt index and the same audit window contains a
+// visible final row for that logical request. attempt_index=0 remains reserved
+// for synthetic Guardian activity and is excluded even if an ID is reused.
+const codexAuditAssociatedAttemptWhereSQL = `(
+	NOT COALESCE(u.guardian_attempt_only, FALSE)
+	OR (
+		COALESCE(u.guardian_attempt_only, FALSE)
+		AND COALESCE(u.attempt_index, 0) > 0
+		AND COALESCE(u.logical_request_id, '') <> ''
+		AND b.logical_request_id IS NOT NULL
+	)
+)`
+
 const codexAuditCanonicalUsageCTE = `
-WITH ranked_usage AS (
+WITH ` + codexAuditBusinessLogicalIDsCTE + `,
+ranked_usage AS MATERIALIZED (
 	SELECT u.*,
 	       COALESCE(NULLIF(u.logical_request_id, ''), 'legacy:' || CAST(u.id AS TEXT)) AS audit_request_id,
 	       ROW_NUMBER() OVER (
 		   PARTITION BY COALESCE(NULLIF(u.logical_request_id, ''), 'legacy:' || CAST(u.id AS TEXT))
-		   -- Retry failures carry attempt_index, while the terminal success row is
-		   -- currently written with the default zero value. The final append is the
-		   -- authoritative logical-request outcome, so rank by write order only.
-		   ORDER BY u.id DESC
+		   -- Hidden rows are attempt evidence only. The newest visible append is
+		   -- always the authoritative business outcome, even if a hidden row was
+		   -- persisted later by an asynchronous transport path.
+		   ORDER BY CASE WHEN NOT COALESCE(u.guardian_attempt_only, FALSE) THEN 0 ELSE 1 END,
+		            u.id DESC
 	       ) AS audit_rn
 	FROM usage_logs u
+	LEFT JOIN business_logical_ids b ON b.logical_request_id = u.logical_request_id
 	WHERE u.created_at >= $1 AND u.created_at <= $2
-	  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
+	  AND ` + codexAuditAssociatedAttemptWhereSQL + `
 ), final_usage AS (
 	SELECT * FROM ranked_usage WHERE audit_rn = 1
 ), request_attempts AS (
@@ -1008,9 +1075,13 @@ WITH ranked_usage AS (
 // window sort and then rescanned it for each CYB counter, which made multi-day
 // audit windows exhaust the report request deadline.
 const codexAuditRouteSummaryCTE = `
-WITH summary_usage AS MATERIALIZED (
+WITH ` + codexAuditBusinessLogicalIDsCTE + `,
+summary_usage AS MATERIALIZED (
 	SELECT u.id,
 	       COALESCE(NULLIF(u.logical_request_id, ''), 'legacy:' || CAST(u.id AS TEXT)) AS audit_request_id,
+	       CASE WHEN NOT COALESCE(u.guardian_attempt_only, FALSE)
+	                   AND (COALESCE(u.logical_request_id, '') = '' OR b.final_id = u.id)
+	              THEN 1 ELSE 0 END AS is_business_final,
 	       COALESCE(u.logical_request_id, '') AS logical_request_id,
 	       COALESCE(u.route_class, '') AS route_class,
 	       COALESCE(u.route_source, '') AS route_source,
@@ -1044,11 +1115,12 @@ WITH summary_usage AS MATERIALIZED (
 	       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND ` + codexAuditRouteMetadataConflictSQL + `
 	             THEN 1 ELSE 0 END AS attempt_route_metadata_conflict
 	FROM usage_logs u
+	LEFT JOIN business_logical_ids b ON b.logical_request_id = u.logical_request_id
 	WHERE u.created_at >= $1 AND u.created_at <= $2
-	  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
+	  AND ` + codexAuditAssociatedAttemptWhereSQL + `
 ), request_rollup AS (
 	SELECT audit_request_id,
-	       MAX(id) AS final_id,
+	       MAX(CASE WHEN is_business_final = 1 THEN id END) AS final_id,
 	       COUNT(DISTINCT CASE
 	         WHEN route_class = 'cyb_relay' AND account_id > 0 THEN account_id
 	       END) AS relay_account_count,

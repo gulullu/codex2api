@@ -156,6 +156,14 @@ func (db *DB) ListCodexAuditCasesPage(ctx context.Context, query CodexAuditCases
 func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID string, start, end time.Time) ([]CodexAuditAttempt, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
 	rows, err := db.conn.QueryContext(ctx, `
+		WITH business_request AS MATERIALIZED (
+			SELECT u.logical_request_id
+			FROM usage_logs u
+			WHERE u.logical_request_id = $1
+			  AND u.created_at >= $2 AND u.created_at <= $3
+			  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
+			GROUP BY u.logical_request_id
+		)
 		SELECT COALESCE(u.account_id, 0), COALESCE(a.name, ''), COALESCE(u.status_code, 0),
 		       COALESCE(u.attempt_index, 0), COALESCE(u.is_retry_attempt, false),
 		       COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
@@ -163,7 +171,14 @@ func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID strin
 		FROM usage_logs u
 		LEFT JOIN accounts a ON a.id = u.account_id
 		WHERE u.logical_request_id = $1 AND u.created_at >= $2 AND u.created_at <= $3
-		  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
+		  AND (
+			NOT COALESCE(u.guardian_attempt_only, FALSE)
+			OR (
+				COALESCE(u.guardian_attempt_only, FALSE)
+				AND COALESCE(u.attempt_index, 0) > 0
+				AND EXISTS (SELECT 1 FROM business_request)
+			)
+		  )
 		ORDER BY u.id ASC
 	`, logicalRequestID, startArg, endArg)
 	if err != nil {
