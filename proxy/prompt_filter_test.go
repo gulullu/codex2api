@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -112,6 +113,120 @@ func TestRoutingPromptFilterConfigForcesMonitorAndDisablesReview(t *testing.T) {
 	}
 	if got.Review.Enabled || got.Review.All {
 		t.Fatalf("review config = %+v, want Omni disabled on codex2api request path", got.Review)
+	}
+}
+
+func TestPromptFilterMultiVectorWebAttackSignalIsNarrow(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       100,
+		StrictThreshold: 150,
+	}
+
+	tests := []struct {
+		name        string
+		verdict     promptfilter.Verdict
+		wantSignal  bool
+		wantSignals []string
+	}{
+		{
+			name: "evidence-backed xss and traversal pair fills the threshold gap",
+			verdict: promptfilter.Verdict{
+				Enabled: true,
+				Score:   80,
+				Matched: []promptfilter.Match{
+					{Name: "path_traversal", Weight: 35},
+					{Name: "xss_attack", Weight: 35},
+					{Name: "generic_exploit", Weight: 10},
+				},
+			},
+			wantSignal:  true,
+			wantSignals: []string{"local_multi_vector_web_attack"},
+		},
+		{
+			name: "score below the evidence threshold stays on the default route",
+			verdict: promptfilter.Verdict{
+				Enabled: true,
+				Score:   79,
+				Matched: []promptfilter.Match{{Name: "path_traversal"}, {Name: "xss_attack"}},
+			},
+		},
+		{
+			name: "single web rule is insufficient",
+			verdict: promptfilter.Verdict{
+				Enabled: true,
+				Score:   80,
+				Matched: []promptfilter.Match{{Name: "xss_attack"}},
+			},
+		},
+		{
+			name: "security scanner command and traversal pair is a known benign context",
+			verdict: promptfilter.Verdict{
+				Enabled: true,
+				Score:   85,
+				Matched: []promptfilter.Match{{Name: "command_injection"}, {Name: "path_traversal"}},
+			},
+		},
+		{
+			name: "stronger existing threshold signal remains the primary reason",
+			verdict: promptfilter.Verdict{
+				Enabled: true,
+				Score:   100,
+				Matched: []promptfilter.Match{{Name: "path_traversal"}, {Name: "xss_attack"}},
+			},
+			wantSignal:  true,
+			wantSignals: []string{"local_threshold"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotSignal, gotSignals := PromptFilterRouteSignal(tt.verdict, "", cfg, "/v1/responses")
+			if gotSignal != tt.wantSignal {
+				t.Fatalf("signal = %v, signals = %v; want signal %v", gotSignal, gotSignals, tt.wantSignal)
+			}
+			if fmt.Sprint(gotSignals) != fmt.Sprint(tt.wantSignals) {
+				t.Fatalf("signals = %v, want %v", gotSignals, tt.wantSignals)
+			}
+		})
+	}
+
+	verdict := promptfilter.Verdict{
+		Enabled: true,
+		Score:   80,
+		Matched: []promptfilter.Match{{Name: "path_traversal"}, {Name: "xss_attack"}},
+	}
+	if signal, signals := PromptFilterRouteSignal(verdict, "", cfg, "/v1/images/generations"); signal || len(signals) != 0 {
+		t.Fatalf("non-text endpoint signal = %v, signals = %v; want no routing signal", signal, signals)
+	}
+}
+
+func TestPromptFilterMultiVectorSignalUsesTheFullResponsesPayload(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       100,
+		StrictThreshold: 150,
+	}
+	body := []byte(`{"model":"gpt-5.4","instructions":"DOM XSS payload, path traversal exploit, vulnerability.","input":"Summarize the result."}`)
+	verdict := promptfilter.Inspect(body, "/v1/responses", cfg)
+	if verdict.Score < promptFilterMultiVectorWebAttackMinScore || verdict.Score >= cfg.Threshold {
+		t.Fatalf("full-payload score = %d, matches = %+v; want the 80-99 routing gap", verdict.Score, verdict.Matched)
+	}
+	signal, signals := PromptFilterRouteSignal(verdict, promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength), cfg, "/v1/responses")
+	if !signal || fmt.Sprint(signals) != "[local_multi_vector_web_attack]" {
+		t.Fatalf("full-payload route signal = %v, signals = %v; want local_multi_vector_web_attack", signal, signals)
+	}
+
+	// This is a redacted replay of the scanner-skills shape that accounted for
+	// 112/113 broad shadow candidates. It mentions command injection and path
+	// traversal, but no XSS rule, so the narrow fallback must not reroute it.
+	scannerBody := []byte(`{"model":"gpt-5.4","instructions":"You are a security scanner and input sanitizer for AI agents. Detect prompt injection, command injection, and path traversal.","input":"Review this configuration."}`)
+	scannerVerdict := promptfilter.Inspect(scannerBody, "/v1/responses", cfg)
+	scannerSignal, scannerSignals := PromptFilterRouteSignal(scannerVerdict, promptfilter.ExtractText(scannerBody, "/v1/responses", cfg.MaxTextLength), cfg, "/v1/responses")
+	if scannerSignal || len(scannerSignals) != 0 {
+		t.Fatalf("redacted scanner replay routed = %v, signals = %v, verdict = %+v; want default route", scannerSignal, scannerSignals, scannerVerdict)
 	}
 }
 

@@ -86,6 +86,31 @@ var promptFilterExplicitHighRiskPatterns = map[string]struct{}{
 	"fraud_carding":                            {},
 }
 
+const promptFilterMultiVectorWebAttackMinScore = 80
+
+// promptFilterMultiVectorWebAttackVerdict is intentionally narrower than a
+// generic "two risky rules" heuristic. Production evidence showed that the
+// path_traversal + xss_attack combination was missed at the normal threshold,
+// while command_injection + path_traversal frequently appears in benign
+// security-scanner instructions. Keep this exact pair until shadow evidence
+// justifies expanding it.
+func promptFilterMultiVectorWebAttackVerdict(verdict promptfilter.Verdict) bool {
+	if verdict.Score < promptFilterMultiVectorWebAttackMinScore {
+		return false
+	}
+	hasPathTraversal := false
+	hasXSSAttack := false
+	for _, match := range verdict.Matched {
+		switch match.Name {
+		case "path_traversal":
+			hasPathTraversal = true
+		case "xss_attack":
+			hasXSSAttack = true
+		}
+	}
+	return hasPathTraversal && hasXSSAttack
+}
+
 func promptFilterExplicitHighRiskVerdict(verdict promptfilter.Verdict) bool {
 	for _, match := range verdict.Matched {
 		if _, ok := promptFilterExplicitHighRiskPatterns[match.Name]; ok {
@@ -124,6 +149,11 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	}
 	if promptfilter.LooksLikeTechnicalCyberIntent(text) {
 		signals = append(signals, "technical_cyber_intent")
+	}
+	// Only fill the evidence-backed gap below the normal routing threshold.
+	// Existing stronger signals retain their original, more specific reason.
+	if len(signals) == 0 && promptFilterMultiVectorWebAttackVerdict(verdict) {
+		signals = append(signals, "local_multi_vector_web_attack")
 	}
 	return len(signals) > 0, signals
 }
