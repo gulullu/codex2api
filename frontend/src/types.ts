@@ -53,7 +53,7 @@ export interface RelayGuardianAccountStatus {
   last_failure_at?: ISODateString | null
   last_action_at?: ISODateString | null
   last_scan_at?: ISODateString | null
-  circuit_state: 'closed' | 'open' | 'half_open' | string
+  circuit_state: 'closed' | 'suspect' | 'open' | 'probation' | 'half_open' | string
   circuit_open_until?: ISODateString | null
   circuit_probe_successes: number
   circuit_required_successes: number
@@ -202,7 +202,7 @@ export interface AccountRow {
   billed_7d?: number
   cooldown_until?: ISODateString
   cooldown_reason?: string
-  relay_circuit_state?: 'closed' | 'open' | 'half_open'
+  relay_circuit_state?: 'closed' | 'suspect' | 'open' | 'probation' | 'half_open'
   relay_circuit_reason?: string
   relay_circuit_open_until?: ISODateString
   relay_circuit_probe_in_flight?: boolean

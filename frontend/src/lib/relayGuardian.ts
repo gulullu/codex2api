@@ -104,7 +104,7 @@ export function getRelayGuardianRecoveryProgress(
     const progress = required > 0 ? `${successes}/${required}` : '试运行中'
     return status.probation_percent > 0 ? `${progress} · ${status.probation_percent}% 并发上限` : progress
   }
-  if (status.circuit_state === 'half_open') {
+  if (status.circuit_state === 'half_open' || status.circuit_state === 'probation') {
     const successes = Math.max(0, status.circuit_probe_successes || 0)
     const required = Math.max(0, status.circuit_required_successes || 0)
     return required > 0 ? `${successes}/${required}` : '恢复探测中'

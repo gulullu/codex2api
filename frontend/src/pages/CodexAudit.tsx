@@ -761,8 +761,8 @@ function HeaderControl({ label, children }: { label: string; children: ReactNode
 function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
   const relayAccounts = accounts.filter((a) => a.openai_responses_api)
   const active = relayAccounts.filter((a) => a.status === 'active' && a.enabled !== false && a.relay_circuit_state !== 'open')
-  const circuitCount = relayAccounts.filter((a) => a.relay_circuit_state === 'open' || a.relay_circuit_state === 'half_open').length
-  const healthy = active.length > 0 && active.length === relayAccounts.length && circuitCount === 0
+  const constrainedCount = relayAccounts.filter((a) => a.relay_circuit_state && a.relay_circuit_state !== 'closed').length
+  const healthy = active.length > 0 && active.length === relayAccounts.length && constrainedCount === 0
   return (
     <div className="min-w-0 rounded-xl border border-border/60 bg-background/75 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
@@ -772,7 +772,7 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
         </div>
         <div className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium ${healthy ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'}`}>
           <span className={`size-1.5 rounded-full ${healthy ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-          {active.length}/{relayAccounts.length} 可调度{circuitCount ? ` · 熔断 ${circuitCount}` : ''}
+          {active.length}/{relayAccounts.length} 可调度{constrainedCount ? ` · 受限 ${constrainedCount}` : ''}
         </div>
       </div>
       <div className="space-y-1.5">
@@ -793,7 +793,11 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
                   className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${circuitState === 'open' ? 'bg-red-500/10 text-red-600 dark:text-red-400' : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'}`}
                   title={[a.relay_circuit_reason, a.relay_circuit_open_until ? `至 ${formatBeijingTime(a.relay_circuit_open_until)}` : ''].filter(Boolean).join(' · ')}
                 >
-                  {circuitState === 'open' ? '熔断' : `恢复探测 ${a.relay_circuit_probe_successes || 0}/${a.relay_circuit_required_successes || 3}`}
+                  {circuitState === 'open'
+                    ? '熔断'
+                    : circuitState === 'suspect'
+                      ? '限流观察'
+                      : `恢复探测 ${a.relay_circuit_probe_successes || 0}/${a.relay_circuit_required_successes || 2}`}
                 </span>
               ) : null}
               <div className="hidden h-1.5 w-16 shrink-0 overflow-hidden rounded-full bg-muted sm:block">

@@ -196,6 +196,18 @@ test('recovery progress is hidden unless guardian or circuit is recovering', () 
     circuit_probe_successes: 1,
     circuit_required_successes: 3,
   })), '1/3')
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({
+    state: 'healthy',
+    circuit_state: 'probation',
+    circuit_probe_successes: 1,
+    circuit_required_successes: 2,
+  })), '1/2')
+})
+
+test('account pool distinguishes limited circuit states from a full open circuit', () => {
+  assert.match(auditPageSource, /受限 \$\{constrainedCount\}/)
+  assert.match(auditPageSource, /circuitState === 'suspect'/)
+  assert.match(auditPageSource, /限流观察/)
 })
 
 test('inactive confirmation, recovery and quarantine details are conditionally omitted', () => {
