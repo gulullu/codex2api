@@ -2172,7 +2172,7 @@ func TestInvalidEncryptedContentErrorDetection(t *testing.T) {
 	}
 }
 
-func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
+func TestRepairInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
 		"input":[
@@ -2182,9 +2182,12 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 		]
 	}`)
 
-	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
-	if !changed {
+	got, repair := repairInvalidEncryptedContentFromResponsesBody(raw)
+	if !repair.Changed {
 		t.Fatalf("expected body to be changed")
+	}
+	if repair.Dropped != 1 || repair.Converted != 0 || repair.InputEmpty {
+		t.Fatalf("unexpected repair metadata: %+v", repair)
 	}
 	items := gjson.GetBytes(got, "input").Array()
 	if len(items) != 2 {
@@ -2203,7 +2206,7 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 
 // ==================== Function Calling 测试 ====================
 
-func TestStripInvalidEncryptedContentFromResponsesBodyDropsBareReasoning(t *testing.T) {
+func TestRepairInvalidEncryptedContentFromResponsesBodyDropsBareReasoning(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
 		"input":[
@@ -2214,9 +2217,12 @@ func TestStripInvalidEncryptedContentFromResponsesBodyDropsBareReasoning(t *test
 		]
 	}`)
 
-	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
-	if !changed {
+	got, repair := repairInvalidEncryptedContentFromResponsesBody(raw)
+	if !repair.Changed {
 		t.Fatalf("expected body to be changed")
+	}
+	if repair.Dropped != 2 || repair.Converted != 0 || repair.InputEmpty {
+		t.Fatalf("unexpected repair metadata: %+v", repair)
 	}
 	items := gjson.GetBytes(got, "input").Array()
 	if len(items) != 2 {
@@ -2227,6 +2233,127 @@ func TestStripInvalidEncryptedContentFromResponsesBodyDropsBareReasoning(t *test
 	}
 	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
 		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+}
+
+func TestRepairInvalidEncryptedContentCompactionHistory(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"compaction","encrypted_content":"opaque-a","summary":"summary a"},
+			{"type":"context_compaction","encrypted_content":"opaque-b","text":"summary b"},
+			{"type":"compaction","encrypted_content":"opaque-c"},
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"keep","encrypted_content":"nested-metadata"}]}
+		]
+	}`)
+
+	got, repair := repairInvalidEncryptedContentFromResponsesBody(raw)
+	if !repair.Changed || repair.Dropped != 1 || repair.Converted != 2 || repair.InputEmpty {
+		t.Fatalf("unexpected repair metadata: %+v; body=%s", repair, got)
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("expected four retained items, got %d: %s", len(items), got)
+	}
+	if text := gjson.GetBytes(got, "input.1.content.0.text").String(); text != responsesCompactionSummaryPrefix+"summary a" {
+		t.Fatalf("compaction summary was not recovered: %q; body=%s", text, got)
+	}
+	if text := gjson.GetBytes(got, "input.2.content.0.text").String(); text != responsesCompactionSummaryPrefix+"summary b" {
+		t.Fatalf("context_compaction summary was not recovered: %q; body=%s", text, got)
+	}
+	if nested := gjson.GetBytes(got, "input.3.content.0.encrypted_content").String(); nested != "nested-metadata" {
+		t.Fatalf("unrelated nested encrypted_content must be preserved, got %q; body=%s", nested, got)
+	}
+	for _, item := range items {
+		if typ := item.Get("type").String(); typ == "compaction" || typ == "context_compaction" {
+			t.Fatalf("opaque compaction shell must not remain: %s", got)
+		}
+	}
+}
+
+func TestRepairInvalidEncryptedContentEmptyInputGuard(t *testing.T) {
+	for _, raw := range [][]byte{
+		[]byte(`{"model":"gpt-5.4","input":[{"type":"context_compaction","encrypted_content":"opaque"}]}`),
+		[]byte(`{"model":"gpt-5.4","input":{"type":"reasoning","encrypted_content":"opaque"}}`),
+	} {
+		got, repair := repairInvalidEncryptedContentFromResponsesBody(raw)
+		if !repair.Changed || !repair.InputEmpty || repair.Dropped != 1 {
+			t.Fatalf("expected empty-input guard, got %+v; body=%s", repair, got)
+		}
+		if len(gjson.GetBytes(got, "input").Array()) != 0 {
+			t.Fatalf("repaired input should be an empty array: %s", got)
+		}
+	}
+}
+
+func TestPrepareResponsesBodyNormalizesContextCompaction(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"context_compaction","summary":"earlier context"},
+			{"type":"context_compaction","encrypted_content":"opaque-context"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("plaintext context_compaction should become a message, got %q; body=%s", typ, got)
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); text != responsesCompactionSummaryPrefix+"earlier context" {
+		t.Fatalf("unexpected recovered context text %q; body=%s", text, got)
+	}
+	if encrypted := gjson.GetBytes(got, "input.1.encrypted_content").String(); encrypted != "opaque-context" {
+		t.Fatalf("valid context_compaction encrypted_content must pass through, got %q; body=%s", encrypted, got)
+	}
+}
+
+func TestEncryptedContentRepairRebuildsAllResponsesBodies(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"reasoning","encrypted_content":"bad-reasoning"},
+			{"type":"compaction","encrypted_content":"bad-compaction","summary":"recover me"},
+			{"type":"context_compaction","encrypted_content":"bad-context"}
+		]
+	}`)
+
+	repaired, repair := repairInvalidEncryptedContentFromResponsesBody(raw)
+	if !repair.Changed || repair.InputEmpty || repair.Dropped != 2 || repair.Converted != 1 {
+		t.Fatalf("unexpected repair metadata: %+v; body=%s", repair, repaired)
+	}
+
+	builders := map[string]func([]byte) []byte{
+		"responses-codex": func(body []byte) []byte {
+			got, _ := PrepareResponsesBodyForOwner(body, "test-owner")
+			return got
+		},
+		"responses-relay": PrepareOpenAIResponsesBody,
+		"compact-codex": func(body []byte) []byte {
+			got, _ := PrepareCompactResponsesBodyForOwner(body, "test-owner")
+			return got
+		},
+		"compact-relay": PrepareOpenAIResponsesCompactBody,
+		"responses-websocket": func(body []byte) []byte {
+			got, _ := PrepareResponsesWebSocketBody(body)
+			return got
+		},
+	}
+
+	for name, build := range builders {
+		got := build(repaired)
+		if strings.Contains(gjson.GetBytes(got, "input").Raw, "encrypted_content") {
+			t.Fatalf("%s rebuilt body retained invalid encrypted content: %s", name, got)
+		}
+		items := gjson.GetBytes(got, "input").Array()
+		if len(items) != 2 || items[0].Get("type").String() != "message" || items[1].Get("type").String() != "message" {
+			t.Fatalf("%s rebuilt an unexpected input shape: %s", name, got)
+		}
+		if text := items[1].Get("content.0.text").String(); text != responsesCompactionSummaryPrefix+"recover me" {
+			t.Fatalf("%s lost recovered summary: %q; body=%s", name, text, got)
+		}
 	}
 }
 

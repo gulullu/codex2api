@@ -2038,19 +2038,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				resp.Body.Close()
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-					if rawChanged || codexChanged {
+					repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
+					if repair.Changed && !repair.InputEmpty {
 						invalidEncryptedContentRetried = true
-						if rawChanged {
-							rawBody = strippedRawBody
-							resetOpenAIResponsesBody()
-						}
-						if codexChanged {
-							codexBody = strippedCodexBody
-							expandedInputRaw = responsesInputRaw(codexBody)
-						}
-						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						rawBody = repairedRawBody
+						codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
+						resetOpenAIResponsesBody()
+						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
 						h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
 							AccountID:            account.ID(),
 							Endpoint:             "/v1/responses",
@@ -2500,19 +2494,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			resp.Body.Close()
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-				if rawChanged || codexChanged {
+				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
+				if repair.Changed && !repair.InputEmpty {
 					invalidEncryptedContentRetried = true
-					if rawChanged {
-						rawBody = strippedRawBody
-						resetOpenAIResponsesBody()
-					}
-					if codexChanged {
-						codexBody = strippedCodexBody
-						expandedInputRaw = responsesInputRaw(codexBody)
-					}
-					log.Printf("上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					rawBody = repairedRawBody
+					codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
+					resetOpenAIResponsesBody()
+					log.Printf("上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
 					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
 						AccountID:            account.ID(),
 						Endpoint:             "/v1/responses",
@@ -3208,18 +3196,13 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				resp.Body.Close()
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-					if rawChanged || codexChanged {
+					repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
+					if repair.Changed && !repair.InputEmpty {
 						invalidEncryptedContentRetried = true
-						if rawChanged {
-							rawBody = strippedRawBody
-							openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
-						}
-						if codexChanged {
-							codexBody = strippedCodexBody
-						}
-						log.Printf("OpenAI Responses compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+						rawBody = repairedRawBody
+						codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
+						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+						log.Printf("OpenAI Responses compact 上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
 						h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
 							AccountID:            account.ID(),
 							Endpoint:             "/v1/responses/compact",
@@ -3428,18 +3411,13 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			resp.Body.Close()
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-				if rawChanged || codexChanged {
+				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
+				if repair.Changed && !repair.InputEmpty {
 					invalidEncryptedContentRetried = true
-					if rawChanged {
-						rawBody = strippedRawBody
-						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
-					}
-					if codexChanged {
-						codexBody = strippedCodexBody
-					}
-					log.Printf("compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+					rawBody = repairedRawBody
+					codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
+					openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+					log.Printf("compact 上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
 					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
 						AccountID:            account.ID(),
 						Endpoint:             "/v1/responses/compact",

@@ -770,12 +770,52 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 	return modified
 }
 
-// normalizeResponsesCompactionItems converts {"type":"compaction","summary":"..."}
-// items in body["input"] into developer-role messages so the upstream Codex
-// /responses endpoint accepts them. Items with empty or missing summary text
-// are dropped. Codex CLI compresses prior turns into compaction items expecting
-// them to be forwarded as conversation context; the upstream rejects the type
-// with "Invalid input type 'compaction' at index N", so we translate in place.
+const responsesCompactionSummaryPrefix = "[Conversation summary from earlier turns]\n"
+
+func isOpaqueEncryptedHistoryItemType(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "reasoning", "compaction", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCompactionHistoryItemType(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "compaction", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactionSummaryDeveloperMessage(item map[string]any) (map[string]any, bool) {
+	summaryText := compactionSummaryText(item["summary"])
+	if summaryText == "" {
+		summaryText = compactionSummaryText(item["text"])
+	}
+	if summaryText == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"type": "message",
+		"role": "developer",
+		"content": []any{
+			map[string]any{
+				"type": "input_text",
+				"text": responsesCompactionSummaryPrefix + summaryText,
+			},
+		},
+	}, true
+}
+
+// normalizeResponsesCompactionItems converts plaintext compaction history
+// items (both legacy "compaction" and "context_compaction") in body["input"]
+// into developer-role messages. Items with empty or missing summary text are
+// dropped. Codex CLI compresses prior turns into compaction items expecting
+// them to be forwarded as conversation context; unsupported plaintext forms
+// are translated in place.
 //
 // Compact v2 (newer Codex CLI) items are left untouched: compaction items
 // carrying "encrypted_content" originate from the upstream itself and must be
@@ -789,8 +829,6 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 		return false
 	}
 
-	const summaryPrefix = "[Conversation summary from earlier turns]\n"
-
 	modified := false
 	out := make([]any, 0, len(inputItems))
 	for _, raw := range inputItems {
@@ -799,7 +837,7 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			out = append(out, raw)
 			continue
 		}
-		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+		if !isCompactionHistoryItemType(firstNonEmptyAnyString(itemMap["type"])) {
 			out = append(out, raw)
 			continue
 		}
@@ -810,25 +848,13 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			continue
 		}
 
-		summaryText := compactionSummaryText(itemMap["summary"])
-		if summaryText == "" {
-			summaryText = compactionSummaryText(itemMap["text"])
-		}
-		if summaryText == "" {
+		message, ok := compactionSummaryDeveloperMessage(itemMap)
+		if !ok {
 			modified = true
 			continue
 		}
 
-		out = append(out, map[string]any{
-			"type": "message",
-			"role": "developer",
-			"content": []any{
-				map[string]any{
-					"type": "input_text",
-					"text": summaryPrefix + summaryText,
-				},
-			},
-		})
+		out = append(out, message)
 		modified = true
 	}
 
@@ -1065,88 +1091,106 @@ func isMissingEncryptedContentError(body []byte) bool {
 	return strings.Contains(msg, "encrypted_content")
 }
 
-func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
+type encryptedContentRepair struct {
+	Changed    bool
+	Dropped    int
+	Converted  int
+	InputEmpty bool
+}
+
+// repairInvalidEncryptedContentFromResponsesBody removes only top-level
+// opaque encrypted history items from input. It deliberately does not recurse
+// through arbitrary maps: an unrelated nested encrypted_content field must not
+// be altered. Reasoning items are dropped as a unit. Compaction items retain
+// recoverable summary/text as a developer message, otherwise they are dropped.
+func repairInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, encryptedContentRepair) {
+	result := encryptedContentRepair{}
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
-		return body, false
+		return body, result
 	}
 	input, ok := root["input"]
 	if !ok {
-		return body, false
+		return body, result
 	}
-	strippedInput, changed, keep := stripInvalidEncryptedContentValue(input, false)
+	repairedInput, changed, keep, dropped, converted := repairInvalidEncryptedInput(input)
 	if !changed {
-		return body, false
+		return body, result
 	}
+	result.Changed = true
+	result.Dropped = dropped
+	result.Converted = converted
 	if keep {
-		root["input"] = strippedInput
+		root["input"] = repairedInput
 	} else {
-		delete(root, "input")
+		root["input"] = []any{}
 	}
-	stripped, err := json.Marshal(root)
+	result.InputEmpty = responsesInputValueEmpty(root["input"])
+	repaired, err := json.Marshal(root)
 	if err != nil {
-		return body, false
+		return body, encryptedContentRepair{}
 	}
-	return stripped, true
+	return repaired, result
 }
 
-func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bool) {
+func repairInvalidEncryptedInput(value any) (any, bool, bool, int, int) {
 	switch v := value.(type) {
 	case []any:
 		changed := false
+		dropped := 0
+		converted := 0
 		out := make([]any, 0, len(v))
 		for _, item := range v {
-			stripped, itemChanged, keep := stripInvalidEncryptedContentValue(item, true)
+			repaired, itemChanged, keep, itemDropped, itemConverted := repairInvalidEncryptedInputItem(item)
 			if itemChanged {
 				changed = true
 			}
+			dropped += itemDropped
+			converted += itemConverted
 			if !keep {
-				changed = true
 				continue
 			}
-			out = append(out, stripped)
+			out = append(out, repaired)
 		}
-		return out, changed, true
+		return out, changed, true, dropped, converted
 	case map[string]any:
-		changed := false
-		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
-			if arrayItem {
-				return nil, true, false
-			}
-			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
-				delete(v, "encrypted_content")
-			}
-			if len(v) == 1 {
-				return nil, true, false
-			}
-			changed = true
-		} else if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
-			delete(v, "encrypted_content")
-			changed = true
-		}
-		for key, child := range v {
-			stripped, childChanged, keep := stripInvalidEncryptedContentValue(child, false)
-			if childChanged {
-				changed = true
-			}
-			if keep {
-				v[key] = stripped
-			} else {
-				delete(v, key)
-			}
-		}
-		return v, changed, true
+		return repairInvalidEncryptedInputItem(v)
 	default:
-		return value, false, true
+		return value, false, true, 0, 0
 	}
 }
 
-func responsesInputRaw(body []byte) string {
-	input := gjson.GetBytes(body, "input")
-	if !input.Exists() {
-		return ""
+func repairInvalidEncryptedInputItem(value any) (any, bool, bool, int, int) {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return value, false, true, 0, 0
 	}
-	return input.Raw
+	itemType := firstNonEmptyAnyString(item["type"])
+	if !isOpaqueEncryptedHistoryItemType(itemType) {
+		return value, false, true, 0, 0
+	}
+	if strings.EqualFold(strings.TrimSpace(itemType), "reasoning") {
+		return nil, true, false, 1, 0
+	}
+	if message, ok := compactionSummaryDeveloperMessage(item); ok {
+		return message, true, true, 0, 1
+	}
+	return nil, true, false, 1, 0
+}
+
+func responsesInputValueEmpty(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(v) == ""
+	case []any:
+		return len(v) == 0
+	case map[string]any:
+		return len(v) == 0
+	default:
+		return false
+	}
 }
 
 func dropBareReasoningInputItems(body map[string]any) bool {
@@ -1977,6 +2021,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
 	normalizeResponsesToolChoice(body)
+	normalizeResponsesCompactionItems(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {

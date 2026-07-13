@@ -454,18 +454,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			resp.Body.Close()
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-				if rawChanged || codexChanged {
+				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
+				if repair.Changed && !repair.InputEmpty {
 					invalidEncryptedContentRetried = true
-					if rawChanged {
-						rawBody = strippedRawBody
-					}
-					if codexChanged {
-						codexBody = strippedCodexBody
-						expandedInputRaw = responsesInputRaw(codexBody)
-					}
-					log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
+					rawBody = repairedRawBody
+					codexBody, expandedInputRaw = PrepareResponsesWebSocketBody(rawBody)
+					log.Printf("Responses WebSocket upstream rejected encrypted_content; repaired encrypted history and retried once (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
 					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
 						AccountID:            account.ID(),
 						Endpoint:             "/v1/responses",
