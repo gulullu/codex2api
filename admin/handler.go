@@ -42,28 +42,29 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store                  *auth.Store
-	cache                  cache.TokenCache
-	db                     *database.DB
-	rateLimiter            *proxy.RateLimiter
-	systemUpdate           *systemUpdater
-	systemUpdateOnce       sync.Once
-	refreshAccount         func(context.Context, int64) error
-	probeUsage             func(context.Context, *auth.Account) error
-	syncAccountPlanOnReset func(context.Context, *auth.Account) error
-	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
-	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
-	recordAccountEvent     func(int64, string, string)
-	cpuSampler             *cpuSampler
-	startedAt              time.Time
-	pgMaxConns             int
-	redisPoolSize          int
-	databaseDriver         string
-	databaseLabel          string
-	cacheDriver            string
-	cacheLabel             string
-	adminSecretEnv         string
-	imageProxy             *proxy.Handler
+	store                   *auth.Store
+	relayGuardianReleaseOps relayGuardianReleaseOps
+	cache                   cache.TokenCache
+	db                      *database.DB
+	rateLimiter             *proxy.RateLimiter
+	systemUpdate            *systemUpdater
+	systemUpdateOnce        sync.Once
+	refreshAccount          func(context.Context, int64) error
+	probeUsage              func(context.Context, *auth.Account) error
+	syncAccountPlanOnReset  func(context.Context, *auth.Account) error
+	queryResetCredits       func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit      func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	recordAccountEvent      func(int64, string, string)
+	cpuSampler              *cpuSampler
+	startedAt               time.Time
+	pgMaxConns              int
+	redisPoolSize           int
+	databaseDriver          string
+	databaseLabel           string
+	cacheDriver             string
+	cacheLabel              string
+	adminSecretEnv          string
+	imageProxy              *proxy.Handler
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex

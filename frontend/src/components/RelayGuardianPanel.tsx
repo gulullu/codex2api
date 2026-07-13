@@ -14,10 +14,13 @@ import { useToast } from '../hooks/useToast'
 import {
   getRelayGuardianActionAvailability,
   getRelayGuardianEventLabel,
+  formatRelayGuardianFailureRate,
+  getRelayGuardianRecoveryProgress,
   getRelayGuardianReasonLabel,
   getRelayGuardianShadowActionMeta,
   getRelayGuardianStateMeta,
   getRelayGuardianTriggerLabel,
+  getRelayGuardianWeakConfirmation,
   resolveRelayGuardianAccountName,
   resolveRelayGuardianState,
   summarizeRelayGuardianEventDetails,
@@ -255,6 +258,13 @@ export default function RelayGuardianPanel({
             </div>
           ) : null}
 
+          {status?.reliability_query_status === 'degraded' ? (
+            <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/[0.07] p-3 text-xs leading-5 text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>可靠性统计暂不可用，弱故障自动隔离已暂停；强网关快熔断仍生效。</span>
+            </div>
+          ) : null}
+
           {statusError ? (
             <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{statusError}</div>
           ) : null}
@@ -365,10 +375,8 @@ function GuardianAccountCard({
   const meta = getRelayGuardianStateMeta(state)
   const availability = getRelayGuardianActionAvailability(mode, account, account.manual_enabled)
   const shadow = account.shadow_action ? getRelayGuardianShadowActionMeta(account.shadow_action) : null
-  const recoveryRequired = account.probation_required_successes || account.circuit_required_successes || 0
-  const recoverySuccesses = account.probation_required_successes
-    ? account.probation_successes
-    : account.circuit_probe_successes
+  const recoveryProgress = getRelayGuardianRecoveryProgress(account)
+  const weakConfirmation = getRelayGuardianWeakConfirmation(account)
   const disabledReason = mode !== 'enforce'
     ? mode === 'off' ? 'Guardian 已关闭' : '监控模式只记录不执行'
     : availability.reason
@@ -378,7 +386,6 @@ function GuardianAccountCard({
       <div className="flex min-w-0 items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold text-foreground" title={accountName}>{accountName}</div>
-          <div className="mt-0.5 text-[11px] text-muted-foreground">运行态第 {account.generation} 代</div>
         </div>
         <Badge className={toneBadgeClass(meta.tone)}>{meta.label}</Badge>
       </div>
@@ -392,19 +399,21 @@ function GuardianAccountCard({
       ) : null}
 
       <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
-        <GuardianField label="统计窗口" value={formatDuration(account.window_seconds)} />
-        <GuardianField label="窗口失败" value={String(account.failure_count)} />
-        <GuardianField label="用户可见失败" value={String(account.user_visible_failures)} />
-        <GuardianField label="强网关失败" value={String(account.strong_gateway_failures)} />
-        <GuardianField label="临时隔离至" value={account.quarantine_until ? formatBeijingTime(account.quarantine_until) : '-'} wide />
-        <GuardianField label="恢复进度" value={recoveryRequired > 0 ? `${recoverySuccesses}/${recoveryRequired}${account.probation_percent > 0 ? ` · ${account.probation_percent}% 并发上限` : ''}` : '-'} wide />
+        <GuardianField label="可靠性窗口" value={formatDuration(account.reliability_window_seconds)} />
+        <GuardianField label="可靠性请求" value={String(account.reliability_total || 0)} />
+        <GuardianField label="用户可见弱失败" value={String(account.reliability_failures || 0)} />
+        <GuardianField label="近 5 分钟强网关" value={String(account.strong_gateway_failures)} />
+        <GuardianField label="弱失败率" value={formatRelayGuardianFailureRate(account)} wide />
+        {weakConfirmation !== '-' ? <GuardianField label="判定确认" value={weakConfirmation} /> : null}
+        {recoveryProgress !== '-' ? <GuardianField label="恢复进度" value={recoveryProgress} /> : null}
+        {account.quarantine_until ? <GuardianField label="临时隔离至" value={formatBeijingTime(account.quarantine_until)} wide /> : null}
         <GuardianField label="调度保护" value={account.last_resort ? `最后兜底 · 并发上限 ${account.last_resort_cap || '-'}` : '正常优先级'} wide />
         <GuardianField label="最近动作" value={account.last_action_at ? formatBeijingTime(account.last_action_at) : '-'} wide />
       </dl>
 
       <div className="mt-3 flex flex-wrap gap-1.5 text-[10px] text-muted-foreground">
         <span className="rounded bg-background/70 px-1.5 py-0.5">当前{account.effective_schedulable ? '可调度' : '不可调度'}</span>
-        <span className="rounded bg-background/70 px-1.5 py-0.5">触发源 {getRelayGuardianTriggerLabel(account.trigger_source)}</span>
+        <span className="rounded bg-background/70 px-1.5 py-0.5">触发规则 {getRelayGuardianTriggerLabel(account.trigger_source)}</span>
         <span className="rounded bg-background/70 px-1.5 py-0.5">快熔断 {account.circuit_state || '-'}</span>
       </div>
 
@@ -453,14 +462,14 @@ function GuardianEventRow({ event, accounts }: { event: RelayGuardianEvent; acco
 
       <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <GuardianField label="统计窗口" value={formatDuration(event.window_seconds)} />
-        <GuardianField label="窗口失败" value={String(event.failure_count)} />
+        <GuardianField label="归因失败" value={String(event.failure_count)} />
         <GuardianField label="用户可见" value={String(event.user_visible_failures)} />
         <GuardianField label="强网关" value={String(event.strong_gateway_failures)} />
       </div>
 
       <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
         <span>操作者 {actorLabel(event.actor)}</span>
-        <span>触发源 {getRelayGuardianTriggerLabel(event.trigger_source)}</span>
+        <span>触发规则 {getRelayGuardianTriggerLabel(event.trigger_source)}</span>
         <span>隔离时长 {event.quarantine_seconds ? formatDuration(event.quarantine_seconds) : '-'}</span>
         <span>代次 {event.generation}</span>
         {(event.logical_request_ids?.length ?? 0) > 0 ? <span title={event.logical_request_ids?.join('\n')}>关联请求 {event.logical_request_ids?.length}</span> : null}

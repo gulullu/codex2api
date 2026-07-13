@@ -237,11 +237,18 @@ func TestRelayGuardianLeaveRejoinStartsHealthyForBothGroupEntrypoints(t *testing
 			}
 			requireRelayGuardianHint(t, account, false, 0, 0)
 			guardian.mu.Lock()
-			_, stateRetained := guardian.states[51]
+			leaveState, stateRetained := guardian.states[51]
+			leaveSnapshot := relayGuardianAccountState{}
+			if leaveState != nil {
+				leaveSnapshot = *leaveState
+			}
 			loadedRetained := guardian.loaded[51]
 			guardian.mu.Unlock()
-			if stateRetained || loadedRetained {
-				t.Fatalf("leave retained Guardian state: state=%v loaded=%v", stateRetained, loadedRetained)
+			if !stateRetained || !loadedRetained || leaveSnapshot.State != RelayGuardianHealthy || leaveSnapshot.ProbationPercent != 0 || leaveSnapshot.LastResort {
+				t.Fatalf("leave membership tombstone: state=%v loaded=%v value=%+v", stateRetained, loadedRetained, leaveSnapshot)
+			}
+			if !store.RelayGuardianSelectable(account) {
+				t.Fatal("non-Relay account was blocked by retained membership tombstone")
 			}
 
 			if entrypoint == "single" {
@@ -496,17 +503,18 @@ func TestRelayGuardianStrongGatewayPoolCorrelationOverridesVisibleTrigger(t *tes
 			guardian.observe(guardianObservation(53, "53-final-1", 524, false, clock.Now()))
 			clock.Advance(2 * time.Minute)
 			guardian.observe(guardianObservation(53, "53-final-2", 524, false, clock.Now()))
+			guardian.observe(guardianObservation(53, "53-final-3", 524, false, clock.Now()))
 
 			guardian.mu.Lock()
 			state53 := guardian.stateLocked(53)
 			if mode == RelayGuardianMonitor {
 				if state53.ShadowAction != "pool_alert" || state53.Reason != "pool_wide_failure_guard" {
 					guardian.mu.Unlock()
-					t.Fatalf("second final 524 did not become monitor pool alert: %+v", state53)
+					t.Fatalf("third strong 524 did not become monitor pool alert: %+v", state53)
 				}
 			} else if !state53.LastResort || state53.Reason != "pool_wide_failure_guard" || state53.State == RelayGuardianQuarantined {
 				guardian.mu.Unlock()
-				t.Fatalf("second final 524 was not enforce pool-wide last-resort: %+v", state53)
+				t.Fatalf("third strong 524 was not enforce pool-wide last-resort: %+v", state53)
 			}
 			for _, accountID := range []int64{50, 53, 54} {
 				if state := guardian.states[accountID]; state != nil && state.State == RelayGuardianQuarantined {
@@ -516,14 +524,6 @@ func TestRelayGuardianStrongGatewayPoolCorrelationOverridesVisibleTrigger(t *tes
 			}
 			guardian.mu.Unlock()
 
-			clock.Advance(time.Minute)
-			guardian.observe(guardianObservation(53, "53-final-3", 524, false, clock.Now()))
-			guardian.mu.Lock()
-			if guardian.stateLocked(53).State == RelayGuardianQuarantined {
-				guardian.mu.Unlock()
-				t.Fatal("third final 524 hard-quarantined an account after pool-wide detection")
-			}
-			guardian.mu.Unlock()
 		})
 	}
 }
@@ -538,6 +538,7 @@ func TestRelayGuardianCapacityWarmupPreventsColdStartHardQuarantine(t *testing.T
 
 	guardian.observe(guardianObservation(51, "cold-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "cold-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	guardian.mu.Lock()
 	cold := guardian.stateLocked(51)
 	if cold.State == RelayGuardianQuarantined || !cold.LastResort || cold.Reason != "capacity_warmup" {
@@ -561,6 +562,7 @@ func TestRelayGuardianCapacityWarmupPreventsColdStartHardQuarantine(t *testing.T
 	guardian.reconcile(context.Background())
 	guardian.observe(guardianObservation(53, "warm-1", 501, false, clock.Now()))
 	guardian.observe(guardianObservation(53, "warm-2", 501, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 53)
 	guardian.mu.Lock()
 	warm := guardian.stateLocked(53)
 	if warm.State != RelayGuardianQuarantined {

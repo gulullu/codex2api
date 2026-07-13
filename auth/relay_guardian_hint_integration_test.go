@@ -26,19 +26,8 @@ func TestRelayGuardianCapacityLastResortEscalatesHintCaps(t *testing.T) {
 	for level, cap := range []int64{5, 3, 1} {
 		prefix := string(rune('a' + level))
 		guardian.observe(guardianObservation(51, prefix+"-1", 500, false, clock.Now()))
-		if level == 2 {
-			guardian.mu.Lock()
-			state := guardian.stateLocked(51)
-			if state.LastResortLevel != 3 || state.TriggerSource != "user_visible_4_in_60m" {
-				guardian.mu.Unlock()
-				t.Fatalf("60m label transition state=%+v, want level 3 without a double jump", state)
-			}
-			guardian.mu.Unlock()
-			// Duplicate logical rows must be ignored before the rule label switches
-			// back to the 2/10m signal on the next distinct request.
-			guardian.observe(guardianObservation(51, prefix+"-1", 500, false, clock.Now()))
-		}
 		guardian.observe(guardianObservation(51, prefix+"-2", 500, false, clock.Now()))
+		confirmGuardianWeakForTest(t, guardian, 51)
 
 		guardian.mu.Lock()
 		state := guardian.stateLocked(51)
@@ -73,6 +62,7 @@ func TestRelayGuardianRecoveryTransitionsApplyAndClearSchedulerHint(t *testing.T
 	account := store.accountsByID[51]
 	guardian.observe(guardianObservation(51, "recovery-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "recovery-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	requireRelayGuardianHint(t, account, false, 0, 0)
 
 	clock.Advance(31 * time.Minute)
@@ -131,6 +121,7 @@ func TestRelayGuardianLifecycleClearsSchedulerHint(t *testing.T) {
 		account := store.accountsByID[51]
 		guardian.observe(guardianObservation(51, "off-1", 500, false, clock.Now()))
 		guardian.observe(guardianObservation(51, "off-2", 500, false, clock.Now()))
+		confirmGuardianWeakForTest(t, guardian, 51)
 		requireRelayGuardianHint(t, account, true, 5, 0)
 		store.SetRelayGuardianMode(string(RelayGuardianOff))
 		requireRelayGuardianHint(t, account, false, 0, 0)
@@ -142,6 +133,7 @@ func TestRelayGuardianLifecycleClearsSchedulerHint(t *testing.T) {
 		account := store.accountsByID[51]
 		guardian.observe(guardianObservation(51, "manual-1", 500, false, clock.Now()))
 		guardian.observe(guardianObservation(51, "manual-2", 500, false, clock.Now()))
+		confirmGuardianWeakForTest(t, guardian, 51)
 		requireRelayGuardianHint(t, account, true, 5, 0)
 		atomic.StoreInt32(&account.Disabled, 1)
 		guardian.reconcile(context.Background())
@@ -174,6 +166,7 @@ func TestRelayGuardianLifecycleClearsSchedulerHint(t *testing.T) {
 		account := store.accountsByID[51]
 		guardian.observe(guardianObservation(51, "group-1", 500, false, clock.Now()))
 		guardian.observe(guardianObservation(51, "group-2", 500, false, clock.Now()))
+		confirmGuardianWeakForTest(t, guardian, 51)
 		requireRelayGuardianHint(t, account, true, 5, 0)
 		account.mu.Lock()
 		account.GroupIDs = nil
@@ -189,24 +182,24 @@ func TestRelayGuardianLifecycleClearsSchedulerHint(t *testing.T) {
 	})
 }
 
-func TestRelayGuardianRedisRestoreReappliesOrClearsSchedulerHint(t *testing.T) {
+func TestRelayGuardianBootEpochClearsPersistedSchedulerHints(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	tokenCache := cache.NewMemory(10)
 	defer tokenCache.Close()
 
 	records := map[int64]relayGuardianRuntimeRecord{
 		51: {
-			Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianSuspect, Generation: 2,
+			SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianSuspect, Generation: 2,
 			LastResort: true, LastResortCap: 3, LastResortLevel: 2,
-			Reason: "last_available_relay", TriggerSource: "user_visible_2_in_10m", LastActionAt: clock.Now().Add(-10 * time.Minute),
+			Reason: "last_available_relay", TriggerSource: "weak_reliability_10m", LastActionAt: clock.Now().Add(-10 * time.Minute),
 			Failures: []relayGuardianFailure{
 				{At: clock.Now(), LogicalRequestID: "restored-1", StatusCode: 500, UserVisible: true},
 				{At: clock.Now(), LogicalRequestID: "restored-2", StatusCode: 500, UserVisible: true},
 			},
 			SeenFinal: map[string]time.Time{"restored-1": clock.Now(), "restored-2": clock.Now()},
 		},
-		50: {Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianProbation, Generation: 4, ProbationPercent: 50, ProbationStartedAt: clock.Now()},
-		53: {Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianQuarantined, Generation: 6, QuarantineUntil: clock.Now().Add(time.Hour)},
+		50: {SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianProbation, Generation: 4, ProbationPercent: 50, ProbationStartedAt: clock.Now()},
+		53: {SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianQuarantined, Generation: 6, QuarantineUntil: clock.Now().Add(time.Hour)},
 	}
 	for accountID, record := range records {
 		payload, err := json.Marshal(record)
@@ -226,24 +219,17 @@ func TestRelayGuardianRedisRestoreReappliesOrClearsSchedulerHint(t *testing.T) {
 		guardian.ensureLoaded(accountID)
 	}
 
-	requireRelayGuardianHint(t, store.accountsByID[51], true, 3, 0)
-	requireRelayGuardianHint(t, store.accountsByID[50], false, 0, 50)
+	requireRelayGuardianHint(t, store.accountsByID[51], false, 0, 0)
+	requireRelayGuardianHint(t, store.accountsByID[50], false, 0, 0)
 	requireRelayGuardianHint(t, store.accountsByID[53], false, 0, 0)
-
-	// The last-resort record intentionally omits LastResortFailureID to model
-	// an upgrade from the previous runtime schema. Its old failures must be
-	// consumed on restore rather than replayed as a level-3 escalation.
 	guardian.mu.Lock()
-	guardian.capacitySamples = append(guardian.capacitySamples, relayGuardianCapacitySample{At: clock.Now(), Active: 1_000})
-	guardian.mu.Unlock()
-	guardian.reconcile(context.Background())
-	guardian.mu.Lock()
-	restored := guardian.stateLocked(51)
-	if restored.LastResortLevel != 2 || restored.LastResortCap != 3 || restored.LastResortFailureID != "restored-2" {
-		guardian.mu.Unlock()
-		t.Fatalf("legacy restored incident replayed: %+v", restored)
+	defer guardian.mu.Unlock()
+	for _, accountID := range []int64{51, 50, 53} {
+		state := guardian.stateLocked(accountID)
+		if state.State != RelayGuardianHealthy || state.LastResort || state.ProbationPercent != 0 || !state.QuarantineUntil.IsZero() {
+			t.Fatalf("account %d restored pre-boot Guardian state: %+v", accountID, state)
+		}
 	}
-	guardian.mu.Unlock()
 }
 
 func TestRelayGuardianStateHintIsRespectedByAllSchedulerPaths(t *testing.T) {
@@ -258,6 +244,7 @@ func TestRelayGuardianStateHintIsRespectedByAllSchedulerPaths(t *testing.T) {
 			guardian.mu.Unlock()
 			guardian.observe(guardianObservation(51, schedulerMode+"-1", 500, false, clock.Now()))
 			guardian.observe(guardianObservation(51, schedulerMode+"-2", 500, false, clock.Now()))
+			confirmGuardianWeakForTest(t, guardian, 51)
 			requireRelayGuardianHint(t, degraded, true, 5, 0)
 
 			switch schedulerMode {

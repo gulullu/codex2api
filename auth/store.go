@@ -4902,14 +4902,12 @@ func (s *Store) SetCybRelayConfig(cfg CybRelayConfig) {
 	previous := s.GetCybRelayConfig()
 	normalized := NormalizeCybRelayConfig(cfg)
 	changed := previous.Enabled != normalized.Enabled || previous.GroupID != normalized.GroupID
-	var accounts []*Account
-	if s.relayGuardian != nil && changed {
-		accounts = s.Accounts()
+	if s.relayGuardian == nil || !changed {
+		s.cybRelayConfig.Store(normalized)
+		return
 	}
-	s.cybRelayConfig.Store(normalized)
-	if s.relayGuardian != nil {
-		s.relayGuardian.relayConfigChanged(previous, normalized, accounts)
-	}
+	accounts := s.Accounts()
+	s.relayGuardian.transitionConfig(normalized, accounts)
 	if changed && normalized.Enabled && normalized.GroupID > 0 {
 		for _, account := range accounts {
 			s.preloadRelayRuntimeAccount(account)

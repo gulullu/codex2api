@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
@@ -22,19 +21,6 @@ import (
 func guardianAdminTestStore(t *testing.T) (*auth.Store, cache.TokenCache) {
 	t.Helper()
 	tokenCache := cache.NewMemory(4)
-	record, err := json.Marshal(map[string]any{
-		"mode":             "enforce",
-		"scope_group_id":   7,
-		"state":            "quarantined",
-		"generation":       2,
-		"quarantine_until": time.Now().Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tokenCache.SetRuntime(context.Background(), "relay-health-guardian", "group:7:account:51", record, time.Hour); err != nil {
-		t.Fatal(err)
-	}
 	store := auth.NewStore(nil, tokenCache, &database.SystemSettings{MaxConcurrency: 100, TestConcurrency: 1, TestModel: "gpt-5.4", RelayGuardianMode: "enforce", PromptFilterCybRelayEnabled: true, PromptFilterCybRelayGroupID: 7})
 	for _, id := range []int64{51, 50} {
 		store.AddAccount(&auth.Account{DBID: id, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example/v1", APIKey: "key", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy, GroupIDs: []int64{7}, Email: "relay"})
@@ -92,21 +78,39 @@ func invokeGuardianModeUpdate(handler *Handler, mode string) *httptest.ResponseR
 	return recorder
 }
 
+type relayGuardianReleaseStub struct {
+	status     auth.RelayGuardianAccountSnapshot
+	accountID  int64
+	generation uint64
+	err        error
+}
+
+func (s *relayGuardianReleaseStub) ReleaseRelayGuardian(accountID int64, generation uint64) error {
+	s.accountID = accountID
+	s.generation = generation
+	if s.err != nil {
+		return s.err
+	}
+	s.status.State = auth.RelayGuardianHalfOpen
+	s.status.Generation++
+	return nil
+}
+
+func (s *relayGuardianReleaseStub) RelayGuardianAccountStatus(accountID int64) (auth.RelayGuardianAccountSnapshot, bool) {
+	return s.status, s.status.AccountID == accountID
+}
+
 func TestRelayGuardianReleaseReturnsSingleAccountSnapshot(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	store, tokenCache := guardianAdminTestStore(t)
-	defer tokenCache.Close()
-	before, ok := store.RelayGuardianAccountStatus(51)
-	if !ok || before.State != auth.RelayGuardianQuarantined {
-		t.Fatalf("setup status=%+v", before)
-	}
+	before := auth.RelayGuardianAccountSnapshot{AccountID: 51, AccountName: "relay-51", State: auth.RelayGuardianQuarantined, Generation: 2}
+	ops := &relayGuardianReleaseStub{status: before}
 	body, _ := json.Marshal(map[string]any{"generation": before.Generation})
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Params = gin.Params{{Key: "id", Value: "51"}}
-	(&Handler{store: store}).ReleaseRelayGuardian(ctx)
+	(&Handler{relayGuardianReleaseOps: ops}).ReleaseRelayGuardian(ctx)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -122,6 +126,9 @@ func TestRelayGuardianReleaseReturnsSingleAccountSnapshot(t *testing.T) {
 	}
 	if generation, _ := response["generation"].(float64); uint64(generation) == before.Generation {
 		t.Fatalf("generation was not refreshed: %v", response)
+	}
+	if ops.accountID != 51 || ops.generation != before.Generation {
+		t.Fatalf("release args account=%d generation=%d", ops.accountID, ops.generation)
 	}
 }
 

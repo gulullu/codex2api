@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,6 +27,50 @@ type relayGuardianFailingCache struct {
 	gets atomic.Int64
 }
 
+type relayGuardianBlockingSetCache struct {
+	cache.TokenCache
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+type relayGuardianBlockingDeleteCache struct {
+	cache.TokenCache
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+type relayGuardianFailingSetCache struct {
+	cache.TokenCache
+	sets atomic.Int64
+}
+
+type relayGuardianFailingMutationCache struct {
+	cache.TokenCache
+	gets    atomic.Int64
+	sets    atomic.Int64
+	deletes atomic.Int64
+}
+
+type relayGuardianMembershipABACache struct {
+	cache.TokenCache
+	deleteOnce    sync.Once
+	deleteEntered chan struct{}
+	deleteRelease chan struct{}
+	sets          atomic.Int64
+	deletes       atomic.Int64
+}
+
+type relayGuardianMembershipMutationCache struct {
+	cache.TokenCache
+	failDelete  bool
+	failHealthy bool
+	gets        atomic.Int64
+	sets        atomic.Int64
+	deletes     atomic.Int64
+}
+
 func (c *relayGuardianFailingCache) GetRuntime(context.Context, string, string) (json.RawMessage, bool, error) {
 	c.gets.Add(1)
 	return nil, false, errors.New("runtime unavailable")
@@ -34,6 +79,96 @@ func (c *relayGuardianFailingCache) GetRuntime(context.Context, string, string) 
 func (c *relayGuardianCountingCache) GetRuntime(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
 	c.gets.Add(1)
 	return c.TokenCache.GetRuntime(ctx, namespace, key)
+}
+
+func (c *relayGuardianBlockingSetCache) SetRuntime(ctx context.Context, namespace, key string, value json.RawMessage, ttl time.Duration) error {
+	block := false
+	c.once.Do(func() {
+		block = true
+		close(c.entered)
+	})
+	if block {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.TokenCache.SetRuntime(ctx, namespace, key, value, ttl)
+}
+
+func (c *relayGuardianBlockingDeleteCache) DeleteRuntime(ctx context.Context, namespace, key string) error {
+	block := false
+	c.once.Do(func() {
+		block = true
+		close(c.entered)
+	})
+	if block {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.TokenCache.DeleteRuntime(ctx, namespace, key)
+}
+
+func (c *relayGuardianFailingSetCache) SetRuntime(context.Context, string, string, json.RawMessage, time.Duration) error {
+	c.sets.Add(1)
+	return errors.New("runtime write unavailable")
+}
+
+func (c *relayGuardianFailingMutationCache) GetRuntime(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	c.gets.Add(1)
+	return c.TokenCache.GetRuntime(ctx, namespace, key)
+}
+
+func (c *relayGuardianFailingMutationCache) SetRuntime(context.Context, string, string, json.RawMessage, time.Duration) error {
+	c.sets.Add(1)
+	return errors.New("runtime write unavailable")
+}
+
+func (c *relayGuardianFailingMutationCache) DeleteRuntime(context.Context, string, string) error {
+	c.deletes.Add(1)
+	return errors.New("runtime delete unavailable")
+}
+
+func (c *relayGuardianMembershipABACache) DeleteRuntime(ctx context.Context, namespace, key string) error {
+	c.deletes.Add(1)
+	c.deleteOnce.Do(func() { close(c.deleteEntered) })
+	select {
+	case <-c.deleteRelease:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return errors.New("runtime delete unavailable")
+}
+
+func (c *relayGuardianMembershipABACache) SetRuntime(ctx context.Context, namespace, key string, payload json.RawMessage, ttl time.Duration) error {
+	if c.sets.Add(1) == 1 {
+		return errors.New("healthy tombstone unavailable")
+	}
+	return c.TokenCache.SetRuntime(ctx, namespace, key, payload, ttl)
+}
+
+func (c *relayGuardianMembershipMutationCache) GetRuntime(ctx context.Context, namespace, key string) (json.RawMessage, bool, error) {
+	c.gets.Add(1)
+	return c.TokenCache.GetRuntime(ctx, namespace, key)
+}
+
+func (c *relayGuardianMembershipMutationCache) DeleteRuntime(ctx context.Context, namespace, key string) error {
+	c.deletes.Add(1)
+	if c.failDelete {
+		return errors.New("runtime delete unavailable")
+	}
+	return c.TokenCache.DeleteRuntime(ctx, namespace, key)
+}
+
+func (c *relayGuardianMembershipMutationCache) SetRuntime(ctx context.Context, namespace, key string, payload json.RawMessage, ttl time.Duration) error {
+	if c.sets.Add(1) == 1 && c.failHealthy {
+		return errors.New("healthy tombstone unavailable")
+	}
+	return c.TokenCache.SetRuntime(ctx, namespace, key, payload, ttl)
 }
 
 func newGuardianTestStore(t *testing.T, mode RelayGuardianMode, clock *relayCircuitTestClock, ids ...int64) (*Store, *relayHealthGuardian) {
@@ -69,6 +204,464 @@ func guardianObservation(accountID int64, logicalID string, status int, attemptO
 		AttemptOnly: attemptOnly, ObservedAt: at}
 }
 
+// confirmGuardianWeakForTest drives the downstream guard/state-machine tests
+// with a DB-confirmed weak incident. Candidate timing and reliability math are
+// covered separately; these older tests are about quarantine, pool and recovery
+// behavior after confirmation.
+func confirmGuardianWeakForTest(t *testing.T, guardian *relayHealthGuardian, accountID int64) {
+	t.Helper()
+	now := guardian.nowTime()
+	accounts := guardian.store.configuredRelayGuardianAccounts()
+	capacity := guardian.capacityInputs(accounts)
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	state := guardian.stateLocked(accountID)
+	state.WeakCandidateTrigger = "weak_reliability_10m"
+	state.WeakCandidateLatestFailureRowID = 101
+	state.WeakCandidateSince = now.Add(-RelayGuardianScanInterval)
+	state.WeakConfirmationCount = relayGuardianWeakConfirmations
+	state.ReliabilityObservedAt = now
+	state.ReliabilityTotal = 2
+	state.ReliabilityFailures = 2
+	state.ReliabilityWindowSeconds = 600
+	state.FailureRatePercent = 100
+	state.FailureRateLowerBoundPercent = 100 * relayGuardianWilsonLowerBound(2, 2)
+	state.ReliabilityLatestFailureRowID = 101
+	guardian.applyTriggerLocked(guardian.store.FindByID(accountID), state, accounts, capacity, "weak_reliability_10m", 10*time.Minute, 2, 0, now)
+}
+
+func applyGuardianReliabilityForTest(t *testing.T, guardian *relayHealthGuardian, accountID int64, snapshot relayGuardianReliabilitySnapshot) {
+	t.Helper()
+	accounts := guardian.store.configuredRelayGuardianAccounts()
+	capacity := guardian.capacityInputs(accounts)
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	if snapshot.ObservedAt.IsZero() {
+		snapshot.ObservedAt = guardian.nowTime()
+	}
+	guardian.applyReliabilityLocked(guardian.store.FindByID(accountID), guardian.stateLocked(accountID), accounts, capacity, snapshot, guardian.nowTime())
+}
+
+func recoverGuardianAccountForTest(t *testing.T, store *Store, guardian *relayHealthGuardian, clock *relayCircuitTestClock, accountID int64) {
+	t.Helper()
+	account := store.accountsByID[accountID]
+	clock.Advance(31 * time.Minute)
+	for index := 0; index < 3; index++ {
+		permit, ok := guardian.begin(account)
+		if !ok || !permit.HalfOpen {
+			t.Fatalf("half-open recovery permit %d missing: %+v", index, permit)
+		}
+		guardian.finishSuccess(permit)
+	}
+	for stage := 0; stage < 2; stage++ {
+		clock.Advance(relayGuardianProbationStage)
+		for success := 0; success < relayGuardianProbationSuccesses; success++ {
+			permit, ok := guardian.begin(account)
+			if !ok || !permit.Probation {
+				t.Fatalf("probation stage=%d success=%d permit missing: %+v", stage, success, permit)
+			}
+			guardian.finishSuccess(permit)
+		}
+	}
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	if state := guardian.stateLocked(accountID); state.State != RelayGuardianHealthy {
+		t.Fatalf("recovery did not finish: %+v", state)
+	}
+}
+
+func TestRelayGuardianWeakReliabilityThresholdsAndConfirmation(t *testing.T) {
+	if relayGuardianTriggerCategory("weak_reliability_10m") != "user_visible" || relayGuardianTriggerCategory("weak_reliability_catastrophic_10m") != "user_visible" || relayGuardianTriggerWindow("weak_reliability_60m") != time.Hour {
+		t.Fatal("weak reliability triggers are not mapped into pool correlation windows")
+	}
+	t.Run("high_volume_noise_does_not_trigger", func(t *testing.T) {
+		decision := relayGuardianWeakReliabilityDecision(relayGuardianReliabilitySnapshot{Total10m: 1209, Failures10m: 6, LatestFailureRowID10m: 6})
+		if decision.Trigger != "" || relayGuardianWilsonLowerBound(6, 1209) >= 0.01 {
+			t.Fatalf("6/1209 triggered weak isolation: %+v lower=%f", decision, relayGuardianWilsonLowerBound(6, 1209))
+		}
+	})
+
+	t.Run("second_reconcile_requires_new_failure_and_60_seconds", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		first := relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 10, Failures10m: 2, LatestFailureRowID10m: 10, Total60m: 10, Failures60m: 2, LatestFailureRowID60m: 10}
+		applyGuardianReliabilityForTest(t, guardian, 51, first)
+		guardian.mu.Lock()
+		if got := guardian.stateLocked(51).WeakConfirmationCount; got != 1 {
+			guardian.mu.Unlock()
+			t.Fatalf("first confirmation=%d", got)
+		}
+		guardian.mu.Unlock()
+		first.LatestFailureRowID10m = 11
+		first.LatestFailureRowID60m = 11
+		applyGuardianReliabilityForTest(t, guardian, 51, first)
+		guardian.mu.Lock()
+		if got := guardian.stateLocked(51).WeakConfirmationCount; got != 1 {
+			guardian.mu.Unlock()
+			t.Fatalf("same-interval confirmation=%d, want 1", got)
+		}
+		guardian.mu.Unlock()
+		clock.Advance(RelayGuardianScanInterval)
+		first.ObservedAt = clock.Now()
+		applyGuardianReliabilityForTest(t, guardian, 51, first)
+		guardian.mu.Lock()
+		state := guardian.stateLocked(51)
+		if state.WeakConfirmationCount != 2 || state.State != RelayGuardianWouldQuarantine || state.TriggerSource != "weak_reliability_10m" {
+			guardian.mu.Unlock()
+			t.Fatalf("confirmed state=%+v", state)
+		}
+		guardian.mu.Unlock()
+	})
+
+	t.Run("same_failure_id_never_confirms", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		snapshot := relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 7, Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 7}
+		applyGuardianReliabilityForTest(t, guardian, 51, snapshot)
+		clock.Advance(RelayGuardianScanInterval)
+		snapshot.ObservedAt = clock.Now()
+		applyGuardianReliabilityForTest(t, guardian, 51, snapshot)
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if state.WeakConfirmationCount != 1 || state.State == RelayGuardianWouldQuarantine {
+			t.Fatalf("unchanged failure confirmed: %+v", state)
+		}
+	})
+
+	t.Run("stale_pending_candidate_restarts_at_one", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 60,
+			Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 60,
+		})
+		clock.Advance(2*RelayGuardianScanInterval + time.Second)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 61,
+			Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 61,
+		})
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if state.WeakConfirmationCount != 1 || state.WeakCandidateLatestFailureRowID != 61 ||
+			!state.WeakCandidateSince.Equal(clock.Now()) || state.State == RelayGuardianWouldQuarantine {
+			t.Fatalf("stale weak candidate was confirmed instead of restarted: %+v", state)
+		}
+	})
+
+	t.Run("below_threshold_clears_pending_explanation", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 7, Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 7})
+		clock.Advance(RelayGuardianScanInterval)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 1000, Failures10m: 1, LatestFailureRowID10m: 8, Total60m: 1000, Failures60m: 1, LatestFailureRowID60m: 8})
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if state.WeakConfirmationCount != 0 || state.TriggerSource != "" || state.WindowSeconds != 0 || state.Reason != "weak_reliability_below_threshold" || state.ReliabilityWindowSeconds != 600 {
+			t.Fatalf("below-threshold state=%+v", state)
+		}
+	})
+
+	t.Run("catastrophic_is_immediate", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 40, Failures10m: 10, LatestFailureRowID10m: 20, Total60m: 40, Failures60m: 10, LatestFailureRowID60m: 20})
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if state.State != RelayGuardianWouldQuarantine || state.TriggerSource != "weak_reliability_catastrophic_10m" || state.WeakConfirmationCount != 0 {
+			t.Fatalf("catastrophic state=%+v", state)
+		}
+	})
+
+	t.Run("sixty_minute_signal_needs_recent_failure", func(t *testing.T) {
+		decision := relayGuardianWeakReliabilityDecision(relayGuardianReliabilitySnapshot{Total10m: 100, Failures10m: 0, Total60m: 100, Failures60m: 4, LatestFailureRowID60m: 4})
+		if decision.Trigger != "" {
+			t.Fatalf("stale 60m failures triggered: %+v", decision)
+		}
+	})
+
+	t.Run("monitor_strong_shadow_transitions_to_weak_confirmation", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index := 0; index < 3; index++ {
+			guardian.observe(guardianObservation(51, fmt.Sprintf("strong-to-weak-%d", index), 502, true, clock.Now()))
+		}
+		guardian.mu.Lock()
+		strong := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if strong.State != RelayGuardianWouldQuarantine || strong.ShadowAction != "quarantine" || strong.TriggerSource != "strong_gateway_3_in_5m" {
+			t.Fatalf("strong shadow state=%+v", strong)
+		}
+
+		clock.Advance(6 * time.Minute)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 20,
+			Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 20,
+		})
+		guardian.mu.Lock()
+		candidate := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if candidate.State != RelayGuardianSuspect || candidate.ShadowAction != "" || candidate.WeakConfirmationCount != 1 ||
+			candidate.TriggerSource != "weak_reliability_10m" || candidate.Reason != "weak_reliability_confirming" {
+			t.Fatalf("first weak confirmation inherited strong shadow: %+v", candidate)
+		}
+
+		clock.Advance(RelayGuardianScanInterval)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 21,
+			Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 21,
+		})
+		guardian.mu.Lock()
+		confirmed := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if confirmed.State != RelayGuardianWouldQuarantine || confirmed.ShadowAction != "quarantine" ||
+			confirmed.WeakConfirmationCount != relayGuardianWeakConfirmations || confirmed.TriggerSource != "weak_reliability_10m" {
+			t.Fatalf("confirmed weak shadow state=%+v", confirmed)
+		}
+	})
+
+	t.Run("enforce_strong_last_resort_rechecks_capacity_after_weak_confirmation", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+		guardian.mu.Lock()
+		peer := guardian.stateLocked(50)
+		peer.State = RelayGuardianProbation
+		peer.ProbationPercent = 50
+		guardian.mu.Unlock()
+		for index := 0; index < 3; index++ {
+			guardian.observe(guardianObservation(51, fmt.Sprintf("last-resort-to-weak-%d", index), 502, true, clock.Now()))
+		}
+		guardian.mu.Lock()
+		strong := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if strong.State == RelayGuardianQuarantined || !strong.LastResort || strong.LastResortCap != 5 || strong.TriggerSource != "strong_gateway_3_in_5m" {
+			t.Fatalf("strong last-resort state=%+v", strong)
+		}
+
+		clock.Advance(6 * time.Minute)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 30,
+			Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 30,
+		})
+		guardian.mu.Lock()
+		candidate := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if !candidate.LastResort || candidate.LastResortCap != 5 || candidate.WeakConfirmationCount != 1 ||
+			candidate.TriggerSource != "weak_reliability_10m" || candidate.Reason != "weak_reliability_confirming" {
+			t.Fatalf("weak candidate discarded last-resort protection: %+v", candidate)
+		}
+
+		guardian.mu.Lock()
+		peer = guardian.stateLocked(50)
+		peer.State = RelayGuardianHealthy
+		peer.ProbationPercent = 0
+		guardian.mu.Unlock()
+		clock.Advance(RelayGuardianScanInterval)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 31,
+			Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 31,
+		})
+		guardian.mu.Lock()
+		confirmed := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if confirmed.State != RelayGuardianQuarantined || confirmed.LastResort || confirmed.LastResortCap != 0 ||
+			confirmed.TriggerSource != "weak_reliability_10m" {
+			t.Fatalf("confirmed weak incident did not re-evaluate capacity: %+v", confirmed)
+		}
+	})
+
+	t.Run("confirmed_weak_window_switch_does_not_reconfirm", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 40,
+			Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 40,
+		})
+		clock.Advance(RelayGuardianScanInterval)
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 41,
+			Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 41,
+		})
+		guardian.mu.Lock()
+		before := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if before.State != RelayGuardianWouldQuarantine || before.WeakConfirmationCount != relayGuardianWeakConfirmations {
+			t.Fatalf("initial weak confirmation state=%+v", before)
+		}
+
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+			AccountID: 51, ObservedAt: clock.Now(), Total10m: 100, Failures10m: 1, LatestFailureRowID10m: 42,
+			Total60m: 10, Failures60m: 4, LatestFailureRowID60m: 50,
+		})
+		guardian.mu.Lock()
+		after := *guardian.stateLocked(51)
+		guardian.mu.Unlock()
+		if after.State != RelayGuardianWouldQuarantine || after.ShadowAction != "quarantine" ||
+			after.WeakConfirmationCount != relayGuardianWeakConfirmations || after.WeakCandidateTrigger != "weak_reliability_60m" ||
+			after.TriggerSource != "weak_reliability_60m" || after.WindowSeconds != 3600 || after.Generation != before.Generation {
+			t.Fatalf("confirmed weak window switch state=%+v before=%+v", after, before)
+		}
+	})
+}
+
+func TestRelayGuardianStrongPathAndOperatorStatusRegressions(t *testing.T) {
+	t.Run("strong_status_ignores_client_text", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index := 0; index < 3; index++ {
+			obs := guardianObservation(51, fmt.Sprintf("strong-client-%d", index), 502, false, clock.Now())
+			obs.UpstreamErrorKind = "client_transport"
+			obs.ErrorMessage = "client received gateway error"
+			guardian.observe(obs)
+		}
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if state.State != RelayGuardianWouldQuarantine || state.TriggerSource != "strong_gateway_3_in_5m" || len(state.SeenFinal) != 0 {
+			t.Fatalf("strong status was suppressed: %+v", state)
+		}
+	})
+
+	t.Run("same_shadow_does_not_advance_generation", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index := 0; index < 3; index++ {
+			guardian.observe(guardianObservation(51, fmt.Sprintf("shadow-%d", index), 502, true, clock.Now()))
+		}
+		guardian.mu.Lock()
+		generation := guardian.stateLocked(51).Generation
+		guardian.mu.Unlock()
+		guardian.observe(guardianObservation(51, "shadow-fourth", 502, true, clock.Now()))
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		if got := guardian.stateLocked(51).Generation; got != generation {
+			t.Fatalf("same shadow generation=%d want=%d", got, generation)
+		}
+	})
+
+	t.Run("expired_strong_shadow_has_consistent_suspect_reason", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index := 0; index < 3; index++ {
+			guardian.observe(guardianObservation(51, fmt.Sprintf("expire-strong-%d", index), 502, true, clock.Now()))
+		}
+		clock.Advance(6 * time.Minute)
+		guardian.reconcile(context.Background())
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if state.State != RelayGuardianSuspect || state.ShadowAction != "" || state.TriggerSource != "" || state.Reason != "recent_failure_observed" {
+			t.Fatalf("expired strong shadow state=%+v", state)
+		}
+	})
+
+	t.Run("confirmed_weak_shadow_survives_later_weak_observation", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		guardian.observe(guardianObservation(51, "weak-shadow-a", 500, false, clock.Now()))
+		guardian.observe(guardianObservation(51, "weak-shadow-b", 500, false, clock.Now()))
+		confirmGuardianWeakForTest(t, guardian, 51)
+		guardian.mu.Lock()
+		before := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(51).relayGuardianRuntimeRecord)
+		guardian.mu.Unlock()
+		guardian.observe(guardianObservation(51, "weak-shadow-c", 500, false, clock.Now()))
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		after := guardian.stateLocked(51)
+		if after.Generation != before.Generation || after.Reason != before.Reason || after.ShadowAction != before.ShadowAction {
+			t.Fatalf("later weak observation changed confirmed shadow: before=%+v after=%+v", before, after)
+		}
+	})
+
+	t.Run("weak_candidate_cannot_demote_strong_shadow", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index := 0; index < 3; index++ {
+			guardian.observe(guardianObservation(51, fmt.Sprintf("strong-before-weak-%d", index), 502, true, clock.Now()))
+		}
+		guardian.mu.Lock()
+		before := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(51).relayGuardianRuntimeRecord)
+		guardian.mu.Unlock()
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 20, Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 20})
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		after := guardian.stateLocked(51)
+		if after.State != before.State || after.ShadowAction != before.ShadowAction || after.Reason != before.Reason || after.Generation != before.Generation || after.WeakConfirmationCount != 0 {
+			t.Fatalf("weak candidate demoted strong shadow: before=%+v after=%+v", before, after)
+		}
+	})
+
+	t.Run("below_threshold_does_not_clear_last_resort_strong_reason", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+		for index := 0; index < 3; index++ {
+			guardian.observe(guardianObservation(51, fmt.Sprintf("last-strong-%d", index), 502, true, clock.Now()))
+		}
+		guardian.mu.Lock()
+		before := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(51).relayGuardianRuntimeRecord)
+		guardian.mu.Unlock()
+		applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{AccountID: 51, ObservedAt: clock.Now(), Total10m: 100, Failures10m: 0, Total60m: 100, Failures60m: 0})
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		after := guardian.stateLocked(51)
+		if !after.LastResort || after.TriggerSource != before.TriggerSource || after.WindowSeconds != before.WindowSeconds || after.Reason != before.Reason {
+			t.Fatalf("below-threshold reliability cleared last-resort action: before=%+v after=%+v", before, after)
+		}
+	})
+
+	t.Run("status_counts_current_state_window", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
+		guardian.mu.Lock()
+		guardian.loaded[51] = true
+		state := guardian.stateLocked(51)
+		state.WindowSeconds = 600
+		state.ReliabilityTotal = 1209
+		state.ReliabilityFailures = 6
+		state.ReliabilityWindowSeconds = 600
+		state.Failures = []relayGuardianFailure{{At: clock.Now().Add(-20 * time.Minute), LogicalRequestID: "old", UserVisible: true}, {At: clock.Now().Add(-2 * time.Minute), LogicalRequestID: "new", UserVisible: true}}
+		guardian.mu.Unlock()
+		status, _ := store.RelayGuardianAccountStatus(51)
+		if status.FailureCount != 1 || status.UserVisibleFailures != 1 || status.ReliabilityTotal != 1209 || status.ReliabilityFailures != 6 || status.ReliabilityWindowSeconds != 600 {
+			t.Fatalf("window counts=%+v", status)
+		}
+	})
+
+	t.Run("strong_gateway_count_is_always_five_minutes", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
+		guardian.mu.Lock()
+		guardian.loaded[51] = true
+		state := guardian.stateLocked(51)
+		state.WindowSeconds = 3600
+		state.Failures = []relayGuardianFailure{{At: clock.Now().Add(-20 * time.Minute), LogicalRequestID: "old-strong", StrongGateway: true}, {At: clock.Now().Add(-2 * time.Minute), LogicalRequestID: "new-strong", StrongGateway: true}}
+		guardian.mu.Unlock()
+		status, _ := store.RelayGuardianAccountStatus(51)
+		if status.FailureCount != 2 || status.StrongGatewayFailures != 1 {
+			t.Fatalf("strong gateway 5m count=%+v", status)
+		}
+	})
+
+	t.Run("weak_candidate_does_not_degrade_health", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
+		guardian.mu.Lock()
+		guardian.loaded[51] = true
+		guardian.heartbeat = time.Now()
+		state := guardian.stateLocked(51)
+		state.State = RelayGuardianSuspect
+		state.WeakConfirmationCount = 1
+		guardian.mu.Unlock()
+		health, relay := store.RelayGuardianHealth()
+		if health.Status != "ok" || relay.Degraded != 0 {
+			t.Fatalf("weak candidate degraded health: health=%+v relay=%+v", health, relay)
+		}
+	})
+}
+
 func TestRelayGuardianStatusUsesOperatorNameAndTracksHotRename(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	store, _ := newGuardianTestStore(t, RelayGuardianMonitor, clock, 50)
@@ -86,17 +679,18 @@ func TestRelayGuardianStatusUsesOperatorNameAndTracksHotRename(t *testing.T) {
 	}
 }
 
-func TestRelayGuardianAccount51ReplayWouldQuarantineOnSecondVisible500(t *testing.T) {
+func TestRelayGuardianAccount51ConfirmedWeakReliabilityWouldQuarantine(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50, 53)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	clock.Advance(2*time.Minute + 5*time.Second)
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 
 	guardian.mu.Lock()
 	state := guardian.stateLocked(51)
-	if state.State != RelayGuardianWouldQuarantine || state.TriggerSource != "user_visible_2_in_10m" {
-		t.Fatalf("state=%s trigger=%s, want would_quarantine at second visible 500", state.State, state.TriggerSource)
+	if state.State != RelayGuardianWouldQuarantine || state.TriggerSource != "weak_reliability_10m" {
+		t.Fatalf("state=%s trigger=%s, want confirmed weak would_quarantine", state.State, state.TriggerSource)
 	}
 	guardian.mu.Unlock()
 }
@@ -180,6 +774,7 @@ func TestRelayGuardianCapacityProtectsLastAccount(t *testing.T) {
 	_, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	guardian.mu.Lock()
 	state := guardian.stateLocked(51)
 	if state.State == RelayGuardianQuarantined || state.Reason != "last_available_relay" {
@@ -213,10 +808,13 @@ func TestRelayGuardianPoolGuardFindsSharedSignatureBehindNewerSingleFailure(t *t
 	guardian.observe(guardianObservation(53, "candidate-shared-524", 524, false, clock.Now()))
 	clock.Advance(time.Minute)
 	guardian.observe(guardianObservation(53, "candidate-single-500", 500, false, clock.Now()))
+	accounts := guardian.store.configuredRelayGuardianAccounts()
+	capacity := guardian.capacityInputs(accounts)
 
 	guardian.mu.Lock()
 	defer guardian.mu.Unlock()
 	state := guardian.stateLocked(53)
+	guardian.applyTriggerLocked(guardian.store.FindByID(53), state, accounts, capacity, "strong_gateway_3_in_5m", 5*time.Minute, 0, 3, clock.Now())
 	if state.State == RelayGuardianQuarantined || !state.LastResort || state.Reason != "pool_wide_failure_guard" {
 		t.Fatalf("newer single 500 hid shared 524 pool signature: %+v", state)
 	}
@@ -230,6 +828,7 @@ func TestRelayGuardianReleaseAndBypassValidateStateAndGeneration(t *testing.T) {
 	}
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	status, _ := store.RelayGuardianAccountStatus(51)
 	if status.State != RelayGuardianQuarantined {
 		t.Fatalf("state=%s", status.State)
@@ -237,11 +836,25 @@ func TestRelayGuardianReleaseAndBypassValidateStateAndGeneration(t *testing.T) {
 	if err := store.ReleaseRelayGuardian(51, status.Generation-1); !errors.Is(err, ErrRelayGuardianStaleGeneration) {
 		t.Fatalf("stale release err=%v", err)
 	}
-	if err := store.TemporaryBypassRelayGuardian(51, status.Generation, 5); err != nil {
+	guardian.mu.Lock()
+	state := guardian.stateLocked(51)
+	state.WeakCandidateTrigger = "weak_reliability_10m"
+	state.WeakCandidateLatestFailureRowID = 120
+	state.WeakCandidateSince = clock.Now()
+	state.WeakConfirmationCount = 1
+	guardian.mu.Unlock()
+	if err := store.ReleaseRelayGuardian(51, status.Generation); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	released, _ := store.RelayGuardianAccountStatus(51)
+	if released.State != RelayGuardianHalfOpen || released.WeakConfirmationCount != 0 {
+		t.Fatalf("release retained pending weak candidate: %+v", released)
+	}
+	if err := store.TemporaryBypassRelayGuardian(51, released.Generation, 5); err != nil {
 		t.Fatalf("bypass: %v", err)
 	}
 	after, _ := store.RelayGuardianAccountStatus(51)
-	if after.State != RelayGuardianTemporaryBypass || after.Generation == status.Generation {
+	if after.State != RelayGuardianTemporaryBypass || after.Generation == released.Generation {
 		t.Fatalf("bypass status=%+v", after)
 	}
 }
@@ -251,6 +864,7 @@ func TestRelayGuardianModeTransitionDoesNotEnforceOldMonitorIncident(t *testing.
 	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	guardian.mu.Lock()
 	guardian.poolWideUntil = clock.Now().Add(time.Hour)
 	guardian.poolEvents["old"] = clock.Now()
@@ -265,7 +879,711 @@ func TestRelayGuardianModeTransitionDoesNotEnforceOldMonitorIncident(t *testing.
 	guardian.mu.Unlock()
 }
 
-func TestRelayGuardianRedisRestartRestoresQuarantine(t *testing.T) {
+func TestRelayGuardianModeFenceCoversConfiguredAccountWhoseInitialCacheReadFailed(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	old := relayGuardianRuntimeRecord{
+		SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7,
+		State: RelayGuardianQuarantined, Generation: 9, QuarantineUntil: clock.Now().Add(time.Hour),
+		TriggerSource: "strong_gateway_3_in_5m", WindowSeconds: 300, UpdatedAt: clock.Now(),
+	}
+	payload, _ := json.Marshal(old)
+	if err := baseCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	failing := &relayGuardianFailingCache{TokenCache: baseCache}
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	store.tokenCache, guardian.cache = failing, failing
+	guardian.ensureLoaded(51)
+	guardian.mu.Lock()
+	initiallyLoaded := guardian.loaded[51]
+	guardian.mu.Unlock()
+	if initiallyLoaded || failing.gets.Load() != 1 {
+		t.Fatalf("initial cache failure did not leave account unloaded: loaded=%v gets=%d", initiallyLoaded, failing.gets.Load())
+	}
+
+	guardian.mu.Lock()
+	initialScopeEpoch := guardian.scopeEpoch
+	guardian.mu.Unlock()
+	store.SetRelayGuardianMode(string(RelayGuardianMonitor))
+	guardian.mu.Lock()
+	monitorScopeEpoch := guardian.scopeEpoch
+	guardian.mu.Unlock()
+	store.SetRelayGuardianMode(string(RelayGuardianEnforce))
+	guardian.mu.Lock()
+	enforceScopeEpoch := guardian.scopeEpoch
+	guardian.mu.Unlock()
+	if initialScopeEpoch == monitorScopeEpoch || monitorScopeEpoch == enforceScopeEpoch || initialScopeEpoch == enforceScopeEpoch {
+		t.Fatalf("same-clock mode transitions reused scope epoch: initial=%q monitor=%q enforce=%q", initialScopeEpoch, monitorScopeEpoch, enforceScopeEpoch)
+	}
+	guardian.ensureLoaded(51)
+	guardian.mu.Lock()
+	state := *guardian.stateLocked(51)
+	loaded := guardian.loaded[51]
+	guardian.mu.Unlock()
+	if !loaded || state.State != RelayGuardianHealthy || state.Mode != RelayGuardianEnforce || !state.QuarantineUntil.IsZero() || state.Generation == old.Generation {
+		t.Fatalf("old enforce quarantine crossed mode fence: loaded=%v state=%+v", loaded, state)
+	}
+	if failing.gets.Load() != 1 {
+		t.Fatalf("mode fence re-read stale cache after failed initial load: gets=%d", failing.gets.Load())
+	}
+	stored, ok, err := baseCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51))
+	if err != nil || !ok {
+		t.Fatalf("mode fence cache write missing: ok=%v err=%v", ok, err)
+	}
+	var persisted relayGuardianRuntimeRecord
+	if err := json.Unmarshal(stored, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.State != RelayGuardianHealthy || persisted.Mode != RelayGuardianEnforce || !persisted.QuarantineUntil.IsZero() {
+		t.Fatalf("stale quarantine remained in cache: %+v", persisted)
+	}
+}
+
+func TestRelayGuardianBootEpochRejectsOldStateWhenTransitionPersistenceFails(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	old := relayGuardianRuntimeRecord{
+		SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7,
+		ScopeEpoch: "old-process-cycle", State: RelayGuardianQuarantined, Generation: 9,
+		QuarantineUntil: clock.Now().Add(time.Hour), TriggerSource: "strong_gateway_3_in_5m", WindowSeconds: 300,
+	}
+	payload, _ := json.Marshal(old)
+	if err := baseCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	failingSet := &relayGuardianFailingSetCache{TokenCache: baseCache}
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	store.tokenCache, guardian.cache = failingSet, failingSet
+	guardian.ensureLoaded(51)
+	store.SetRelayGuardianMode(string(RelayGuardianMonitor))
+	store.SetRelayGuardianMode(string(RelayGuardianEnforce))
+	if failingSet.sets.Load() < 2 {
+		t.Fatalf("transition cache writes did not fail twice: %d", failingSet.sets.Load())
+	}
+	// The underlying cache still contains the original enforce quarantine.
+	stored, ok, err := baseCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51))
+	if err != nil || !ok || string(stored) != string(payload) {
+		t.Fatalf("test did not preserve stale cache record: ok=%v err=%v", ok, err)
+	}
+
+	store2, guardian2 := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	store2.tokenCache, guardian2.cache = baseCache, baseCache
+	guardian2.ensureLoaded(51)
+	guardian2.mu.Lock()
+	after := *guardian2.stateLocked(51)
+	guardian2.mu.Unlock()
+	if after.State != RelayGuardianHealthy || !after.QuarantineUntil.IsZero() || !guardian2.selectable(store2.accountsByID[51]) {
+		t.Fatalf("restart revived stale quarantine despite boot epoch: %+v", after)
+	}
+}
+
+func TestRelayGuardianModeTransitionAtomicallyFencesObserveReconcileAndOldPersist(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	blocking := &relayGuardianBlockingSetCache{TokenCache: baseCache, entered: make(chan struct{}), release: make(chan struct{})}
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+	store.tokenCache, guardian.cache = blocking, blocking
+	guardian.ensureLoaded(51)
+	guardian.ensureLoaded(50)
+	guardian.observe(guardianObservation(51, "atomic-mode-a", 502, true, clock.Now()))
+	select {
+	case <-blocking.entered:
+	case <-time.After(time.Second):
+		t.Fatal("old monitor persist did not block")
+	}
+	guardian.observe(guardianObservation(51, "atomic-mode-b", 502, true, clock.Now()))
+
+	transitionDone := make(chan struct{})
+	go func() {
+		store.SetRelayGuardianMode(string(RelayGuardianEnforce))
+		close(transitionDone)
+	}()
+	// While transitionMode is fenced behind the old persist, both observations
+	// and reconcile still see monitor. Their writes must become stale once the
+	// atomic mode boundary publishes enforce and resets the state.
+	guardian.reconcile(context.Background())
+	guardian.observe(guardianObservation(51, "atomic-mode-c", 502, true, clock.Now()))
+	if mode := store.GetRelayGuardianMode(); mode != RelayGuardianMonitor {
+		t.Fatalf("new mode published before persistence fence: %s", mode)
+	}
+	close(blocking.release)
+	select {
+	case <-transitionDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mode transition did not finish")
+	}
+	guardian.mu.Lock()
+	state := *guardian.stateLocked(51)
+	guardian.mu.Unlock()
+	if state.State != RelayGuardianHealthy || state.Mode != RelayGuardianEnforce || len(state.Failures) != 0 || state.TriggerSource != "" {
+		t.Fatalf("old monitor evidence crossed atomic mode boundary: %+v", state)
+	}
+	stored, ok, err := baseCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51))
+	if err != nil || !ok {
+		t.Fatalf("mode transition cache state missing: ok=%v err=%v", ok, err)
+	}
+	var persisted relayGuardianRuntimeRecord
+	if err := json.Unmarshal(stored, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Mode != RelayGuardianEnforce || persisted.State != RelayGuardianHealthy || len(persisted.Failures) != 0 {
+		t.Fatalf("old asynchronous persist overwrote mode fence: %+v", persisted)
+	}
+}
+
+func TestRelayGuardianConfigTransitionFailClosedDuringCacheFence(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	blocking := &relayGuardianBlockingDeleteCache{TokenCache: baseCache, entered: make(chan struct{}), release: make(chan struct{})}
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	store.accountsByID[51].GroupIDs = []int64{7, 8}
+	store.tokenCache, guardian.cache = blocking, blocking
+	guardian.ensureLoaded(51)
+	guardian.ensureLoaded(50)
+	guardian.observe(guardianObservation(51, "old-group-evidence", 500, false, clock.Now()))
+
+	transitionDone := make(chan struct{})
+	go func() {
+		store.SetCybRelayConfig(CybRelayConfig{Enabled: true, GroupID: 8})
+		close(transitionDone)
+	}()
+	select {
+	case <-blocking.entered:
+	case <-time.After(time.Second):
+		t.Fatal("config cache invalidation did not block")
+	}
+	if cfg := store.GetCybRelayConfig(); !cfg.Enabled || cfg.GroupID != 8 {
+		t.Fatalf("new config was not published inside fence: %+v", cfg)
+	}
+	if store.RelayGuardianSelectable(store.accountsByID[51]) {
+		t.Fatal("new group was schedulable before its runtime was preloaded")
+	}
+	obs := guardianObservation(51, "new-group-during-fence", 502, true, clock.Now())
+	obs.RouteGroupID = 8
+	guardian.observe(obs)
+	close(blocking.release)
+	select {
+	case <-transitionDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("config transition did not finish")
+	}
+	guardian.mu.Lock()
+	state := *guardian.stateLocked(51)
+	loaded := guardian.loaded[51]
+	guardian.mu.Unlock()
+	if !loaded || state.State != RelayGuardianHealthy || len(state.Failures) != 0 || state.ScopeGroupID != 8 {
+		t.Fatalf("old/new-group evidence crossed config fence: loaded=%v state=%+v", loaded, state)
+	}
+}
+
+func TestRelayGuardianMembershipRejoinDoesNotReadStaleStateAfterCacheMutationFailure(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	guardian.mu.Lock()
+	scopeEpoch := guardian.scopeEpoch
+	guardian.mu.Unlock()
+	stale := relayGuardianRuntimeRecord{
+		SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7, ScopeEpoch: scopeEpoch,
+		State: RelayGuardianQuarantined, Generation: 9, QuarantineUntil: clock.Now().Add(time.Hour),
+		WeakCandidateTrigger: "weak_reliability_10m", WeakConfirmationCount: relayGuardianWeakConfirmations,
+	}
+	payload, _ := json.Marshal(stale)
+	if err := baseCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	failing := &relayGuardianFailingMutationCache{TokenCache: baseCache}
+	store.tokenCache, guardian.cache = failing, failing
+	account := store.accountsByID[51]
+	guardian.forgetAccountRuntime(account, 7)
+	guardian.preloadAndReplay(account)
+
+	guardian.mu.Lock()
+	state := *guardian.stateLocked(51)
+	loaded := guardian.loaded[51]
+	guardian.mu.Unlock()
+	if !loaded || state.State != RelayGuardianHealthy || !state.QuarantineUntil.IsZero() || state.WeakConfirmationCount != 0 || state.ScopeEpoch != scopeEpoch {
+		t.Fatalf("membership failure fence state: loaded=%v state=%+v", loaded, state)
+	}
+	if failing.deletes.Load() != 1 || failing.sets.Load() != 1 || failing.gets.Load() != 0 {
+		t.Fatalf("membership mutation calls delete=%d set=%d get=%d", failing.deletes.Load(), failing.sets.Load(), failing.gets.Load())
+	}
+	stored, ok, err := baseCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51))
+	if err != nil || !ok || string(stored) != string(payload) {
+		t.Fatalf("test did not preserve stale cache key: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRelayGuardianMembershipLeaveClearsHintReplayedAfterEntryClear(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	account := store.accountsByID[51]
+	guardian.mu.Lock()
+	state := guardian.stateLocked(51)
+	state.LastResort = true
+	state.LastResortCap = 3
+	guardian.loaded[51] = true
+	replayEntered := make(chan struct{})
+	replayRelease := make(chan struct{})
+	var hookOnce sync.Once
+	guardian.replayLockedHook = func() {
+		hookOnce.Do(func() { close(replayEntered) })
+		<-replayRelease
+	}
+	guardian.mu.Unlock()
+	relayGuardianSchedulingHint(account, true, 3, 0)
+
+	replayDone := make(chan struct{})
+	go func() {
+		guardian.replaySchedulingHint(account)
+		close(replayDone)
+	}()
+	select {
+	case <-replayEntered:
+	case <-time.After(time.Second):
+		t.Fatal("replay did not hold the Guardian state lock")
+	}
+	forgetDone := make(chan struct{})
+	go func() {
+		guardian.forgetAccountRuntime(account, 7)
+		close(forgetDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		hint := account.relayGuardianSchedulingHintSnapshot()
+		if !hint.lastResort && hint.hardCap == 0 && hint.percent == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("membership entry clear did not execute")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(replayRelease)
+	select {
+	case <-replayDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked replay did not finish")
+	}
+	select {
+	case <-forgetDone:
+	case <-time.After(time.Second):
+		t.Fatal("membership leave did not finish")
+	}
+	if hint := account.relayGuardianSchedulingHintSnapshot(); hint.lastResort || hint.hardCap != 0 || hint.percent != 0 {
+		t.Fatalf("old-state replay survived membership boundary: %+v", hint)
+	}
+}
+
+func TestRelayGuardianConfigTransitionClearsHintReplayedAfterEntryClear(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	account := store.accountsByID[51]
+	account.GroupIDs = []int64{7, 8}
+	guardian.mu.Lock()
+	state := guardian.stateLocked(51)
+	state.LastResort = true
+	state.LastResortCap = 3
+	guardian.loaded[51] = true
+	replayEntered := make(chan struct{})
+	replayRelease := make(chan struct{})
+	var hookOnce sync.Once
+	guardian.replayLockedHook = func() {
+		hookOnce.Do(func() { close(replayEntered) })
+		<-replayRelease
+	}
+	guardian.mu.Unlock()
+	relayGuardianSchedulingHint(account, true, 3, 0)
+
+	replayDone := make(chan struct{})
+	go func() {
+		guardian.replaySchedulingHint(account)
+		close(replayDone)
+	}()
+	select {
+	case <-replayEntered:
+	case <-time.After(time.Second):
+		t.Fatal("replay did not hold the Guardian state lock")
+	}
+	transitionDone := make(chan struct{})
+	go func() {
+		store.SetCybRelayConfig(CybRelayConfig{Enabled: true, GroupID: 8})
+		close(transitionDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		hint := account.relayGuardianSchedulingHintSnapshot()
+		if !hint.lastResort && hint.hardCap == 0 && hint.percent == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("config entry clear did not execute")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(replayRelease)
+	select {
+	case <-replayDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked replay did not finish")
+	}
+	select {
+	case <-transitionDone:
+	case <-time.After(time.Second):
+		t.Fatal("config transition did not finish")
+	}
+	if hint := account.relayGuardianSchedulingHintSnapshot(); hint.lastResort || hint.hardCap != 0 || hint.percent != 0 {
+		t.Fatalf("old-state replay survived config boundary: %+v", hint)
+	}
+}
+
+func TestRelayGuardianMembershipFenceRejectsQueuedOldPersistAfterMutationFailure(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	account := store.accountsByID[51]
+	guardian.mu.Lock()
+	state := guardian.stateLocked(51)
+	guardian.resetForModeLocked(state, RelayGuardianEnforce, clock.Now())
+	state.State = RelayGuardianQuarantined
+	state.Generation = 9
+	state.QuarantineUntil = clock.Now().Add(time.Hour)
+	state.WeakCandidateTrigger = "weak_reliability_10m"
+	state.WeakConfirmationCount = relayGuardianWeakConfirmations
+	state.SchemaVersion = relayGuardianRuntimeSchemaVersion
+	state.Mode = RelayGuardianEnforce
+	state.ScopeGroupID = 7
+	state.ScopeEpoch = guardian.scopeEpoch
+	state.revision = 1
+	guardian.loaded[51] = true
+	oldRevision := state.revision
+	oldRecord := cloneRelayGuardianRuntimeRecord(state.relayGuardianRuntimeRecord)
+	guardian.mu.Unlock()
+
+	payload, _ := json.Marshal(oldRecord)
+	if err := baseCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	guardedCache := &relayGuardianMembershipABACache{
+		TokenCache:    baseCache,
+		deleteEntered: make(chan struct{}),
+		deleteRelease: make(chan struct{}),
+	}
+	store.tokenCache, guardian.cache = guardedCache, guardedCache
+	relayGuardianSchedulingHint(account, true, 3, 0)
+	if hint := account.relayGuardianSchedulingHintSnapshot(); !hint.lastResort || hint.hardCap != 3 {
+		t.Fatal("test did not install a last-resort scheduling hint")
+	}
+
+	forgetDone := make(chan struct{})
+	go func() {
+		guardian.forgetAccountRuntime(account, 7)
+		close(forgetDone)
+	}()
+	select {
+	case <-guardedCache.deleteEntered:
+	case <-time.After(time.Second):
+		t.Fatal("membership delete did not hold the persistence fence")
+	}
+	oldPersistDone := make(chan struct{})
+	go func() {
+		guardian.persist(51, oldRevision, oldRecord)
+		close(oldPersistDone)
+	}()
+	close(guardedCache.deleteRelease)
+	select {
+	case <-forgetDone:
+	case <-time.After(time.Second):
+		t.Fatal("membership invalidation did not finish")
+	}
+	if hint := account.relayGuardianSchedulingHintSnapshot(); hint.lastResort || hint.hardCap != 0 || hint.percent != 0 {
+		t.Fatalf("leaving Relay did not clear the account scheduling hint: %+v", hint)
+	}
+	account.mu.Lock()
+	account.GroupIDs = []int64{8}
+	account.mu.Unlock()
+	if !store.RelayGuardianSelectable(account) {
+		t.Fatal("a non-Relay account was blocked by the membership tombstone")
+	}
+	account.mu.Lock()
+	account.GroupIDs = []int64{7}
+	account.mu.Unlock()
+	// Rejoin immediately while the old asynchronous persist is queued behind
+	// the membership fence. The materialized tombstone must prevent a cache read.
+	guardian.preloadAndReplay(account)
+	select {
+	case <-oldPersistDone:
+	case <-time.After(time.Second):
+		t.Fatal("queued old persist did not finish")
+	}
+	if guardedCache.deletes.Load() != 1 || guardedCache.sets.Load() != 1 {
+		t.Fatalf("old persist escaped membership revision fence: deletes=%d sets=%d", guardedCache.deletes.Load(), guardedCache.sets.Load())
+	}
+	guardian.mu.Lock()
+	state = guardian.stateLocked(51)
+	if state.State != RelayGuardianHealthy || state.revision != oldRevision+1 || !guardian.loaded[51] {
+		copy := *state
+		guardian.mu.Unlock()
+		t.Fatalf("membership tombstone not healthy: %+v", copy)
+	}
+	// Simulate the next successful state flush. This proves the cache converges
+	// to healthy after the two membership mutations failed, without allowing the
+	// queued old quarantine write to land first.
+	guardian.persistState(51, state)
+	guardian.mu.Unlock()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		stored, ok, err := baseCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			var record relayGuardianRuntimeRecord
+			if err := json.Unmarshal(stored, &record); err != nil {
+				t.Fatal(err)
+			}
+			if record.State == RelayGuardianHealthy && record.ScopeEpoch == guardian.scopeEpoch {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("healthy membership tombstone did not converge to cache")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if guardedCache.sets.Load() != 2 {
+		t.Fatalf("unexpected cache writes after convergence: %d", guardedCache.sets.Load())
+	}
+}
+
+func TestRelayGuardianMembershipFenceMaterializesTombstoneForEveryDeleteOutcome(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		failDelete         bool
+		failHealthy        bool
+		writesBeforeRejoin int64
+	}{
+		{name: "delete_succeeds"},
+		{name: "delete_fails_healthy_overwrite_succeeds", failDelete: true, writesBeforeRejoin: 1},
+		{name: "delete_fails_healthy_overwrite_fails", failDelete: true, failHealthy: true, writesBeforeRejoin: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			baseCache := cache.NewMemory(10)
+			defer baseCache.Close()
+			store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+			account := store.accountsByID[51]
+			guardian.mu.Lock()
+			state := guardian.stateLocked(51)
+			guardian.resetForModeLocked(state, RelayGuardianEnforce, clock.Now())
+			state.State = RelayGuardianQuarantined
+			state.Generation = 9
+			state.QuarantineUntil = clock.Now().Add(time.Hour)
+			state.SchemaVersion = relayGuardianRuntimeSchemaVersion
+			state.Mode = RelayGuardianEnforce
+			state.ScopeGroupID = 7
+			state.ScopeEpoch = guardian.scopeEpoch
+			state.revision = 1
+			guardian.loaded[51] = true
+			oldRevision := state.revision
+			oldRecord := cloneRelayGuardianRuntimeRecord(state.relayGuardianRuntimeRecord)
+			guardian.mu.Unlock()
+
+			payload, _ := json.Marshal(oldRecord)
+			if err := baseCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
+				t.Fatal(err)
+			}
+			guardedCache := &relayGuardianMembershipMutationCache{TokenCache: baseCache, failDelete: tt.failDelete, failHealthy: tt.failHealthy}
+			store.tokenCache, guardian.cache = guardedCache, guardedCache
+
+			// Model an asynchronous persist that was created by the old membership
+			// but has not reached persistMu yet. Release it only after the account
+			// immediately rejoins, which deterministically exercises revision ABA.
+			oldPersistReady := make(chan struct{})
+			oldPersistRelease := make(chan struct{})
+			oldPersistDone := make(chan struct{})
+			go func() {
+				close(oldPersistReady)
+				<-oldPersistRelease
+				guardian.persist(51, oldRevision, oldRecord)
+				close(oldPersistDone)
+			}()
+			<-oldPersistReady
+			guardian.forgetAccountRuntime(account, 7)
+			guardian.preloadAndReplay(account)
+			// Let the new membership create and persist its first revision before
+			// the delayed old persist resumes. Without the tombstone, both would
+			// recycle revision 1 after a successful delete.
+			guardian.observe(guardianObservation(51, "new-membership-failure", 502, true, clock.Now()))
+			expectedAfterNewPersist := tt.writesBeforeRejoin + 1
+			deadline := time.Now().Add(time.Second)
+			for guardedCache.sets.Load() < expectedAfterNewPersist {
+				if time.Now().After(deadline) {
+					t.Fatalf("new membership persist missing: sets=%d", guardedCache.sets.Load())
+				}
+				time.Sleep(time.Millisecond)
+			}
+			close(oldPersistRelease)
+			select {
+			case <-oldPersistDone:
+			case <-time.After(time.Second):
+				t.Fatal("delayed old persist did not finish")
+			}
+
+			if guardedCache.deletes.Load() != 1 || guardedCache.sets.Load() != expectedAfterNewPersist || guardedCache.gets.Load() != 0 {
+				t.Fatalf("membership fence calls delete=%d set=%d get=%d", guardedCache.deletes.Load(), guardedCache.sets.Load(), guardedCache.gets.Load())
+			}
+			guardian.mu.Lock()
+			state = guardian.stateLocked(51)
+			if state.State != RelayGuardianSuspect || state.revision != oldRevision+2 || !guardian.loaded[51] {
+				copy := *state
+				guardian.mu.Unlock()
+				t.Fatalf("membership tombstone not materialized: %+v", copy)
+			}
+			guardian.resetForModeLocked(state, RelayGuardianEnforce, clock.Now())
+			state.Reason = "test_cache_convergence"
+			guardian.persistState(51, state)
+			guardian.mu.Unlock()
+
+			expectedFinalWrites := expectedAfterNewPersist + 1
+			deadline = time.Now().Add(time.Second)
+			for {
+				stored, ok, err := baseCache.GetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ok {
+					var record relayGuardianRuntimeRecord
+					if err := json.Unmarshal(stored, &record); err != nil {
+						t.Fatal(err)
+					}
+					if record.State == RelayGuardianHealthy && record.ScopeEpoch == guardian.scopeEpoch && guardedCache.sets.Load() >= expectedFinalWrites {
+						break
+					}
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("healthy tombstone did not converge to cache")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if guardedCache.sets.Load() != expectedFinalWrites {
+				t.Fatalf("old persist wrote cache: sets=%d", guardedCache.sets.Load())
+			}
+		})
+	}
+}
+
+func TestRelayGuardianPersistRejectsStaleScopeAtSameRevision(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	baseCache := cache.NewMemory(10)
+	defer baseCache.Close()
+	counting := &relayGuardianFailingSetCache{TokenCache: baseCache}
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	store.tokenCache, guardian.cache = counting, counting
+	guardian.mu.Lock()
+	state := guardian.stateLocked(51)
+	guardian.resetForModeLocked(state, RelayGuardianEnforce, clock.Now())
+	state.SchemaVersion = relayGuardianRuntimeSchemaVersion
+	state.Mode = RelayGuardianEnforce
+	state.ScopeGroupID = 7
+	state.ScopeEpoch = guardian.scopeEpoch
+	state.revision = 11
+	revision := state.revision
+	current := cloneRelayGuardianRuntimeRecord(state.relayGuardianRuntimeRecord)
+	guardian.mu.Unlock()
+
+	oldEpoch := current
+	oldEpoch.ScopeEpoch = "previous-process-cycle"
+	oldMode := current
+	oldMode.Mode = RelayGuardianMonitor
+	oldGroup := current
+	oldGroup.ScopeGroupID = 8
+	for _, record := range []relayGuardianRuntimeRecord{oldEpoch, oldMode, oldGroup} {
+		guardian.persist(51, revision, record)
+	}
+	if counting.sets.Load() != 0 {
+		t.Fatalf("stale epoch/mode/group persist reached cache: %d", counting.sets.Load())
+	}
+	guardian.persist(51, revision, current)
+	if counting.sets.Load() != 1 {
+		t.Fatalf("current persist did not reach cache: %d", counting.sets.Load())
+	}
+}
+
+func TestRelayGuardianModeAndConfigTransitionsInvalidateOldRecoveryPermit(t *testing.T) {
+	for _, transition := range []string{"mode", "config"} {
+		t.Run(transition, func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+			if transition == "config" {
+				store.accountsByID[51].GroupIDs = []int64{7, 8}
+			}
+			guardian.mu.Lock()
+			state := guardian.stateLocked(51)
+			state.State = RelayGuardianHalfOpen
+			state.Generation = 7
+			state.permits = make(map[uint64]RelayGuardianPermit)
+			guardian.mu.Unlock()
+			permit, ok := guardian.begin(store.accountsByID[51])
+			if !ok || !permit.HalfOpen {
+				t.Fatalf("old recovery permit missing: %+v", permit)
+			}
+			if transition == "mode" {
+				store.SetRelayGuardianMode(string(RelayGuardianMonitor))
+				store.SetRelayGuardianMode(string(RelayGuardianEnforce))
+			} else {
+				store.SetCybRelayConfig(CybRelayConfig{Enabled: true, GroupID: 8})
+			}
+			guardian.finishFailure(permit, 500)
+			guardian.mu.Lock()
+			defer guardian.mu.Unlock()
+			after := guardian.stateLocked(51)
+			if after.State != RelayGuardianHealthy || len(after.Failures) != 0 {
+				t.Fatalf("old permit mutated post-transition state: %+v", after)
+			}
+		})
+	}
+}
+
+func TestRelayGuardianManualDisableClearsPendingWeakCandidate(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 100,
+		Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 100,
+	})
+	atomic.StoreInt32(&store.accountsByID[51].DispatchPaused, 1)
+	clock.Advance(RelayGuardianScanInterval)
+	guardian.reconcile(context.Background())
+	guardian.mu.Lock()
+	paused := *guardian.stateLocked(51)
+	guardian.mu.Unlock()
+	if paused.WeakConfirmationCount != 0 || paused.WeakCandidateTrigger != "" {
+		t.Fatalf("manual disable retained pending candidate: %+v", paused)
+	}
+
+	atomic.StoreInt32(&store.accountsByID[51].DispatchPaused, 0)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 101,
+		Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 101,
+	})
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	resumed := guardian.stateLocked(51)
+	if resumed.WeakConfirmationCount != 1 || resumed.State == RelayGuardianWouldQuarantine {
+		t.Fatalf("resumed account skipped fresh confirmation: %+v", resumed)
+	}
+}
+
+func TestRelayGuardianBootEpochDoesNotRestoreQuarantine(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	tokenCache := cache.NewMemory(10)
 	defer tokenCache.Close()
@@ -278,6 +1596,7 @@ func TestRelayGuardianRedisRestartRestoresQuarantine(t *testing.T) {
 	guardian.ensureLoaded(50)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	guardian.mu.Lock()
 	setupState := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(51).relayGuardianRuntimeRecord)
 	setupRevision := guardian.stateLocked(51).revision
@@ -297,17 +1616,25 @@ func TestRelayGuardianRedisRestartRestoresQuarantine(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	guardian.mu.Lock()
+	delete(guardian.states, 51)
+	delete(guardian.loaded, 51)
+	guardian.mu.Unlock()
+	guardian.ensureLoaded(51)
+	if guardian.selectable(store.accountsByID[51]) {
+		t.Fatal("same-process scope token failed to restore current quarantine")
+	}
 
 	store2, guardian2 := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 	store2.tokenCache = tokenCache
 	guardian2.cache = tokenCache
 	guardian2.ensureLoaded(51)
-	if guardian2.selectable(store2.accountsByID[51]) {
-		t.Fatal("quarantined account became selectable after restart")
+	if !guardian2.selectable(store2.accountsByID[51]) {
+		t.Fatal("boot epoch restored a stale Guardian quarantine")
 	}
 }
 
-func TestRelayGuardianRedisRestartRestoresPoolIncidentProtection(t *testing.T) {
+func TestRelayGuardianBootEpochDoesNotRestorePoolIncidentProtection(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	tokenCache := cache.NewMemory(10)
 	defer tokenCache.Close()
@@ -321,10 +1648,12 @@ func TestRelayGuardianRedisRestartRestoresPoolIncidentProtection(t *testing.T) {
 	guardian.observe(guardianObservation(50, "peer-a", 524, false, clock.Now()))
 	clock.Advance(30 * time.Second)
 	guardian.observe(guardianObservation(50, "peer-b", 524, false, clock.Now()))
+	guardian.observe(guardianObservation(50, "peer-c", 524, false, clock.Now()))
 	clock.Advance(3 * time.Minute)
 	guardian.observe(guardianObservation(53, "candidate-a", 524, false, clock.Now()))
 	clock.Advance(30 * time.Second)
 	guardian.observe(guardianObservation(53, "candidate-b", 524, false, clock.Now()))
+	guardian.observe(guardianObservation(53, "candidate-c", 524, false, clock.Now()))
 
 	guardian.mu.Lock()
 	wantUntil := guardian.poolWideUntil
@@ -352,15 +1681,8 @@ func TestRelayGuardianRedisRestartRestoresPoolIncidentProtection(t *testing.T) {
 	guardian2.mu.Lock()
 	gotUntil := guardian2.poolWideUntil
 	guardian2.mu.Unlock()
-	if !gotUntil.Equal(wantUntil) {
-		t.Fatalf("restored pool deadline=%s want=%s", gotUntil, wantUntil)
-	}
-
-	clock.Advance(2 * time.Minute)
-	guardian2.observe(guardianObservation(53, "later-transport", 598, false, clock.Now()))
-	status, ok := store2.RelayGuardianAccountStatus(53)
-	if !ok || status.State == RelayGuardianQuarantined || status.ShadowAction != "pool_alert" || status.Reason != "pool_wide_failure_guard" {
-		t.Fatalf("restart lost pool protection: %+v ok=%t", status, ok)
+	if !gotUntil.IsZero() || wantUntil.IsZero() {
+		t.Fatalf("boot epoch restored pool deadline=%s old=%s", gotUntil, wantUntil)
 	}
 
 	clock.Advance(11 * time.Minute)
@@ -374,7 +1696,8 @@ func TestRelayGuardianRedisRestartRestoresPoolIncidentProtection(t *testing.T) {
 	guardian2.observe(guardianObservation(53, "independent-a", 500, false, clock.Now()))
 	clock.Advance(time.Second)
 	guardian2.observe(guardianObservation(53, "independent-b", 500, false, clock.Now()))
-	status, ok = store2.RelayGuardianAccountStatus(53)
+	confirmGuardianWeakForTest(t, guardian2, 53)
+	status, ok := store2.RelayGuardianAccountStatus(53)
 	if !ok || status.State != RelayGuardianWouldQuarantine || status.ShadowAction != "quarantine" || status.Reason != "shadow_quarantine" {
 		t.Fatalf("new incident remained protected after restored deadline: %+v ok=%t", status, ok)
 	}
@@ -398,6 +1721,107 @@ func TestRelayGuardianRedisOldModeClearsAllExecutionState(t *testing.T) {
 	defer guardian.mu.Unlock()
 	if state.State != RelayGuardianHealthy || state.Mode != RelayGuardianEnforce || state.BackoffLevel != 0 || !state.QuarantineUntil.IsZero() || state.ProbationPercent != 0 || state.ProbationSuccesses != 0 || !state.ProbationStartedAt.IsZero() || !state.TemporaryBypassUntil.IsZero() || state.BypassReturnState != "" || len(state.Failures) != 0 || len(state.SeenFinal) != 0 || state.halfOpenSuccesses != 0 {
 		t.Fatalf("old mode execution state leaked: %+v", state)
+	}
+}
+
+func TestRelayGuardianLegacyRuntimeSchemaCannotRestoreOldWeakThreshold(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	tokenCache := cache.NewMemory(10)
+	defer tokenCache.Close()
+	record := relayGuardianRuntimeRecord{Mode: RelayGuardianMonitor, ScopeGroupID: 7, State: RelayGuardianWouldQuarantine,
+		Generation: 9, Reason: "shadow_quarantine", TriggerSource: "user_visible_2_in_10m", WindowSeconds: 600,
+		Failures: []relayGuardianFailure{{At: clock.Now(), LogicalRequestID: "legacy", StatusCode: 500, UserVisible: true}}}
+	payload, _ := json.Marshal(record)
+	if err := tokenCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+	store.tokenCache, guardian.cache = tokenCache, tokenCache
+	guardian.ensureLoaded(51)
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	state := guardian.stateLocked(51)
+	if state.SchemaVersion != relayGuardianRuntimeSchemaVersion || state.State != RelayGuardianHealthy || len(state.Failures) != 0 || state.WeakConfirmationCount != 0 {
+		t.Fatalf("legacy runtime survived schema fence: %+v", state)
+	}
+}
+
+func TestRelayGuardianReliabilityDBFailureCannotTriggerWeakIsolation(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+	db, err := database.New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guardian.db = db
+	guardian.incidentEpoch = clock.Now().Add(-10 * time.Minute)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 110,
+		Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 110,
+	})
+	db.Close()
+	guardian.observe(guardianObservation(51, "db-fail-a", 500, false, clock.Now()))
+	guardian.observe(guardianObservation(51, "db-fail-b", 500, false, clock.Now()))
+	guardian.reconcile(context.Background())
+	guardian.mu.Lock()
+	state := guardian.stateLocked(51)
+	if state.State == RelayGuardianWouldQuarantine || state.State == RelayGuardianQuarantined || state.WeakConfirmationCount != 0 {
+		guardian.mu.Unlock()
+		t.Fatalf("DB failure triggered weak isolation: %+v", state)
+	}
+	guardian.heartbeat = time.Now()
+	guardian.mu.Unlock()
+	status := store.RelayGuardianStatus()
+	if status.ReliabilityQueryStatus != "retrying" || status.ReliabilityConsecutiveErrors != 1 {
+		t.Fatalf("first DB failure status=%+v", status)
+	}
+	health, _ := store.RelayGuardianHealth()
+	if containsString(health.Reasons, "guardian_reliability_db_unavailable") {
+		t.Fatalf("single DB failure degraded health: %+v", health)
+	}
+	clock.Advance(RelayGuardianScanInterval)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 111,
+		Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 111,
+	})
+	guardian.mu.Lock()
+	firstAfterOutage := *guardian.stateLocked(51)
+	guardian.mu.Unlock()
+	if firstAfterOutage.WeakConfirmationCount != 1 || firstAfterOutage.State == RelayGuardianWouldQuarantine {
+		t.Fatalf("first successful snapshot after outage reused pending confirmation: %+v", firstAfterOutage)
+	}
+	for attempt := 2; attempt <= 3; attempt++ {
+		clock.Advance(RelayGuardianScanInterval)
+		guardian.reconcile(context.Background())
+	}
+	status = store.RelayGuardianStatus()
+	if status.ReliabilityQueryStatus != "degraded" || status.ReliabilityConsecutiveErrors != 3 {
+		t.Fatalf("third DB failure status=%+v", status)
+	}
+	guardian.mu.Lock()
+	guardian.heartbeat = time.Now()
+	guardian.mu.Unlock()
+	health, _ = store.RelayGuardianHealth()
+	if !containsString(health.Reasons, "guardian_reliability_db_unavailable") {
+		t.Fatalf("repeated DB failures missing health reason: %+v", health)
+	}
+}
+
+func TestRelayGuardianReliabilityWaitsForMaturityAfterStartup(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+	db, err := database.New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	guardian.db = db
+	rows, err := guardian.loadReliability(context.Background(), 7, clock.Now().Add(-time.Minute), clock.Now())
+	if err != nil {
+		t.Fatalf("startup maturity should return before querying DB: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("startup maturity rows=%+v", rows)
 	}
 }
 
@@ -551,6 +1975,7 @@ func TestRelayGuardianRecoveryStateMachine(t *testing.T) {
 	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	clock.Advance(31 * time.Minute)
 	if !guardian.selectable(store.accountsByID[51]) {
 		t.Fatal("expired quarantine did not enter half-open")
@@ -608,11 +2033,74 @@ func TestRelayGuardianRecoveryStateMachine(t *testing.T) {
 	guardian.mu.Unlock()
 }
 
+func TestRelayGuardianRecoveredAccountRequiresFreshTwoWeakScans(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 70,
+		Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 70,
+	})
+	clock.Advance(RelayGuardianScanInterval)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 5, Failures10m: 3, LatestFailureRowID10m: 71,
+		Total60m: 5, Failures60m: 3, LatestFailureRowID60m: 71,
+	})
+	guardian.mu.Lock()
+	quarantined := *guardian.stateLocked(51)
+	guardian.mu.Unlock()
+	if quarantined.State != RelayGuardianQuarantined || quarantined.WeakConfirmationCount != 0 {
+		t.Fatalf("quarantine retained weak confirmation fence: %+v", quarantined)
+	}
+
+	recoverGuardianAccountForTest(t, store, guardian, clock, 51)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 6, Failures10m: 2, LatestFailureRowID10m: 80,
+		Total60m: 6, Failures60m: 2, LatestFailureRowID60m: 80,
+	})
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	firstFresh := guardian.stateLocked(51)
+	if firstFresh.WeakConfirmationCount != 1 || firstFresh.State != RelayGuardianSuspect {
+		t.Fatalf("recovered account skipped fresh first confirmation: %+v", firstFresh)
+	}
+}
+
+func TestRelayGuardianStrongQuarantineAfterWeakCandidateDoesNotLeakAcrossRecovery(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 4, Failures10m: 2, LatestFailureRowID10m: 90,
+		Total60m: 4, Failures60m: 2, LatestFailureRowID60m: 90,
+	})
+	for index := 0; index < 3; index++ {
+		guardian.observe(guardianObservation(51, fmt.Sprintf("strong-after-weak-%d", index), 502, true, clock.Now()))
+	}
+	guardian.mu.Lock()
+	quarantined := *guardian.stateLocked(51)
+	guardian.mu.Unlock()
+	if quarantined.State != RelayGuardianQuarantined || quarantined.TriggerSource != "strong_gateway_3_in_5m" || quarantined.WeakConfirmationCount != 0 {
+		t.Fatalf("strong quarantine retained pending weak candidate: %+v", quarantined)
+	}
+
+	recoverGuardianAccountForTest(t, store, guardian, clock, 51)
+	applyGuardianReliabilityForTest(t, guardian, 51, relayGuardianReliabilitySnapshot{
+		AccountID: 51, ObservedAt: clock.Now(), Total10m: 6, Failures10m: 2, LatestFailureRowID10m: 91,
+		Total60m: 6, Failures60m: 2, LatestFailureRowID60m: 91,
+	})
+	guardian.mu.Lock()
+	defer guardian.mu.Unlock()
+	firstFresh := guardian.stateLocked(51)
+	if firstFresh.WeakConfirmationCount != 1 || firstFresh.State != RelayGuardianSuspect {
+		t.Fatalf("post-strong recovery reused old weak candidate: %+v", firstFresh)
+	}
+}
+
 func TestRelayGuardianProbationFailureReopensWithBackoff(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 	guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	clock.Advance(31 * time.Minute)
 	for i := 0; i < 3; i++ {
 		permit, ok := guardian.begin(store.accountsByID[51])
@@ -654,6 +2142,7 @@ func TestRelayGuardianHalfOpenNonAttributableOutcomesReleaseLease(t *testing.T) 
 			store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 			guardian.observe(guardianObservation(51, "u-1", 500, false, clock.Now()))
 			guardian.observe(guardianObservation(51, "u-2", 500, false, clock.Now()))
+			confirmGuardianWeakForTest(t, guardian, 51)
 			clock.Advance(31 * time.Minute)
 			permit, ok := guardian.begin(store.accountsByID[51])
 			if !ok {
@@ -838,7 +2327,7 @@ func TestRelayGuardianFallbackHonorsEpochAndOnlyLastLogicalRowIsFinal(t *testing
 	guardian.mu.Lock()
 	defer guardian.mu.Unlock()
 	state51 := guardian.stateLocked(51)
-	if state51.State != RelayGuardianQuarantined || len(state51.SeenFinal) != 2 {
+	if state51.State != RelayGuardianSuspect || len(state51.SeenFinal) != 2 || state51.WeakConfirmationCount != 0 {
 		t.Fatalf("post-epoch finals=%+v", state51)
 	}
 	if _, leaked := state51.SeenFinal["old-a"]; leaked {
@@ -920,6 +2409,7 @@ func TestRelayGuardianCapacityRequiresAnotherHealthyClosedRelay(t *testing.T) {
 	guardian.mu.Unlock()
 	guardian.observe(guardianObservation(51, "capacity-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "capacity-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	guardian.mu.Lock()
 	state := guardian.stateLocked(51)
 	if state.State == RelayGuardianQuarantined || !state.LastResort || state.Reason != "last_available_relay" {
@@ -939,6 +2429,7 @@ func TestRelayGuardianCapacityDoesNotCountCircuitHalfOpenAsHealthy(t *testing.T)
 	breaker.mu.Unlock()
 	guardian.observe(guardianObservation(51, "half-capacity-1", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "half-capacity-2", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	guardian.mu.Lock()
 	state := guardian.stateLocked(51)
 	if state.State == RelayGuardianQuarantined || !state.LastResort || state.Reason != "last_available_relay" {
@@ -1044,6 +2535,7 @@ func TestRelayGuardianProductionReplayFixture(t *testing.T) {
 		_, guardian := replay(t, []int64{50}, []replayRow{
 			{50, 0, 500, "direct", "server", "visible-a", false}, {50, 2 * time.Minute, 500, "direct", "server", "visible-b", false},
 		})
+		confirmGuardianWeakForTest(t, guardian, 50)
 		guardian.mu.Lock()
 		defer guardian.mu.Unlock()
 		if state := guardian.stateLocked(50); state.State == RelayGuardianQuarantined || !state.LastResort || state.LastResortCap != 5 {
@@ -1088,6 +2580,7 @@ func TestRelayGuardianMonitorShadowDecisionsMatchEnforceGuards(t *testing.T) {
 		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 50)
 		guardian.observe(guardianObservation(50, "only-a", 500, false, clock.Now()))
 		guardian.observe(guardianObservation(50, "only-b", 500, false, clock.Now()))
+		confirmGuardianWeakForTest(t, guardian, 50)
 		guardian.mu.Lock()
 		defer guardian.mu.Unlock()
 		state := guardian.stateLocked(50)
@@ -1129,21 +2622,23 @@ func TestRelayGuardianPoolIncidentProtectionDoesNotDecayIntoAccountQuarantine(t 
 			guardian.observe(guardianObservation(50, "peer-a", 524, false, clock.Now()))
 			clock.Advance(30 * time.Second)
 			guardian.observe(guardianObservation(50, "peer-b", 524, false, clock.Now()))
+			guardian.observe(guardianObservation(50, "peer-c", 524, false, clock.Now()))
 			clock.Advance(3 * time.Minute)
 			guardian.observe(guardianObservation(53, "candidate-a", 524, false, clock.Now()))
 			clock.Advance(30 * time.Second)
 			guardian.observe(guardianObservation(53, "candidate-b", 524, false, clock.Now()))
+			guardian.observe(guardianObservation(53, "candidate-c", 524, false, clock.Now()))
 
 			guardian.mu.Lock()
 			incidentUntil := guardian.poolWideUntil
 			state := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(53).relayGuardianRuntimeRecord)
 			guardian.mu.Unlock()
-			if state.Reason != "pool_wide_failure_guard" || !incidentUntil.Equal(clock.Now().Add(10*time.Minute)) {
+			if state.Reason != "pool_wide_failure_guard" || !incidentUntil.Equal(clock.Now().Add(5*time.Minute)) {
 				t.Fatalf("initial pool incident state=%+v until=%s now=%s", state, incidentUntil, clock.Now())
 			}
 
 			// The peer 524 evidence leaves the 5m signature window while the
-			// candidate's final 524 evidence still occupies the 10m trigger window.
+			// candidate's 524 evidence still occupies the strong 5m trigger window.
 			// A later single 598 must remain part of the pool-safe incident rather
 			// than combining with the 524s into an account quarantine.
 			clock.Advance(2 * time.Minute)
@@ -1173,6 +2668,7 @@ func TestRelayGuardianPoolIncidentProtectionDoesNotDecayIntoAccountQuarantine(t 
 			guardian.observe(guardianObservation(53, "independent-a", 500, false, clock.Now()))
 			clock.Advance(time.Second)
 			guardian.observe(guardianObservation(53, "independent-b", 500, false, clock.Now()))
+			confirmGuardianWeakForTest(t, guardian, 53)
 			status, ok := store.RelayGuardianAccountStatus(53)
 			if !ok {
 				t.Fatal("missing account 53 status")
@@ -1221,7 +2717,7 @@ func TestRelayGuardianRelayGroupScopeDoesNotInheritOldRuntime(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	tokenCache := cache.NewMemory(10)
 	defer tokenCache.Close()
-	record := relayGuardianRuntimeRecord{Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianQuarantined, Generation: 3, QuarantineUntil: clock.Now().Add(time.Hour)}
+	record := relayGuardianRuntimeRecord{SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: RelayGuardianEnforce, ScopeGroupID: 7, State: RelayGuardianQuarantined, Generation: 3, QuarantineUntil: clock.Now().Add(time.Hour)}
 	payload, _ := json.Marshal(record)
 	if err := tokenCache.SetRuntime(context.Background(), relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(7, 51), payload, time.Hour); err != nil {
 		t.Fatal(err)
@@ -1229,8 +2725,13 @@ func TestRelayGuardianRelayGroupScopeDoesNotInheritOldRuntime(t *testing.T) {
 	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50)
 	store.tokenCache = tokenCache
 	guardian.cache = tokenCache
-	if guardian.selectable(store.accountsByID[51]) {
-		t.Fatal("setup quarantine was not restored")
+	guardian.ensureLoaded(51)
+	if !guardian.selectable(store.accountsByID[51]) {
+		guardian.mu.Lock()
+		state := cloneRelayGuardianRuntimeRecord(guardian.stateLocked(51).relayGuardianRuntimeRecord)
+		loaded := guardian.loaded[51]
+		guardian.mu.Unlock()
+		t.Fatalf("boot epoch restored old-group quarantine: loaded=%v state=%+v", loaded, state)
 	}
 	store.SetCybRelayConfig(CybRelayConfig{Enabled: true, GroupID: 9})
 	deadline := time.Now().Add(2 * time.Second)
@@ -1255,6 +2756,7 @@ func TestRelayGuardianOneScanCanCreateOnlyOneNewQuarantine(t *testing.T) {
 	_, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51, 50, 53)
 	guardian.observe(guardianObservation(51, "first-a", 500, false, clock.Now()))
 	guardian.observe(guardianObservation(51, "first-b", 500, false, clock.Now()))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	for _, logical := range []string{"second-a", "second-b", "second-c"} {
 		guardian.observe(guardianObservation(50, logical, 502, true, clock.Now()))
 	}
@@ -1335,6 +2837,7 @@ func TestRelayGuardianEventUsesActionTimeAndMaskedAccountName(t *testing.T) {
 	guardian.incidentEpoch = observed.Add(-time.Second)
 	guardian.observe(guardianObservation(51, "event-a", 500, false, observed))
 	guardian.observe(guardianObservation(51, "event-b", 500, false, observed.Add(time.Minute)))
+	confirmGuardianWeakForTest(t, guardian, 51)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		page, listErr := db.ListRelayGuardianEvents(context.Background(), 1, 20, time.Time{}, time.Time{})
@@ -1352,10 +2855,14 @@ func TestRelayGuardianEventUsesActionTimeAndMaskedAccountName(t *testing.T) {
 				t.Fatalf("action time=%s want current=%s (observed=%s)", event.CreatedAt, clock.Now(), observed)
 			}
 			guardian.mu.Lock()
-			until := guardian.stateLocked(51).QuarantineUntil
+			runtimeState := *guardian.stateLocked(51)
 			guardian.mu.Unlock()
-			if until.Sub(clock.Now()) != 30*time.Minute {
-				t.Fatalf("quarantine used observation time: until=%s", until)
+			if runtimeState.QuarantineUntil.Sub(clock.Now()) != 30*time.Minute {
+				t.Fatalf("quarantine used observation time: until=%s", runtimeState.QuarantineUntil)
+			}
+			details, _ := event.Details.(map[string]any)
+			if runtimeState.WeakConfirmationCount != 0 || fmt.Sprint(details["weak_confirmation_count"]) != "2" {
+				t.Fatalf("weak fence/event evidence mismatch: runtime=%+v event=%+v", runtimeState, event.Details)
 			}
 			return
 		}

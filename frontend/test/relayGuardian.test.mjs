@@ -17,12 +17,15 @@ const compiled = ts.transpileModule(source, {
 const moduleURL = `data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`
 const {
   buildRelayGuardianEventsQuery,
+  formatRelayGuardianFailureRate,
   getRelayGuardianActionAvailability,
   getRelayGuardianEventLabel,
   getRelayGuardianReasonLabel,
+  getRelayGuardianRecoveryProgress,
   getRelayGuardianShadowActionMeta,
   getRelayGuardianStateMeta,
   getRelayGuardianTriggerLabel,
+  getRelayGuardianWeakConfirmation,
   mergeRelayGuardianAccounts,
   resolveRelayGuardianAccountName,
   resolveRelayGuardianState,
@@ -43,6 +46,13 @@ function guardianAccount(overrides = {}) {
     failure_count: 2,
     user_visible_failures: 2,
     strong_gateway_failures: 0,
+    reliability_window_seconds: 600,
+    reliability_total: 2000,
+    reliability_failures: 2,
+    failure_rate_percent: 0.1,
+    failure_rate_lower_bound_percent: 0.03,
+    weak_confirmation_count: 0,
+    weak_confirmation_required: 2,
     would_quarantine: false,
     quarantine_until: '2026-07-12T19:00:00+08:00',
     backoff_level: 0,
@@ -82,6 +92,20 @@ test('monitor mode describes would-quarantine but disables runtime actions', () 
   assert.equal(availability.canRelease, false)
   assert.equal(availability.canBypass, false)
   assert.match(availability.reason, /只记录不执行/)
+})
+
+test('suspect state makes its non-disruptive scheduling semantics explicit', () => {
+  assert.match(getRelayGuardianStateMeta('suspect').description, /仅观察，不影响调度/)
+})
+
+test('reliability degradation warning is compact and only keyed by degraded status', () => {
+  assert.match(panelSource, /status\?\.reliability_query_status === 'degraded'/)
+  assert.match(panelSource, /可靠性统计暂不可用，弱故障自动隔离已暂停；强网关快熔断仍生效。/)
+  assert.doesNotMatch(panelSource, /reliability_query_status === 'retrying'/)
+})
+
+test('recent upstream failure reason is operator friendly', () => {
+  assert.equal(getRelayGuardianReasonLabel('recent_failure_observed'), '近期出现上游失败，继续观察')
 })
 
 test('off mode disables every runtime action', () => {
@@ -142,6 +166,67 @@ test('event query carries the audit window and pagination exactly', () => {
 test('guardian event pagination defaults to five and keeps compact and larger choices', () => {
   assert.match(panelSource, /const PAGE_SIZE_OPTIONS = \[1, 5, 10, 20, 50\]/)
   assert.match(panelSource, /const \[pageSize, setPageSize\] = useState\(5\)/)
+})
+
+test('account cards show reliability evidence without exposing internal generations', () => {
+  assert.doesNotMatch(panelSource, /运行态第\s*\{account\.generation\}/)
+  assert.doesNotMatch(panelSource, /label="窗口失败"/)
+  assert.match(panelSource, /label="可靠性窗口" value=\{formatDuration\(account\.reliability_window_seconds\)\}/)
+  assert.match(panelSource, /label="可靠性请求"/)
+  assert.match(panelSource, /label="用户可见弱失败" value=\{String\(account\.reliability_failures \|\| 0\)\}/)
+  assert.match(panelSource, /label="弱失败率"/)
+  assert.match(panelSource, /label="近 5 分钟强网关"/)
+  assert.match(panelSource, /触发规则/)
+})
+
+test('recovery progress is hidden unless guardian or circuit is recovering', () => {
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({ state: 'healthy' })), '-')
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({ state: 'suspect' })), '-')
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({ state: 'would_quarantine' })), '-')
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({ state: 'half_open', circuit_state: 'closed' })), '恢复探测中')
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({
+    state: 'probation',
+    probation_successes: 4,
+    probation_required_successes: 20,
+    probation_percent: 10,
+  })), '4/20 · 10% 并发上限')
+  assert.equal(getRelayGuardianRecoveryProgress(guardianAccount({
+    state: 'healthy',
+    circuit_state: 'half_open',
+    circuit_probe_successes: 1,
+    circuit_required_successes: 3,
+  })), '1/3')
+})
+
+test('inactive confirmation, recovery and quarantine details are conditionally omitted', () => {
+  const healthy = guardianAccount({
+    state: 'healthy',
+    quarantine_until: null,
+    weak_confirmation_count: 0,
+  })
+  assert.equal(getRelayGuardianWeakConfirmation(healthy), '-')
+  assert.equal(getRelayGuardianRecoveryProgress(healthy), '-')
+  assert.match(panelSource, /weakConfirmation !== '-' \? <GuardianField label="判定确认"/)
+  assert.match(panelSource, /recoveryProgress !== '-' \? <GuardianField label="恢复进度"/)
+  assert.match(panelSource, /account\.quarantine_until \? <GuardianField label="临时隔离至"/)
+})
+
+test('weak reliability confirmation is shown only while confirmation is pending', () => {
+  const pending = guardianAccount({
+    state: 'suspect',
+    reason: 'weak_reliability_confirming',
+    weak_confirmation_count: 1,
+    weak_confirmation_required: 2,
+  })
+  assert.equal(getRelayGuardianWeakConfirmation(pending), '1/2')
+  assert.equal(getRelayGuardianWeakConfirmation(guardianAccount({ ...pending, state: 'healthy' })), '-')
+  assert.equal(getRelayGuardianWeakConfirmation(guardianAccount({ ...pending, weak_confirmation_count: 2 })), '-')
+  assert.equal(getRelayGuardianWeakConfirmation(guardianAccount({ ...pending, manual_enabled: false })), '-')
+})
+
+test('weak failure rate includes its confidence lower bound', () => {
+  assert.equal(formatRelayGuardianFailureRate(guardianAccount()), '0.1% · 可信下限 0.03%')
+  assert.equal(formatRelayGuardianFailureRate(guardianAccount({ reliability_total: 0 })), '-')
 })
 
 test('core guardian event names have operator-friendly Chinese labels', () => {
@@ -223,9 +308,17 @@ test('known guardian reasons and triggers are translated', () => {
   assert.equal(getRelayGuardianReasonLabel('last_available_relay'), '仅剩当前 Relay 账号，无法安全隔离')
   assert.equal(getRelayGuardianReasonLabel('capacity_warmup'), '容量基线预热中，暂不自动隔离')
   assert.equal(getRelayGuardianReasonLabel('insufficient_remaining_capacity'), '隔离后剩余并发不足，已降为最后兜底')
+  assert.equal(getRelayGuardianReasonLabel('weak_reliability_confirming'), '弱失败率偏高，等待下一窗口确认')
+  assert.equal(getRelayGuardianReasonLabel('weak_reliability_below_threshold'), '弱失败率低于隔离阈值')
   assert.equal(getRelayGuardianTriggerLabel('user_visible_2_in_10m'), '10 分钟内 2 个用户可见失败')
   assert.equal(getRelayGuardianTriggerLabel('strong_gateway_3_in_5m'), '5 分钟内 3 个强网关失败')
   assert.equal(getRelayGuardianTriggerLabel('user_visible_4_in_60m'), '60 分钟内 4 个用户可见失败')
+  assert.equal(getRelayGuardianTriggerLabel('weak_reliability_10m'), '10 分钟弱失败率可信偏高')
+  assert.equal(getRelayGuardianTriggerLabel('weak_reliability_60m'), '60 分钟弱失败率持续偏高')
+  assert.equal(getRelayGuardianTriggerLabel('weak_reliability_catastrophic_10m'), '10 分钟弱失败集中爆发')
+  assert.equal(getRelayGuardianTriggerLabel('catastrophic_10m'), '10 分钟弱失败集中爆发')
+  assert.equal(getRelayGuardianTriggerLabel('user_visible_rate_10m'), '10 分钟弱失败率可信偏高')
+  assert.equal(getRelayGuardianTriggerLabel('user_visible_rate_60m'), '60 分钟弱失败率持续偏高')
   assert.equal(getRelayGuardianTriggerLabel('recovery_failure_502'), '恢复阶段再次收到 HTTP 502')
   assert.equal(getRelayGuardianTriggerLabel('probation_complete'), '试运行完成')
   assert.equal(getRelayGuardianTriggerLabel('manual_release'), '管理员手动解除')

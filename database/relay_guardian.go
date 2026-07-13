@@ -153,6 +153,97 @@ type RelayGuardianUsageRow struct {
 	GuardianAttemptOnly bool
 }
 
+// RelayGuardianReliabilityRow is a database-derived view of the final logical
+// requests assigned to one Relay account. Intermediate attempts, probes and
+// guardian-only rows are deliberately excluded so the Guardian's weak-failure
+// path measures user-visible reliability instead of retry noise.
+type RelayGuardianReliabilityRow struct {
+	AccountID             int64
+	Total10m              int
+	Failures10m           int
+	LatestFailureRowID10m int64
+	Total60m              int
+	Failures60m           int
+	LatestFailureRowID60m int64
+}
+
+// ListRelayGuardianReliability aggregates logical requests whose final row is
+// in the current Relay scope. Ranking deliberately happens across the whole
+// site before the Relay filter: a Relay attempt followed by a successful OAuth
+// fallback is not a Relay final failure, while an OAuth attempt followed by a
+// Relay terminal failure is. The query intentionally uses only SQL features
+// shared by PostgreSQL and the supported SQLite test database.
+func (db *DB) ListRelayGuardianReliability(ctx context.Context, groupID int64, start, tenMinuteStart, matureEnd, scanEnd time.Time) ([]RelayGuardianReliabilityRow, error) {
+	if db == nil || groupID <= 0 || !matureEnd.After(start) || scanEnd.Before(matureEnd) {
+		return nil, nil
+	}
+	if tenMinuteStart.Before(start) {
+		tenMinuteStart = start
+	}
+	startArg, scanEndArg := db.timeRangeArgs(start, scanEnd)
+	tenMinuteArg := db.timeArg(tenMinuteStart)
+	matureEndArg := db.timeArg(matureEnd)
+	rows, err := db.conn.QueryContext(ctx, `WITH ranked AS (
+		SELECT id, created_at, account_id, logical_request_id, status_code,
+			COALESCE(upstream_error_kind,'') AS upstream_error_kind,
+			COALESCE(error_message,'') AS error_message,
+			COALESCE(route_class,'') AS route_class,
+			COALESCE(route_source,'') AS route_source,
+			COALESCE(route_group_id,0) AS route_group_id,
+			COALESCE(upstream_account_type,'') AS upstream_account_type,
+			ROW_NUMBER() OVER (PARTITION BY logical_request_id ORDER BY id DESC) AS row_rank
+		FROM usage_logs
+		WHERE created_at >= $1 AND created_at <= $2
+			AND NOT COALESCE(guardian_attempt_only, false)
+			AND logical_request_id <> ''
+	), final_rows AS (
+		SELECT id, created_at, account_id, status_code,
+			CASE WHEN status_code BETWEEN 500 AND 599
+				AND status_code NOT IN (502, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530)
+				AND LOWER(upstream_error_kind) NOT LIKE '%cyber_policy%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%content_policy%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%client%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%cancel%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%rate_limit%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%bad_request%'
+				AND LOWER(error_message) NOT LIKE '%cyber_policy%'
+				AND LOWER(error_message) NOT LIKE '%content_policy%'
+				AND LOWER(error_message) NOT LIKE '%client%'
+				AND LOWER(error_message) NOT LIKE '%cancel%'
+				AND LOWER(error_message) NOT LIKE '%rate_limit%'
+				AND LOWER(error_message) NOT LIKE '%bad_request%'
+			THEN 1 ELSE 0 END AS attributable_failure
+		FROM ranked
+		WHERE row_rank = 1 AND created_at <= $5 AND route_group_id = $3
+			AND route_class = 'cyb_relay'
+			AND upstream_account_type = 'openai_responses'
+			AND LOWER(route_source) <> 'probe'
+	)
+	SELECT account_id,
+		SUM(CASE WHEN created_at >= $4 AND (status_code BETWEEN 200 AND 399 OR attributable_failure = 1) THEN 1 ELSE 0 END),
+		SUM(CASE WHEN created_at >= $4 AND attributable_failure = 1 THEN 1 ELSE 0 END),
+		MAX(CASE WHEN created_at >= $4 AND attributable_failure = 1 THEN id ELSE 0 END),
+		SUM(CASE WHEN status_code BETWEEN 200 AND 399 OR attributable_failure = 1 THEN 1 ELSE 0 END),
+		SUM(attributable_failure),
+		MAX(CASE WHEN attributable_failure = 1 THEN id ELSE 0 END)
+	FROM final_rows
+	GROUP BY account_id`, startArg, scanEndArg, groupID, tenMinuteArg, matureEndArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]RelayGuardianReliabilityRow, 0)
+	for rows.Next() {
+		var row RelayGuardianReliabilityRow
+		if err := rows.Scan(&row.AccountID, &row.Total10m, &row.Failures10m, &row.LatestFailureRowID10m,
+			&row.Total60m, &row.Failures60m, &row.LatestFailureRowID60m); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
 func (db *DB) ListRelayGuardianUsage(ctx context.Context, groupID int64, start, end time.Time, limit int) ([]RelayGuardianUsageRow, error) {
 	if db == nil || groupID <= 0 || !end.After(start) {
 		return nil, nil

@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,15 +20,28 @@ import (
 	"github.com/codex2api/database"
 )
 
+var relayGuardianScopeEpochFallback atomic.Uint64
+
+func newRelayGuardianScopeEpoch() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf("%d-%d", time.Now().UnixNano(), relayGuardianScopeEpochFallback.Add(1))
+}
+
 const (
-	relayGuardianRuntimeNamespace = "relay-health-guardian"
-	relayGuardianRuntimeTTL       = 7 * 24 * time.Hour
-	relayGuardianCacheTimeout     = 300 * time.Millisecond
-	RelayGuardianScanInterval     = 60 * time.Second
+	relayGuardianRuntimeNamespace     = "relay-health-guardian"
+	relayGuardianRuntimeSchemaVersion = 2
+	relayGuardianRuntimeTTL           = 7 * 24 * time.Hour
+	relayGuardianCacheTimeout         = 300 * time.Millisecond
+	relayGuardianDBTimeout            = 3 * time.Second
+	RelayGuardianScanInterval         = 60 * time.Second
 
 	relayGuardianInitialQuarantine  = 30 * time.Minute
 	relayGuardianProbationStage     = 10 * time.Minute
 	relayGuardianProbationSuccesses = 20
+	relayGuardianWeakConfirmations  = 2
 )
 
 const (
@@ -92,34 +107,47 @@ type relayGuardianFailure struct {
 }
 
 type relayGuardianRuntimeRecord struct {
-	Mode                 RelayGuardianMode      `json:"mode,omitempty"`
-	ScopeGroupID         int64                  `json:"scope_group_id,omitempty"`
-	State                RelayGuardianState     `json:"state"`
-	Generation           uint64                 `json:"generation"`
-	Reason               string                 `json:"reason,omitempty"`
-	TriggerSource        string                 `json:"trigger_source,omitempty"`
-	WindowSeconds        int                    `json:"window_seconds,omitempty"`
-	QuarantineUntil      time.Time              `json:"quarantine_until,omitempty"`
-	BackoffLevel         int                    `json:"backoff_level"`
-	ProbationPercent     int                    `json:"probation_percent,omitempty"`
-	ProbationSuccesses   int                    `json:"probation_successes,omitempty"`
-	ProbationStartedAt   time.Time              `json:"probation_started_at,omitempty"`
-	TemporaryBypassUntil time.Time              `json:"temporary_bypass_until,omitempty"`
-	BypassReturnState    RelayGuardianState     `json:"bypass_return_state,omitempty"`
-	LastResort           bool                   `json:"last_resort,omitempty"`
-	LastResortCap        int                    `json:"last_resort_cap,omitempty"`
-	LastResortLevel      int                    `json:"last_resort_level,omitempty"`
-	LastResortFailureID  string                 `json:"last_resort_failure_id,omitempty"`
-	ShadowAction         string                 `json:"shadow_action,omitempty"`
-	HealthySince         time.Time              `json:"healthy_since,omitempty"`
-	PoolWideReportedAt   time.Time              `json:"pool_wide_reported_at,omitempty"`
-	Failures             []relayGuardianFailure `json:"failures,omitempty"`
-	SeenStrong           map[string]time.Time   `json:"seen_strong,omitempty"`
-	SeenFinal            map[string]time.Time   `json:"seen_final,omitempty"`
-	LastFailureAt        time.Time              `json:"last_failure_at,omitempty"`
-	LastActionAt         time.Time              `json:"last_action_at,omitempty"`
-	LastScanAt           time.Time              `json:"last_scan_at,omitempty"`
-	UpdatedAt            time.Time              `json:"updated_at,omitempty"`
+	SchemaVersion                   int                    `json:"schema_version,omitempty"`
+	Mode                            RelayGuardianMode      `json:"mode,omitempty"`
+	ScopeGroupID                    int64                  `json:"scope_group_id,omitempty"`
+	ScopeEpoch                      string                 `json:"scope_epoch,omitempty"`
+	State                           RelayGuardianState     `json:"state"`
+	Generation                      uint64                 `json:"generation"`
+	Reason                          string                 `json:"reason,omitempty"`
+	TriggerSource                   string                 `json:"trigger_source,omitempty"`
+	WindowSeconds                   int                    `json:"window_seconds,omitempty"`
+	QuarantineUntil                 time.Time              `json:"quarantine_until,omitempty"`
+	BackoffLevel                    int                    `json:"backoff_level"`
+	ProbationPercent                int                    `json:"probation_percent,omitempty"`
+	ProbationSuccesses              int                    `json:"probation_successes,omitempty"`
+	ProbationStartedAt              time.Time              `json:"probation_started_at,omitempty"`
+	TemporaryBypassUntil            time.Time              `json:"temporary_bypass_until,omitempty"`
+	BypassReturnState               RelayGuardianState     `json:"bypass_return_state,omitempty"`
+	LastResort                      bool                   `json:"last_resort,omitempty"`
+	LastResortCap                   int                    `json:"last_resort_cap,omitempty"`
+	LastResortLevel                 int                    `json:"last_resort_level,omitempty"`
+	LastResortFailureID             string                 `json:"last_resort_failure_id,omitempty"`
+	ShadowAction                    string                 `json:"shadow_action,omitempty"`
+	HealthySince                    time.Time              `json:"healthy_since,omitempty"`
+	PoolWideReportedAt              time.Time              `json:"pool_wide_reported_at,omitempty"`
+	Failures                        []relayGuardianFailure `json:"failures,omitempty"`
+	SeenStrong                      map[string]time.Time   `json:"seen_strong,omitempty"`
+	SeenFinal                       map[string]time.Time   `json:"seen_final,omitempty"`
+	LastFailureAt                   time.Time              `json:"last_failure_at,omitempty"`
+	LastActionAt                    time.Time              `json:"last_action_at,omitempty"`
+	LastScanAt                      time.Time              `json:"last_scan_at,omitempty"`
+	ReliabilityObservedAt           time.Time              `json:"reliability_observed_at,omitempty"`
+	ReliabilityTotal                int                    `json:"reliability_total,omitempty"`
+	ReliabilityFailures             int                    `json:"reliability_failures,omitempty"`
+	ReliabilityWindowSeconds        int                    `json:"reliability_window_seconds,omitempty"`
+	FailureRatePercent              float64                `json:"failure_rate_percent,omitempty"`
+	FailureRateLowerBoundPercent    float64                `json:"failure_rate_lower_bound_percent,omitempty"`
+	ReliabilityLatestFailureRowID   int64                  `json:"reliability_latest_failure_row_id,omitempty"`
+	WeakCandidateTrigger            string                 `json:"weak_candidate_trigger,omitempty"`
+	WeakCandidateLatestFailureRowID int64                  `json:"weak_candidate_latest_failure_row_id,omitempty"`
+	WeakCandidateSince              time.Time              `json:"weak_candidate_since,omitempty"`
+	WeakConfirmationCount           int                    `json:"weak_confirmation_count,omitempty"`
+	UpdatedAt                       time.Time              `json:"updated_at,omitempty"`
 }
 
 type relayGuardianAccountState struct {
@@ -146,6 +174,28 @@ type relayGuardianCapacityAccount struct {
 	circuit   RelayCircuitSnapshot
 }
 
+type relayGuardianReliabilitySnapshot struct {
+	AccountID             int64
+	ObservedAt            time.Time
+	Total10m              int
+	Failures10m           int
+	LatestFailureRowID10m int64
+	Total60m              int
+	Failures60m           int
+	LatestFailureRowID60m int64
+}
+
+type relayGuardianWeakDecision struct {
+	Trigger            string
+	Window             time.Duration
+	Total              int
+	Failures           int
+	LatestFailureRowID int64
+	Rate               float64
+	LowerBound         float64
+	Catastrophic       bool
+}
+
 type relayHealthGuardian struct {
 	store                         *Store
 	cache                         cache.TokenCache
@@ -167,10 +217,19 @@ type relayHealthGuardian struct {
 	lastSummary                   time.Time
 	lastAudit                     time.Time
 	scanInFlight                  bool
+	reliabilityInFlight           bool
+	lastReliabilityQuery          time.Time
+	lastReliabilitySuccess        time.Time
+	lastReliabilityError          time.Time
+	reliabilityFailureSince       time.Time
+	reliabilityConsecutiveErrors  int
+	scopeEpoch                    string
+	scopeEpochGroupID             int64
 	poolWideUntil                 time.Time
 	poolEvents                    map[string]time.Time
 	capacitySamples               []relayGuardianCapacitySample
 	now                           func() time.Time
+	replayLockedHook              func() // deterministic test synchronization; nil in production
 }
 
 type RelayGuardianPermit struct {
@@ -197,43 +256,54 @@ type RelayGuardianObservation struct {
 }
 
 type RelayGuardianAccountSnapshot struct {
-	AccountID                  int64              `json:"account_id"`
-	AccountName                string             `json:"account_name"`
-	ManualEnabled              bool               `json:"manual_enabled"`
-	State                      RelayGuardianState `json:"state"`
-	EffectiveSchedulable       bool               `json:"effective_schedulable"`
-	Reason                     string             `json:"reason,omitempty"`
-	TriggerSource              string             `json:"trigger_source,omitempty"`
-	Generation                 uint64             `json:"generation"`
-	WindowSeconds              int                `json:"window_seconds,omitempty"`
-	FailureCount               int                `json:"failure_count"`
-	UserVisibleFailures        int                `json:"user_visible_failures"`
-	StrongGatewayFailures      int                `json:"strong_gateway_failures"`
-	WouldQuarantine            bool               `json:"would_quarantine"`
-	QuarantineUntil            *time.Time         `json:"quarantine_until,omitempty"`
-	BackoffLevel               int                `json:"backoff_level"`
-	LastResort                 bool               `json:"last_resort"`
-	LastResortCap              int                `json:"last_resort_cap"`
-	ShadowAction               string             `json:"shadow_action,omitempty"`
-	ProbationPercent           int                `json:"probation_percent"`
-	ProbationSuccesses         int                `json:"probation_successes"`
-	ProbationRequiredSuccesses int                `json:"probation_required_successes"`
-	LastFailureAt              *time.Time         `json:"last_failure_at,omitempty"`
-	LastActionAt               *time.Time         `json:"last_action_at,omitempty"`
-	LastScanAt                 *time.Time         `json:"last_scan_at,omitempty"`
-	CircuitState               RelayCircuitState  `json:"circuit_state"`
-	CircuitOpenUntil           *time.Time         `json:"circuit_open_until,omitempty"`
-	CircuitProbeSuccesses      int                `json:"circuit_probe_successes"`
-	CircuitRequiredSuccesses   int                `json:"circuit_required_successes"`
+	AccountID                    int64              `json:"account_id"`
+	AccountName                  string             `json:"account_name"`
+	ManualEnabled                bool               `json:"manual_enabled"`
+	State                        RelayGuardianState `json:"state"`
+	EffectiveSchedulable         bool               `json:"effective_schedulable"`
+	Reason                       string             `json:"reason,omitempty"`
+	TriggerSource                string             `json:"trigger_source,omitempty"`
+	Generation                   uint64             `json:"generation"`
+	WindowSeconds                int                `json:"window_seconds,omitempty"`
+	FailureCount                 int                `json:"failure_count"`
+	UserVisibleFailures          int                `json:"user_visible_failures"`
+	StrongGatewayFailures        int                `json:"strong_gateway_failures"`
+	WouldQuarantine              bool               `json:"would_quarantine"`
+	QuarantineUntil              *time.Time         `json:"quarantine_until,omitempty"`
+	BackoffLevel                 int                `json:"backoff_level"`
+	LastResort                   bool               `json:"last_resort"`
+	LastResortCap                int                `json:"last_resort_cap"`
+	ShadowAction                 string             `json:"shadow_action,omitempty"`
+	ProbationPercent             int                `json:"probation_percent"`
+	ProbationSuccesses           int                `json:"probation_successes"`
+	ProbationRequiredSuccesses   int                `json:"probation_required_successes"`
+	LastFailureAt                *time.Time         `json:"last_failure_at,omitempty"`
+	LastActionAt                 *time.Time         `json:"last_action_at,omitempty"`
+	LastScanAt                   *time.Time         `json:"last_scan_at,omitempty"`
+	CircuitState                 RelayCircuitState  `json:"circuit_state"`
+	CircuitOpenUntil             *time.Time         `json:"circuit_open_until,omitempty"`
+	CircuitProbeSuccesses        int                `json:"circuit_probe_successes"`
+	CircuitRequiredSuccesses     int                `json:"circuit_required_successes"`
+	ReliabilityTotal             int                `json:"reliability_total"`
+	ReliabilityFailures          int                `json:"reliability_failures"`
+	ReliabilityWindowSeconds     int                `json:"reliability_window_seconds"`
+	FailureRatePercent           float64            `json:"failure_rate_percent"`
+	FailureRateLowerBoundPercent float64            `json:"failure_rate_lower_bound_percent"`
+	WeakConfirmationCount        int                `json:"weak_confirmation_count"`
+	WeakConfirmationRequired     int                `json:"weak_confirmation_required"`
 }
 
 type RelayGuardianStatus struct {
-	Enabled             bool                           `json:"enabled"`
-	Mode                RelayGuardianMode              `json:"mode"`
-	GeneratedAt         time.Time                      `json:"generated_at"`
-	HeartbeatAt         *time.Time                     `json:"heartbeat_at,omitempty"`
-	ScanIntervalSeconds int                            `json:"scan_interval_seconds"`
-	Accounts            []RelayGuardianAccountSnapshot `json:"accounts"`
+	Enabled                      bool                           `json:"enabled"`
+	Mode                         RelayGuardianMode              `json:"mode"`
+	GeneratedAt                  time.Time                      `json:"generated_at"`
+	HeartbeatAt                  *time.Time                     `json:"heartbeat_at,omitempty"`
+	ScanIntervalSeconds          int                            `json:"scan_interval_seconds"`
+	ReliabilityQueryStatus       string                         `json:"reliability_query_status"`
+	ReliabilityConsecutiveErrors int                            `json:"reliability_consecutive_errors"`
+	ReliabilityLastSuccessAt     *time.Time                     `json:"reliability_last_success_at,omitempty"`
+	ReliabilityLastErrorAt       *time.Time                     `json:"reliability_last_error_at,omitempty"`
+	Accounts                     []RelayGuardianAccountSnapshot `json:"accounts"`
 }
 
 type RelayGuardianHealthSummary struct {
@@ -260,33 +330,61 @@ var ErrRelayGuardianInvalidState = errors.New("relay guardian action is not allo
 var ErrRelayGuardianRuntimeUnavailable = errors.New("relay guardian runtime state is unavailable")
 
 func newRelayHealthGuardian(store *Store) *relayHealthGuardian {
+	now := time.Now()
+	groupID := store.GetCybRelayConfig().GroupID
+	// Availability-first boot fence: Guardian weak isolation/recovery state is
+	// intentionally reset after a process restart. The independent strong
+	// circuit breaker still restores/rebuilds its own transport protection.
+	// A random process-cycle token also makes this safe under clock rollback.
 	return &relayHealthGuardian{
-		store:         store,
-		cache:         store.tokenCache,
-		db:            store.db,
-		states:        make(map[int64]*relayGuardianAccountState),
-		loaded:        make(map[int64]bool),
-		loading:       make(map[int64]bool),
-		retryLoad:     make(map[int64]time.Time),
-		poolEvents:    make(map[string]time.Time),
-		now:           time.Now,
-		incidentEpoch: time.Now(),
+		store:             store,
+		cache:             store.tokenCache,
+		db:                store.db,
+		states:            make(map[int64]*relayGuardianAccountState),
+		loaded:            make(map[int64]bool),
+		loading:           make(map[int64]bool),
+		retryLoad:         make(map[int64]time.Time),
+		poolEvents:        make(map[string]time.Time),
+		now:               time.Now,
+		incidentEpoch:     now,
+		scopeEpoch:        newRelayGuardianScopeEpoch(),
+		scopeEpochGroupID: groupID,
 	}
 }
 
-func (g *relayHealthGuardian) modeChanged(previous, current RelayGuardianMode) {
+func (g *relayHealthGuardian) transitionMode(current RelayGuardianMode) {
 	if g == nil {
 		return
 	}
+	// Serialize mode boundaries with both restore and persistence. In
+	// particular, an account whose first cache read failed may not be present in
+	// g.states yet; resetting only loaded states would let its old enforce-mode
+	// quarantine reappear after E -> M -> E.
+	g.loadMu.Lock()
+	defer g.loadMu.Unlock()
+	g.persistMu.Lock()
+	defer g.persistMu.Unlock()
+	previous := g.store.GetRelayGuardianMode()
+	if previous == current {
+		return
+	}
 	now := g.nowTime()
+	nextScopeEpoch := newRelayGuardianScopeEpoch()
 	accounts := g.store.configuredRelayGuardianAccounts()
+	groupID := g.store.GetCybRelayConfig().GroupID
 	byID := make(map[int64]*Account, len(accounts))
 	for _, account := range accounts {
 		byID[account.DBID] = account
+		relayGuardianSchedulingHint(account, false, 0, 0)
 	}
+	records := make(map[int64]relayGuardianRuntimeRecord, len(accounts))
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	// Publish the new mode only after all outer fences are held. Any request
+	// that observes it must then wait on g.mu until the old evidence is reset.
+	g.store.relayGuardianMode.Store(string(current))
 	g.incidentEpoch = now
+	g.scopeEpoch = nextScopeEpoch
+	g.scopeEpochGroupID = groupID
 	g.lastScan = now
 	g.lastNewQuarantine = time.Time{}
 	g.lastShadowQuarantine = time.Time{}
@@ -296,25 +394,81 @@ func (g *relayHealthGuardian) modeChanged(previous, current RelayGuardianMode) {
 	g.capacitySamples = nil
 	g.lastSummary = time.Time{}
 	g.lastAudit = time.Time{}
+	g.lastReliabilityQuery = time.Time{}
+	g.reliabilityInFlight = false
+	g.lastReliabilitySuccess = time.Time{}
+	g.lastReliabilityError = time.Time{}
+	g.reliabilityFailureSince = time.Time{}
+	g.reliabilityConsecutiveErrors = 0
+	// Preserve the old behavior for any already-known state, then explicitly
+	// materialize every configured account so cache failures cannot keep it in
+	// an unknown state across the mode fence.
 	for accountID, state := range g.states {
 		if state == nil {
 			continue
 		}
 		g.resetForModeLocked(state, current, now)
 		relayGuardianSchedulingHint(byID[accountID], false, 0, 0)
-		g.persistState(accountID, state)
+		state.revision++
+		state.UpdatedAt = now
+		records[accountID] = cloneRelayGuardianRuntimeRecord(state.relayGuardianRuntimeRecord)
+	}
+	for accountID := range byID {
+		state := g.states[accountID]
+		if state == nil {
+			state = &relayGuardianAccountState{permits: make(map[uint64]RelayGuardianPermit)}
+			g.states[accountID] = state
+			g.resetForModeLocked(state, current, now)
+			state.revision++
+			state.UpdatedAt = now
+			records[accountID] = cloneRelayGuardianRuntimeRecord(state.relayGuardianRuntimeRecord)
+		}
+	}
+	g.loaded = make(map[int64]bool, len(byID))
+	for accountID := range byID {
+		g.loaded[accountID] = true
+	}
+	g.loading = make(map[int64]bool)
+	g.retryLoad = make(map[int64]time.Time)
+	g.mu.Unlock()
+
+	if g.cache == nil {
+		return
+	}
+	for accountID, record := range records {
+		if groupID <= 0 || record.ScopeGroupID != groupID {
+			continue
+		}
+		payload, err := json.Marshal(record)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := relayGuardianCacheContext()
+		err = g.cache.SetRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, accountID), payload, relayGuardianRuntimeTTL)
+		cancel()
+		if err != nil {
+			// The in-memory state remains authoritatively loaded and every
+			// reconcile persists it again; never reload the stale cache record.
+			log.Printf("[Relay guardian account=%d] persist mode transition failed: %v", accountID, err)
+		}
 	}
 }
 
-func (g *relayHealthGuardian) relayConfigChanged(previous, current CybRelayConfig, accounts []*Account) {
-	if g == nil || (previous.Enabled == current.Enabled && previous.GroupID == current.GroupID) {
+func (g *relayHealthGuardian) transitionConfig(current CybRelayConfig, accounts []*Account) {
+	if g == nil {
 		return
 	}
 	g.loadMu.Lock()
 	defer g.loadMu.Unlock()
 	g.persistMu.Lock()
 	defer g.persistMu.Unlock()
+	previous := g.store.GetCybRelayConfig()
+	if previous.Enabled == current.Enabled && previous.GroupID == current.GroupID {
+		g.store.cybRelayConfig.Store(current)
+		return
+	}
 	now := g.nowTime()
+	nextScopeEpoch := newRelayGuardianScopeEpoch()
 	ids := make(map[int64]struct{}, len(accounts))
 	for _, account := range accounts {
 		if account == nil {
@@ -331,11 +485,22 @@ func (g *relayHealthGuardian) relayConfigChanged(previous, current CybRelayConfi
 	for accountID := range g.states {
 		ids[accountID] = struct{}{}
 	}
+	// Publish the new scope while g.mu is held. A request that observes the new
+	// group then blocks until the old states, permits and hints are gone.
+	g.store.cybRelayConfig.Store(current)
 	g.states = make(map[int64]*relayGuardianAccountState)
 	g.loaded = make(map[int64]bool)
 	g.loading = make(map[int64]bool)
 	g.retryLoad = make(map[int64]time.Time)
 	g.incidentEpoch = now
+	g.scopeEpoch = nextScopeEpoch
+	g.scopeEpochGroupID = current.GroupID
+	// The entry clear above can race with a replay that already passed its
+	// membership check and is waiting for g.mu. Clear again while publishing the
+	// scope boundary so no old-group last-resort/probation hint can survive it.
+	for _, account := range accounts {
+		relayGuardianSchedulingHint(account, false, 0, 0)
+	}
 	g.lastScan = now
 	g.lastNewQuarantine = time.Time{}
 	g.lastShadowQuarantine = time.Time{}
@@ -345,6 +510,12 @@ func (g *relayHealthGuardian) relayConfigChanged(previous, current CybRelayConfi
 	g.capacitySamples = nil
 	g.lastSummary = time.Time{}
 	g.lastAudit = time.Time{}
+	g.lastReliabilityQuery = time.Time{}
+	g.reliabilityInFlight = false
+	g.lastReliabilitySuccess = time.Time{}
+	g.lastReliabilityError = time.Time{}
+	g.reliabilityFailureSince = time.Time{}
+	g.reliabilityConsecutiveErrors = 0
 	g.mu.Unlock()
 	if g.cache == nil {
 		return
@@ -362,7 +533,7 @@ func (g *relayHealthGuardian) relayConfigChanged(previous, current CybRelayConfi
 			err := g.cache.DeleteRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, accountID))
 			cancel()
 			if err != nil {
-				record := relayGuardianRuntimeRecord{Mode: g.store.GetRelayGuardianMode(), ScopeGroupID: groupID, State: RelayGuardianHealthy, Generation: 1, UpdatedAt: now}
+				record := relayGuardianRuntimeRecord{SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: g.store.GetRelayGuardianMode(), ScopeGroupID: groupID, ScopeEpoch: g.scopeEpoch, State: RelayGuardianHealthy, Generation: 1, UpdatedAt: now}
 				payload, marshalErr := json.Marshal(record)
 				if marshalErr == nil {
 					ctx, cancel = relayGuardianCacheContext()
@@ -383,8 +554,10 @@ func (g *relayHealthGuardian) resetForModeLocked(state *relayGuardianAccountStat
 	if state == nil {
 		return
 	}
+	state.SchemaVersion = relayGuardianRuntimeSchemaVersion
 	state.Mode = mode
 	state.ScopeGroupID = g.store.GetCybRelayConfig().GroupID
+	state.ScopeEpoch = g.scopeEpoch
 	state.State = RelayGuardianHealthy
 	state.Generation++
 	state.Reason = "mode_transition"
@@ -408,6 +581,17 @@ func (g *relayHealthGuardian) resetForModeLocked(state *relayGuardianAccountStat
 	state.SeenStrong = make(map[string]time.Time)
 	state.SeenFinal = make(map[string]time.Time)
 	state.LastFailureAt = time.Time{}
+	state.ReliabilityObservedAt = time.Time{}
+	state.ReliabilityTotal = 0
+	state.ReliabilityFailures = 0
+	state.ReliabilityWindowSeconds = 0
+	state.FailureRatePercent = 0
+	state.FailureRateLowerBoundPercent = 0
+	state.ReliabilityLatestFailureRowID = 0
+	state.WeakCandidateTrigger = ""
+	state.WeakCandidateLatestFailureRowID = 0
+	state.WeakCandidateSince = time.Time{}
+	state.WeakConfirmationCount = 0
 	state.LastActionAt = now
 	state.halfOpenInFlight = false
 	state.halfOpenLeaseID = 0
@@ -426,7 +610,7 @@ func (g *relayHealthGuardian) nowTime() time.Time {
 func (g *relayHealthGuardian) stateLocked(accountID int64) *relayGuardianAccountState {
 	state := g.states[accountID]
 	if state == nil {
-		state = &relayGuardianAccountState{relayGuardianRuntimeRecord: relayGuardianRuntimeRecord{State: RelayGuardianHealthy, Generation: 1}, permits: make(map[uint64]RelayGuardianPermit)}
+		state = &relayGuardianAccountState{relayGuardianRuntimeRecord: relayGuardianRuntimeRecord{SchemaVersion: relayGuardianRuntimeSchemaVersion, Mode: g.store.GetRelayGuardianMode(), ScopeGroupID: g.store.GetCybRelayConfig().GroupID, ScopeEpoch: g.scopeEpoch, State: RelayGuardianHealthy, Generation: 1}, permits: make(map[uint64]RelayGuardianPermit)}
 		g.states[accountID] = state
 	}
 	if state.State == "" {
@@ -434,6 +618,9 @@ func (g *relayHealthGuardian) stateLocked(accountID int64) *relayGuardianAccount
 	}
 	if state.Generation == 0 {
 		state.Generation = 1
+	}
+	if state.SchemaVersion == 0 {
+		state.SchemaVersion = relayGuardianRuntimeSchemaVersion
 	}
 	if state.Mode == "" {
 		state.Mode = g.store.GetRelayGuardianMode()
@@ -525,6 +712,9 @@ func (g *relayHealthGuardian) replaySchedulingHint(account *Account) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.replayLockedHook != nil {
+		g.replayLockedHook()
+	}
 	if !g.loaded[account.DBID] {
 		relayGuardianSchedulingHint(account, false, 0, 0)
 		return
@@ -556,44 +746,79 @@ func (g *relayHealthGuardian) forgetAccountRuntime(account *Account, groupID int
 	defer g.persistMu.Unlock()
 	now := g.nowTime()
 	g.mu.Lock()
+	oldRevision := uint64(0)
+	if state := g.states[account.DBID]; state != nil {
+		oldRevision = state.revision
+	}
 	delete(g.states, account.DBID)
 	delete(g.loaded, account.DBID)
 	delete(g.loading, account.DBID)
 	delete(g.retryLoad, account.DBID)
+	// A replay may have passed its membership check before the entry clear and
+	// then waited for g.mu. Clearing inside the state-deletion boundary makes
+	// the leave authoritative regardless of that ordering.
+	relayGuardianSchedulingHint(account, false, 0, 0)
 	// Do not let the fallback scanner replay rows from the membership that
 	// just ended if the account is immediately added back.
 	g.incidentEpoch = now
 	g.lastScan = now
 	g.mu.Unlock()
-	if g.cache == nil || groupID <= 0 {
-		return
-	}
-	ctx, cancel := relayGuardianCacheContext()
-	err := g.cache.DeleteRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, account.DBID))
-	cancel()
-	if err == nil {
-		return
-	}
-	// A failed delete must not leave a known-bad quarantine/probation record
-	// behind. Best-effort overwrite it with an explicit healthy tombstone.
-	record := relayGuardianRuntimeRecord{
-		Mode:         g.store.GetRelayGuardianMode(),
-		ScopeGroupID: groupID,
-		State:        RelayGuardianHealthy,
-		Generation:   1,
-		UpdatedAt:    now,
-	}
-	payload, marshalErr := json.Marshal(record)
-	if marshalErr == nil {
-		ctx, cancel = relayGuardianCacheContext()
-		setErr := g.cache.SetRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, account.DBID), payload, relayGuardianRuntimeTTL)
+	cacheFenced := g.cache == nil || groupID <= 0
+	var err error
+	if !cacheFenced {
+		ctx, cancel := relayGuardianCacheContext()
+		err = g.cache.DeleteRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, account.DBID))
 		cancel()
-		if setErr == nil {
-			return
+		if err == nil {
+			cacheFenced = true
+		} else {
+			// A failed delete must not leave a known-bad quarantine/probation
+			// record behind. Best-effort overwrite it with a healthy tombstone.
+			record := relayGuardianRuntimeRecord{
+				SchemaVersion: relayGuardianRuntimeSchemaVersion,
+				Mode:          g.store.GetRelayGuardianMode(),
+				ScopeGroupID:  groupID,
+				ScopeEpoch:    g.scopeEpoch,
+				State:         RelayGuardianHealthy,
+				Generation:    1,
+				UpdatedAt:     now,
+			}
+			payload, marshalErr := json.Marshal(record)
+			if marshalErr == nil {
+				ctx, cancel = relayGuardianCacheContext()
+				setErr := g.cache.SetRuntime(ctx, relayGuardianRuntimeNamespace, relayGuardianRuntimeKey(groupID, account.DBID), payload, relayGuardianRuntimeTTL)
+				cancel()
+				if setErr == nil {
+					cacheFenced = true
+				} else {
+					err = fmt.Errorf("delete failed: %v; healthy overwrite failed: %w", err, setErr)
+				}
+			}
 		}
-		err = fmt.Errorf("delete failed: %v; healthy overwrite failed: %w", err, setErr)
 	}
-	log.Printf("[Relay guardian account=%d] invalidate removed account state failed: %v", account.DBID, err)
+	// Every membership leave needs an in-process tombstone. A successful cache
+	// delete is not enough: an immediate rejoin can create revision 1 while an
+	// old revision-1 persist is still queued on persistMu.
+	g.mu.Lock()
+	state := g.stateLocked(account.DBID)
+	g.resetForModeLocked(state, g.store.GetRelayGuardianMode(), now)
+	state.Reason = "membership_transition"
+	relayGuardianSchedulingHint(account, false, 0, 0)
+	// Revisions from the membership that just ended may still be queued on
+	// persistMu. Never recycle their numbers: otherwise an old asynchronous
+	// persist can pass the equality fence after this fresh state is materialized
+	// and recreate the quarantine we just invalidated.
+	state.revision = oldRevision + 1
+	if state.revision == 0 {
+		state.revision = 1
+	}
+	g.loaded[account.DBID] = true
+	delete(g.loading, account.DBID)
+	delete(g.retryLoad, account.DBID)
+	g.mu.Unlock()
+	if !cacheFenced {
+		log.Printf("[Relay guardian account=%d] invalidate removed account state failed: %v", account.DBID, err)
+	}
 }
 
 func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
@@ -605,6 +830,10 @@ func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
 	now := g.nowTime()
 	groupID := g.store.GetCybRelayConfig().GroupID
 	g.mu.Lock()
+	if g.scopeEpochGroupID != groupID {
+		g.scopeEpoch = newRelayGuardianScopeEpoch()
+		g.scopeEpochGroupID = groupID
+	}
 	if g.loaded[accountID] || g.loading[accountID] || g.retryLoad[accountID].After(now) {
 		g.mu.Unlock()
 		return
@@ -644,7 +873,8 @@ func (g *relayHealthGuardian) ensureLoaded(accountID int64) {
 	state := g.stateLocked(accountID)
 	state.relayGuardianRuntimeRecord = record
 	currentMode := g.store.GetRelayGuardianMode()
-	if state.Mode != currentMode || state.ScopeGroupID != groupID {
+	if state.SchemaVersion != relayGuardianRuntimeSchemaVersion || state.Mode != currentMode || state.ScopeGroupID != groupID ||
+		state.ScopeEpoch == "" || state.ScopeEpoch != g.scopeEpoch {
 		g.resetForModeLocked(state, currentMode, now)
 		relayGuardianSchedulingHint(account, false, 0, 0)
 		g.incidentEpoch = now
@@ -677,12 +907,12 @@ func (g *relayHealthGuardian) persist(accountID int64, revision uint64, record r
 	defer g.persistMu.Unlock()
 	g.mu.Lock()
 	state := g.states[accountID]
-	current := state != nil && state.revision == revision
+	current := state != nil && state.revision == revision && record.ScopeEpoch != "" && record.ScopeEpoch == g.scopeEpoch
 	g.mu.Unlock()
 	if !current {
 		return
 	}
-	if record.ScopeGroupID <= 0 || record.ScopeGroupID != g.store.GetCybRelayConfig().GroupID {
+	if record.Mode != g.store.GetRelayGuardianMode() || record.ScopeGroupID <= 0 || record.ScopeGroupID != g.store.GetCybRelayConfig().GroupID {
 		return
 	}
 	payload, err := json.Marshal(record)
@@ -701,9 +931,11 @@ func (g *relayHealthGuardian) persistState(accountID int64, state *relayGuardian
 		return
 	}
 	state.revision++
+	state.SchemaVersion = relayGuardianRuntimeSchemaVersion
 	state.UpdatedAt = g.nowTime()
 	state.Mode = g.store.GetRelayGuardianMode()
 	state.ScopeGroupID = g.store.GetCybRelayConfig().GroupID
+	state.ScopeEpoch = g.scopeEpoch
 	revision := state.revision
 	record := cloneRelayGuardianRuntimeRecord(state.relayGuardianRuntimeRecord)
 	go g.persist(accountID, revision, record)
@@ -784,7 +1016,12 @@ func (g *relayHealthGuardian) observe(obs RelayGuardianObservation) {
 	if obs.RouteClass != "cyb_relay" || obs.RouteGroupID != cfg.GroupID || !strings.EqualFold(obs.UpstreamAccountType, UpstreamOpenAIResponses) {
 		return
 	}
-	if !relayGuardianAttributable(obs) {
+	strong := IsRelayStrongGatewayFailureStatus(obs.StatusCode)
+	weakAttributable := relayGuardianAttributable(obs)
+	// Transport status is authoritative for the fast breaker. A misleading
+	// upstream error string (for example one containing "client") must never
+	// suppress a real 502/504-class gateway failure.
+	if !strong && !weakAttributable {
 		return
 	}
 	observedAt := obs.ObservedAt
@@ -792,8 +1029,7 @@ func (g *relayHealthGuardian) observe(obs RelayGuardianObservation) {
 		observedAt = g.nowTime()
 	}
 	now := g.nowTime()
-	strong := IsRelayStrongGatewayFailureStatus(obs.StatusCode)
-	userVisible := !obs.AttemptOnly && !strings.EqualFold(strings.TrimSpace(obs.RouteSource), "probe")
+	userVisible := weakAttributable && !strong && !obs.AttemptOnly && !strings.EqualFold(strings.TrimSpace(obs.RouteSource), "probe")
 	if !strong && !userVisible {
 		return
 	}
@@ -835,9 +1071,11 @@ func (g *relayHealthGuardian) observe(obs RelayGuardianObservation) {
 		return
 	}
 	state.LastFailureAt = observedAt
-	state.Reason = "upstream_http_" + strconv.Itoa(obs.StatusCode)
 	trigger, window, finals, gateways := g.triggerLocked(state, now)
 	if trigger == "" {
+		if state.State != RelayGuardianWouldQuarantine && state.ShadowAction == "" && !state.LastResort {
+			state.Reason = "upstream_http_" + strconv.Itoa(obs.StatusCode)
+		}
 		if state.State == RelayGuardianHealthy {
 			state.State = RelayGuardianSuspect
 		}
@@ -861,19 +1099,158 @@ func (g *relayHealthGuardian) triggerLocked(state *relayGuardianAccountState, no
 		}
 		return len(seen)
 	}
-	final10 := count(10*time.Minute, true, false)
 	strong5 := count(5*time.Minute, false, true)
-	final60 := count(60*time.Minute, true, false)
-	switch {
-	case final10 >= 2:
-		return "user_visible_2_in_10m", 10 * time.Minute, final10, strong5
-	case strong5 >= 3:
-		return "strong_gateway_3_in_5m", 5 * time.Minute, final10, strong5
-	case final60 >= 4:
-		return "user_visible_4_in_60m", 60 * time.Minute, final60, strong5
-	default:
-		return "", 0, final10, strong5
+	final5 := count(5*time.Minute, true, false)
+	if strong5 >= 3 {
+		return "strong_gateway_3_in_5m", 5 * time.Minute, final5, strong5
 	}
+	return "", 0, final5, strong5
+}
+
+func relayGuardianWilsonLowerBound(failures, total int) float64 {
+	if failures <= 0 || total <= 0 || failures > total {
+		return 0
+	}
+	z := 1.959963984540054
+	n := float64(total)
+	p := float64(failures) / n
+	z2 := z * z
+	return (p + z2/(2*n) - z*math.Sqrt((p*(1-p)+z2/(4*n))/n)) / (1 + z2/n)
+}
+
+func relayGuardianWeakReliabilityDecision(snapshot relayGuardianReliabilitySnapshot) relayGuardianWeakDecision {
+	decision := func(trigger string, window time.Duration, total, failures int, latest int64, catastrophic bool) relayGuardianWeakDecision {
+		rate := 0.0
+		if total > 0 {
+			rate = float64(failures) / float64(total)
+		}
+		return relayGuardianWeakDecision{Trigger: trigger, Window: window, Total: total, Failures: failures,
+			LatestFailureRowID: latest, Rate: rate, LowerBound: relayGuardianWilsonLowerBound(failures, total), Catastrophic: catastrophic}
+	}
+	rate10 := 0.0
+	if snapshot.Total10m > 0 {
+		rate10 = float64(snapshot.Failures10m) / float64(snapshot.Total10m)
+	}
+	if snapshot.Failures10m >= 10 && rate10 >= 0.20 {
+		return decision("weak_reliability_catastrophic_10m", 10*time.Minute, snapshot.Total10m, snapshot.Failures10m, snapshot.LatestFailureRowID10m, true)
+	}
+	if snapshot.Failures10m >= 2 && relayGuardianWilsonLowerBound(snapshot.Failures10m, snapshot.Total10m) > 0.01 {
+		return decision("weak_reliability_10m", 10*time.Minute, snapshot.Total10m, snapshot.Failures10m, snapshot.LatestFailureRowID10m, false)
+	}
+	if snapshot.Failures60m >= 4 && snapshot.Failures10m > 0 && relayGuardianWilsonLowerBound(snapshot.Failures60m, snapshot.Total60m) > 0.01 {
+		return decision("weak_reliability_60m", 60*time.Minute, snapshot.Total60m, snapshot.Failures60m, snapshot.LatestFailureRowID60m, false)
+	}
+	return relayGuardianWeakDecision{}
+}
+
+func (g *relayHealthGuardian) resetWeakCandidateLocked(state *relayGuardianAccountState) {
+	if state == nil {
+		return
+	}
+	state.WeakCandidateTrigger = ""
+	state.WeakCandidateLatestFailureRowID = 0
+	state.WeakCandidateSince = time.Time{}
+	state.WeakConfirmationCount = 0
+}
+
+func (g *relayHealthGuardian) applyReliabilityLocked(account *Account, state *relayGuardianAccountState, accounts []*Account,
+	capacity []relayGuardianCapacityAccount, snapshot relayGuardianReliabilitySnapshot, now time.Time) bool {
+	if state == nil || snapshot.ObservedAt.IsZero() || snapshot.ObservedAt.Before(g.incidentEpoch) ||
+		now.Sub(snapshot.ObservedAt) > 2*RelayGuardianScanInterval || snapshot.ObservedAt.After(now.Add(RelayGuardianScanInterval)) {
+		return false
+	}
+	decision := relayGuardianWeakReliabilityDecision(snapshot)
+	state.ReliabilityObservedAt = snapshot.ObservedAt
+	if decision.Trigger == "" {
+		state.ReliabilityTotal = snapshot.Total10m
+		state.ReliabilityFailures = snapshot.Failures10m
+		state.ReliabilityWindowSeconds = int((10 * time.Minute) / time.Second)
+		state.FailureRatePercent = 0
+		if snapshot.Total10m > 0 {
+			state.FailureRatePercent = 100 * float64(snapshot.Failures10m) / float64(snapshot.Total10m)
+		}
+		state.FailureRateLowerBoundPercent = 100 * relayGuardianWilsonLowerBound(snapshot.Failures10m, snapshot.Total10m)
+		state.ReliabilityLatestFailureRowID = snapshot.LatestFailureRowID10m
+		hadCandidate := state.WeakConfirmationCount > 0 || state.WeakCandidateTrigger != ""
+		g.resetWeakCandidateLocked(state)
+		clearWeakExplanation := !state.LastResort && (hadCandidate || strings.HasPrefix(state.TriggerSource, "weak_reliability_"))
+		if clearWeakExplanation {
+			state.TriggerSource = ""
+			state.WindowSeconds = 0
+			state.Reason = "weak_reliability_below_threshold"
+		}
+		return false
+	}
+	state.ReliabilityTotal = decision.Total
+	state.ReliabilityFailures = decision.Failures
+	state.ReliabilityWindowSeconds = int(decision.Window / time.Second)
+	state.FailureRatePercent = 100 * decision.Rate
+	state.FailureRateLowerBoundPercent = 100 * decision.LowerBound
+	state.ReliabilityLatestFailureRowID = decision.LatestFailureRowID
+	if decision.Catastrophic {
+		g.resetWeakCandidateLocked(state)
+		g.applyTriggerLocked(account, state, accounts, capacity, decision.Trigger, decision.Window, decision.Failures, 0, now)
+		return true
+	}
+	// Do not demote a still-active strong action merely because the DB also has
+	// weak evidence. The handoff to weak confirmation starts only after the hot
+	// 5-minute trigger has actually expired.
+	oldNonWeakAction := (state.State == RelayGuardianWouldQuarantine || state.ShadowAction != "" || state.LastResort) &&
+		!strings.HasPrefix(state.TriggerSource, "weak_reliability_")
+	if oldNonWeakAction {
+		if activeTrigger, _, _, _ := g.triggerLocked(state, now); activeTrigger != "" {
+			g.resetWeakCandidateLocked(state)
+			return true
+		}
+	}
+	state.WindowSeconds = int(decision.Window / time.Second)
+	// A pending weak candidate is only valid across adjacent successful scans.
+	// Never let a stale 1/2 survive a scheduler pause, a missed reconcile or a
+	// database outage and turn one fresh failure into a confirmed incident.
+	if state.WeakConfirmationCount > 0 && state.WeakConfirmationCount < relayGuardianWeakConfirmations &&
+		(state.WeakCandidateSince.IsZero() || now.Before(state.WeakCandidateSince) || now.Sub(state.WeakCandidateSince) > 2*RelayGuardianScanInterval) {
+		g.resetWeakCandidateLocked(state)
+	}
+	// A confirmed weak incident remains confirmed when the statistically best
+	// window changes between 10m and 60m. Re-run the action/capacity decision
+	// immediately instead of creating a second confirmation cycle.
+	confirmedWeak := state.WeakConfirmationCount >= relayGuardianWeakConfirmations && strings.HasPrefix(state.WeakCandidateTrigger, "weak_reliability_")
+	if confirmedWeak {
+		state.WeakCandidateTrigger = decision.Trigger
+		state.WeakCandidateLatestFailureRowID = decision.LatestFailureRowID
+		g.applyTriggerLocked(account, state, accounts, capacity, decision.Trigger, decision.Window, decision.Failures, 0, now)
+		return true
+	}
+	// Monitor conclusions are reversible shadows. Once their strong/pool signal
+	// has expired, a current weak signal must be allowed to start its own two-scan
+	// confirmation instead of inheriting the old would-quarantine action.
+	if g.store.GetRelayGuardianMode() == RelayGuardianMonitor && (state.State == RelayGuardianWouldQuarantine || state.ShadowAction != "") {
+		state.State = RelayGuardianSuspect
+		state.ShadowAction = ""
+	}
+	if state.WeakCandidateTrigger != decision.Trigger || state.WeakConfirmationCount == 0 {
+		state.WeakCandidateTrigger = decision.Trigger
+		state.WeakCandidateLatestFailureRowID = decision.LatestFailureRowID
+		state.WeakCandidateSince = now
+		state.WeakConfirmationCount = 1
+		state.State = RelayGuardianSuspect
+		state.Reason = "weak_reliability_confirming"
+		state.TriggerSource = decision.Trigger
+		g.persistState(account.DBID, state)
+		return true
+	}
+	if now.Sub(state.WeakCandidateSince) >= RelayGuardianScanInterval && decision.LatestFailureRowID > state.WeakCandidateLatestFailureRowID {
+		state.WeakCandidateLatestFailureRowID = decision.LatestFailureRowID
+		if state.WeakConfirmationCount < relayGuardianWeakConfirmations {
+			state.WeakConfirmationCount++
+		}
+	}
+	if state.WeakConfirmationCount < relayGuardianWeakConfirmations {
+		g.persistState(account.DBID, state)
+		return true
+	}
+	g.applyTriggerLocked(account, state, accounts, capacity, decision.Trigger, decision.Window, decision.Failures, 0, now)
+	return true
 }
 
 func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID int64, trigger string, triggerWindow time.Duration, now time.Time) bool {
@@ -945,7 +1322,7 @@ func (g *relayHealthGuardian) poolGuardLocked(accounts []*Account, candidateID i
 
 func relayGuardianTriggerCategory(trigger string) string {
 	switch {
-	case strings.HasPrefix(trigger, "user_visible_"):
+	case strings.HasPrefix(trigger, "user_visible_"), strings.HasPrefix(trigger, "weak_reliability_"):
 		return "user_visible"
 	case strings.HasPrefix(trigger, "strong_gateway_"):
 		return "strong_gateway"
@@ -1213,7 +1590,10 @@ func (g *relayHealthGuardian) applyTriggerLocked(account *Account, state *relayG
 			g.lastShadowQuarantine = now
 			g.lastShadowQuarantineAccountID = account.DBID
 		}
-		changed := state.State != RelayGuardianWouldQuarantine || previousAction != shadowAction || state.Reason != shadowReason
+		// Reason may legitimately vary as capacity warms or pool evidence ages.
+		// The operator-visible shadow conclusion is the action; do not turn a
+		// reason-only refresh into a new generation and duplicate event.
+		changed := state.State != RelayGuardianWouldQuarantine || previousAction != shadowAction
 		state.ShadowAction = shadowAction
 		state.Reason = shadowReason
 		if changed {
@@ -1337,8 +1717,12 @@ func (g *relayHealthGuardian) quarantineLocked(account *Account, state *relayGua
 	state.permits = make(map[uint64]RelayGuardianPermit)
 	relayGuardianSchedulingHint(account, false, 0, 0)
 	g.lastNewQuarantine = now
-	g.persistState(account.DBID, state)
+	// The quarantine event must retain the confirmation evidence that caused
+	// this transition. Clear the candidate only after the event value has been
+	// assembled so no 2/2 fence can leak into recovery or the next incident.
 	g.recordEventLocked(account, RelayGuardianEventQuarantine, from, state, "guardian", trigger, window, finals, gateways, duration)
+	g.resetWeakCandidateLocked(state)
+	g.persistState(account.DBID, state)
 	log.Printf("[Relay guardian account=%d] quarantined for %s trigger=%s generation=%d", account.DBID, duration, trigger, state.Generation)
 }
 
@@ -1370,6 +1754,13 @@ func (g *relayHealthGuardian) recordEventLocked(account *Account, eventType stri
 		seen[f.LogicalRequestID] = struct{}{}
 		logical = append(logical, f.LogicalRequestID)
 	}
+	failureCount := len(logical)
+	if finals > failureCount {
+		failureCount = finals
+	}
+	if gateways > failureCount {
+		failureCount = gateways
+	}
 	if len(logical) > 20 {
 		logical = logical[len(logical)-20:]
 	}
@@ -1381,10 +1772,15 @@ func (g *relayHealthGuardian) recordEventLocked(account *Account, eventType stri
 		CreatedAt: eventTime, AccountID: account.DBID, AccountName: account.DisplayName(), EventType: eventType,
 		FromState: string(from), ToState: string(state.State), Actor: actor,
 		Reason: state.Reason, TriggerSource: trigger, WindowSeconds: int(window / time.Second),
-		FailureCount: len(logical), UserVisibleFailures: finals, StrongGatewayFailures: gateways,
+		FailureCount: failureCount, UserVisibleFailures: finals, StrongGatewayFailures: gateways,
 		QuarantineSeconds: int(quarantine / time.Second), Generation: state.Generation,
 		LogicalRequestIDs: logical,
-		Details:           map[string]any{"mode": g.store.GetRelayGuardianMode(), "probation_percent": state.ProbationPercent, "shadow_action": state.ShadowAction, "quarantine_until": state.QuarantineUntil, "event_time": eventTime, "window_id": windowID},
+		Details: map[string]any{"mode": g.store.GetRelayGuardianMode(), "probation_percent": state.ProbationPercent,
+			"shadow_action": state.ShadowAction, "quarantine_until": state.QuarantineUntil, "event_time": eventTime, "window_id": windowID,
+			"reliability_total": state.ReliabilityTotal, "reliability_failures": state.ReliabilityFailures,
+			"reliability_window_seconds": state.ReliabilityWindowSeconds, "failure_rate_percent": state.FailureRatePercent,
+			"failure_rate_lower_bound_percent": state.FailureRateLowerBoundPercent,
+			"weak_confirmation_count":          state.WeakConfirmationCount, "weak_confirmation_required": relayGuardianWeakConfirmations},
 	}
 	g.recordEvent(event)
 }
@@ -1427,6 +1823,7 @@ func (g *relayHealthGuardian) advanceTimeLocked(account *Account, state *relayGu
 		}
 		state.Generation++
 		state.LastActionAt = now
+		g.resetWeakCandidateLocked(state)
 		relayGuardianSchedulingHint(account, false, 0, 0)
 		g.persistState(account.DBID, state)
 		g.recordEventLocked(account, RelayGuardianEventBypassExpired, from, state, "system", state.TriggerSource, time.Duration(state.WindowSeconds)*time.Second, 0, 0, 0)
@@ -1439,6 +1836,7 @@ func (g *relayHealthGuardian) advanceTimeLocked(account *Account, state *relayGu
 		state.halfOpenInFlight = false
 		state.halfOpenSuccesses = 0
 		state.LastActionAt = now
+		g.resetWeakCandidateLocked(state)
 		relayGuardianSchedulingHint(account, false, 0, 0)
 		g.persistState(account.DBID, state)
 		g.recordEventLocked(account, RelayGuardianEventHalfOpen, from, state, "system", state.TriggerSource, time.Duration(state.WindowSeconds)*time.Second, 0, 0, 0)
@@ -1639,6 +2037,7 @@ func (g *relayHealthGuardian) finishSuccess(permit RelayGuardianPermit) {
 				state.SeenStrong = make(map[string]time.Time)
 				state.SeenFinal = make(map[string]time.Time)
 				state.permits = make(map[uint64]RelayGuardianPermit)
+				g.resetWeakCandidateLocked(state)
 				relayGuardianSchedulingHint(account, false, 0, 0)
 				g.recordEventLocked(account, RelayGuardianEventRecovered, from, state, "system", "probation_complete", 0, 0, 0, 0)
 			}
@@ -1686,6 +2085,7 @@ func (g *relayHealthGuardian) ageStateLocked(account *Account, state *relayGuard
 		return
 	}
 	if len(state.Failures) > 0 {
+		clearedAction := state.State == RelayGuardianWouldQuarantine || state.ShadowAction != ""
 		state.ShadowAction = ""
 		state.HealthySince = time.Time{}
 		if state.State == RelayGuardianHealthy || state.State == RelayGuardianWouldQuarantine {
@@ -1694,6 +2094,9 @@ func (g *relayHealthGuardian) ageStateLocked(account *Account, state *relayGuard
 		if !state.LastResort {
 			state.TriggerSource = ""
 			state.WindowSeconds = 0
+			if clearedAction {
+				state.Reason = "recent_failure_observed"
+			}
 		}
 		return
 	}
@@ -1705,6 +2108,7 @@ func (g *relayHealthGuardian) ageStateLocked(account *Account, state *relayGuard
 	state.LastResortCap = 0
 	state.LastResortFailureID = ""
 	state.ShadowAction = ""
+	g.resetWeakCandidateLocked(state)
 	if state.HealthySince.IsZero() {
 		state.HealthySince = now
 	}
@@ -1742,6 +2146,44 @@ func (g *relayHealthGuardian) summaryDetailsLocked(accounts []*Account, now time
 	return map[string]any{"counts": counts, "window_id": now.UTC().Truncate(5*time.Minute).Format(time.RFC3339) + "/5m"}
 }
 
+func (g *relayHealthGuardian) loadReliability(ctx context.Context, groupID int64, incidentEpoch, now time.Time) (map[int64]relayGuardianReliabilitySnapshot, error) {
+	if g == nil || g.db == nil || groupID <= 0 {
+		return nil, nil
+	}
+	// Leave a two-minute maturity gap so a retry/fallback chain has time to
+	// append its terminal row before weak reliability evaluates it. The strong
+	// gateway breaker remains entirely on the real-time observation path.
+	matureEnd := now.Add(-2 * time.Minute)
+	if !matureEnd.After(incidentEpoch) {
+		return map[int64]relayGuardianReliabilitySnapshot{}, nil
+	}
+	start := matureEnd.Add(-60 * time.Minute)
+	if start.Before(incidentEpoch) {
+		start = incidentEpoch
+	}
+	if !matureEnd.After(start) {
+		return map[int64]relayGuardianReliabilitySnapshot{}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, relayGuardianDBTimeout)
+	defer cancel()
+	rows, err := g.db.ListRelayGuardianReliability(queryCtx, groupID, start, matureEnd.Add(-10*time.Minute), matureEnd, now)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[int64]relayGuardianReliabilitySnapshot, len(rows))
+	for _, row := range rows {
+		result[row.AccountID] = relayGuardianReliabilitySnapshot{
+			AccountID: row.AccountID, ObservedAt: now,
+			Total10m: row.Total10m, Failures10m: row.Failures10m, LatestFailureRowID10m: row.LatestFailureRowID10m,
+			Total60m: row.Total60m, Failures60m: row.Failures60m, LatestFailureRowID60m: row.LatestFailureRowID60m,
+		}
+	}
+	return result, nil
+}
+
 func (g *relayHealthGuardian) reconcile(ctx context.Context) {
 	if g == nil {
 		return
@@ -1749,6 +2191,50 @@ func (g *relayHealthGuardian) reconcile(ctx context.Context) {
 	now := g.nowTime()
 	mode := g.store.GetRelayGuardianMode()
 	groupID := g.store.GetCybRelayConfig().GroupID
+	g.mu.Lock()
+	epochForReliability := g.incidentEpoch
+	queryReliability := g.db != nil && mode != RelayGuardianOff && !g.reliabilityInFlight &&
+		(g.lastReliabilityQuery.IsZero() || now.Sub(g.lastReliabilityQuery) >= RelayGuardianScanInterval)
+	if queryReliability {
+		g.reliabilityInFlight = true
+		g.lastReliabilityQuery = now
+	}
+	g.mu.Unlock()
+	var reliability map[int64]relayGuardianReliabilitySnapshot
+	reliabilityOK := false
+	if queryReliability {
+		var reliabilityErr error
+		reliability, reliabilityErr = g.loadReliability(ctx, groupID, epochForReliability, now)
+		g.mu.Lock()
+		scopeMatches := g.incidentEpoch.Equal(epochForReliability) && g.store.GetRelayGuardianMode() == mode && g.store.GetCybRelayConfig().GroupID == groupID
+		g.reliabilityInFlight = false
+		if scopeMatches && reliabilityErr != nil {
+			if g.reliabilityConsecutiveErrors == 0 {
+				g.reliabilityFailureSince = now
+			}
+			g.reliabilityConsecutiveErrors++
+			g.lastReliabilityError = now
+			// Two confirmations must come from adjacent successful DB scans. A
+			// query gap invalidates every pending 1/2 candidate, while already
+			// confirmed actions remain untouched.
+			for accountID, state := range g.states {
+				if state != nil && state.WeakConfirmationCount > 0 && state.WeakConfirmationCount < relayGuardianWeakConfirmations {
+					g.resetWeakCandidateLocked(state)
+					g.persistState(accountID, state)
+				}
+			}
+		} else if scopeMatches {
+			g.reliabilityConsecutiveErrors = 0
+			g.reliabilityFailureSince = time.Time{}
+			g.lastReliabilitySuccess = now
+		}
+		g.mu.Unlock()
+		if reliabilityErr != nil {
+			log.Printf("Relay guardian reliability aggregation failed; weak quarantine suppressed: %v", reliabilityErr)
+		} else if scopeMatches {
+			reliabilityOK = true
+		}
+	}
 	allAccounts := g.store.Accounts()
 	allByID := make(map[int64]*Account, len(allAccounts))
 	for _, account := range allAccounts {
@@ -1790,6 +2276,9 @@ func (g *relayHealthGuardian) reconcile(ctx context.Context) {
 		g.trimLocked(state, now)
 		g.advanceTimeLocked(account, state, now)
 		if !relayGuardianManualEnabled(account) {
+			if state.WeakConfirmationCount > 0 && state.WeakConfirmationCount < relayGuardianWeakConfirmations {
+				g.resetWeakCandidateLocked(state)
+			}
 			relayGuardianSchedulingHint(account, false, 0, 0)
 			g.ageStateLocked(account, state, now)
 			g.persistState(account.DBID, state)
@@ -1799,18 +2288,43 @@ func (g *relayHealthGuardian) reconcile(ctx context.Context) {
 		// zero-valued Account hint. Re-derive it every reconcile from the
 		// authoritative in-memory state before making further transitions.
 		relayGuardianApplySchedulingHint(account, state)
-		if mode == RelayGuardianEnforce && state.State != RelayGuardianQuarantined && state.State != RelayGuardianHalfOpen && state.State != RelayGuardianProbation && state.State != RelayGuardianTemporaryBypass {
+		eligibleForTrigger := state.State != RelayGuardianQuarantined && state.State != RelayGuardianHalfOpen && state.State != RelayGuardianProbation && state.State != RelayGuardianTemporaryBypass
+		if mode != RelayGuardianOff && eligibleForTrigger {
 			trigger, window, finals, gateways := g.triggerLocked(state, now)
 			if trigger != "" {
 				g.applyTriggerLocked(account, state, accounts, capacity, trigger, window, finals, gateways, now)
 				continue
 			}
+			if reliabilityOK {
+				snapshot := reliability[account.DBID]
+				snapshot.AccountID = account.DBID
+				snapshot.ObservedAt = now
+				if g.applyReliabilityLocked(account, state, accounts, capacity, snapshot, now) {
+					continue
+				}
+			}
 		}
-		if mode == RelayGuardianMonitor {
-			trigger, window, finals, gateways := g.triggerLocked(state, now)
-			if trigger != "" {
-				g.applyTriggerLocked(account, state, accounts, capacity, trigger, window, finals, gateways, now)
-				continue
+		if reliabilityOK && !eligibleForTrigger {
+			// Keep operator-facing reliability metrics current during quarantine
+			// and recovery without allowing the weak path to change those states.
+			snapshot := reliability[account.DBID]
+			snapshot.ObservedAt = now
+			decision := relayGuardianWeakReliabilityDecision(snapshot)
+			state.ReliabilityObservedAt = now
+			if decision.Trigger != "" {
+				state.ReliabilityTotal, state.ReliabilityFailures = decision.Total, decision.Failures
+				state.ReliabilityWindowSeconds = int(decision.Window / time.Second)
+				state.FailureRatePercent, state.FailureRateLowerBoundPercent = 100*decision.Rate, 100*decision.LowerBound
+				state.ReliabilityLatestFailureRowID = decision.LatestFailureRowID
+			} else {
+				state.ReliabilityTotal, state.ReliabilityFailures = snapshot.Total10m, snapshot.Failures10m
+				state.ReliabilityWindowSeconds = int((10 * time.Minute) / time.Second)
+				state.FailureRatePercent = 0
+				if snapshot.Total10m > 0 {
+					state.FailureRatePercent = 100 * float64(snapshot.Failures10m) / float64(snapshot.Total10m)
+				}
+				state.FailureRateLowerBoundPercent = 100 * relayGuardianWilsonLowerBound(snapshot.Failures10m, snapshot.Total10m)
+				state.ReliabilityLatestFailureRowID = snapshot.LatestFailureRowID10m
 			}
 		}
 		g.ageStateLocked(account, state, now)
@@ -1956,6 +2470,7 @@ func (g *relayHealthGuardian) release(accountID int64, generation uint64) error 
 	state.halfOpenSuccesses = 0
 	state.LastActionAt = g.nowTime()
 	state.permits = make(map[uint64]RelayGuardianPermit)
+	g.resetWeakCandidateLocked(state)
 	relayGuardianSchedulingHint(account, false, 0, 0)
 	g.persistState(accountID, state)
 	g.recordEventLocked(account, RelayGuardianEventRelease, from, state, "admin", "manual_release", 0, 0, 0, 0)
@@ -2009,9 +2524,22 @@ func (g *relayHealthGuardian) temporaryBypass(accountID int64, generation uint64
 
 func (g *relayHealthGuardian) status() RelayGuardianStatus {
 	now := g.nowTime()
-	result := RelayGuardianStatus{Enabled: g.store.GetRelayGuardianMode() != RelayGuardianOff, Mode: g.store.GetRelayGuardianMode(), GeneratedAt: now, ScanIntervalSeconds: int(RelayGuardianScanInterval / time.Second)}
+	result := RelayGuardianStatus{Enabled: g.store.GetRelayGuardianMode() != RelayGuardianOff, Mode: g.store.GetRelayGuardianMode(), GeneratedAt: now, ScanIntervalSeconds: int(RelayGuardianScanInterval / time.Second), ReliabilityQueryStatus: "pending"}
 	g.mu.Lock()
 	result.HeartbeatAt = relayGuardianTimePtr(g.heartbeat)
+	result.ReliabilityConsecutiveErrors = g.reliabilityConsecutiveErrors
+	result.ReliabilityLastSuccessAt = relayGuardianTimePtr(g.lastReliabilitySuccess)
+	result.ReliabilityLastErrorAt = relayGuardianTimePtr(g.lastReliabilityError)
+	if !result.Enabled {
+		result.ReliabilityQueryStatus = "disabled"
+	} else if g.reliabilityConsecutiveErrors > 0 {
+		result.ReliabilityQueryStatus = "retrying"
+		if g.reliabilityConsecutiveErrors >= 3 || (!g.reliabilityFailureSince.IsZero() && now.Sub(g.reliabilityFailureSince) >= 3*RelayGuardianScanInterval) {
+			result.ReliabilityQueryStatus = "degraded"
+		}
+	} else if !g.lastReliabilitySuccess.IsZero() {
+		result.ReliabilityQueryStatus = "ok"
+	}
 	g.mu.Unlock()
 	for _, account := range g.store.configuredRelayGuardianAccounts() {
 		g.ensureLoaded(account.DBID)
@@ -2022,7 +2550,7 @@ func (g *relayHealthGuardian) status() RelayGuardianStatus {
 			if !manual {
 				displayState = RelayGuardianManualDisabled
 			}
-			snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: account.DisplayName(), ManualEnabled: manual, State: displayState, EffectiveSchedulable: manual && account.IsAvailable() && g.store.GetRelayGuardianMode() != RelayGuardianEnforce, Reason: "runtime_state_unavailable", ProbationRequiredSuccesses: relayGuardianProbationSuccesses}
+			snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: account.DisplayName(), ManualEnabled: manual, State: displayState, EffectiveSchedulable: manual && account.IsAvailable() && g.store.GetRelayGuardianMode() != RelayGuardianEnforce, Reason: "runtime_state_unavailable", ProbationRequiredSuccesses: relayGuardianProbationSuccesses, WeakConfirmationRequired: relayGuardianWeakConfirmations}
 			g.mu.Unlock()
 			result.Accounts = append(result.Accounts, g.decorateCircuitSnapshot(snapshot, now))
 			continue
@@ -2032,13 +2560,25 @@ func (g *relayHealthGuardian) status() RelayGuardianStatus {
 		failureIDs := make(map[string]struct{})
 		finalIDs := make(map[string]struct{})
 		strongIDs := make(map[string]struct{})
+		countWindow := 60 * time.Minute
+		if state.WindowSeconds > 0 {
+			countWindow = time.Duration(state.WindowSeconds) * time.Second
+			if countWindow > 60*time.Minute {
+				countWindow = 60 * time.Minute
+			}
+		}
+		countCutoff := now.Add(-countWindow)
+		strongCutoff := now.Add(-5 * time.Minute)
 		for _, f := range state.Failures {
+			if f.StrongGateway && !f.At.Before(strongCutoff) {
+				strongIDs[f.LogicalRequestID] = struct{}{}
+			}
+			if f.At.Before(countCutoff) {
+				continue
+			}
 			failureIDs[f.LogicalRequestID] = struct{}{}
 			if f.UserVisible {
 				finalIDs[f.LogicalRequestID] = struct{}{}
-			}
-			if f.StrongGateway {
-				strongIDs[f.LogicalRequestID] = struct{}{}
 			}
 		}
 		manual := relayGuardianManualEnabled(account)
@@ -2047,7 +2587,7 @@ func (g *relayHealthGuardian) status() RelayGuardianStatus {
 			displayState = RelayGuardianManualDisabled
 		}
 		effective := manual && account.IsAvailable() && displayState != RelayGuardianQuarantined && (displayState != RelayGuardianHalfOpen || !state.halfOpenInFlight)
-		snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: account.DisplayName(), ManualEnabled: manual, State: displayState, EffectiveSchedulable: effective, Reason: state.Reason, TriggerSource: state.TriggerSource, Generation: state.Generation, WindowSeconds: state.WindowSeconds, FailureCount: len(failureIDs), UserVisibleFailures: len(finalIDs), StrongGatewayFailures: len(strongIDs), WouldQuarantine: state.State == RelayGuardianWouldQuarantine, QuarantineUntil: relayGuardianTimePtr(state.QuarantineUntil), BackoffLevel: state.BackoffLevel, LastResort: state.LastResort, LastResortCap: state.LastResortCap, ShadowAction: state.ShadowAction, ProbationPercent: state.ProbationPercent, ProbationSuccesses: state.ProbationSuccesses, ProbationRequiredSuccesses: relayGuardianProbationSuccesses, LastFailureAt: relayGuardianTimePtr(state.LastFailureAt), LastActionAt: relayGuardianTimePtr(state.LastActionAt), LastScanAt: relayGuardianTimePtr(state.LastScanAt)}
+		snapshot := RelayGuardianAccountSnapshot{AccountID: account.DBID, AccountName: account.DisplayName(), ManualEnabled: manual, State: displayState, EffectiveSchedulable: effective, Reason: state.Reason, TriggerSource: state.TriggerSource, Generation: state.Generation, WindowSeconds: state.WindowSeconds, FailureCount: len(failureIDs), UserVisibleFailures: len(finalIDs), StrongGatewayFailures: len(strongIDs), WouldQuarantine: state.State == RelayGuardianWouldQuarantine, QuarantineUntil: relayGuardianTimePtr(state.QuarantineUntil), BackoffLevel: state.BackoffLevel, LastResort: state.LastResort, LastResortCap: state.LastResortCap, ShadowAction: state.ShadowAction, ProbationPercent: state.ProbationPercent, ProbationSuccesses: state.ProbationSuccesses, ProbationRequiredSuccesses: relayGuardianProbationSuccesses, LastFailureAt: relayGuardianTimePtr(state.LastFailureAt), LastActionAt: relayGuardianTimePtr(state.LastActionAt), LastScanAt: relayGuardianTimePtr(state.LastScanAt), ReliabilityTotal: state.ReliabilityTotal, ReliabilityFailures: state.ReliabilityFailures, ReliabilityWindowSeconds: state.ReliabilityWindowSeconds, FailureRatePercent: state.FailureRatePercent, FailureRateLowerBoundPercent: state.FailureRateLowerBoundPercent, WeakConfirmationCount: state.WeakConfirmationCount, WeakConfirmationRequired: relayGuardianWeakConfirmations}
 		g.mu.Unlock()
 		result.Accounts = append(result.Accounts, g.decorateCircuitSnapshot(snapshot, now))
 	}
@@ -2150,11 +2690,11 @@ func (s *Store) SetRelayGuardianMode(mode string) {
 		return
 	}
 	normalized := NormalizeRelayGuardianMode(mode)
-	previous := s.GetRelayGuardianMode()
-	s.relayGuardianMode.Store(string(normalized))
-	if previous != normalized && s.relayGuardian != nil {
-		s.relayGuardian.modeChanged(previous, normalized)
+	if s.relayGuardian == nil {
+		s.relayGuardianMode.Store(string(normalized))
+		return
 	}
+	s.relayGuardian.transitionMode(normalized)
 }
 func (s *Store) GetRelayGuardianMode() RelayGuardianMode {
 	if s == nil {
@@ -2248,10 +2788,14 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 	}
 	guardianStates := make(map[int64]guardianLocal)
 	poolWide := false
+	reliabilityDBDegraded := false
 	if guardian := s.relayGuardianManager(); guardian != nil {
+		reliabilityNow := guardian.nowTime()
 		guardian.mu.Lock()
 		health.HeartbeatAt = relayGuardianTimePtr(guardian.heartbeat)
 		poolWide = guardian.poolWideUntil.After(now)
+		reliabilityDBDegraded = guardian.reliabilityConsecutiveErrors >= 3 ||
+			(!guardian.reliabilityFailureSince.IsZero() && reliabilityNow.Sub(guardian.reliabilityFailureSince) >= 3*RelayGuardianScanInterval)
 		for accountID, loaded := range guardian.loaded {
 			guardianStates[accountID] = guardianLocal{loaded: loaded || guardian.cache == nil, state: RelayGuardianHealthy}
 		}
@@ -2273,6 +2817,9 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 		}
 		if poolWide {
 			addReason("pool_wide_failure")
+		}
+		if reliabilityDBDegraded {
+			addReason("guardian_reliability_db_unavailable")
 		}
 	}
 
@@ -2311,7 +2858,10 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 		if guardianState.state == RelayGuardianProbation {
 			relay.Probation++
 		}
-		if guardianState.state == RelayGuardianSuspect || guardianState.state == RelayGuardianWouldQuarantine || guardianState.lastResort {
+		// A weak failure merely places an account in suspect/candidate state.
+		// It remains schedulable and must not make /health fail (the watchdog is
+		// intentionally strict). Only an actionable Guardian state degrades it.
+		if guardianState.state == RelayGuardianWouldQuarantine || guardianState.state == RelayGuardianQuarantined || guardianState.state == RelayGuardianHalfOpen || guardianState.state == RelayGuardianProbation || guardianState.lastResort {
 			accountDegraded = true
 			addReason("relay_account_degraded")
 		}

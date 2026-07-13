@@ -95,6 +95,21 @@ type relayGuardianActionRequest struct {
 	Minutes    int    `json:"minutes,omitempty"`
 }
 
+// relayGuardianReleaseOps keeps the HTTP contract testable without forging a
+// persisted Guardian state. Production handlers leave the field nil and use
+// the real auth.Store implementation.
+type relayGuardianReleaseOps interface {
+	ReleaseRelayGuardian(accountID int64, generation uint64) error
+	RelayGuardianAccountStatus(accountID int64) (auth.RelayGuardianAccountSnapshot, bool)
+}
+
+func (h *Handler) guardianReleaseOps() relayGuardianReleaseOps {
+	if h.relayGuardianReleaseOps != nil {
+		return h.relayGuardianReleaseOps
+	}
+	return h.store
+}
+
 func relayGuardianActionError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, auth.ErrRelayGuardianNotEnforcing):
@@ -123,11 +138,12 @@ func (h *Handler) ReleaseRelayGuardian(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if err := h.store.ReleaseRelayGuardian(accountID, req.Generation); err != nil {
+	ops := h.guardianReleaseOps()
+	if err := ops.ReleaseRelayGuardian(accountID, req.Generation); err != nil {
 		relayGuardianActionError(c, err)
 		return
 	}
-	status, ok := h.store.RelayGuardianAccountStatus(accountID)
+	status, ok := ops.RelayGuardianAccountStatus(accountID)
 	if !ok {
 		writeError(c, http.StatusNotFound, "Relay 账号不存在")
 		return

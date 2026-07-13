@@ -35,6 +35,124 @@ func TestRelayGuardianUsagePersistsAttemptTerminalAcrossLongRetry(t *testing.T) 
 	}
 }
 
+func TestRelayGuardianReliabilityUsesOnlyFinalUserVisibleLogicalRequests(t *testing.T) {
+	db, err := New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 13, 8, 0, 0, 0, time.UTC)
+	insert := func(at time.Time, accountID int64, logical string, status int, kind, routeSource string, attemptOnly bool) {
+		t.Helper()
+		_, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs (created_at,account_id,logical_request_id,status_code,
+			upstream_error_kind,route_class,route_source,route_group_id,upstream_account_type,guardian_attempt_only)
+			VALUES ($1,$2,$3,$4,$5,'cyb_relay',$6,7,'openai_responses',$7)`,
+			db.timeArg(at), accountID, logical, status, kind, routeSource, attemptOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(now.Add(-9*time.Minute), 50, "retry-success", 502, "server", "direct", true)
+	insert(now.Add(-8*time.Minute), 51, "retry-success", 200, "", "direct", false)
+	insert(now.Add(-7*time.Minute), 51, "visible-500", 500, "server", "direct", false)
+	insert(now.Add(-6*time.Minute), 51, "probe", 500, "server", "probe", false)
+	insert(now.Add(-5*time.Minute), 51, "policy", 500, "content_policy", "direct", false)
+	insert(now.Add(-4*time.Minute), 51, "client-400", 400, "bad_request", "direct", false)
+	insert(now.Add(-3*time.Minute), 51, "strong-502", 502, "server", "direct", false)
+	insert(now.Add(-30*time.Minute), 51, "old-success", 200, "", "direct", false)
+	insert(now.Add(-40*time.Minute), 51, "old-failure", 503, "server", "direct", false)
+
+	rows, err := db.ListRelayGuardianReliability(ctx, 7, now.Add(-time.Hour), now.Add(-10*time.Minute), now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%+v", rows)
+	}
+	got := rows[0]
+	if got.AccountID != 51 || got.Total10m != 2 || got.Failures10m != 1 || got.Total60m != 4 || got.Failures60m != 2 {
+		t.Fatalf("unexpected reliability aggregate: %+v", got)
+	}
+	if got.LatestFailureRowID10m <= 0 || got.LatestFailureRowID60m <= got.LatestFailureRowID10m {
+		t.Fatalf("unexpected latest failure ids: %+v", got)
+	}
+}
+
+func TestRelayGuardianReliabilityRanksGloballyBeforeRelayScope(t *testing.T) {
+	db, err := New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 13, 8, 0, 0, 0, time.UTC)
+	insert := func(at time.Time, accountID int64, logical string, status int, kind, routeClass string, groupID int64, accountType string) {
+		t.Helper()
+		_, insertErr := db.conn.ExecContext(ctx, `INSERT INTO usage_logs (created_at,account_id,logical_request_id,status_code,
+			upstream_error_kind,route_class,route_source,route_group_id,upstream_account_type,guardian_attempt_only)
+			VALUES ($1,$2,$3,$4,$5,$6,'direct',$7,$8,false)`,
+			db.timeArg(at), accountID, logical, status, kind, routeClass, groupID, accountType)
+		if insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+
+	// Neither Relay attempt is the final logical outcome, so neither may count.
+	insert(now.Add(-9*time.Minute), 51, "relay-500-oauth-success", 500, "server", "cyb_relay", 7, "openai_responses")
+	insert(now.Add(-8*time.Minute), 0, "relay-500-oauth-success", 200, "", "oauth", 0, "oauth")
+	insert(now.Add(-7*time.Minute), 51, "relay-503-oauth-success", 503, "server", "cyb_relay", 7, "openai_responses")
+	insert(now.Add(-6*time.Minute), 0, "relay-503-oauth-success", 200, "", "oauth", 0, "oauth")
+	// This chain terminates in Relay and must be charged to the final Relay account.
+	insert(now.Add(-5*time.Minute), 0, "oauth-failure-relay-final", 500, "server", "oauth", 0, "oauth")
+	insert(now.Add(-4*time.Minute), 53, "oauth-failure-relay-final", 500, "server", "cyb_relay", 7, "openai_responses")
+
+	rows, err := db.ListRelayGuardianReliability(ctx, 7, now.Add(-time.Hour), now.Add(-10*time.Minute), now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].AccountID != 53 || rows[0].Total10m != 1 || rows[0].Failures10m != 1 ||
+		rows[0].Total60m != 1 || rows[0].Failures60m != 1 {
+		t.Fatalf("cross-pool final ranking aggregate=%+v", rows)
+	}
+}
+
+func TestRelayGuardianReliabilityExcludesUnmaturedRows(t *testing.T) {
+	db, err := New("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 13, 8, 0, 0, 0, time.UTC)
+	insert := func(at time.Time, logical string) {
+		t.Helper()
+		_, insertErr := db.conn.ExecContext(ctx, `INSERT INTO usage_logs (created_at,account_id,logical_request_id,status_code,
+			upstream_error_kind,route_class,route_source,route_group_id,upstream_account_type,guardian_attempt_only)
+			VALUES ($1,51,$2,500,'server','cyb_relay','direct',7,'openai_responses',false)`, db.timeArg(at), logical)
+		if insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+	insert(now.Add(-3*time.Minute), "mature-failure")
+	insert(now.Add(-time.Minute), "unmatured-failure")
+	insert(now.Add(-4*time.Minute), "mature-failure-recent-success")
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs (created_at,account_id,logical_request_id,status_code,
+		upstream_error_kind,route_class,route_source,route_group_id,upstream_account_type,guardian_attempt_only)
+		VALUES ($1,51,'mature-failure-recent-success',200,'','cyb_relay','direct',7,'openai_responses',false)`, db.timeArg(now.Add(-time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+
+	matureEnd := now.Add(-2 * time.Minute)
+	rows, err := db.ListRelayGuardianReliability(ctx, 7, matureEnd.Add(-time.Hour), matureEnd.Add(-10*time.Minute), matureEnd, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Total10m != 1 || rows[0].Failures10m != 1 {
+		t.Fatalf("maturity watermark aggregate=%+v", rows)
+	}
+}
+
 func TestRelayGuardianModeRoundTrip(t *testing.T) {
 	db, err := New("sqlite", ":memory:")
 	if err != nil {

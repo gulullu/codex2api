@@ -20,7 +20,7 @@ export const relayGuardianStateMeta: Record<RelayGuardianState, {
   },
   suspect: {
     label: '观察中',
-    description: '已出现可归因故障，但尚未达到临时隔离阈值。',
+    description: '仅观察，不影响调度；尚未达到临时隔离条件。',
     tone: 'warn',
   },
   would_quarantine: {
@@ -91,6 +91,49 @@ export function resolveRelayGuardianState(
 ): RelayGuardianState {
   if (!accountEnabled || status?.manual_enabled === false) return 'manual_disabled'
   return status?.state ?? 'healthy'
+}
+
+export function getRelayGuardianRecoveryProgress(
+  status: RelayGuardianAccountStatus,
+  accountEnabled = status.manual_enabled,
+) {
+  const state = resolveRelayGuardianState(status, accountEnabled)
+  if (state === 'probation') {
+    const successes = Math.max(0, status.probation_successes || 0)
+    const required = Math.max(0, status.probation_required_successes || 0)
+    const progress = required > 0 ? `${successes}/${required}` : '试运行中'
+    return status.probation_percent > 0 ? `${progress} · ${status.probation_percent}% 并发上限` : progress
+  }
+  if (status.circuit_state === 'half_open') {
+    const successes = Math.max(0, status.circuit_probe_successes || 0)
+    const required = Math.max(0, status.circuit_required_successes || 0)
+    return required > 0 ? `${successes}/${required}` : '恢复探测中'
+  }
+  if (state === 'half_open') return '恢复探测中'
+  return '-'
+}
+
+export function getRelayGuardianWeakConfirmation(status: RelayGuardianAccountStatus) {
+  const count = Math.max(0, status.weak_confirmation_count || 0)
+  const required = Math.max(0, status.weak_confirmation_required || 0)
+  if (
+    resolveRelayGuardianState(status, status.manual_enabled) === 'suspect'
+    && status.reason === 'weak_reliability_confirming'
+    && required > 0
+    && count > 0
+    && count < required
+  ) return `${count}/${required}`
+  return '-'
+}
+
+export function formatRelayGuardianFailureRate(status: RelayGuardianAccountStatus) {
+  if (!Number.isFinite(status.reliability_total) || status.reliability_total <= 0) return '-'
+  const rate = Number.isFinite(status.failure_rate_percent) ? Math.max(0, status.failure_rate_percent) : 0
+  const lowerBound = Number.isFinite(status.failure_rate_lower_bound_percent)
+    ? Math.max(0, status.failure_rate_lower_bound_percent)
+    : 0
+  const formatPercent = (value: number) => value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
+  return `${formatPercent(rate)}% · 可信下限 ${formatPercent(lowerBound)}%`
 }
 
 export function getRelayGuardianActionAvailability(
@@ -231,6 +274,9 @@ export function getRelayGuardianReasonLabel(reason?: string | null) {
     last_available_relay: '仅剩当前 Relay 账号，无法安全隔离',
     capacity_warmup: '容量基线预热中，暂不自动隔离',
     insufficient_remaining_capacity: '隔离后剩余并发不足，已降为最后兜底',
+    recent_failure_observed: '近期出现上游失败，继续观察',
+    weak_reliability_confirming: '弱失败率偏高，等待下一窗口确认',
+    weak_reliability_below_threshold: '弱失败率低于隔离阈值',
   }
   if (labels[value]) return labels[value]
   const upstream = value.match(/^upstream_http_(\d{3})$/)
@@ -252,6 +298,12 @@ export function getRelayGuardianTriggerLabel(trigger?: string | null) {
     user_visible_2_in_10m: '10 分钟内 2 个用户可见失败',
     strong_gateway_3_in_5m: '5 分钟内 3 个强网关失败',
     user_visible_4_in_60m: '60 分钟内 4 个用户可见失败',
+    weak_reliability_10m: '10 分钟弱失败率可信偏高',
+    weak_reliability_60m: '60 分钟弱失败率持续偏高',
+    weak_reliability_catastrophic_10m: '10 分钟弱失败集中爆发',
+    catastrophic_10m: '10 分钟弱失败集中爆发',
+    user_visible_rate_10m: '10 分钟弱失败率可信偏高',
+    user_visible_rate_60m: '60 分钟弱失败率持续偏高',
     probation_complete: '试运行完成',
     manual_release: '管理员手动解除',
     temporary_bypass: '管理员临时旁路',

@@ -34,6 +34,13 @@ export interface RelayGuardianAccountStatus {
   failure_count: number
   user_visible_failures: number
   strong_gateway_failures: number
+  reliability_window_seconds: number
+  reliability_total: number
+  reliability_failures: number
+  failure_rate_percent: number
+  failure_rate_lower_bound_percent: number
+  weak_confirmation_count: number
+  weak_confirmation_required: number
   would_quarantine: boolean
   quarantine_until?: ISODateString | null
   backoff_level: number
@@ -58,6 +65,10 @@ export interface RelayGuardianStatusResponse {
   generated_at: ISODateString
   heartbeat_at?: ISODateString | null
   scan_interval_seconds: number
+  reliability_query_status?: 'pending' | 'disabled' | 'retrying' | 'degraded' | 'ok' | string
+  reliability_consecutive_errors?: number
+  reliability_last_success_at?: ISODateString | null
+  reliability_last_error_at?: ISODateString | null
   accounts: RelayGuardianAccountStatus[]
 }
 
