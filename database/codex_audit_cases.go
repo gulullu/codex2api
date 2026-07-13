@@ -163,6 +163,7 @@ func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID strin
 		FROM usage_logs u
 		LEFT JOIN accounts a ON a.id = u.account_id
 		WHERE u.logical_request_id = $1 AND u.created_at >= $2 AND u.created_at <= $3
+		  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
 		ORDER BY u.id ASC
 	`, logicalRequestID, startArg, endArg)
 	if err != nil {
@@ -202,6 +203,7 @@ func (db *DB) listCodexAuditRelayCasesPage(ctx context.Context, start, end time.
 		       ) AS audit_rn
 		FROM usage_logs
 		WHERE created_at >= $1 AND created_at <= $2
+		  AND NOT COALESCE(guardian_attempt_only, FALSE)
 	)
 		SELECT COUNT(*) FROM ranked_routes
 		WHERE audit_rn = 1 AND route_class = 'cyb_relay'

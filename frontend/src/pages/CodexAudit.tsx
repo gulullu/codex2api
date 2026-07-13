@@ -1,5 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, AlertTriangle, BarChart3, CheckCircle2, ChevronDown, CircleHelp, Clock3, Gauge, RefreshCw, ShieldAlert, ShieldCheck, ShieldX, Zap } from 'lucide-react'
+import { Activity, BarChart3, CheckCircle2, ChevronDown, CircleHelp, Clock3, Gauge, RefreshCw, ShieldAlert, ShieldCheck, ShieldX, Zap } from 'lucide-react'
 import {
   Bar,
   BarChart,
@@ -20,7 +20,7 @@ import { useLatestDataLoader } from '../hooks/useLatestDataLoader'
 import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import type { AccountRow, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
-import { formatCodexAuditHealthScore, getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
+import { formatCodexAuditHealthScore, getCodexAuditFindings, getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -102,6 +102,34 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: '沿用上一响应账号',
     description: '请求携带上一响应 ID，需要继续使用创建该响应的原账号。',
   },
+  local_multi_vector_web_attack: {
+    label: 'XSS 与路径穿越技术共现',
+    description: '完整请求同时命中 XSS 与路径穿越技术规则，且折扣后分数达到 80，因此改走 Relay；不代表本地拦截。',
+  },
+  encrypted_owner_hit: {
+    label: '命中加密上下文原账号',
+    description: '请求携带的加密上下文已找到原账号，并继续由该账号处理。',
+  },
+  encrypted_owner_miss: {
+    label: '未找到加密上下文归属',
+    description: '未找到加密上下文对应的原账号；系统会按安全降级规则处理。',
+  },
+  encrypted_owner_partial_miss: {
+    label: '部分加密上下文归属缺失',
+    description: '请求中的部分加密上下文未找到原账号；系统会按安全降级规则处理。',
+  },
+  encrypted_owner_conflict: {
+    label: '加密上下文归属冲突',
+    description: '同一请求中的加密上下文指向不同原账号，需要检查上下文来源。',
+  },
+  encrypted_owner_unavailable: {
+    label: '加密上下文原账号不可用',
+    description: '已找到原账号，但该账号当前不可用。',
+  },
+  encrypted_context_downgraded: {
+    label: '加密上下文已安全降级',
+    description: '无法安全续接原账号时，系统已移除有归属约束的加密项并重新路由。',
+  },
 }
 
 const routeSourceLabels: Record<string, string> = {
@@ -109,7 +137,7 @@ const routeSourceLabels: Record<string, string> = {
   probe: '探针分流',
   overflow: '容量分流',
   continuation: '响应续接',
-  pin: '会话固定',
+  pin: '账号归属续接',
   default: '默认 OAuth',
   legacy: '历史记录',
 }
@@ -120,6 +148,7 @@ const pinKindLabels: Record<string, string> = {
   conversation_id: '对话标识',
   session_id: '会话标识',
   websocket: 'WebSocket 会话',
+  encrypted_content: '加密上下文归属',
 }
 
 function describeRouteSignal(signal?: string | null) {
@@ -239,6 +268,15 @@ export default function CodexAudit() {
     relaySchedulable: health?.relay?.schedulable,
     timeline: report?.timeline,
   })
+  const findings = getCodexAuditFindings({
+    oauthCyberRequests: report?.summary.oauth_cyber_miss_requests ?? 0,
+    oauthCyberAttempts: report?.summary.oauth_cyber_miss_attempts ?? 0,
+    routeInvariantViolations: report?.summary.route_invariant_violations ?? 0,
+    routePoolViolations: report?.summary.route_pool_violations ?? 0,
+    encryptedOwnerViolations: report?.summary.encrypted_owner_violations ?? 0,
+    sessionBleed: report?.summary.session_bleed ?? 0,
+    routeMetadataConflicts: report?.summary.route_metadata_conflicts ?? 0,
+  })
 
   const timeline = useMemo(() => (report?.timeline || []).map((point) => ({
     ...point,
@@ -311,20 +349,24 @@ export default function CodexAudit() {
                   </div>
                 </div>
 
+                <div className="grid min-w-0 grid-cols-2 gap-2 border-b border-border/70 p-3 sm:p-4 xl:grid-cols-4">
+                  {findings.map((finding) => (
+                    <AuditFindingTile key={finding.key} label={finding.label} value={finding.value} detail={finding.detail} tone={finding.tone} />
+                  ))}
+                </div>
+
                 <div className="grid min-w-0 grid-cols-2 gap-3 p-3 sm:grid-cols-3 sm:p-4 xl:grid-cols-6">
                   <AuditMetricGuide />
                   <SignalTile label="请求数（去重）" value={formatNumber(report.usage.requests)} detail={`上游调用 ${formatNumber(report.usage.upstream_attempts)} · 最终错误 ${formatPercent(errorRate)}`} icon={<Activity />} tone={errorTone} />
-                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · 固定 ${formatNumber(report.summary.relay_pinned)} · 续接 ${formatNumber(report.summary.relay_continuation || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
+                  <SignalTile label="Relay 分流" value={formatNumber(report.summary.relay_requests)} detail={`占比 ${formatPercent(relayRate)} · 归属续接 ${formatNumber(report.summary.relay_pinned)} · 响应续接 ${formatNumber(report.summary.relay_continuation || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
                   <SignalTile label="规则命中 → Relay" value={formatNumber(report.summary.relay_direct)} detail="完整请求命中本地分流规则" icon={<Gauge />} tone="ok" />
                   <SignalTile label="探针分流" value={formatNumber(report.summary.relay_probe || 0)} detail="探针统一交由 Relay" icon={<Zap />} tone="ok" />
                   <SignalTile label="OAuth 容量分流" value={formatNumber(report.summary.relay_overflow || 0)} detail="OAuth 并发不足时转交 Relay" icon={<BarChart3 />} tone="neutral" />
                   <SignalTile label="Relay 成功率" value={formatPercent(relaySuccessRate)} detail={`最终成功 ${formatNumber(relaySuccesses)} / Relay 请求 ${formatNumber(report.summary.relay_requests)}`} icon={<CheckCircle2 />} tone={report.summary.relay_route_failures ? 'warn' : 'ok'} />
                   <SignalTile label="Relay 自动换号" value={formatNumber(report.summary.relay_failovers || 0)} detail={`换号后成功 ${formatNumber(report.summary.relay_failover_successes || 0)} · 成功率 ${formatPercent(relayFailoverSuccessRate)}`} icon={<RefreshCw />} tone={report.summary.relay_failover_failures ? 'warn' : 'ok'} />
                   <SignalTile label="上游 5xx 已吸收" value={formatNumber(report.summary.relay_absorbed_5xx || 0)} detail={`首个 Relay 账号失败，但备用账号接管成功 · 全池失败 ${formatNumber(report.summary.relay_failover_failures || 0)}`} icon={<ShieldCheck />} tone={report.summary.relay_failover_failures ? 'warn' : 'ok'} />
-                  <SignalTile label="OAuth 安全拦截" value={formatNumber(report.summary.oauth_cyber_miss_attempts)} detail={`${formatNumber(report.summary.oauth_cyber_miss_requests)} 个请求进入 OAuth 后被上游策略拦截`} icon={<AlertTriangle />} tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'} />
                   <SignalTile label="Relay 安全拦截" value={formatNumber(report.summary.relay_cyber_attempts)} detail={`${formatNumber(report.summary.relay_cyber_requests)} 个请求被 Relay 上游策略拦截，不计 OAuth 漏放`} icon={<ShieldAlert />} tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'} />
-                  <SignalTile label="Relay 最终失败" value={formatNumber(report.summary.relay_route_failures)} detail={`仅统计 Relay 路由 · 落错账号池 ${formatNumber(report.summary.route_invariant_violations)}`} icon={<ShieldX />} tone={(report.summary.relay_route_failures || report.summary.route_invariant_violations) ? 'bad' : 'ok'} />
-                  <SignalTile label="会话串扰" value={formatNumber(report.summary.session_bleed)} detail={report.summary.session_bleed ? '上游响应标识不一致，需立即排查' : '未发现其他请求的响应混入当前会话'} icon={<ShieldAlert />} tone={report.summary.session_bleed ? 'bad' : 'ok'} />
+                  <SignalTile label="Relay 最终失败" value={formatNumber(report.summary.relay_route_failures)} detail="仅统计 Relay 路由的最终运行故障，不混入路由安全约束" icon={<ShieldX />} tone={report.summary.relay_route_failures ? 'bad' : 'ok'} />
                   <SignalTile label="首字延迟 P95" value={formatMS(report.usage.first_token_p95_ms)} detail={`95% 的有效样本在该时间内收到首个响应 · ${formatNumber(report.usage.first_token_samples)} 个样本`} icon={<Clock3 />} tone={firstTokenTone} />
                   <SignalTile label="WebSocket 占比" value={formatPercent(report.usage.websocket_ratio || 0)} detail={`${formatNumber(report.usage.websocket_requests)} 个请求通过 WebSocket 连接上游`} icon={<Zap />} tone={(report.usage.websocket_ratio || 0) >= 0.85 ? 'ok' : 'warn'} />
                 </div>
@@ -364,7 +406,7 @@ export default function CodexAudit() {
             <SessionBleedPanel start={report.window_start} end={report.window_end} />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.85fr)]">
-              <ChartPanel title="请求与 Relay 路由趋势" description="按当前筛选窗口展示请求数，以及默认 OAuth、规则命中、探针、容量分流、响应续接、会话固定和异常的变化。">
+              <ChartPanel title="请求与 Relay 路由趋势" description="按当前筛选窗口展示请求数，以及默认 OAuth、规则命中、探针、容量分流、响应续接、账号归属续接和异常的变化。">
                 <ResponsiveContainer width="100%" height={286}>
                   <LineChart data={timeline} margin={{ top: 12, right: 18, bottom: 0, left: 0 }}>
                     <CartesianGrid strokeDasharray="4 4" stroke="hsl(var(--border))" vertical={false} />
@@ -374,7 +416,7 @@ export default function CodexAudit() {
                     <Line type="monotone" dataKey="requests" name="请求数（去重）" stroke={chartColors.request} strokeWidth={2.5} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="default_requests" name="默认 OAuth" stroke={chartColors.default} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_direct" name="规则命中 → Relay" stroke={chartColors.relayDirect} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
-                    <Line type="monotone" dataKey="relay_pinned" name="会话固定" stroke={chartColors.relayPinned} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
+                    <Line type="monotone" dataKey="relay_pinned" name="账号归属续接" stroke={chartColors.relayPinned} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_probe" name="探针分流" stroke={chartColors.relayProbe} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_overflow" name="OAuth 容量分流" stroke={chartColors.relayOverflow} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
                     <Line type="monotone" dataKey="relay_continuation" name="响应续接" stroke={chartColors.relayContinuation} strokeWidth={2} dot={false} activeDot={{ r: 4 }} />
@@ -417,10 +459,10 @@ export default function CodexAudit() {
               <Panel title="Relay 账号与分流原因" description="按 Relay 账号和分流原因统计。请求数已合并自动重试，上游调用包含重试；成功、4xx、5xx 按最终结果统计，安全拦截表示上游返回 cyber_policy。">
                 <div className="mb-3 rounded-lg border border-border/60 bg-muted/25 px-3 py-2.5 text-xs leading-5 text-muted-foreground">
                   <span className="font-medium text-foreground">分流原因：</span>
-                  规则命中＝本轮完整请求命中本地规则；探针分流＝识别为探针；容量分流＝OAuth 暂无可用并发；响应续接＝沿用上一响应的原账号；会话固定＝历史会话绑定。
+                  规则命中＝本轮完整请求命中本地规则；探针分流＝识别为探针；容量分流＝OAuth 暂无可用并发；响应续接＝沿用上一响应的原账号；账号归属续接＝按加密上下文等明确归属继续使用原账号。
                 </div>
                 <SimpleTable
-                  columns={['账号', '分流原因', '固定方式', '请求数', '上游调用', '成功请求', '请求错误（4xx）', '服务错误（5xx）', '安全策略拦截']}
+                  columns={['账号', '分流原因', '归属方式', '请求数', '上游调用', '成功请求', '请求错误（4xx）', '服务错误（5xx）', '安全策略拦截']}
                   rows={(report.relay_routes || []).map((row) => [
                     row.account_name || `#${row.account_id}`,
                     routeSourceLabel(row.route_source),
@@ -636,7 +678,8 @@ function SessionBleedPanel({ start, end }: { start: string; end: string }) {
 
 function routeCaseBadge(log: PromptFilterLog) {
   const source = (log.route_source || '').trim()
-  if (source === 'pin') return `会话固定 · ${pinKindLabel(log.pin_kind)}`
+  if (source === 'pin' && (log.pin_kind || '').trim() === 'encrypted_content') return '加密上下文续接'
+  if (source === 'pin') return `账号归属续接 · ${pinKindLabel(log.pin_kind)}`
   return source ? routeSourceLabel(source) : 'Relay 分流'
 }
 
@@ -675,7 +718,7 @@ function AuditLogRow({ log }: { log: PromptFilterLog }) {
             <span>账号 {log.account_name || (log.account_id ? `#${log.account_id}` : '-')}</span>
             <span>{upstreamAccountTypeLabel(log.upstream_account_type)}</span>
             <span>分流原因 {routeSourceLabel(log.route_source || log.route_class)}</span>
-            <span>固定方式 {pinKindLabel(log.pin_kind)}</span>
+            <span>归属方式 {pinKindLabel(log.pin_kind)}</span>
             <span>分组 {log.route_group_id || '-'}</span>
             {log.route_signals ? <span>信号 {formatRouteSignals(log.route_signals)}</span> : null}
           </div>
@@ -763,6 +806,18 @@ function AccountPoolTile({ accounts }: { accounts: AccountRow[] }) {
         })}
         {relayAccounts.length === 0 ? <div className="py-3 text-center text-xs text-muted-foreground">暂无 Relay API 账号</div> : null}
       </div>
+    </div>
+  )
+}
+
+function AuditFindingTile({ label, value, detail, tone }: { label: string; value: number; detail: string; tone: Tone }) {
+  return (
+    <div className="min-w-0 rounded-xl border border-border/60 bg-background/75 p-3 shadow-sm">
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs font-medium text-muted-foreground">{label}</span>
+        <span className={`text-lg font-semibold tabular-nums ${toneTextClass(tone)}`}>{formatNumber(value)}</span>
+      </div>
+      <p className="mt-1 line-clamp-2 text-[11px] leading-4 text-muted-foreground">{detail}</p>
     </div>
   )
 }

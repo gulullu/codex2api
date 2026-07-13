@@ -40,6 +40,26 @@ export interface CodexAuditPresentation {
   recentRecovered: boolean
 }
 
+export type CodexAuditFindingKey = 'oauth_cyber' | 'route_safety' | 'session_bleed' | 'metadata_conflict'
+
+export interface CodexAuditFindingInput {
+  oauthCyberRequests?: number
+  oauthCyberAttempts?: number
+  routeInvariantViolations?: number
+  routePoolViolations?: number
+  encryptedOwnerViolations?: number
+  sessionBleed?: number
+  routeMetadataConflicts?: number
+}
+
+export interface CodexAuditFinding {
+  key: CodexAuditFindingKey
+  label: string
+  value: number
+  detail: string
+  tone: CodexAuditTone
+}
+
 const operationalThresholds = {
   stableScore: 99.5,
   attentionScore: 95,
@@ -143,6 +163,50 @@ export function operationalWindowRecentlyRecovered(
     && (!needsFinal5xxRecovery || final5xxWindowRecentlyRecovered(timeline, requiredBuckets))
 }
 
+export function getCodexAuditFindings(input: CodexAuditFindingInput): CodexAuditFinding[] {
+  const oauthCyberAttempts = finiteCount(input.oauthCyberAttempts)
+  const oauthCyberRequests = finiteCount(input.oauthCyberRequests) || oauthCyberAttempts
+  const severeUnion = finiteCount(input.routeInvariantViolations)
+  const routePool = finiteCount(input.routePoolViolations)
+  const encryptedOwner = finiteCount(input.encryptedOwnerViolations)
+  const sessionBleed = finiteCount(input.sessionBleed)
+  const metadata = finiteCount(input.routeMetadataConflicts)
+  const routeBreakdown = routePool > 0 || encryptedOwner > 0
+    ? `跨池异常 ${routePool} · 加密归属异常 ${encryptedOwner}`
+    : `严重约束 ${severeUnion}`
+
+  return [
+    {
+      key: 'oauth_cyber',
+      label: 'OAuth 漏放',
+      value: oauthCyberRequests,
+      detail: oauthCyberRequests > 0 ? `${oauthCyberAttempts} 次 OAuth 上游 cyber_policy 拦截，需复盘本地路由。` : '未发现 OAuth 上游策略拦截。',
+      tone: oauthCyberRequests > 0 ? 'bad' : 'ok',
+    },
+    {
+      key: 'route_safety',
+      label: '路由安全约束',
+      value: severeUnion,
+      detail: severeUnion > 0 ? routeBreakdown : '未发现账号池越界或加密归属冲突。',
+      tone: severeUnion > 0 ? 'bad' : 'ok',
+    },
+    {
+      key: 'session_bleed',
+      label: '会话串扰',
+      value: sessionBleed,
+      detail: sessionBleed > 0 ? '检测到响应标识不一致，需立即复盘。' : '未检测到会话响应标识串扰。',
+      tone: sessionBleed > 0 ? 'bad' : 'ok',
+    },
+    {
+      key: 'metadata_conflict',
+      label: '审计字段冲突',
+      value: metadata,
+      detail: metadata > 0 ? '路由审计字段缺失或不一致，不等同于账号池越界。' : '路由审计字段一致。',
+      tone: metadata > 0 ? 'warn' : 'ok',
+    },
+  ]
+}
+
 export function getCodexAuditPresentation(input: CodexAuditOperationalInput): CodexAuditPresentation {
   const relayFailures = finiteCount(input.relayRouteFailures)
   const relayRequests = finiteCount(input.relayRequests)
@@ -168,33 +232,6 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
   const base = { healthScore, relayFailureRate, final5xxRate, worstFailureRate, recentRecovered }
   const measurements = `Relay 最终失败 ${relayFailures}/${relayRequests}（${percent(relayFailureRate)}）；全站最终 5xx ${final5xx}/${totalRequests}（${percent(final5xxRate)}）；运行健康分 ${formatCodexAuditHealthScore(healthScore)}。`
 
-  if (finiteCount(input.oauthCyberAttempts) > 0) {
-    return {
-      ...base,
-      label: 'OAuth CYB',
-      title: '发现 OAuth 漏放',
-      description: '受保护 OAuth 账号返回了上游安全策略拦截，请优先复盘路由。',
-      tone: 'bad',
-    }
-  }
-  if (finiteCount(input.routeInvariantViolations) > 0) {
-    return {
-      ...base,
-      label: '路由越界',
-      title: 'Relay 隔离约束被破坏',
-      description: '发现请求落错账号池或审计字段冲突，请立即排查。',
-      tone: 'bad',
-    }
-  }
-  if (finiteCount(input.sessionBleed) > 0) {
-    return {
-      ...base,
-      label: '会话串扰',
-      title: '发现会话响应标识不一致',
-      description: '窗口内检测到会话串扰信号，请立即排查。',
-      tone: 'bad',
-    }
-  }
   if (liveUnhealthy) {
     const liveReason = relayCapacityUnavailable
       ? relayConfigured === 0
@@ -263,21 +300,11 @@ export function getCodexAuditPresentation(input: CodexAuditOperationalInput): Co
       tone: 'warn',
     }
   }
-  if (finiteCount(input.relayCyberAttempts) > 0) {
-    return {
-      ...base,
-      label: 'Relay 策略',
-      title: 'Relay 上游出现安全策略拦截',
-      description: '仅影响 Relay 供应商质量分析，不计入 OAuth 漏放或运行故障。',
-      tone: 'warn',
-    }
-  }
-
   return {
     ...base,
     label: '正常',
-    title: 'Relay 路由态势稳定',
-    description: liveHealthy ? '筛选窗口内无 Relay 失败，实时健康正常。' : '筛选窗口内未发现 Relay 失败或安全路由异常。',
+    title: '服务运行态势稳定',
+    description: liveHealthy ? '筛选窗口内未发现运行故障，实时健康正常。' : '筛选窗口内未发现 Relay 或全站最终 5xx 运行故障。',
     tone: 'ok',
   }
 }

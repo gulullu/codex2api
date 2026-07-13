@@ -374,6 +374,90 @@ func TestCodexAuditRouteCyberAndUnavailableAccounting(t *testing.T) {
 	}
 }
 
+func TestCodexAuditEncryptedOwnerMatrixAndAttemptSafety(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	ownerHit := `["encrypted_owner_hit"]`
+
+	insertCodexAuditUsage(t, db,
+		// All supported encrypted-owner route shapes are legitimate. direct/probe
+		// may carry encrypted affinity metadata alongside the current rule.
+		&UsageLogInput{LogicalRequestID: "oauth-owner", AccountID: 11, StatusCode: 200, RouteClass: "default", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "relay-owner-pin", AccountID: 21, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "relay-owner-direct", AccountID: 22, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "direct", PinKind: "encrypted_content", RouteSignals: `["local_threshold","encrypted_owner_hit"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "relay-owner-probe", AccountID: 23, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "probe", PinKind: "encrypted_content", RouteSignals: `["probe_request","encrypted_owner_hit"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+
+		// Missing owner evidence and missing account identity are encrypted
+		// safety violations, but are not automatically pool violations.
+		&UsageLogInput{LogicalRequestID: "owner-missing-hit", AccountID: 12, StatusCode: 200, RouteClass: "default", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: `[]`, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "owner-missing-account", StatusCode: 200, RouteClass: "default", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, UpstreamAccountType: "oauth"},
+
+		// One malformed encrypted request can violate both categories, but the
+		// backward-compatible invariant total must still count it once.
+		&UsageLogInput{LogicalRequestID: "owner-cross-pool", AccountID: 31, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "pin", PinKind: "encrypted_content", RouteSignals: ownerHit, UpstreamAccountType: "oauth"},
+
+		// Safety checks inspect every attempt even when the final business row
+		// succeeds on the right pool.
+		&UsageLogInput{LogicalRequestID: "wrong-first-attempt", AccountID: 41, StatusCode: 502, AttemptIndex: 1, IsRetryAttempt: true, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "wrong-first-attempt", AccountID: 42, StatusCode: 200, RouteClass: "default", RouteSource: "default", UpstreamAccountType: "oauth"},
+
+		// Metadata quality is reported separately from severe pool/owner safety.
+		&UsageLogInput{LogicalRequestID: "metadata-only", AccountID: 51, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `[]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+
+		// Guardian attempts must not become business outcomes or audit findings,
+		// including when a synthetic row reuses a business logical ID.
+		&UsageLogInput{LogicalRequestID: "guardian-only", AccountID: 61, StatusCode: 503, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "oauth", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "mixed-business", AccountID: 62, StatusCode: 200, RouteClass: "default", RouteSource: "default", UpstreamAccountType: "oauth"},
+		&UsageLogInput{LogicalRequestID: "mixed-business", AccountID: 63, StatusCode: 503, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "oauth", GuardianAttemptOnly: true},
+	)
+
+	report := buildCodexAuditTestReport(t, db)
+	if report.Usage.Requests != 10 || report.Usage.UpstreamAttempts != 11 || report.Usage.Errors5xx != 0 {
+		t.Fatalf("business usage = requests:%d attempts:%d final5xx:%d, want 10/11/0",
+			report.Usage.Requests, report.Usage.UpstreamAttempts, report.Usage.Errors5xx)
+	}
+	if report.Summary.RoutePoolViolations != 2 || report.Summary.EncryptedOwnerViolations != 3 || report.Summary.RouteInvariantViolations != 4 {
+		t.Fatalf("severe findings = pool:%d owner:%d union:%d, want 2/3/4",
+			report.Summary.RoutePoolViolations, report.Summary.EncryptedOwnerViolations, report.Summary.RouteInvariantViolations)
+	}
+	if report.Summary.RouteMetadataConflicts != 1 {
+		t.Fatalf("metadata conflicts = %d, want 1", report.Summary.RouteMetadataConflicts)
+	}
+
+	var pool, owner, invariant, metadata int64
+	for _, point := range report.Timeline {
+		pool += point.RoutePoolViolations
+		owner += point.EncryptedOwnerViolations
+		invariant += point.RouteInvariantViolations
+		metadata += point.RouteMetadataConflicts
+	}
+	if pool != 2 || owner != 3 || invariant != 4 || metadata != 1 {
+		t.Fatalf("timeline findings = pool:%d owner:%d union:%d metadata:%d, want 2/3/4/1", pool, owner, invariant, metadata)
+	}
+}
+
+func TestCodexAuditRelayCasesExcludeGuardianAttempts(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db,
+		&UsageLogInput{LogicalRequestID: "business-relay", AccountID: 101, StatusCode: 200, RouteClass: "cyb_relay", RouteSource: "direct", RouteSignals: `["local_threshold"]`, RouteGroupID: 3, UpstreamAccountType: "openai_responses"},
+		&UsageLogInput{LogicalRequestID: "business-relay", AccountID: 999, StatusCode: 503, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "oauth", GuardianAttemptOnly: true},
+		&UsageLogInput{LogicalRequestID: "guardian-only-relay", AccountID: 998, StatusCode: 503, RouteClass: "cyb_relay", RouteSource: "direct", RouteGroupID: 3, UpstreamAccountType: "oauth", GuardianAttemptOnly: true},
+	)
+
+	page, err := db.ListCodexAuditCasesPage(context.Background(), CodexAuditCasesQuery{
+		Kind: CodexAuditCaseRelayRoute, Start: time.Now().Add(-time.Minute), End: time.Now().Add(time.Minute), Page: 1, PageSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListCodexAuditCasesPage returned error: %v", err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("relay cases = total:%d items:%d, want 1/1", page.Total, len(page.Items))
+	}
+	item := page.Items[0]
+	if item.AccountID != 101 || len(item.AuditAttempts) != 1 || item.AuditAttempts[0].AccountID != 101 {
+		t.Fatalf("relay case includes Guardian attempt: account=%d attempts=%+v", item.AccountID, item.AuditAttempts)
+	}
+}
+
 func TestPromptFilterCyberScopeSeparatesOAuthAndIsolatedRelay(t *testing.T) {
 	db := newCodexAuditSQLiteTestDB(t)
 	ctx := context.Background()

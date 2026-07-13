@@ -1026,6 +1026,9 @@ export interface CodexAuditSummary {
   relay_cyber_attempts: number
   legacy_cyber_unattributed: number
   route_invariant_violations: number
+  route_pool_violations?: number
+  encrypted_owner_violations?: number
+  route_metadata_conflicts?: number
   legacy_usage_rows: number
 }
 
@@ -1049,6 +1052,9 @@ export interface CodexAuditTimelinePoint {
   oauth_cyber_attempts: number
   relay_cyber_attempts: number
   route_invariant_violations: number
+  route_pool_violations?: number
+  encrypted_owner_violations?: number
+  route_metadata_conflicts?: number
 }
 
 export interface CodexAuditRelayRouteRow {

@@ -76,6 +76,9 @@ type CodexAuditSummary struct {
 	RelayCyberAttempts         int64 `json:"relay_cyber_attempts"`
 	LegacyCyberUnattributed    int64 `json:"legacy_cyber_unattributed"`
 	RouteInvariantViolations   int64 `json:"route_invariant_violations"`
+	RoutePoolViolations        int64 `json:"route_pool_violations"`
+	EncryptedOwnerViolations   int64 `json:"encrypted_owner_violations"`
+	RouteMetadataConflicts     int64 `json:"route_metadata_conflicts"`
 	LegacyUsageRows            int64 `json:"legacy_usage_rows"`
 }
 
@@ -126,6 +129,9 @@ type CodexAuditTimelinePoint struct {
 	OAuthCyberAttempts       int64     `json:"oauth_cyber_attempts"`
 	RelayCyberAttempts       int64     `json:"relay_cyber_attempts"`
 	RouteInvariantViolations int64     `json:"route_invariant_violations"`
+	RoutePoolViolations      int64     `json:"route_pool_violations"`
+	EncryptedOwnerViolations int64     `json:"encrypted_owner_violations"`
+	RouteMetadataConflicts   int64     `json:"route_metadata_conflicts"`
 }
 
 type CodexAuditRelayRouteRow struct {
@@ -281,6 +287,7 @@ func (db *DB) codexAuditLastCyberPolicyAt(ctx context.Context, end time.Time, sc
 		SELECT MAX(created_at) FROM usage_logs
 		WHERE LOWER(COALESCE(upstream_error_kind, '')) = 'cyber_policy'
 		  AND COALESCE(upstream_account_type, '') = $3
+		  AND NOT COALESCE(guardian_attempt_only, FALSE)
 		  AND created_at >= $1 AND created_at <= $2`+routeClause,
 		startArg, endArg, accountType).Scan(&raw); err != nil {
 		return nil, err
@@ -383,6 +390,60 @@ func (db *DB) codexAuditFirstTokenValues(ctx context.Context, start, end time.Ti
 	return values, rows.Err()
 }
 
+// These predicates intentionally use only portable SQL string operations so
+// the audit behaves identically on PostgreSQL and SQLite. route_signals is a
+// JSON-encoded text column; matching the quoted token avoids partial names.
+const codexAuditEncryptedOAuthRouteShapeSQL = `(
+	COALESCE(u.pin_kind, '') = 'encrypted_content'
+	AND COALESCE(u.route_class, '') = 'default'
+	AND COALESCE(u.route_source, '') = 'pin'
+	AND COALESCE(u.upstream_account_type, '') = 'oauth'
+	AND COALESCE(u.route_group_id, 0) = 0
+)`
+
+const codexAuditRoutePoolViolationSQL = `(
+	(COALESCE(u.route_class, '') = 'cyb_relay'
+	 AND COALESCE(u.account_id, 0) > 0
+	 AND COALESCE(u.upstream_account_type, '') <> 'openai_responses')
+	OR (COALESCE(u.route_class, '') = 'cyb_relay'
+	    AND COALESCE(u.route_group_id, 0) <= 0)
+	OR (COALESCE(u.route_class, '') = 'cyb_relay'
+	    AND COALESCE(u.route_source, '') NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation'))
+	OR (COALESCE(u.route_class, '') <> 'cyb_relay'
+	    AND (
+		COALESCE(u.route_group_id, 0) > 0
+		OR COALESCE(u.route_source, '') IN ('direct', 'probe', 'overflow')
+		OR (COALESCE(u.route_source, '') = 'pin'
+		    AND NOT ` + codexAuditEncryptedOAuthRouteShapeSQL + `)
+	    ))
+)`
+
+const codexAuditEncryptedOwnerViolationSQL = `(
+	COALESCE(u.pin_kind, '') = 'encrypted_content'
+	AND NOT (
+		COALESCE(u.account_id, 0) > 0
+		AND LOWER(COALESCE(u.route_signals, '')) LIKE '%"encrypted_owner_hit"%'
+		AND (
+			` + codexAuditEncryptedOAuthRouteShapeSQL + `
+			OR (
+				COALESCE(u.route_class, '') = 'cyb_relay'
+				AND COALESCE(u.route_source, '') IN ('pin', 'direct', 'probe')
+				AND COALESCE(u.upstream_account_type, '') = 'openai_responses'
+				AND COALESCE(u.route_group_id, 0) > 0
+			)
+		)
+	)
+)`
+
+const codexAuditRouteMetadataConflictSQL = `(
+	(COALESCE(u.route_source, '') = 'pin' AND COALESCE(u.pin_kind, '') = '')
+	OR (COALESCE(u.route_source, '') = 'direct'
+	    AND COALESCE(u.route_signals, '[]') IN ('', '[]', 'null'))
+	OR (COALESCE(u.route_source, '') = 'pin'
+	    AND COALESCE(u.pin_kind, '') <> 'encrypted_content'
+	    AND COALESCE(u.route_signals, '[]') NOT IN ('', '[]', 'null'))
+)`
+
 func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, bucketMinutes int) ([]CodexAuditTimelinePoint, error) {
 	bucketSeconds := int64(bucketMinutes) * 60
 	if bucketSeconds <= 0 {
@@ -408,15 +469,25 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 			       COALESCE(u.upstream_error_kind, '') AS upstream_error_kind,
 			       COALESCE(u.account_id, 0) AS account_id,
 			       COALESCE(u.route_signals, '[]') AS route_signals,
-			       COALESCE(u.pin_kind, '') AS pin_kind
+			       COALESCE(u.pin_kind, '') AS pin_kind,
+			       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND `+codexAuditRoutePoolViolationSQL+`
+			            THEN 1 ELSE 0 END AS attempt_route_pool_violation,
+			       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND `+codexAuditEncryptedOwnerViolationSQL+`
+			            THEN 1 ELSE 0 END AS attempt_encrypted_owner_violation,
+			       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND `+codexAuditRouteMetadataConflictSQL+`
+			            THEN 1 ELSE 0 END AS attempt_route_metadata_conflict
 			FROM usage_logs u
 			WHERE u.created_at >= $1 AND u.created_at <= $2
+			  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
 		), request_rollup AS (
-			SELECT audit_request_id, MAX(id) AS final_id
+			SELECT audit_request_id, MAX(id) AS final_id,
+			       MAX(attempt_route_pool_violation) AS route_pool_violation,
+			       MAX(attempt_encrypted_owner_violation) AS encrypted_owner_violation,
+			       MAX(attempt_route_metadata_conflict) AS route_metadata_conflict
 			FROM timeline_scope
 			GROUP BY audit_request_id
 		), final_usage AS (
-			SELECT f.*
+			SELECT f.*, r.route_pool_violation, r.encrypted_owner_violation, r.route_metadata_conflict
 			FROM request_rollup r
 			JOIN timeline_scope f ON f.id = r.final_id
 		), bucket_counts AS (
@@ -434,15 +505,10 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 			       COALESCE(SUM(CASE WHEN route_class = 'cyb_relay' AND (
 			         status_code >= 500 OR upstream_error_kind IN ('relay_route_unavailable', 'no_available_relay_account', 'relay_affinity_unavailable', 'route_switch_requires_replay')
 			       ) THEN 1 ELSE 0 END), 0) AS relay_route_failures,
-			       COALESCE(SUM(CASE WHEN logical_request_id <> '' AND (
-			         (route_class = 'cyb_relay' AND account_id > 0 AND upstream_account_type <> 'openai_responses') OR
-			         (route_class = 'cyb_relay' AND route_group_id <= 0) OR
-			         (route_class = 'cyb_relay' AND route_source NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation')) OR
-			         (route_source = 'pin' AND pin_kind = '') OR
-			         (route_source = 'direct' AND route_signals IN ('', '[]', 'null')) OR
-			         (route_source = 'pin' AND route_signals NOT IN ('', '[]', 'null')) OR
-			         (route_source IN ('direct', 'pin') AND route_class <> 'cyb_relay')
-			       ) THEN 1 ELSE 0 END), 0) AS route_invariant_violations
+			       COALESCE(SUM(CASE WHEN route_pool_violation = 1 OR encrypted_owner_violation = 1 THEN 1 ELSE 0 END), 0) AS route_invariant_violations,
+			       COALESCE(SUM(route_pool_violation), 0) AS route_pool_violations,
+			       COALESCE(SUM(encrypted_owner_violation), 0) AS encrypted_owner_violations,
+			       COALESCE(SUM(route_metadata_conflict), 0) AS route_metadata_conflicts
 			FROM final_usage
 			GROUP BY bucket_unix
 		), first_token_ranked AS (
@@ -483,7 +549,9 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 		       COALESCE(c.default_requests, 0), COALESCE(c.relay_direct, 0), COALESCE(c.relay_pinned, 0),
 		       COALESCE(c.relay_probe, 0), COALESCE(c.relay_overflow, 0), COALESCE(c.relay_continuation, 0),
 		       COALESCE(c.relay_legacy_unknown, 0), COALESCE(c.relay_route_failures, 0),
-		       COALESCE(c.route_invariant_violations, 0), COALESCE(p.first_token_p95_ms, 0),
+		       COALESCE(c.route_invariant_violations, 0), COALESCE(c.route_pool_violations, 0),
+		       COALESCE(c.encrypted_owner_violations, 0), COALESCE(c.route_metadata_conflicts, 0),
+		       COALESCE(p.first_token_p95_ms, 0),
 		       COALESCE(y.oauth_cyber_attempts, 0), COALESCE(y.relay_cyber_attempts, 0)
 		FROM bucket_keys k
 		LEFT JOIN bucket_counts c ON c.bucket_unix = k.bucket_unix
@@ -502,7 +570,8 @@ func (db *DB) codexAuditTimeline(ctx context.Context, start, end time.Time, buck
 		if err := rows.Scan(&bucketUnix, &point.Requests, &point.Errors4xx, &point.Errors5xx,
 			&point.DefaultRequests, &point.RelayDirect, &point.RelayPinned, &point.RelayProbe,
 			&point.RelayOverflow, &point.RelayContinuation, &point.RelayLegacyUnknown,
-			&point.RelayRouteFailures, &point.RouteInvariantViolations, &point.FirstTokenP95MS,
+			&point.RelayRouteFailures, &point.RouteInvariantViolations, &point.RoutePoolViolations,
+			&point.EncryptedOwnerViolations, &point.RouteMetadataConflicts, &point.FirstTokenP95MS,
 			&point.OAuthCyberAttempts, &point.RelayCyberAttempts); err != nil {
 			return nil, err
 		}
@@ -830,7 +899,7 @@ func (db *DB) codexAuditPolicyErrorSamples(ctx context.Context, start, end time.
 		OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%cyber%'
 		OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%violat%'
 		OR LOWER(COALESCE(u.upstream_error_kind, '')) LIKE '%safety%'
-	)`
+	) AND NOT COALESCE(u.guardian_attempt_only, FALSE)`
 	limitArg := fmt.Sprintf("$%d", len(args)+1)
 	args = append(args, limit)
 
@@ -916,6 +985,7 @@ WITH ranked_usage AS (
 	       ) AS audit_rn
 	FROM usage_logs u
 	WHERE u.created_at >= $1 AND u.created_at <= $2
+	  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
 ), final_usage AS (
 	SELECT * FROM ranked_usage WHERE audit_rn = 1
 ), request_attempts AS (
@@ -966,9 +1036,16 @@ WITH summary_usage AS MATERIALIZED (
 	                     AND COALESCE(u.route_class, '') = 'cyb_relay'
 	                     AND COALESCE(u.route_group_id, 0) > 0)
 	                  )
-	            THEN 1 ELSE 0 END AS legacy_cyber
+	            THEN 1 ELSE 0 END AS legacy_cyber,
+	       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND ` + codexAuditRoutePoolViolationSQL + `
+	             THEN 1 ELSE 0 END AS attempt_route_pool_violation,
+	       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND ` + codexAuditEncryptedOwnerViolationSQL + `
+	             THEN 1 ELSE 0 END AS attempt_encrypted_owner_violation,
+	       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND ` + codexAuditRouteMetadataConflictSQL + `
+	             THEN 1 ELSE 0 END AS attempt_route_metadata_conflict
 	FROM usage_logs u
 	WHERE u.created_at >= $1 AND u.created_at <= $2
+	  AND NOT COALESCE(u.guardian_attempt_only, FALSE)
 ), request_rollup AS (
 	SELECT audit_request_id,
 	       MAX(id) AS final_id,
@@ -978,12 +1055,16 @@ WITH summary_usage AS MATERIALIZED (
 	       COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) AS attempts_5xx,
 	       COALESCE(SUM(oauth_cyber), 0) AS oauth_cyber_attempts,
 	       COALESCE(SUM(relay_cyber), 0) AS relay_cyber_attempts,
-	       COALESCE(SUM(legacy_cyber), 0) AS legacy_cyber_attempts
+	       COALESCE(SUM(legacy_cyber), 0) AS legacy_cyber_attempts,
+	       MAX(attempt_route_pool_violation) AS route_pool_violation,
+	       MAX(attempt_encrypted_owner_violation) AS encrypted_owner_violation,
+	       MAX(attempt_route_metadata_conflict) AS route_metadata_conflict
 	FROM summary_usage
 	GROUP BY audit_request_id
 ), canonical_requests AS (
 	SELECT f.*, r.relay_account_count, r.attempts_5xx,
-	       r.oauth_cyber_attempts, r.relay_cyber_attempts, r.legacy_cyber_attempts
+	       r.oauth_cyber_attempts, r.relay_cyber_attempts, r.legacy_cyber_attempts,
+	       r.route_pool_violation, r.encrypted_owner_violation, r.route_metadata_conflict
 	FROM request_rollup r
 	JOIN summary_usage f ON f.id = r.final_id
 )
@@ -1008,15 +1089,10 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		  COALESCE(SUM(CASE WHEN route_class = 'cyb_relay' AND relay_account_count > 1 AND status_code >= 400 THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN route_class = 'cyb_relay' AND relay_account_count > 1 AND status_code BETWEEN 200 AND 299 AND attempts_5xx > 0 THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') = '' THEN 1 ELSE 0 END), 0),
-		  COALESCE(SUM(CASE WHEN COALESCE(logical_request_id, '') <> '' AND (
-		      (COALESCE(route_class, '') = 'cyb_relay' AND account_id > 0 AND COALESCE(upstream_account_type, '') <> 'openai_responses') OR
-		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_group_id, 0) <= 0) OR
-		      (COALESCE(route_class, '') = 'cyb_relay' AND COALESCE(route_source, '') NOT IN ('direct', 'pin', 'probe', 'overflow', 'continuation')) OR
-		      (COALESCE(route_source, '') = 'pin' AND COALESCE(pin_kind, '') = '') OR
-		      (COALESCE(route_source, '') = 'direct' AND COALESCE(route_signals, '[]') IN ('', '[]', 'null')) OR
-		      (COALESCE(route_source, '') = 'pin' AND COALESCE(route_signals, '[]') NOT IN ('', '[]', 'null')) OR
-		      (COALESCE(route_source, '') IN ('direct', 'pin') AND COALESCE(route_class, '') <> 'cyb_relay')
-		  ) THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(CASE WHEN route_pool_violation = 1 OR encrypted_owner_violation = 1 THEN 1 ELSE 0 END), 0),
+		  COALESCE(SUM(route_pool_violation), 0),
+		  COALESCE(SUM(encrypted_owner_violation), 0),
+		  COALESCE(SUM(route_metadata_conflict), 0),
 		  COALESCE(SUM(CASE WHEN oauth_cyber_attempts > 0 THEN 1 ELSE 0 END), 0),
 		  COALESCE(SUM(oauth_cyber_attempts), 0),
 		  COALESCE(SUM(CASE WHEN relay_cyber_attempts > 0 THEN 1 ELSE 0 END), 0),
@@ -1039,6 +1115,9 @@ func (db *DB) codexAuditRouteSummary(ctx context.Context, start, end time.Time) 
 		&summary.RelayAbsorbed5xx,
 		&summary.LegacyUsageRows,
 		&summary.RouteInvariantViolations,
+		&summary.RoutePoolViolations,
+		&summary.EncryptedOwnerViolations,
+		&summary.RouteMetadataConflicts,
 		&summary.OAuthCyberMissRequests,
 		&summary.OAuthCyberMissAttempts,
 		&summary.RelayCyberRequests,
@@ -1071,6 +1150,9 @@ func mergeCodexAuditRouteSummary(target *CodexAuditSummary, route CodexAuditSumm
 	target.RelayCyberAttempts = route.RelayCyberAttempts
 	target.LegacyCyberUnattributed = route.LegacyCyberUnattributed
 	target.RouteInvariantViolations = route.RouteInvariantViolations
+	target.RoutePoolViolations = route.RoutePoolViolations
+	target.EncryptedOwnerViolations = route.EncryptedOwnerViolations
+	target.RouteMetadataConflicts = route.RouteMetadataConflicts
 	target.LegacyUsageRows = route.LegacyUsageRows
 	// Backward-compatible aggregate now follows the protected OAuth scope only;
 	// Relay provider policy events must never re-enter the leak counter.

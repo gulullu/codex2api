@@ -18,6 +18,7 @@ const {
   calculateRelayWindowHealthScore,
   final5xxWindowRecentlyRecovered,
   formatCodexAuditHealthScore,
+  getCodexAuditFindings,
   getCodexAuditPresentation,
   getRelayWindowHealthStandard,
   operationalWindowRecentlyRecovered,
@@ -217,17 +218,68 @@ test('clean recent buckets turn green only after guardian degradation clears', (
   assert.equal(presentation({ relayRequests: 30, relayRouteFailures: 2, timeline, guardianStatus: 'healthy', relayConfigured: 3, relaySchedulable: 3 }).label, '已恢复')
 })
 
-test('security and routing invariants take precedence over quality scoring', () => {
-  assert.equal(presentation({ oauthCyberAttempts: 1 }).label, 'OAuth CYB')
-  assert.equal(presentation({ routeInvariantViolations: 1 }).label, '路由越界')
-  assert.equal(presentation({ sessionBleed: 1 }).label, '会话串扰')
+test('operational presentation is not masked by independent security findings', () => {
+  const result = presentation({
+    totalRequests: 1370,
+    final5xx: 60,
+    relayRequests: 667,
+    relayRouteFailures: 47,
+    oauthCyberAttempts: 1,
+    routeInvariantViolations: 1,
+    sessionBleed: 1,
+  })
+  assert.equal(result.label, '运行异常')
+  assert.equal(result.tone, 'bad')
+  assert.equal(result.healthScore, 92.95)
 })
 
-test('relay cyber policy is quality warning and not an operational failure', () => {
+test('relay cyber policy does not replace the operational presentation', () => {
   const result = presentation({ relayCyberAttempts: 2 })
-  assert.equal(result.label, 'Relay 策略')
-  assert.equal(result.tone, 'warn')
-  assert.match(result.description, /不计入.*运行故障/)
+  assert.equal(result.label, '正常')
+  assert.equal(result.tone, 'ok')
+})
+
+test('all audit findings remain visible together', () => {
+  const findings = getCodexAuditFindings({
+    oauthCyberAttempts: 2,
+    routeInvariantViolations: 3,
+    routePoolViolations: 2,
+    encryptedOwnerViolations: 1,
+    sessionBleed: 4,
+    routeMetadataConflicts: 5,
+  })
+  assert.deepEqual(findings.map((item) => [item.key, item.value, item.tone]), [
+    ['oauth_cyber', 2, 'bad'],
+    ['route_safety', 3, 'bad'],
+    ['session_bleed', 4, 'bad'],
+    ['metadata_conflict', 5, 'warn'],
+  ])
+})
+
+test('route safety uses the severe union and preserves category breakdown', () => {
+  const route = getCodexAuditFindings({
+    routeInvariantViolations: 1,
+    routePoolViolations: 1,
+    encryptedOwnerViolations: 1,
+  }).find((item) => item.key === 'route_safety')
+  assert.equal(route.value, 1)
+  assert.match(route.detail, /跨池异常 1 · 加密归属异常 1/)
+})
+
+test('OAuth finding counts logical requests and explains upstream attempts', () => {
+  const oauth = getCodexAuditFindings({ oauthCyberRequests: 1, oauthCyberAttempts: 3 })
+    .find((item) => item.key === 'oauth_cyber')
+  assert.equal(oauth.value, 1)
+  assert.match(oauth.detail, /3 次/)
+})
+
+test('metadata conflict is yellow and does not change operational score', () => {
+  const before = presentation({ relayRequests: 1000, relayRouteFailures: 1 })
+  const after = presentation({ relayRequests: 1000, relayRouteFailures: 1, routeMetadataConflicts: 9 })
+  assert.equal(after.healthScore, before.healthScore)
+  const metadata = getCodexAuditFindings({ routeMetadataConflicts: 9 }).find((item) => item.key === 'metadata_conflict')
+  assert.equal(metadata.tone, 'warn')
+  assert.equal(metadata.value, 9)
 })
 
 test('health score standards are explicit and stable', () => {
