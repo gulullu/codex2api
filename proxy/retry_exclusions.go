@@ -32,6 +32,10 @@ func (r *retryAccountExclusions) IsHard(accountID int64) bool {
 	return r != nil && accountID != 0 && r.hard[accountID]
 }
 
+func (r *retryAccountExclusions) IsSoft(accountID int64) bool {
+	return r != nil && accountID != 0 && r.soft[accountID]
+}
+
 func (r *retryAccountExclusions) MarkSoftFirstTokenTimeout(accountID int64) {
 	if r == nil || accountID == 0 {
 		return
@@ -86,5 +90,5 @@ func (h *Handler) nextRetryAccountForSession(ctx context.Context, affinityKey st
 }
 
 func isFirstTokenTimeoutOutcome(outcome streamOutcome) bool {
-	return outcome.failureKind == "timeout"
+	return outcome.softFirstTokenTimeout
 }

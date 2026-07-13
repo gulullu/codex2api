@@ -23,6 +23,7 @@ const (
 	contextRouteSelectionError      = "routeSelectionError"
 	routeSwitchRequiresReplay       = "route_switch_requires_replay"
 	continuationOwnerUnavailable    = "continuation_owner_unavailable"
+	encryptedOwnerAttemptUncertain  = "encrypted_context_owner_attempt_uncertain"
 )
 
 type responseRouteOwner struct {
@@ -55,6 +56,9 @@ func routeSelectionFailureSpecFor(routeErr routeSelectionError) routeSelectionFa
 		spec.OpenAIErrorType = api.ErrorTypeInvalidRequest
 		spec.AnthropicErrorType = "invalid_request_error"
 		spec.WebSocketCloseCode = websocket.ClosePolicyViolation
+	} else if routeErr.Kind == encryptedOwnerAttemptUncertain {
+		spec.HTTPStatusCode = http.StatusGatewayTimeout
+		spec.OpenAIErrorType = api.ErrorTypeUpstream
 	}
 	return spec
 }

@@ -43,6 +43,11 @@ func TestUpstreamCyberPolicyCodeDetectsResponseFailed(t *testing.T) {
 			want:    "cyber_policy",
 		},
 		{
+			name:    "content policy message fallback",
+			payload: `{"type":"response.failed","response":{"error":{"message":"This request was blocked by the content policy. Please rephrase and try again."}}}`,
+			want:    "content_policy",
+		},
+		{
 			name:    "unrelated failure is not cyber_policy",
 			payload: `{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded"}}}`,
 			want:    "",

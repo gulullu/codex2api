@@ -81,10 +81,11 @@ func (g *firstTokenTimeoutGuard) TimedOut() bool {
 
 func firstTokenTimeoutOutcome(timeout time.Duration) streamOutcome {
 	return streamOutcome{
-		logStatusCode:  logStatusUpstreamStreamBreak,
-		failureKind:    "timeout",
-		failureMessage: fmt.Sprintf("上游首字超时：%s 内未收到首个响应事件", timeout.Round(time.Millisecond)),
-		penalize:       true,
+		logStatusCode:         logStatusUpstreamStreamBreak,
+		failureKind:           "timeout",
+		failureMessage:        fmt.Sprintf("上游首字超时：%s 内未收到首个响应事件", timeout.Round(time.Millisecond)),
+		penalize:              true,
+		softFirstTokenTimeout: true,
 	}
 }
 

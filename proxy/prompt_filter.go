@@ -343,12 +343,22 @@ func upstreamCyberPolicyCode(body []byte) string {
 	}
 	raw := string(body)
 	for _, path := range []string{"codex_error_info", "error.codex_error_info", "error.code", "code"} {
-		if value := strings.TrimSpace(gjson.GetBytes(body, path).String()); strings.EqualFold(value, "cyber_policy") {
+		value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, path).String()))
+		switch value {
+		case "cyber_policy":
 			return "cyber_policy"
+		case "content_policy", "content_filter", "policy_violation", "safety":
+			return value
 		}
 	}
-	if strings.Contains(strings.ToLower(raw), "cyber_policy") || strings.Contains(strings.ToLower(raw), "cyber security risk") {
+	lowerRaw := strings.ToLower(raw)
+	if strings.Contains(lowerRaw, "cyber_policy") || strings.Contains(lowerRaw, "cyber security risk") {
 		return "cyber_policy"
+	}
+	if strings.Contains(lowerRaw, "blocked by the content policy") ||
+		strings.Contains(lowerRaw, "content policy violation") ||
+		strings.Contains(lowerRaw, "violates the content policy") {
+		return "content_policy"
 	}
 	return ""
 }

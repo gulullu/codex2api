@@ -252,6 +252,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	var lastBody []byte
 	var lastRetryableUpstreamErr *api.APIError
 	lastFailureWasRelay := false
+	var pendingFinalFailure *retryAttemptUsageSpec
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
 	invalidEncryptedContentRetried := false
@@ -273,6 +274,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				apiErr = routeSelectionAPIError(routeErr, spec)
 				_ = writeResponsesWSError(conn, apiErr)
 				return newResponsesWSCloseError(spec.WebSocketCloseCode, apiErr.Message, apiErr)
+			}
+			if lastFailureWasRelay {
+				h.logPendingFinalFailure(c, pendingFinalFailure)
 			}
 			if lastFailureWasRelay && lastRetryableUpstreamErr != nil {
 				apiErr = responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
@@ -388,14 +392,44 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
 			}
-			retryable := IsRetryableError(reqErr) || kind != ""
+			retryable := shouldRetryTransportFailure(reqErr, kind)
 			shouldRetry := false
 			if silentRetryEnabled && retryable && attempt < maxRetries {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			requestFailureSpec := retryAttemptUsageSpec{
+				AccountID:            account.ID(),
+				Endpoint:             "/v1/responses",
+				Model:                logModel,
+				EffectiveModel:       attemptLogEffectiveModel,
+				DurationMs:           durationMs,
+				ReasoningEffort:      reasoningEffort,
+				UpstreamEndpoint:     "/v1/responses",
+				Stream:               true,
+				ViaWebsocket:         useWebsocket,
+				RequestedServiceTier: serviceTier,
+				Attempt:              attempt,
+			}
+			relayRequestFailure := selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() &&
+				kind != "" && kind != upstreamErrorKindMessageTooBig && c.Request.Context().Err() == nil
+			if relayRequestFailure && !shouldRetry {
+				h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
+			}
+			if relayRequestFailure && shouldRetry {
+				pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				lastStatusCode = pending.StatusCode
+				lastBody = upstreamFailureBody(pending.ErrorMessage)
+				lastFailureWasRelay = true
+			}
+			relayTransportFailure := circuitAttempt.UpstreamTransportFailure(c.Request.Context(), kind, timedOut)
+			if relayTransportFailure {
+				recyclePooledClient(account, proxyURL)
+			}
+			// Preserve sticky retries for non-Relay accounts only. Relay transport
+			// failure must rotate away from the failed front door.
+			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
+			if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			circuitAttempt.Release(h.store, account)
@@ -433,7 +467,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			log.Printf("Responses WebSocket upstream request failed (attempt %d): %v", attempt+1, reqErr)
 			lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
 			if shouldRetry {
-				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+				lastFailureWasRelay = relayRequestFailure
 				if stickyRetry {
 					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, ws)", account.ID(), attempt+1, maxRetries+1)
 				}
@@ -514,6 +548,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				shouldRetry = shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
+			relayFailure := selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+			failureKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
+			failureMessage := usageLogErrorMessage(resp.StatusCode, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
@@ -532,15 +569,34 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+				UpstreamErrorKind:    failureKind,
+				ErrorMessage:         failureMessage,
+				GuardianAttemptOnly:  shouldRetry,
 			})
 
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastRetryableUpstreamErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
-				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+				lastFailureWasRelay = relayFailure
+				if relayFailure {
+					pendingFinalFailure = rememberPendingFinalFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						StatusCode:           resp.StatusCode,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     "/v1/responses",
+						Stream:               true,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+						UpstreamErrorKind:    failureKind,
+						ErrorMessage:         failureMessage,
+					})
+				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return errResponsesWSClientGone
 				}
@@ -553,17 +609,36 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, circuitAttempt, proxyURL, affinityKey, logModel, attemptEffectiveModel, attemptLogEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, attempt, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
+		transparentRetryAllowed := silentRetryEnabled && attempt < maxRetries
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, circuitAttempt, proxyURL, affinityKey, logModel, attemptEffectiveModel, attemptLogEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, attempt, ttftGuard, transparentRetryAllowed, hideUpstreamErrors, useWebsocket); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
 				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+				if lastFailureWasRelay {
+					pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						DurationMs:           int(time.Since(start).Milliseconds()),
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     "/v1/responses",
+						Stream:               true,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+					}, retryErr.outcome)
+					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+					lastStatusCode = pending.StatusCode
+					lastBody = upstreamFailureBody(pending.ErrorMessage)
+				}
 				if useWebsocket && isWebsocketMessageTooBigOutcome(retryErr.outcome) {
 					log.Printf("Responses WebSocket upstream message too large before first token; falling back to HTTP (attempt %d, account %d): %s", attempt+1, account.ID(), retryErr.outcome.failureMessage)
 					forceHTTPAfterWSMessageTooBig = true
 					continue
 				}
-				if silentRetryEnabled && attempt < maxRetries {
+				if transparentRetryAllowed {
 					if isFirstTokenTimeoutOutcome(retryErr.outcome) {
 						retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 					} else {
@@ -611,10 +686,15 @@ func (h *Handler) streamResponsesWSUpstream(
 	start time.Time,
 	attempt int,
 	ttftGuard *firstTokenTimeoutGuard,
-	silentRetryEnabled bool,
+	transparentRetryAllowed bool,
 	hideUpstreamErrors bool,
 	viaWebsocket bool,
 ) error {
+	// Keep this helper's historical signature for direct callers. The passed
+	// retry flag is attempt-specific; runtime configuration is consulted only
+	// to decide whether a final retryable response.failed should be hidden and
+	// rewritten as a structured error instead of leaked as a raw success frame.
+	silentRetryEnabled := transparentRetryAllowed || CurrentRuntimeSettings().CodexWSSilentRetry
 	SyncCodexUsageState(h.store, account, resp)
 
 	account.Mu().RLock()
@@ -707,6 +787,9 @@ func (h *Handler) streamResponsesWSUpstream(
 				if (silentRetryEnabled || hideUpstreamErrors) && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody && responseFailedRetryable(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0
+					if !transparentRetryAllowed {
+						abortedForErrorClose = true
+					}
 					return false
 				}
 				// 首 token 前的不可重试 response.failed(如 context_length_exceeded)
@@ -741,6 +824,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 	}
 	ttftGuard.Stop()
+	if outcome.verifyAccountAuth {
+		h.store.VerifyAccountAuthAsync(account)
+	}
 	var responseFailedDecision codex429Decision
 	if len(terminalFailurePayload) > 0 {
 		outcome = classifyResponseFailedOutcome(terminalFailurePayload)
@@ -769,12 +855,12 @@ func (h *Handler) streamResponsesWSUpstream(
 			Attempt:              attempt,
 		}, outcome)
 		resp.Body.Close()
-		circuitAttempt.Failure(outcome.logStatusCode)
+		circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
 		circuitAttempt.Release(h.store, account)
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
-	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+	if transparentRetryAllowed && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
 		h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
 			AccountID:            account.ID(),
 			Endpoint:             "/v1/responses",
@@ -794,7 +880,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		}
-		circuitAttempt.Failure(outcome.logStatusCode)
+		circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
 		circuitAttempt.Release(h.store, account)
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		return &responsesWSRetryableStreamError{outcome: outcome}
@@ -816,12 +902,13 @@ func (h *Handler) streamResponsesWSUpstream(
 
 	usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
 	c.Set("x-service-tier", usageTiers.ServiceTier)
+	logStatusCode := canonicalStreamStatus(outcome)
 	logInput := &database.UsageLogInput{
 		AccountID:            account.ID(),
 		Endpoint:             "/v1/responses",
 		Model:                model,
 		EffectiveModel:       logEffectiveModel,
-		StatusCode:           outcome.logStatusCode,
+		StatusCode:           logStatusCode,
 		DurationMs:           totalDuration,
 		IsRetryAttempt:       attempt > 0,
 		AttemptIndex:         attempt + 1,
@@ -836,8 +923,8 @@ func (h *Handler) streamResponsesWSUpstream(
 		ActualServiceTier:    usageTiers.ActualServiceTier,
 		BillingServiceTier:   usageTiers.BillingServiceTier,
 	}
-	if outcome.logStatusCode != http.StatusOK {
-		logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
+	if logStatusCode != http.StatusOK {
+		logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
 		logInput.UpstreamErrorKind = outcome.failureKind
 	}
 	if usage != nil {
@@ -865,7 +952,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	if outcome.logStatusCode == http.StatusOK {
 		circuitAttempt.Success()
 	} else {
-		circuitAttempt.Failure(outcome.logStatusCode)
+		circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
 	}
 	circuitAttempt.Release(h.store, account)
 

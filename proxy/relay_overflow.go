@@ -47,12 +47,94 @@ func overflowPromptRiskDecision() promptRiskDecision {
 	}
 }
 
+func (h *Handler) relayCircuitRequestPoolFilter(apiKeyID int64, relayFilter auth.AccountFilter) auth.AccountFilter {
+	return accountFilterAnd(relayFilter, func(account *auth.Account) bool {
+		return h != nil && h.store != nil && account != nil &&
+			account.AllowsAPIKey(apiKeyID) && h.store.APIKeyAllowsAccount(apiKeyID, account)
+	})
+}
+
+// nextRelayAccountForSessionWithInvariant gives the request-scoped Relay pool
+// one availability repair pass after the ordinary scheduler has no candidate.
+// The Store owns the atomic last-resort decision; this layer supplies the same
+// model, routing, API-key and exclusion authority used by real selection.
+func (h *Handler) nextRelayAccountForSessionWithInvariant(
+	affinityKey string,
+	apiKeyID int64,
+	exclude map[int64]bool,
+	relayFilter auth.AccountFilter,
+) (*auth.Account, string) {
+	account, proxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, relayFilter)
+	if account != nil || h == nil || h.store == nil {
+		return account, proxyURL
+	}
+	requestPoolFilter := h.relayCircuitRequestPoolFilter(apiKeyID, relayFilter)
+	if !h.store.EnsureRelayCircuitRequestPoolInvariant(requestPoolFilter, exclude) {
+		return nil, ""
+	}
+	return h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, relayFilter)
+}
+
+func (h *Handler) nextRetryRelayAccountForSession(
+	ctx context.Context,
+	affinityKey string,
+	apiKeyID int64,
+	exclusions *retryAccountExclusions,
+	relayFilter auth.AccountFilter,
+) (*auth.Account, string) {
+	if h == nil || h.store == nil {
+		return nil, ""
+	}
+	for {
+		exclude := exclusions.ForSelection()
+		account, proxyURL := h.nextRelayAccountForSessionWithInvariant(affinityKey, apiKeyID, exclude, relayFilter)
+		if account != nil {
+			return account, proxyURL
+		}
+		account, proxyURL = h.store.WaitForSessionAvailableWithFilter(
+			ctx,
+			affinityKey,
+			30*time.Second,
+			apiKeyID,
+			exclude,
+			relayFilter,
+		)
+		if account != nil {
+			return account, proxyURL
+		}
+		if exclusions == nil || !exclusions.ResetSoft() {
+			return nil, ""
+		}
+		log.Printf("first-token soft exclusions exhausted; retrying Relay routing")
+	}
+}
+
 func (h *Handler) setSelectedRouteDecision(c *gin.Context, decision promptRiskDecision) promptRiskDecision {
 	for _, signal := range encryptedContextSignalsFromContext(c) {
 		decision.Signals = appendUniqueRouteSignal(decision.Signals, signal)
 	}
 	setPromptRiskDecisionContext(c, decision, h.cybRelayConfig().GroupID)
 	return decision
+}
+
+func (h *Handler) failUncertainEncryptedOwner(
+	c *gin.Context,
+	owner responseRouteOwner,
+	required promptRiskDecision,
+	extraSignal string,
+) promptRiskDecision {
+	decision := encryptedContextPromptRiskDecision(owner)
+	if required.routesToCybRelay() {
+		decision = required
+		decision.RouteSource = cybRelayRouteSourcePin
+		decision.PinKind = encryptedContextPinKind
+		decision.RoutePinned = true
+		decision.Signals = appendUniqueRouteSignal(decision.Signals, encryptedOwnerHitSignal)
+	}
+	decision.Signals = appendUniqueRouteSignal(decision.Signals, extraSignal)
+	decision.Reason = "encrypted context owner timed out before first token; request was not replayed or switched"
+	setRouteSelectionError(c, encryptedOwnerAttemptUncertain, "The account that owns encrypted_content timed out before first token; the request was not replayed or switched because upstream completion is uncertain")
+	return h.setSelectedRouteDecision(c, decision)
 }
 
 // nextRoutedAccountForSession keeps policy-triggered traffic Relay-only, while
@@ -70,8 +152,17 @@ func (h *Handler) nextRoutedAccountForSession(
 ) (*auth.Account, string, promptRiskDecision) {
 	clearRouteSelectionError(c)
 	if owner, ok := responseRouteOwnerFromContext(c); ok {
-		if encryptedOwner, encryptedOK := encryptedContextOwnerFromContext(c); encryptedOK && encryptedOwner.AccountID != owner.AccountID {
-			markEncryptedContextDowngrade(c, encryptedOwnerConflictSignal)
+		if encryptedOwner, encryptedOK := encryptedContextOwnerFromContext(c); encryptedOK {
+			if encryptedOwner.AccountID != owner.AccountID {
+				markEncryptedContextDowngrade(c, encryptedOwnerConflictSignal)
+			} else if exclusions != nil && exclusions.IsSoft(owner.AccountID) {
+				// previous_response_id still owns exact routing for ordinary requests.
+				// When the same request also carries owner-bound encrypted_content,
+				// however, its uncertain first attempt must not be replayed even to that
+				// exact owner.
+				decision := h.failUncertainEncryptedOwner(c, encryptedOwner, required, responseOwnerRouteSignal)
+				return nil, "", decision
+			}
 		}
 		ownerIsRelay := owner.AccountType == auth.UpstreamOpenAIResponses || owner.RouteClass == cybRelayRouteClass
 		if required.routesToCybRelay() && !ownerIsRelay {
@@ -126,6 +217,14 @@ func (h *Handler) nextRoutedAccountForSession(
 			markEncryptedContextDowngrade(c, encryptedOwnerConflictSignal)
 		case exclusions != nil && exclusions.IsHard(owner.AccountID):
 			markEncryptedContextDowngrade(c, encryptedOwnerUnavailableSignal)
+		case exclusions != nil && exclusions.IsSoft(owner.AccountID):
+			// A first-token timeout is deliberately only a soft health signal: the
+			// upstream may already be executing even though no response token reached
+			// us. Opaque encrypted_content is account-owned, so neither replaying the
+			// request nor switching/downgrading to another account is safe here. Keep
+			// the owner/pin intact and fail this logical request explicitly.
+			decision := h.failUncertainEncryptedOwner(c, owner, required, "")
+			return nil, "", decision
 		default:
 			ownerFilter := oauthOnlyAccountFilter(baseFilter)
 			if ownerIsRelay {
@@ -158,7 +257,7 @@ func (h *Handler) nextRoutedAccountForSession(
 
 	if required.routesToCybRelay() {
 		relayFilter := h.applyCybRelayAccountFilter(baseFilter, required)
-		account, proxyURL := h.nextRetryAccountForSession(ctx, affinityKey, apiKeyID, exclusions, relayFilter)
+		account, proxyURL := h.nextRetryRelayAccountForSession(ctx, affinityKey, apiKeyID, exclusions, relayFilter)
 		required = h.setSelectedRouteDecision(c, required)
 		return account, proxyURL, required
 	}
@@ -183,7 +282,7 @@ func (h *Handler) nextRoutedAccountForSession(
 			decision = h.setSelectedRouteDecision(c, decision)
 			return account, proxyURL, decision
 		}
-		if account, proxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, relayFilter); account != nil {
+		if account, proxyURL := h.nextRelayAccountForSessionWithInvariant(affinityKey, apiKeyID, exclude, relayFilter); account != nil {
 			overflowDecision = h.setSelectedRouteDecision(c, overflowDecision)
 			return account, proxyURL, overflowDecision
 		}
@@ -218,6 +317,14 @@ func (h *Handler) logRouteSelectionError(c *gin.Context, endpoint, model, effect
 	_ = logicalRequestID(c)
 	durationMs := logicalRequestDurationMs(c)
 	clearUpstreamAccountContext(c)
+	if routeErr.Kind == encryptedOwnerAttemptUncertain {
+		if owner, ok := encryptedContextOwnerFromContext(c); ok {
+			// The canonical row is intentionally account-neutral because no second
+			// attempt started, but the route shape still needs the owner's upstream
+			// class so audit can validate the retained encrypted pin.
+			c.Set(contextUpstreamAccountType, owner.AccountType)
+		}
+	}
 	h.logUsageForRequest(c, &database.UsageLogInput{
 		AccountID:         0,
 		Endpoint:          endpoint,

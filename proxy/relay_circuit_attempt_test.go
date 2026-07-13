@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 func TestRelayCircuitAttemptFinishIsIdempotent(t *testing.T) {
@@ -41,6 +43,169 @@ func TestRelayCircuitAttemptFinishIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRelayCircuitAttemptUpstreamTransportFailureBoundaries(t *testing.T) {
+	tests := []struct {
+		name                  string
+		kind                  string
+		softFirstTokenTimeout bool
+		requestContext        func() context.Context
+		wantRecorded          bool
+	}{
+		{
+			name:           "live relay transport failure",
+			kind:           "transport",
+			requestContext: context.Background,
+			wantRecorded:   true,
+		},
+		{
+			name:                  "soft first token timeout",
+			kind:                  "transport",
+			softFirstTokenTimeout: true,
+			requestContext:        context.Background,
+		},
+		{
+			name:           "websocket message too big fallback",
+			kind:           upstreamErrorKindMessageTooBig,
+			requestContext: context.Background,
+		},
+		{
+			name:           "websocket policy violation",
+			kind:           upstreamErrorKindWebsocketPolicy,
+			requestContext: context.Background,
+		},
+		{
+			name: "downstream canceled",
+			kind: "transport",
+			requestContext: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+		},
+		{
+			name:           "unclassified request error",
+			requestContext: context.Background,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, account := newRelayCircuitProxyTestStore(t)
+			permit, ok := store.BeginRelayCircuitRequestForLogicalRequest(account, "logical-transport-boundary")
+			if !ok {
+				t.Fatal("relay circuit permit denied")
+			}
+			attempt := newRelayCircuitAttempt(store, permit)
+			got := attempt.UpstreamTransportFailure(test.requestContext(), test.kind, test.softFirstTokenTimeout)
+			if got != test.wantRecorded {
+				t.Fatalf("UpstreamTransportFailure()=%t, want %t", got, test.wantRecorded)
+			}
+			if !got {
+				attempt.Abandon()
+			}
+
+			snapshot := store.RelayCircuitSnapshot(account.ID())
+			if test.wantRecorded {
+				if snapshot.State != auth.RelayCircuitSuspect || snapshot.StrongFailures != 1 ||
+					snapshot.LastStatusCode != auth.RelayCircuitTransportFailureStatus || snapshot.Reason != "upstream_transport_failure" {
+					t.Fatalf("recorded transport snapshot=%+v", snapshot)
+				}
+				return
+			}
+			if snapshot.State != auth.RelayCircuitClosed || snapshot.StrongFailures != 0 || snapshot.LastStatusCode != 0 {
+				t.Fatalf("excluded boundary contaminated breaker evidence: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestRelayWebsocketClosePolicyDoesNotContaminateCircuit(t *testing.T) {
+	tests := []struct {
+		code            int
+		wantKind        string
+		wantPenalize    bool
+		wantStrongFault bool
+	}{
+		{code: websocket.ClosePolicyViolation, wantKind: upstreamErrorKindWebsocketPolicy},
+		{code: websocket.CloseAbnormalClosure, wantKind: "transport", wantPenalize: true, wantStrongFault: true},
+		{code: websocket.CloseInternalServerErr, wantKind: "transport", wantPenalize: true, wantStrongFault: true},
+	}
+	for _, test := range tests {
+		t.Run(strconv.Itoa(test.code), func(t *testing.T) {
+			readErr := fmt.Errorf("websocket read error: %w", &websocket.CloseError{Code: test.code, Text: "test close"})
+			outcome := classifyStreamOutcome(nil, readErr, nil, false)
+			if outcome.failureKind != test.wantKind || outcome.penalize != test.wantPenalize || !outcome.verifyAccountAuth {
+				t.Fatalf("outcome=%+v want kind=%q penalize=%t verify=true", outcome, test.wantKind, test.wantPenalize)
+			}
+
+			store, account := newRelayCircuitProxyTestStore(t)
+			permit, ok := store.BeginRelayCircuitRequestForLogicalRequest(account, "logical-ws-close-"+strconv.Itoa(test.code))
+			if !ok {
+				t.Fatal("relay circuit permit denied")
+			}
+			attempt := newRelayCircuitAttempt(store, permit)
+			gotStrong := attempt.FinishStreamOutcome(context.Background(), outcome, isFirstTokenTimeoutOutcome(outcome))
+			attempt.Release(store, account)
+			if gotStrong != test.wantStrongFault {
+				t.Fatalf("strong fault=%t want %t", gotStrong, test.wantStrongFault)
+			}
+			snapshot := store.RelayCircuitSnapshot(account.ID())
+			if test.wantStrongFault {
+				if snapshot.State != auth.RelayCircuitSuspect || snapshot.StrongFailures != 1 || snapshot.LastStatusCode != auth.RelayCircuitTransportFailureStatus {
+					t.Fatalf("transport close circuit=%+v", snapshot)
+				}
+				return
+			}
+			if snapshot.State != auth.RelayCircuitClosed || snapshot.StrongFailures != 0 || snapshot.LastStatusCode != 0 {
+				t.Fatalf("policy close contaminated circuit=%+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestStreamReadTimeoutIsStrongButFirstTokenGuardTimeoutIsSoft(t *testing.T) {
+	tests := []struct {
+		name            string
+		outcome         streamOutcome
+		wantStrongFault bool
+	}{
+		{name: "upstream read timeout", outcome: classifyStreamOutcome(nil, context.DeadlineExceeded, nil, false), wantStrongFault: true},
+		{name: "local first token guard", outcome: firstTokenTimeoutOutcome(time.Second)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, account := newRelayCircuitProxyTestStore(t)
+			permit, ok := store.BeginRelayCircuitRequestForLogicalRequest(account, "logical-timeout-"+test.name)
+			if !ok {
+				t.Fatal("relay circuit permit denied")
+			}
+			attempt := newRelayCircuitAttempt(store, permit)
+			gotStrong := attempt.FinishStreamOutcome(context.Background(), test.outcome, isFirstTokenTimeoutOutcome(test.outcome))
+			attempt.Release(store, account)
+			if gotStrong != test.wantStrongFault {
+				t.Fatalf("strong fault=%t want %t; outcome=%+v", gotStrong, test.wantStrongFault, test.outcome)
+			}
+			snapshot := store.RelayCircuitSnapshot(account.ID())
+			if test.wantStrongFault {
+				if snapshot.State != auth.RelayCircuitSuspect || snapshot.StrongFailures != 1 {
+					t.Fatalf("read timeout circuit=%+v", snapshot)
+				}
+				return
+			}
+			if snapshot.State != auth.RelayCircuitClosed || snapshot.StrongFailures != 0 {
+				t.Fatalf("soft timeout contaminated circuit=%+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestRelayCircuitAttemptInactiveTransportFailureIsIgnored(t *testing.T) {
+	attempt := inactiveRelayCircuitAttempt()
+	if attempt.UpstreamTransportFailure(context.Background(), "transport", false) {
+		t.Fatal("inactive non-Relay attempt recorded transport failure")
+	}
+}
+
 func TestUpstreamErrorKindClassifiesCloudflare5xxAsServer(t *testing.T) {
 	for _, statusCode := range []int{520, 521, 522, 523, 524, 525, 526, 527, 530} {
 		if got := upstreamErrorKind(statusCode, nil, codex429Decision{}); got != "server" {
@@ -49,7 +214,7 @@ func TestUpstreamErrorKindClassifiesCloudflare5xxAsServer(t *testing.T) {
 	}
 }
 
-func TestRelayCircuitConcurrentSelectAndBeginAllowsOneHalfOpenUpstream(t *testing.T) {
+func TestRelayCircuitConcurrentSelectAndBeginAllowsThreeProbationUpstreams(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tokenCache := cache.NewMemory(1)
 	t.Cleanup(func() { _ = tokenCache.Close() })
@@ -126,8 +291,8 @@ func TestRelayCircuitConcurrentSelectAndBeginAllowsOneHalfOpenUpstream(t *testin
 			selectedCount++
 		}
 	}
-	if selectedCount != 1 || upstreamHits.Load() != 1 {
-		t.Fatalf("half-open selected=%d upstream=%d, want 1/1", selectedCount, upstreamHits.Load())
+	if selectedCount != 3 || upstreamHits.Load() != 3 {
+		t.Fatalf("probation selected=%d upstream=%d, want 3/3", selectedCount, upstreamHits.Load())
 	}
 	if snapshot := store.RelayCircuitSnapshot(accountID); !snapshot.ProbeInFlight {
 		t.Fatalf("winner did not hold half-open lease: %+v", snapshot)

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -151,16 +152,30 @@ func TestRelayCircuitHeldNeverEscapesToOAuthAcrossProtocols(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler, oauth, relay := newRelayOverflowTestHandler()
-			permit, ok := handler.store.BeginRelayCircuitRequest(relay)
-			if !ok || !permit.Active {
-				t.Fatalf("Relay circuit permit=%+v ok=%v", permit, ok)
+			backupRelay := &auth.Account{
+				DBID: 3, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay-backup.example/v1",
+				APIKey: "backup-key", Status: auth.StatusReady, GroupIDs: []int64{7}, BaseConcurrencyOverride: int64Pointer(1),
 			}
-			if !handler.store.ReportRelayCircuitFailure(permit, http.StatusBadGateway) {
-				t.Fatal("failed to open Relay circuit")
+			handler.store.AddAccount(backupRelay)
+			for i := 0; i < 3; i++ {
+				permit, ok := handler.store.BeginRelayCircuitRequestForLogicalRequest(relay, fmt.Sprintf("held-%d", i))
+				if !ok || !permit.Active {
+					t.Fatalf("Relay circuit permit=%+v ok=%v", permit, ok)
+				}
+				opened := handler.store.ReportRelayCircuitFailure(permit, http.StatusBadGateway)
+				if opened != (i == 2) {
+					t.Fatalf("strong failure %d opened=%v", i+1, opened)
+				}
 			}
+			atomic.StoreInt32(&backupRelay.Disabled, 1)
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
 			ctx.Request = httptest.NewRequest(http.MethodPost, test.path, nil)
+			if test.continuation {
+				requestContext, cancel := context.WithTimeout(ctx.Request.Context(), 100*time.Millisecond)
+				defer cancel()
+				ctx.Request = ctx.Request.WithContext(requestContext)
+			}
 			if test.websocket {
 				ctx.Request.Header.Set("Connection", "Upgrade")
 				ctx.Request.Header.Set("Upgrade", "websocket")
@@ -170,9 +185,26 @@ func TestRelayCircuitHeldNeverEscapesToOAuthAcrossProtocols(t *testing.T) {
 			}
 			required := promptRiskDecision{Disposition: promptRiskDispositionRelay, RouteSource: cybRelayRouteSourceProbe, Signals: []string{probeRouteSignal}}
 			account, _, decision := handler.nextRoutedAccountForSession(ctx, ctx.Request.Context(), "", 0, newRetryAccountExclusions(), nil, required)
-			if account != nil {
+			if test.continuation {
+				if account != nil {
+					handler.store.Release(account)
+					t.Fatalf("exact continuation unexpectedly bypassed its open owner with account=%d", account.ID())
+				}
+				if snapshot := handler.store.RelayCircuitSnapshot(relay.ID()); snapshot.LastResort {
+					t.Fatalf("exact continuation promoted its open owner to last-resort: %+v", snapshot)
+				}
+			} else {
+				if account != relay {
+					if account != nil {
+						handler.store.Release(account)
+					}
+					t.Fatalf("Relay-only request selected account=%v, want last-resort Relay %d", account, relay.ID())
+				}
+				if snapshot := handler.store.RelayCircuitSnapshot(relay.ID()); !snapshot.LastResort || snapshot.AdmissionLimit != 2 {
+					handler.store.Release(account)
+					t.Fatalf("Relay circuit snapshot = %+v, want cap-2 last-resort", snapshot)
+				}
 				handler.store.Release(account)
-				t.Fatalf("held Relay escaped to account=%d", account.ID())
 			}
 			if !decision.routesToCybRelay() {
 				t.Fatalf("Relay-only decision lost: %+v", decision)
@@ -181,6 +213,56 @@ func TestRelayCircuitHeldNeverEscapesToOAuthAcrossProtocols(t *testing.T) {
 				t.Fatalf("OAuth touched under Relay-only %s: active=%d", test.name, got)
 			}
 		})
+	}
+}
+
+func TestOAuthOverflowRepairsAllOpenRelayPoolWithoutTouchingOAuth(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, oauth, relay := newRelayOverflowTestHandler()
+	backupRelay := &auth.Account{
+		DBID: 3, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay-backup.example/v1",
+		APIKey: "backup-key", Status: auth.StatusReady, GroupIDs: []int64{7}, BaseConcurrencyOverride: int64Pointer(1),
+	}
+	handler.store.AddAccount(backupRelay)
+	for i := 0; i < 3; i++ {
+		permit, ok := handler.store.BeginRelayCircuitRequestForLogicalRequest(relay, fmt.Sprintf("overflow-open-%d", i))
+		if !ok || !permit.Active {
+			t.Fatalf("Relay circuit permit=%+v ok=%v", permit, ok)
+		}
+		if opened := handler.store.ReportRelayCircuitFailure(permit, http.StatusBadGateway); opened != (i == 2) {
+			t.Fatalf("strong failure %d opened=%v", i+1, opened)
+		}
+	}
+	atomic.StoreInt32(&backupRelay.Disabled, 1)
+	atomic.StoreInt64(&oauth.ActiveRequests, 1)
+
+	ctx := newRouteTestContext()
+	account, _, decision := handler.nextRoutedAccountForSession(
+		ctx,
+		ctx.Request.Context(),
+		"",
+		0,
+		newRetryAccountExclusions(),
+		nil,
+		defaultPromptRiskDecision(),
+	)
+	if account != relay {
+		if account != nil {
+			handler.store.Release(account)
+		}
+		t.Fatalf("overflow account=%v, want Relay last-resort %d", account, relay.ID())
+	}
+	if !decision.routesToCybRelay() || decision.RouteSource != cybRelayRouteSourceOverflow {
+		handler.store.Release(account)
+		t.Fatalf("decision=%+v, want overflow Relay decision", decision)
+	}
+	if snapshot := handler.store.RelayCircuitSnapshot(relay.ID()); !snapshot.LastResort || snapshot.AdmissionLimit != 2 {
+		handler.store.Release(account)
+		t.Fatalf("Relay circuit snapshot=%+v, want cap-2 last-resort", snapshot)
+	}
+	handler.store.Release(account)
+	if got := atomic.LoadInt64(&oauth.ActiveRequests); got != 1 {
+		t.Fatalf("OAuth active requests=%d, want original saturation only", got)
 	}
 }
 

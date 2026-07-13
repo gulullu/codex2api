@@ -77,6 +77,13 @@ func TestErrorUpstream(t *testing.T) {
 	}
 }
 
+func TestErrorUpstreamInvalidStatusUsesBadGateway(t *testing.T) {
+	err := ErrUpstream(0, "transport failed", errors.New("EOF"))
+	if err.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("expected invalid upstream status to normalize to %d, got %d", http.StatusBadGateway, err.HTTPStatus)
+	}
+}
+
 // TestErrorUnwrap 测试错误链 Unwrap
 func TestErrorUnwrap(t *testing.T) {
 	cause := errors.New("underlying error")

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
 
@@ -54,8 +55,17 @@ func (a *relayCircuitAttempt) finish(fn func(*auth.Store, auth.RelayCircuitPermi
 }
 
 // Failure reports only statuses owned by the Relay breaker. Other outcomes
-// abandon a half-open lease without changing the breaker state.
+// release the bounded permit without changing the breaker state.
 func (a *relayCircuitAttempt) Failure(statusCode int) {
+	// 598 is an internal marker shared by stream/audit code, not an upstream
+	// HTTP response. It is only breaker evidence when the caller has proved
+	// that the failure came from the upstream transport via the explicit
+	// helpers below. This prevents client cancellation, downstream write
+	// failure, first-token guards, and WS frame fallback from opening a front.
+	if statusCode == auth.RelayCircuitTransportFailureStatus {
+		a.Abandon()
+		return
+	}
 	a.finish(func(store *auth.Store, permit auth.RelayCircuitPermit) {
 		if auth.IsRelayCircuitFailureStatus(statusCode) {
 			store.ReportRelayCircuitFailure(permit, statusCode)
@@ -64,6 +74,42 @@ func (a *relayCircuitAttempt) Failure(statusCode int) {
 			store.AbandonRelayCircuitRequest(permit)
 		}
 	})
+}
+
+// UpstreamTransportFailure records a Relay-only failure that produced no HTTP
+// response. It deliberately rejects soft first-token timeouts, WebSocket frame
+// size fallback, and any error observed after the downstream request context
+// was canceled. The return value tells retry policy to hard-exclude this front
+// door even when the global transport policy is sticky.
+func (a *relayCircuitAttempt) UpstreamTransportFailure(ctx context.Context, kind string, softFirstTokenTimeout bool) bool {
+	if a == nil || !a.permit.Active || softFirstTokenTimeout {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if kind != "transport" && kind != "timeout" {
+		return false
+	}
+	a.finish(func(store *auth.Store, permit auth.RelayCircuitPermit) {
+		store.ReportRelayCircuitFailure(permit, auth.RelayCircuitTransportFailureStatus)
+	})
+	return true
+}
+
+// FinishStreamOutcome centralizes the distinction between a real upstream
+// stream break and an internal 598 marker produced for a non-upstream cause.
+// Callers may use the return value to hard-exclude the failed Relay front.
+func (a *relayCircuitAttempt) FinishStreamOutcome(ctx context.Context, outcome streamOutcome, softFirstTokenTimeout bool) bool {
+	if outcome.logStatusCode != auth.RelayCircuitTransportFailureStatus {
+		a.Failure(outcome.logStatusCode)
+		return false
+	}
+	if a.UpstreamTransportFailure(ctx, outcome.failureKind, softFirstTokenTimeout) {
+		return true
+	}
+	a.Abandon()
+	return false
 }
 
 func (a *relayCircuitAttempt) Success() {
@@ -89,10 +135,9 @@ func (a *relayCircuitAttempt) Release(store *auth.Store, account *auth.Account) 
 }
 
 // nextCircuitPermittedRoutedAccountForSession keeps a scheduler/Begin race out
-// of the logical attempt count. When an expired half-open account was selected
-// concurrently but another request won its single probe lease, release it and
-// reselect inside this function. No upstream attempt or audit attempt has
-// started yet.
+// of the logical attempt count. If suspect/probation capacity changes between
+// selection and permit acquisition, release the account and reselect here. No
+// upstream attempt or audit attempt has started yet.
 func (h *Handler) nextCircuitPermittedRoutedAccountForSession(
 	c *gin.Context,
 	affinityKey string,
@@ -118,14 +163,23 @@ func (h *Handler) nextCircuitPermittedRoutedAccountForSession(
 			return account, proxyURL, selected, inactiveRelayCircuitAttempt()
 		}
 
-		permit, ok := h.store.BeginRelayCircuitRequest(account)
+		// Last-resort/open decisions must use the same request eligibility as the
+		// scheduler. A healthy peer that this API key cannot use is not real
+		// fallback capacity for the current logical request.
+		poolFilter := func(candidate *auth.Account) bool {
+			if candidate == nil || !candidate.AllowsAPIKey(apiKeyID) || !h.store.APIKeyAllowsAccount(apiKeyID, candidate) {
+				return false
+			}
+			return baseFilter == nil || baseFilter(candidate)
+		}
+		permit, ok := h.store.BeginRelayCircuitRequestForLogicalRequestWithFilter(account, logicalRequestID(c), poolFilter)
 		if ok {
 			return account, proxyURL, selected, newRelayCircuitAttempt(h.store, permit)
 		}
 
 		// Selection increments ActiveRequests and dispatch counters. Release the
 		// account immediately; hard exclusion prevents this logical request from
-		// spinning on the same half-open account.
+		// spinning on the same bounded account.
 		h.store.Release(account)
 		if exclusions == nil {
 			return nil, "", selected, inactiveRelayCircuitAttempt()

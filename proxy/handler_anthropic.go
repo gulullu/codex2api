@@ -179,6 +179,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	lastFailureWasRelay := false
+	var pendingFinalFailure *retryAttemptUsageSpec
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
 	forceHTTPAfterWSMessageTooBig := false
@@ -201,6 +202,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				return
 			}
 			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
+				h.logPendingFinalFailure(c, pendingFinalFailure)
 				sendFinalAnthropicUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
@@ -296,12 +298,35 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				continue
 			}
-			retryable := IsRetryableError(reqErr) || kind != ""
+			retryable := shouldRetryTransportFailure(reqErr, kind)
 			shouldRetry := false
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			if kind != "" && !(timedOut && shouldRetry) {
+			relayTransportFailure := circuitAttempt.UpstreamTransportFailure(c.Request.Context(), kind, timedOut)
+			if relayTransportFailure {
+				recyclePooledClient(account, proxyURL)
+			}
+			relayRequestFailure := selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() &&
+				kind != "" && kind != upstreamErrorKindMessageTooBig && c.Request.Context().Err() == nil
+			requestFailureSpec := retryAttemptUsageSpec{
+				AccountID: account.ID(), Endpoint: "/v1/messages", Model: model,
+				EffectiveModel: attemptEffectiveModel, DurationMs: durationMs,
+				ReasoningEffort: reasoningEffort, UpstreamEndpoint: upstreamEndpoint,
+				Stream: isStream, ViaWebsocket: useWebsocket,
+				RequestedServiceTier: serviceTier, Attempt: attempt,
+			}
+			if relayRequestFailure && !shouldRetry {
+				h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
+			}
+			if relayRequestFailure && shouldRetry {
+				pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				lastStatusCode = pending.StatusCode
+				lastBody = upstreamFailureBody(pending.ErrorMessage)
+				lastFailureWasRelay = true
+			}
+			if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			circuitAttempt.Release(h.store, account)
@@ -375,6 +400,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
+			relayFailure := selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+			failureKind := upstreamErrorKind(resp.StatusCode, errBody, decision)
+			failureMessage := usageLogErrorMessage(resp.StatusCode, errBody)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/messages",
@@ -393,14 +421,33 @@ func (h *Handler) Messages(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+				UpstreamErrorKind:    failureKind,
+				ErrorMessage:         failureMessage,
+				GuardianAttemptOnly:  shouldRetry,
 			})
 
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+				lastFailureWasRelay = relayFailure
+				if relayFailure {
+					pendingFinalFailure = rememberPendingFinalFailure(c, retryAttemptUsageSpec{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/messages",
+						Model:                model,
+						EffectiveModel:       attemptEffectiveModel,
+						StatusCode:           resp.StatusCode,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						UpstreamEndpoint:     upstreamEndpoint,
+						Stream:               isStream,
+						ViaWebsocket:         useWebsocket,
+						RequestedServiceTier: serviceTier,
+						Attempt:              attempt,
+						UpstreamErrorKind:    failureKind,
+						ErrorMessage:         failureMessage,
+					})
+				}
 				continue
 			}
 
@@ -427,6 +474,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		wroteAnyBody := false
 		var terminalFailurePayload []byte
 		var anthropicResp *anthropicResponse
+		var anthropicStreamWriter *streamFlushWriter
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
@@ -446,6 +494,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			translator := newAnthropicStreamTranslator(originalModel)
 			streamWriter := newStreamFlushWriter(c.Writer, flusher)
+			anthropicStreamWriter = streamWriter
 			var pendingFirstTokenEvents bytes.Buffer
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
@@ -528,20 +577,6 @@ func (h *Handler) Messages(c *gin.Context) {
 				writeErr = streamWriter.Flush()
 			}
 
-			// 流结束后补齐事件
-			if writeErr == nil && !gotTerminal && ttftRecorded {
-				finalEvents := translator.finalize()
-				for _, evt := range finalEvents {
-					sse := anthropicEventToSSE(evt)
-					if err := streamWriter.WriteString(sse); err != nil {
-						writeErr = err
-						break
-					}
-				}
-				if writeErr == nil {
-					writeErr = streamWriter.Flush()
-				}
-			}
 		} else {
 			// 非流式：缓冲所有事件后构建完整 JSON 响应
 			var lastCompletedData []byte
@@ -620,7 +655,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				Attempt:              attempt,
 			}, outcome)
 			resp.Body.Close()
-			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
 			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
@@ -644,7 +679,24 @@ func (h *Handler) Messages(c *gin.Context) {
 				Attempt:              attempt,
 			}, outcome)
 			if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
-				lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
+				pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/messages",
+					Model:                model,
+					EffectiveModel:       attemptEffectiveModel,
+					DurationMs:           totalDuration,
+					FirstTokenMs:         firstTokenMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					ActualServiceTier:    actualServiceTier,
+					Attempt:              attempt,
+				}, outcome)
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				lastStatusCode = pending.StatusCode
+				lastBody = upstreamFailureBody(pending.ErrorMessage)
 				lastFailureWasRelay = true
 			}
 			recyclePooledClient(account, proxyURL)
@@ -658,10 +710,30 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
-			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
 			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
+		}
+
+		// A truncated Anthropic stream is never a successful message_stop. Once
+		// output has reached the client it cannot be replayed safely, so terminate
+		// the existing SSE stream with an explicit Anthropic error event. Before
+		// any output, preserve normal HTTP error semantics instead of an empty 200.
+		if isStream && outcome.logStatusCode == logStatusUpstreamStreamBreak && c.Request.Context().Err() == nil && writeErr == nil {
+			canonicalStatus := canonicalStreamStatus(outcome)
+			if wroteAnyBody {
+				if anthropicStreamWriter != nil {
+					if err := anthropicStreamWriter.WriteString(anthropicStreamErrorSSE(mapHTTPStatusToAnthropicError(canonicalStatus), outcome.failureMessage)); err != nil {
+						log.Printf("failed to signal truncated Anthropic stream (account %d): %v", account.ID(), err)
+					} else if err := anthropicStreamWriter.Flush(); err != nil {
+						log.Printf("failed to flush truncated Anthropic stream error (account %d): %v", account.ID(), err)
+					}
+				}
+			} else {
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				sendAnthropicError(c, canonicalStatus, mapHTTPStatusToAnthropicError(canonicalStatus), outcome.failureMessage)
+			}
 		}
 
 		if !isStream {
@@ -674,7 +746,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
-		logStatusCode := outcome.logStatusCode
+		logStatusCode := canonicalStreamStatus(outcome)
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/messages, status %d): %s，已转发约 %d 字符",
 				account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -744,7 +816,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		if outcome.logStatusCode == http.StatusOK {
 			circuitAttempt.Success()
 		} else {
-			circuitAttempt.Failure(outcome.logStatusCode)
+			circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
 		}
 		circuitAttempt.Release(h.store, account)
 		return
