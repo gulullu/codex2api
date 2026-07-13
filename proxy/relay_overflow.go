@@ -47,8 +47,12 @@ func overflowPromptRiskDecision() promptRiskDecision {
 	}
 }
 
-func (h *Handler) setSelectedRouteDecision(c *gin.Context, decision promptRiskDecision) {
+func (h *Handler) setSelectedRouteDecision(c *gin.Context, decision promptRiskDecision) promptRiskDecision {
+	for _, signal := range encryptedContextSignalsFromContext(c) {
+		decision.Signals = appendUniqueRouteSignal(decision.Signals, signal)
+	}
 	setPromptRiskDecisionContext(c, decision, h.cybRelayConfig().GroupID)
+	return decision
 }
 
 // nextRoutedAccountForSession keeps policy-triggered traffic Relay-only, while
@@ -66,6 +70,9 @@ func (h *Handler) nextRoutedAccountForSession(
 ) (*auth.Account, string, promptRiskDecision) {
 	clearRouteSelectionError(c)
 	if owner, ok := responseRouteOwnerFromContext(c); ok {
+		if encryptedOwner, encryptedOK := encryptedContextOwnerFromContext(c); encryptedOK && encryptedOwner.AccountID != owner.AccountID {
+			markEncryptedContextDowngrade(c, encryptedOwnerConflictSignal)
+		}
 		ownerIsRelay := owner.AccountType == auth.UpstreamOpenAIResponses || owner.RouteClass == cybRelayRouteClass
 		if required.routesToCybRelay() && !ownerIsRelay {
 			conflict := required
@@ -73,7 +80,7 @@ func (h *Handler) nextRoutedAccountForSession(
 			conflict.Reason = "previous_response_id belongs to OAuth; resend full context without previous_response_id to use Relay"
 			conflict.Signals = appendUniqueRouteSignal(conflict.Signals, responseOwnerRouteSignal)
 			setRouteSelectionError(c, routeSwitchRequiresReplay, conflict.Reason)
-			h.setSelectedRouteDecision(c, conflict)
+			conflict = h.setSelectedRouteDecision(c, conflict)
 			return nil, "", conflict
 		}
 		decision := continuationPromptRiskDecision(owner)
@@ -89,7 +96,7 @@ func (h *Handler) nextRoutedAccountForSession(
 		// for an account that the hard-exclusion set makes impossible to select.
 		if exclusions != nil && exclusions.IsHard(owner.AccountID) {
 			setRouteSelectionError(c, continuationOwnerUnavailable, "The account that owns previous_response_id is unavailable; retry later or resend full context")
-			h.setSelectedRouteDecision(c, decision)
+			decision = h.setSelectedRouteDecision(c, decision)
 			return nil, "", decision
 		}
 		ownerBaseFilter := oauthOnlyAccountFilter(baseFilter)
@@ -106,14 +113,53 @@ func (h *Handler) nextRoutedAccountForSession(
 		if account == nil {
 			setRouteSelectionError(c, continuationOwnerUnavailable, "The account that owns previous_response_id is unavailable; retry later or resend full context")
 		}
-		h.setSelectedRouteDecision(c, decision)
+		decision = h.setSelectedRouteDecision(c, decision)
 		return account, proxyURL, decision
+	}
+
+	if owner, ok := encryptedContextOwnerFromContext(c); ok {
+		ownerIsRelay := owner.AccountType == auth.UpstreamOpenAIResponses || owner.RouteClass == cybRelayRouteClass
+		switch {
+		case required.routesToCybRelay() && !ownerIsRelay:
+			// Local full-payload routing rules always win over an OAuth owner.
+			// The caller will downgrade opaque history before sending to Relay.
+			markEncryptedContextDowngrade(c, encryptedOwnerConflictSignal)
+		case exclusions != nil && exclusions.IsHard(owner.AccountID):
+			markEncryptedContextDowngrade(c, encryptedOwnerUnavailableSignal)
+		default:
+			ownerFilter := oauthOnlyAccountFilter(baseFilter)
+			if ownerIsRelay {
+				ownerFilter = h.applyCybRelayAccountFilter(baseFilter, promptRiskDecision{Disposition: promptRiskDispositionRelay})
+			}
+			var exclude map[int64]bool
+			if exclusions != nil {
+				exclude = exclusions.ForSelection()
+			}
+			account, proxyURL := h.nextAccountForSessionWithFilter(
+				affinityKey,
+				apiKeyID,
+				exclude,
+				responseOwnerAccountFilter(ownerFilter, owner),
+			)
+			if account != nil {
+				decision := encryptedContextPromptRiskDecision(owner)
+				if required.routesToCybRelay() {
+					decision = required
+					decision.PinKind = encryptedContextPinKind
+					decision.RoutePinned = true
+					decision.Signals = appendUniqueRouteSignal(decision.Signals, encryptedOwnerHitSignal)
+				}
+				decision = h.setSelectedRouteDecision(c, decision)
+				return account, proxyURL, decision
+			}
+			markEncryptedContextDowngrade(c, encryptedOwnerUnavailableSignal)
+		}
 	}
 
 	if required.routesToCybRelay() {
 		relayFilter := h.applyCybRelayAccountFilter(baseFilter, required)
 		account, proxyURL := h.nextRetryAccountForSession(ctx, affinityKey, apiKeyID, exclusions, relayFilter)
-		h.setSelectedRouteDecision(c, required)
+		required = h.setSelectedRouteDecision(c, required)
 		return account, proxyURL, required
 	}
 
@@ -123,7 +169,7 @@ func (h *Handler) nextRoutedAccountForSession(
 	if !cfg.Enabled || cfg.GroupID <= 0 {
 		account, proxyURL := h.nextRetryAccountForSession(ctx, affinityKey, apiKeyID, exclusions, baseFilter)
 		decision := defaultPromptRiskDecision()
-		h.setSelectedRouteDecision(c, decision)
+		decision = h.setSelectedRouteDecision(c, decision)
 		return account, proxyURL, decision
 	}
 
@@ -134,11 +180,11 @@ func (h *Handler) nextRoutedAccountForSession(
 		exclude := exclusions.ForSelection()
 		if account, proxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, oauthFilter); account != nil {
 			decision := defaultPromptRiskDecision()
-			h.setSelectedRouteDecision(c, decision)
+			decision = h.setSelectedRouteDecision(c, decision)
 			return account, proxyURL, decision
 		}
 		if account, proxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, relayFilter); account != nil {
-			h.setSelectedRouteDecision(c, overflowDecision)
+			overflowDecision = h.setSelectedRouteDecision(c, overflowDecision)
 			return account, proxyURL, overflowDecision
 		}
 
@@ -152,16 +198,16 @@ func (h *Handler) nextRoutedAccountForSession(
 		)
 		if account != nil {
 			if account.IsOpenAIResponsesAPI() {
-				h.setSelectedRouteDecision(c, overflowDecision)
+				overflowDecision = h.setSelectedRouteDecision(c, overflowDecision)
 				return account, proxyURL, overflowDecision
 			}
 			decision := defaultPromptRiskDecision()
-			h.setSelectedRouteDecision(c, decision)
+			decision = h.setSelectedRouteDecision(c, decision)
 			return account, proxyURL, decision
 		}
 		if exclusions == nil || !exclusions.ResetSoft() {
 			decision := defaultPromptRiskDecision()
-			h.setSelectedRouteDecision(c, decision)
+			decision = h.setSelectedRouteDecision(c, decision)
 			return nil, "", decision
 		}
 		log.Printf("first-token soft exclusions exhausted; retrying OAuth/Relay routing")

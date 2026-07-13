@@ -192,6 +192,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	h.loadResponseRouteOwner(c, rawBody)
+	h.loadEncryptedContextAffinity(c, rawBody)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -290,6 +291,18 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 			_ = writeResponsesWSError(conn, apiErr)
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
+		}
+		if encryptedContextNeedsDowngrade(c) {
+			repairedRawBody, repair, repairErr := h.repairEncryptedContextForAccountSwitch(c, rawBody)
+			if repairErr != nil {
+				circuitAttempt.Release(h.store, account)
+				apiErr = api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest)
+				_ = writeResponsesWSError(conn, apiErr)
+				return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, repairErr)
+			}
+			rawBody = repairedRawBody
+			codexBody, expandedInputRaw = PrepareResponsesWebSocketBody(rawBody)
+			log.Printf("encrypted context owner unavailable or conflicted; downgraded before WebSocket routing (dropped=%d converted=%d)", repair.Dropped, repair.Converted)
 		}
 
 		start := time.Now()
@@ -456,6 +469,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 				if repair.Changed && !repair.InputEmpty {
+					h.invalidateEncryptedContextBindings(c)
 					invalidEncryptedContentRetried = true
 					rawBody = repairedRawBody
 					codexBody, expandedInputRaw = PrepareResponsesWebSocketBody(rawBody)
@@ -628,6 +642,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	abortedForErrorClose := false
 	pendingFirstTokenMessages := make([][]byte, 0, 4)
 	pendingFirstTokenBytes := 0
+	encryptedCapture := newEncryptedContextCapture(requestAPIKeyID(c))
 
 	flushPendingFirstTokenMessages := func() bool {
 		for _, pending := range pendingFirstTokenMessages {
@@ -644,6 +659,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+		encryptedCapture.Observe(data)
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
 		ttftGuard.MarkProgress(eventType)
@@ -659,6 +675,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 		}
 		if eventType == "response.completed" {
+			h.commitEncryptedContextCapture(account, encryptedCapture)
 			h.pinCybRelayResponseID(c, data)
 			usage = extractUsageFromResult(parsed.Get("response.usage"))
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {

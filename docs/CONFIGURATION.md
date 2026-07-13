@@ -60,6 +60,8 @@ Codex2API 采用三层配置架构：
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |
+| `CODEX_ENCRYPTED_CONTEXT_AFFINITY_ENABLED` | 否 | `false` | 仅对携带 Responses `encrypted_content` 的请求优先选择其原上游账号；独立于普通会话黏性 |
+| `CODEX_ENCRYPTED_CONTEXT_AFFINITY_TTL` | 否 | `24h` | 加密上下文账号归属的缓存 TTL，支持 Go duration，最大 7 天 |
 | `CODEX_FINGERPRINT_DEBUG` | 否 | `false` | 输出脱敏指纹策略诊断日志，不记录 token |
 
 > `CODEX_UPSTREAM_TRANSPORT` 只控制 HTTP 入站请求转发到 Codex 上游时使用 `http` 还是 `ws`。客户端侧 WebSocket 入口独立可用：使用 `GET ws://<host>/v1/responses` 建连，首帧发送 `response.create` JSON，服务端会通过 Codex 上游 WS 返回 Responses 事件帧。

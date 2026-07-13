@@ -1790,6 +1790,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	h.loadResponseRouteOwner(c, rawBody)
+	h.loadEncryptedContextAffinity(c, rawBody)
 	affinityKey := sessionAffinityKey(explicitSessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
@@ -1888,11 +1889,24 @@ func (h *Handler) Responses(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
+		if encryptedContextNeedsDowngrade(c) {
+			repairedRawBody, repair, repairErr := h.repairEncryptedContextForAccountSwitch(c, rawBody)
+			if repairErr != nil {
+				circuitAttempt.Release(h.store, account)
+				api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest))
+				return
+			}
+			rawBody = repairedRawBody
+			codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
+			resetOpenAIResponsesBody()
+			log.Printf("加密历史原账号不可用或冲突，已安全降级后继续调度 (endpoint=/v1/responses dropped=%d converted=%d)", repair.Dropped, repair.Converted)
+		}
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		setUpstreamAccountContext(c, account)
+		encryptedCapture := newEncryptedContextCapture(apiKeyID)
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
@@ -2040,6 +2054,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 					if repair.Changed && !repair.InputEmpty {
+						h.invalidateEncryptedContextBindings(c)
 						invalidEncryptedContentRetried = true
 						rawBody = repairedRawBody
 						codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
@@ -2157,6 +2172,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+					encryptedCapture.Observe(data)
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
 					ttftGuard.MarkProgress(eventType)
@@ -2169,6 +2185,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
 					if eventType == "response.completed" {
+						h.commitEncryptedContextCapture(account, encryptedCapture)
 						h.pinCybRelayResponseID(c, data)
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -2215,6 +2232,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				var respBody []byte
 				respBody, readErr = io.ReadAll(resp.Body)
 				if readErr == nil {
+					encryptedCapture.Observe(respBody)
+					h.commitEncryptedContextCapture(account, encryptedCapture)
 					h.pinCybRelayResponseID(c, respBody)
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
@@ -2496,6 +2515,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 				if repair.Changed && !repair.InputEmpty {
+					h.invalidateEncryptedContextBindings(c)
 					invalidEncryptedContentRetried = true
 					rawBody = repairedRawBody
 					codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
@@ -2622,6 +2642,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			clientGone := false
 			var pendingFirstTokenEvents bytes.Buffer
 			forward := func(data []byte) bool {
+				encryptedCapture.Observe(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
@@ -2643,6 +2664,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
+					h.commitEncryptedContextCapture(account, encryptedCapture)
 					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -2757,6 +2779,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			imageOutputs := make([]json.RawMessage, 0, 1)
 			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+				encryptedCapture.Observe(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
@@ -2775,6 +2798,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
+					h.commitEncryptedContextCapture(account, encryptedCapture)
 					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -3057,6 +3081,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	h.loadResponseRouteOwner(c, rawBody)
+	h.loadEncryptedContextAffinity(c, rawBody)
 	affinityKey := sessionAffinityKey(explicitSessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
@@ -3131,11 +3156,24 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
+		if encryptedContextNeedsDowngrade(c) {
+			repairedRawBody, repair, repairErr := h.repairEncryptedContextForAccountSwitch(c, rawBody)
+			if repairErr != nil {
+				circuitAttempt.Release(h.store, account)
+				api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest))
+				return
+			}
+			rawBody = repairedRawBody
+			codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
+			openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+			log.Printf("加密历史原账号不可用或冲突，已安全降级后继续调度 (endpoint=/v1/responses/compact dropped=%d converted=%d)", repair.Dropped, repair.Converted)
+		}
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		setUpstreamAccountContext(c, account)
+		encryptedCapture := newEncryptedContextCapture(apiKeyID)
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
 
@@ -3198,6 +3236,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 					if repair.Changed && !repair.InputEmpty {
+						h.invalidateEncryptedContextBindings(c)
 						invalidEncryptedContentRetried = true
 						rawBody = repairedRawBody
 						codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
@@ -3315,6 +3354,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				return
 			}
 
+			encryptedCapture.Observe(respBody)
+			h.commitEncryptedContextCapture(account, encryptedCapture)
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
 
@@ -3413,6 +3454,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 				if repair.Changed && !repair.InputEmpty {
+					h.invalidateEncryptedContextBindings(c)
 					invalidEncryptedContentRetried = true
 					rawBody = repairedRawBody
 					codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
@@ -3532,6 +3574,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			return
 		}
 
+		encryptedCapture.Observe(respBody)
+		h.commitEncryptedContextCapture(account, encryptedCapture)
 		SyncCodexUsageState(h.store, account, resp)
 		h.store.ClearModelCooldown(account, effectiveModel)
 
