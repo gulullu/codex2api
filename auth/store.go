@@ -197,6 +197,10 @@ type Account struct {
 	// relayGuardianSchedulingHint 是 Guardian 的纯运行态调度提示。
 	// 它只影响选号顺序与并发上限，不写数据库，也不改变人工 enabled/Disabled 配置。
 	relayGuardianSchedulingHint atomic.Uint64
+	// relayCircuitLastResort is independent from the Guardian mode. It keeps a
+	// failing sole front available at a tiny cap, but places it behind every
+	// normal Relay front as soon as another front recovers.
+	relayCircuitLastResort atomic.Bool
 
 	// per-account 调度配置（nil = 跟随默认）
 	ScoreBiasOverride       *int64
@@ -2419,6 +2423,7 @@ type Store struct {
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
 	promptFilterConfig    atomic.Value // promptfilter.Config
+	cybRelayConfigMu      sync.Mutex   // serializes config scope publication and runtime epoch reset
 	cybRelayConfig        atomic.Value // CybRelayConfig
 	relayCircuitOnce      sync.Once
 	relayCircuit          *relayCircuitBreaker
@@ -4028,8 +4033,8 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			lastResort := hintToken&relayGuardianHintLastResortBit != 0
-			// Guardian 兜底账号严格排在所有普通账号之后；只有普通账号均无余量时才使用。
+			lastResort := acc.relayAvailabilityLastResort()
+			// Guardian/circuit 兜底账号严格排在所有普通账号之后；只有普通账号均无余量时才使用。
 			// 在同一类别内继续遵循官方 scheduler_priority / 健康档位 / 分数排序。
 			sameClass := best != nil && lastResort == bestLastResort
 			if best == nil || (bestLastResort && !lastResort) || (sameClass &&
@@ -4057,7 +4062,10 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			continue
 		}
 		if s.tryAcquireAccountWithToken(best, bestLimit, true, bestHintToken) {
-			return best
+			if best.relayAvailabilityLastResort() == bestLastResort {
+				return best
+			}
+			s.Release(best)
 		}
 	}
 	return nil
@@ -4212,7 +4220,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			lastResort := hintToken&relayGuardianHintLastResortBit != 0
+			lastResort := acc.relayAvailabilityLastResort()
 			sameClass := best != nil && lastResort == bestLastResort
 			if best == nil || (bestLastResort && !lastResort) || (sameClass &&
 				(schedulerPriority > bestSchedulerPriority ||
@@ -4241,7 +4249,10 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 			continue
 		}
 		if s.acquireLazyCandidate(best, maxConcurrency, bestHintToken) {
-			return best
+			if best.relayAvailabilityLastResort() == bestLastResort {
+				return best
+			}
+			s.Release(best)
 		}
 	}
 	return nil
@@ -4899,20 +4910,39 @@ func (s *Store) SetCybRelayConfig(cfg CybRelayConfig) {
 	if s == nil {
 		return
 	}
+	s.cybRelayConfigMu.Lock()
+	defer s.cybRelayConfigMu.Unlock()
+
 	previous := s.GetCybRelayConfig()
 	normalized := NormalizeCybRelayConfig(cfg)
 	changed := previous.Enabled != normalized.Enabled || previous.GroupID != normalized.GroupID
-	if s.relayGuardian == nil || !changed {
+	if !changed {
 		s.cybRelayConfig.Store(normalized)
 		return
 	}
+
 	accounts := s.Accounts()
-	s.relayGuardian.transitionConfig(normalized, accounts)
-	if changed && normalized.Enabled && normalized.GroupID > 0 {
+	guardianInitialized := s.relayGuardian != nil
+	if guardianInitialized {
+		// Publish the new routing authority and revoke the old Guardian epoch
+		// before resetting breaker generations. Any request admitted before
+		// publication is then revoked by the final breaker reset; any request
+		// admitted after publication belongs to the new scope.
+		s.relayGuardian.transitionConfig(normalized, accounts)
+	} else {
+		s.cybRelayConfig.Store(normalized)
+	}
+
+	// Restore the new Guardian scope before breaker cache cleanup, so enforce
+	// mode does not stay fail-closed for every account while sequential Redis
+	// deletes complete. Breaker state is intentionally reset afterwards and is
+	// the final membership/config epoch fence.
+	if guardianInitialized && normalized.Enabled && normalized.GroupID > 0 {
 		for _, account := range accounts {
 			s.preloadRelayRuntimeAccount(account)
 		}
 	}
+	s.relayCircuitConfigChanged(previous, normalized, accounts)
 }
 
 func (s *Store) GetCybRelayConfig() CybRelayConfig {
@@ -5152,18 +5182,26 @@ func (s *Store) AddAccount(acc *Account) {
 // RemoveAccount 从内存池移除账号
 func (s *Store) RemoveAccount(dbID int64) {
 	s.mu.Lock()
-	removed := false
+	var removedAccount *Account
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
 			s.rebuildAccountIndex()
-			removed = true
+			removedAccount = acc
 			break
 		}
 	}
 	s.mu.Unlock()
-	if !removed {
+	if removedAccount == nil {
 		return
+	}
+	// A DB ID may be re-added with a new Account object. Revoke breaker permits
+	// from the removed object so their late completion cannot affect the new
+	// front. Guardian state is deliberately retained: delete/re-add must not be
+	// an escape hatch from reliability quarantine.
+	if removedAccount.IsOpenAIResponsesAPI() {
+		removedAccount.setRelayCircuitLastResort(false)
+		s.relayCircuitManager().forgetAccountRuntime(dbID, relayCircuitAccountIdentityFingerprint(removedAccount))
 	}
 	s.fastSchedulerRemove(dbID)
 	// 清理 RefreshScheduler 中可能残留的任务。
@@ -5615,6 +5653,8 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 		return false
 	}
 
+	wasRelay := s.isConfiguredRelayCircuitAccount(acc)
+	oldIdentity := relayCircuitAccountIdentityFingerprint(acc)
 	acc.mu.Lock()
 	acc.UpstreamType = UpstreamOpenAIResponses
 	acc.BaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
@@ -5632,6 +5672,13 @@ func (s *Store) ApplyOpenAIResponsesConfig(dbID int64, baseURL, apiKey string, m
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
+	isRelay := s.isConfiguredRelayCircuitAccount(acc)
+	newIdentity := relayCircuitAccountIdentityFingerprint(acc)
+	if wasRelay != isRelay {
+		s.relayGuardianAccountMembershipChanged(acc, wasRelay, isRelay)
+	} else if isRelay && oldIdentity != newIdentity {
+		s.relayRuntimeAccountIdentityChanged(acc)
+	}
 	s.fastSchedulerUpdate(acc)
 	return true
 }
@@ -5655,9 +5702,13 @@ func (s *Store) ApplyAccountProxyURL(dbID int64, proxyURL string) bool {
 	if acc == nil {
 		return false
 	}
+	oldIdentity := relayCircuitAccountIdentityFingerprint(acc)
 	acc.mu.Lock()
 	acc.ProxyURL = strings.TrimSpace(proxyURL)
 	acc.mu.Unlock()
+	if s.isConfiguredRelayCircuitAccount(acc) && oldIdentity != relayCircuitAccountIdentityFingerprint(acc) {
+		s.relayRuntimeAccountIdentityChanged(acc)
+	}
 	return true
 }
 
@@ -5666,9 +5717,13 @@ func (s *Store) ApplyAccountCustomHeaders(dbID int64, headers map[string]string)
 	if acc == nil {
 		return false
 	}
+	oldIdentity := relayCircuitAccountIdentityFingerprint(acc)
 	acc.mu.Lock()
 	acc.CustomHeaders = cloneStringMap(headers)
 	acc.mu.Unlock()
+	if s.isConfiguredRelayCircuitAccount(acc) && oldIdentity != relayCircuitAccountIdentityFingerprint(acc) {
+		s.relayRuntimeAccountIdentityChanged(acc)
+	}
 	return true
 }
 
@@ -6720,12 +6775,12 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		removeSet[id] = struct{}{}
 	}
 
-	removedIDs := make([]int64, 0, len(removeSet))
+	removedAccounts := make([]*Account, 0, len(removeSet))
 	s.mu.Lock()
 	kept := s.accounts[:0]
 	for _, acc := range s.accounts {
 		if _, remove := removeSet[acc.DBID]; remove {
-			removedIDs = append(removedIDs, acc.DBID)
+			removedAccounts = append(removedAccounts, acc)
 		} else {
 			kept = append(kept, acc)
 		}
@@ -6733,7 +6788,12 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 	s.accounts = kept
 	s.rebuildAccountIndex()
 	s.mu.Unlock()
-	for _, dbID := range removedIDs {
+	for _, account := range removedAccounts {
+		dbID := account.DBID
+		if account.IsOpenAIResponsesAPI() {
+			account.setRelayCircuitLastResort(false)
+			s.relayCircuitManager().forgetAccountRuntime(dbID, relayCircuitAccountIdentityFingerprint(account))
+		}
 		s.fastSchedulerRemove(dbID)
 		if scheduler := s.GetRefreshScheduler(); scheduler != nil {
 			scheduler.CancelTask(dbID)

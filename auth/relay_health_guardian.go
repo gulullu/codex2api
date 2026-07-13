@@ -316,12 +316,19 @@ type RelayGuardianHealthSummary struct {
 }
 
 type RelayGuardianRelaySummary struct {
-	Configured  int `json:"configured"`
-	Enabled     int `json:"enabled"`
-	Schedulable int `json:"schedulable"`
-	Quarantined int `json:"quarantined"`
-	Probation   int `json:"probation"`
-	Degraded    int `json:"degraded"`
+	GroupID                 int64 `json:"group_id"`
+	Configured              int   `json:"configured"`
+	Enabled                 int   `json:"enabled"`
+	Schedulable             int   `json:"schedulable"`
+	NormalSchedulable       int   `json:"normal_schedulable"`
+	Suspect                 int   `json:"suspect"`
+	RecoveryOnly            int   `json:"recovery_only"`
+	CircuitOpen             int   `json:"circuit_open"`
+	EffectiveAvailableSlots int64 `json:"effective_available_slots"`
+	LastResort              int   `json:"last_resort"`
+	Quarantined             int   `json:"quarantined"`
+	Probation               int   `json:"probation"`
+	Degraded                int   `json:"degraded"`
 }
 
 var ErrRelayGuardianStaleGeneration = errors.New("relay guardian generation changed")
@@ -1869,6 +1876,36 @@ func (g *relayHealthGuardian) selectable(account *Account) bool {
 	}
 }
 
+// normalCapacity reports whether Guardian considers an account stable pool
+// capacity. Recovery-only entrances are intentionally stricter than
+// selectable: half-open, probation, temporary bypass and last-resort traffic
+// may serve bounded requests, but they must not be used as proof that another
+// failing Relay front door can be removed safely.
+func (g *relayHealthGuardian) normalCapacity(account *Account) bool {
+	if g == nil || account == nil || g.store.GetRelayGuardianMode() != RelayGuardianEnforce {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.loaded[account.DBID] && g.cache == nil {
+		g.loaded[account.DBID] = true
+	}
+	if !g.loaded[account.DBID] {
+		return false
+	}
+	state := g.stateLocked(account.DBID)
+	g.advanceTimeLocked(account, state, g.nowTime())
+	if state.LastResort {
+		return false
+	}
+	switch state.State {
+	case RelayGuardianHealthy, RelayGuardianSuspect:
+		return true
+	default:
+		return false
+	}
+}
+
 func (g *relayHealthGuardian) begin(account *Account) (RelayGuardianPermit, bool) {
 	if g == nil || account == nil || g.store.GetRelayGuardianMode() != RelayGuardianEnforce {
 		return RelayGuardianPermit{}, true
@@ -2639,8 +2676,23 @@ func (s *Store) preloadRelayRuntimeAccount(account *Account) {
 		relayGuardianSchedulingHint(account, false, 0, 0)
 		return
 	}
-	s.relayCircuitManager().ensureLoaded(account.DBID)
+	s.relayCircuitManager().ensureLoadedForAccount(account)
+	account.setRelayCircuitLastResort(s.relayCircuitManager().snapshot(account.DBID).LastResort)
 	s.relayGuardianManager().preloadAndReplay(account)
+}
+
+// relayRuntimeAccountIdentityChanged starts a fresh health epoch after an
+// operator changes the actual Relay front door. A display-name edit does not
+// call this path. Both breaker and Guardian are reset so old endpoint evidence
+// cannot penalize replacement credentials or a replacement gateway.
+func (s *Store) relayRuntimeAccountIdentityChanged(account *Account) {
+	if s == nil || account == nil || !s.isConfiguredRelayCircuitAccount(account) {
+		return
+	}
+	account.setRelayCircuitLastResort(false)
+	s.relayCircuitManager().forgetAccountRuntime(account.DBID, relayCircuitAccountIdentityFingerprint(account))
+	s.relayGuardianManager().forgetAccountRuntime(account, s.GetCybRelayConfig().GroupID)
+	s.preloadRelayRuntimeAccount(account)
 }
 
 func (s *Store) relayGuardianAccountAvailabilityChanged(account *Account) {
@@ -2660,6 +2712,11 @@ func (s *Store) relayGuardianAccountMembershipChanged(account *Account, wasRelay
 	if account == nil || wasRelay == isRelay {
 		return
 	}
+	// Breaker permits and restart fences are scoped to one membership epoch,
+	// just like Guardian state. Reset before either leaving or joining so a late
+	// completion from the old membership cannot cross the boundary.
+	account.setRelayCircuitLastResort(false)
+	s.relayCircuitManager().forgetAccountRuntime(account.DBID, relayCircuitAccountIdentityFingerprint(account))
 	if !isRelay {
 		// The hint lives on Account, not on a group bucket, so it must be cleared
 		// synchronously before another group can schedule this account. Drop the
@@ -2780,11 +2837,13 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 	now := time.Now()
 	health := RelayGuardianHealthSummary{Enabled: mode != RelayGuardianOff, Mode: mode, Status: "disabled", ScanIntervalSeconds: int(RelayGuardianScanInterval / time.Second)}
 	type guardianLocal struct {
-		loaded     bool
-		state      RelayGuardianState
-		until      time.Time
-		probe      bool
-		lastResort bool
+		loaded           bool
+		state            RelayGuardianState
+		until            time.Time
+		bypassUntil      time.Time
+		probe            bool
+		probationPercent int
+		lastResort       bool
 	}
 	guardianStates := make(map[int64]guardianLocal)
 	poolWide := false
@@ -2800,7 +2859,12 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 			guardianStates[accountID] = guardianLocal{loaded: loaded || guardian.cache == nil, state: RelayGuardianHealthy}
 		}
 		for accountID, state := range guardian.states {
-			guardianStates[accountID] = guardianLocal{loaded: guardian.loaded[accountID] || guardian.cache == nil, state: state.State, until: state.QuarantineUntil, probe: state.halfOpenInFlight, lastResort: state.LastResort}
+			guardianStates[accountID] = guardianLocal{
+				loaded: guardian.loaded[accountID] || guardian.cache == nil, state: state.State,
+				until: state.QuarantineUntil, bypassUntil: state.TemporaryBypassUntil,
+				probe: state.halfOpenInFlight, probationPercent: state.ProbationPercent,
+				lastResort: state.LastResort,
+			}
 		}
 		guardian.mu.Unlock()
 	}
@@ -2823,27 +2887,8 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 		}
 	}
 
-	type circuitLocal struct {
-		loaded bool
-		state  RelayCircuitState
-		until  time.Time
-		probe  bool
-	}
-	circuitStates := make(map[int64]circuitLocal)
-	circuitCacheBacked := false
-	if breaker := s.relayCircuitManager(); breaker != nil {
-		breaker.mu.Lock()
-		circuitCacheBacked = breaker.cache != nil
-		for accountID, loaded := range breaker.loaded {
-			circuitStates[accountID] = circuitLocal{loaded: loaded || breaker.cache == nil, state: RelayCircuitClosed}
-		}
-		for accountID, state := range breaker.states {
-			circuitStates[accountID] = circuitLocal{loaded: breaker.loaded[accountID] || breaker.cache == nil, state: state.state, until: state.openUntil, probe: state.probeInFlight}
-		}
-		breaker.mu.Unlock()
-	}
 	accounts := s.configuredRelayGuardianAccounts()
-	relay := RelayGuardianRelaySummary{Configured: len(accounts)}
+	relay := RelayGuardianRelaySummary{GroupID: s.GetCybRelayConfig().GroupID, Configured: len(accounts)}
 	for _, account := range accounts {
 		manual := relayGuardianManualEnabled(account)
 		if !manual {
@@ -2852,57 +2897,185 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 		relay.Enabled++
 		accountDegraded := false
 		guardianState, knownGuardian := guardianStates[account.DBID]
-		if guardianState.state == RelayGuardianQuarantined || guardianState.state == RelayGuardianHalfOpen {
-			relay.Quarantined++
-		}
-		if guardianState.state == RelayGuardianProbation {
-			relay.Probation++
+		guardianEnforcing := mode == RelayGuardianEnforce
+		guardianShadowWarning := mode == RelayGuardianMonitor && guardianState.state == RelayGuardianWouldQuarantine
+		guardianNonNormal := false
+		guardianRecoveryOnly := false
+		guardianRecoveryCap := int64(0)
+		guardianBypassActive := false
+		if guardianEnforcing {
+			switch guardianState.state {
+			case RelayGuardianQuarantined:
+				relay.Quarantined++
+				guardianNonNormal = true
+				if !guardianState.until.After(now) {
+					// The next scheduler touch advances an expired quarantine to
+					// single-request half-open. Until that happens it is recovery
+					// capacity, never normal capacity.
+					guardianRecoveryOnly = true
+					guardianRecoveryCap = 1
+				}
+			case RelayGuardianHalfOpen:
+				relay.Quarantined++
+				guardianNonNormal = true
+				guardianRecoveryOnly = true
+				guardianRecoveryCap = 1
+			case RelayGuardianProbation:
+				relay.Probation++
+				guardianNonNormal = true
+				guardianRecoveryOnly = true
+			case RelayGuardianTemporaryBypass:
+				guardianNonNormal = true
+				guardianBypassActive = guardianState.bypassUntil.After(now)
+				if guardianBypassActive {
+					guardianRecoveryOnly = true
+				} else if !guardianState.until.After(now) {
+					// An expired bypass returns to half-open on the next touch.
+					guardianRecoveryOnly = true
+					guardianRecoveryCap = 1
+				}
+			}
 		}
 		// A weak failure merely places an account in suspect/candidate state.
 		// It remains schedulable and must not make /health fail (the watchdog is
 		// intentionally strict). Only an actionable Guardian state degrades it.
-		if guardianState.state == RelayGuardianWouldQuarantine || guardianState.state == RelayGuardianQuarantined || guardianState.state == RelayGuardianHalfOpen || guardianState.state == RelayGuardianProbation || guardianState.lastResort {
+		if guardianShadowWarning || guardianNonNormal || (guardianEnforcing && guardianState.lastResort) {
 			accountDegraded = true
 			addReason("relay_account_degraded")
 		}
+		if guardianEnforcing && guardianState.state == RelayGuardianTemporaryBypass {
+			addReason("relay_guardian_temporary_bypass")
+		}
+		if guardianRecoveryOnly {
+			addReason("relay_guardian_recovery_only")
+		}
 		schedulable := account.IsAvailable()
-		guardianUnknown := !knownGuardian || !guardianState.loaded
+		normalSchedulable := schedulable
+		if guardianNonNormal {
+			normalSchedulable = false
+		}
+		guardianUnknown := guardianEnforcing && (!knownGuardian || !guardianState.loaded)
+		guardianBlocked := false
+		recoveryOnly := guardianRecoveryOnly
 		if mode != RelayGuardianOff && guardianUnknown {
 			accountDegraded = true
+			normalSchedulable = false
 			addReason("guardian_runtime_state_unavailable")
 		}
 		if mode == RelayGuardianEnforce {
 			if guardianUnknown {
 				schedulable = false
+				guardianBlocked = true
 			}
-			if guardianState.state == RelayGuardianQuarantined && guardianState.until.After(now) {
+			if guardianState.state == RelayGuardianQuarantined {
+				schedulable = false
+				guardianBlocked = guardianState.until.After(now)
+			}
+			if guardianState.state == RelayGuardianHalfOpen || guardianState.state == RelayGuardianProbation {
 				schedulable = false
 			}
-			if guardianState.state == RelayGuardianHalfOpen && guardianState.probe {
+			if guardianState.state == RelayGuardianTemporaryBypass && !guardianBypassActive {
 				schedulable = false
+				guardianBlocked = guardianState.until.After(now)
 			}
 		}
-		circuitState, knownCircuit := circuitStates[account.DBID]
-		if circuitCacheBacked && (!knownCircuit || !circuitState.loaded) {
+
+		circuit := s.RelayCircuitSnapshot(account.DBID)
+		circuitUnknown := circuit.Reason == "runtime_fence_restore_pending"
+		if circuitUnknown {
 			accountDegraded = true
 			addReason("circuit_runtime_state_unavailable")
 			schedulable = false
+			normalSchedulable = false
 		}
-		if knownCircuit && circuitState.loaded {
-			switch circuitState.state {
-			case RelayCircuitOpen:
-				if circuitState.until.IsZero() || circuitState.until.After(now) {
-					accountDegraded = true
-					addReason("relay_circuit_open")
-					schedulable = false
-				}
-			case RelayCircuitHalfOpen:
-				accountDegraded = true
-				addReason("relay_circuit_half_open")
-				if circuitState.probe {
-					schedulable = false
-				}
+
+		switch circuit.State {
+		case RelayCircuitOpen:
+			relay.CircuitOpen++
+			accountDegraded = true
+			addReason("relay_circuit_open")
+			schedulable = false
+			normalSchedulable = false
+		case RelayCircuitHalfOpen, RelayCircuitProbation:
+			recoveryOnly = true
+			accountDegraded = true
+			addReason("relay_circuit_recovery_only")
+			// A recovery-only entrance deliberately admits a bounded proving
+			// request. It is not stable business capacity and must never keep
+			// sub2 standby accounts closed.
+			schedulable = false
+			normalSchedulable = false
+		case RelayCircuitSuspect:
+			relay.Suspect++
+			accountDegraded = true
+			normalSchedulable = false
+			addReason("relay_circuit_suspect")
+		}
+		if recoveryOnly {
+			// Guardian and circuit recovery can overlap for one account; the
+			// account contributes one recovery-only entrance, never two.
+			relay.RecoveryOnly++
+		}
+
+		lastResort := (guardianEnforcing && guardianState.lastResort) || circuit.LastResort
+		if lastResort {
+			relay.LastResort++
+			normalSchedulable = false
+			accountDegraded = true
+			addReason("relay_last_resort")
+		}
+
+		// Total account concurrency and the current breaker cohort are separate
+		// budgets. ActiveRequests includes every generation, while circuit.InFlight
+		// contains only the current bounded suspect/probation cohort. Subtract each
+		// from its own cap before taking the smaller remaining budget.
+		dynamicLimit := account.GetDynamicConcurrencyLimit()
+		guardianLimit := dynamicLimit
+		if guardianEnforcing {
+			guardianLimit = account.relayGuardianConcurrencyLimit(dynamicLimit)
+		}
+		if mode == RelayGuardianEnforce && guardianState.state == RelayGuardianProbation {
+			percent := guardianState.probationPercent
+			if percent != 50 {
+				percent = 10
 			}
+			probationLimit := (dynamicLimit*int64(percent) + 99) / 100
+			if dynamicLimit > 0 && probationLimit < 1 {
+				probationLimit = 1
+			}
+			if probationLimit < guardianLimit {
+				guardianLimit = probationLimit
+			}
+		}
+		if mode == RelayGuardianEnforce && guardianRecoveryCap > 0 && guardianRecoveryCap < guardianLimit {
+			guardianLimit = guardianRecoveryCap
+		}
+		if mode == RelayGuardianEnforce && guardianRecoveryCap > 0 && guardianState.probe {
+			guardianLimit = 0
+		}
+		available := guardianLimit - atomic.LoadInt64(&account.ActiveRequests)
+		if available < 0 {
+			available = 0
+		}
+		if circuit.AdmissionLimit > 0 {
+			boundedAvailable := int64(circuit.AdmissionLimit) - int64(circuit.InFlight)
+			if boundedAvailable < 0 {
+				boundedAvailable = 0
+			}
+			if boundedAvailable < available {
+				available = boundedAvailable
+			}
+		}
+		if !account.IsAvailable() || guardianBlocked || circuit.State == RelayCircuitOpen || circuitUnknown {
+			available = 0
+		}
+		if available > 0 {
+			relay.EffectiveAvailableSlots += available
+		} else if circuit.State == RelayCircuitSuspect {
+			// Suspect remains schedulable only while its bounded admission
+			// window has a real slot. A nominal entrance at capacity is not
+			// usable failover capacity.
+			schedulable = false
 		}
 		if accountDegraded {
 			relay.Degraded++
@@ -2910,8 +3083,11 @@ func (s *Store) RelayGuardianHealth() (RelayGuardianHealthSummary, RelayGuardian
 		if schedulable {
 			relay.Schedulable++
 		}
+		if normalSchedulable && circuit.State == RelayCircuitClosed && !lastResort {
+			relay.NormalSchedulable++
+		}
 	}
-	if health.Enabled && relay.Enabled > 0 && relay.Schedulable == 0 {
+	if health.Enabled && relay.Enabled > 0 && relay.NormalSchedulable == 0 {
 		addReason("relay_capacity_unavailable")
 	}
 	if health.Enabled && len(reasonSet) > 0 {

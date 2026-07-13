@@ -132,6 +132,20 @@ func (a *Account) relayGuardianLastResort() bool {
 	return a.relayGuardianSchedulingHint.Load()&relayGuardianHintLastResortBit != 0
 }
 
+func (a *Account) setRelayCircuitLastResort(enabled bool) {
+	if a == nil {
+		return
+	}
+	a.relayCircuitLastResort.Store(enabled)
+}
+
+func (a *Account) relayAvailabilityLastResort() bool {
+	if a == nil {
+		return false
+	}
+	return a.relayGuardianLastResort() || a.relayCircuitLastResort.Load()
+}
+
 func relayGuardianConcurrencyLimitForToken(limit int64, token uint64) int64 {
 	if limit <= 0 {
 		return 0

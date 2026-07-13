@@ -29,9 +29,10 @@ type relayGuardianFailingCache struct {
 
 type relayGuardianBlockingSetCache struct {
 	cache.TokenCache
-	once    sync.Once
-	entered chan struct{}
-	release chan struct{}
+	once          sync.Once
+	entered       chan struct{}
+	release       chan struct{}
+	ignoreContext bool
 }
 
 type relayGuardianBlockingDeleteCache struct {
@@ -88,10 +89,14 @@ func (c *relayGuardianBlockingSetCache) SetRuntime(ctx context.Context, namespac
 		close(c.entered)
 	})
 	if block {
-		select {
-		case <-c.release:
-		case <-ctx.Done():
-			return ctx.Err()
+		if c.ignoreContext {
+			<-c.release
+		} else {
+			select {
+			case <-c.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 	return c.TokenCache.SetRuntime(ctx, namespace, key, value, ttl)
@@ -983,8 +988,16 @@ func TestRelayGuardianBootEpochRejectsOldStateWhenTransitionPersistenceFails(t *
 func TestRelayGuardianModeTransitionAtomicallyFencesObserveReconcileAndOldPersist(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	baseCache := cache.NewMemory(10)
-	defer baseCache.Close()
-	blocking := &relayGuardianBlockingSetCache{TokenCache: baseCache, entered: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { _ = baseCache.Close() })
+	blocking := &relayGuardianBlockingSetCache{TokenCache: baseCache, entered: make(chan struct{}), release: make(chan struct{}), ignoreContext: true}
+	releaseBlocking := func() {
+		select {
+		case <-blocking.release:
+		default:
+			close(blocking.release)
+		}
+	}
+	t.Cleanup(releaseBlocking)
 	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
 	store.tokenCache, guardian.cache = blocking, blocking
 	guardian.ensureLoaded(51)
@@ -1002,19 +1015,39 @@ func TestRelayGuardianModeTransitionAtomicallyFencesObserveReconcileAndOldPersis
 		store.SetRelayGuardianMode(string(RelayGuardianEnforce))
 		close(transitionDone)
 	}()
-	// While transitionMode is fenced behind the old persist, both observations
-	// and reconcile still see monitor. Their writes must become stale once the
-	// atomic mode boundary publishes enforce and resets the state.
-	guardian.reconcile(context.Background())
+	// Wait until transitionMode owns loadMu and is fenced behind the old
+	// persist. Reconcile is expected to wait behind that load fence; keeping it
+	// synchronous here would make the test itself deadlock before release.
+	deadline := time.Now().Add(time.Second)
+	for guardian.loadMu.TryLock() {
+		guardian.loadMu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("mode transition did not acquire load fence")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	reconcileDone := make(chan struct{})
+	go func() {
+		guardian.reconcile(context.Background())
+		close(reconcileDone)
+	}()
+	// An observation already inside the old mode can still finish before the
+	// boundary. Its queued write must become stale once transitionMode publishes
+	// enforce and resets the state.
 	guardian.observe(guardianObservation(51, "atomic-mode-c", 502, true, clock.Now()))
 	if mode := store.GetRelayGuardianMode(); mode != RelayGuardianMonitor {
 		t.Fatalf("new mode published before persistence fence: %s", mode)
 	}
-	close(blocking.release)
+	releaseBlocking()
 	select {
 	case <-transitionDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("mode transition did not finish")
+	}
+	select {
+	case <-reconcileDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcile did not resume after mode transition")
 	}
 	guardian.mu.Lock()
 	state := *guardian.stateLocked(51)
@@ -1877,14 +1910,22 @@ func TestRelayGuardianHealthReportsCircuitRecoveryWithoutDoubleCounting(t *testi
 		probe            bool
 		guardianDegraded bool
 		wantSchedulable  int
+		wantNormal       int
+		wantSuspect      int
+		wantRecoveryOnly int
+		wantCircuitOpen  int
 		wantDegraded     int
 		wantReason       string
+		wantEffective    bool
 	}{
-		{name: "active_open", state: RelayCircuitOpen, openUntil: time.Now().Add(time.Minute), wantDegraded: 1, wantReason: "relay_circuit_open"},
-		{name: "expired_open_probe_available", state: RelayCircuitOpen, openUntil: time.Now().Add(-time.Minute), wantSchedulable: 1},
-		{name: "half_open_available", state: RelayCircuitHalfOpen, wantSchedulable: 1, wantDegraded: 1, wantReason: "relay_circuit_half_open"},
-		{name: "half_open_probe_in_flight", state: RelayCircuitHalfOpen, probe: true, wantDegraded: 1, wantReason: "relay_circuit_half_open"},
-		{name: "guardian_and_circuit_degraded_once", state: RelayCircuitOpen, openUntil: time.Now().Add(time.Minute), guardianDegraded: true, wantDegraded: 1, wantReason: "relay_circuit_open"},
+		{name: "closed", state: RelayCircuitClosed, wantSchedulable: 1, wantNormal: 1, wantEffective: true},
+		{name: "active_open", state: RelayCircuitOpen, openUntil: time.Now().Add(time.Minute), wantCircuitOpen: 1, wantDegraded: 1, wantReason: "relay_circuit_open"},
+		{name: "expired_open_is_not_stable_capacity", state: RelayCircuitOpen, openUntil: time.Now().Add(-time.Minute), wantRecoveryOnly: 1, wantDegraded: 1, wantReason: "relay_circuit_recovery_only", wantEffective: true},
+		{name: "legacy_half_open_idle_is_recovery_only", state: RelayCircuitHalfOpen, wantRecoveryOnly: 1, wantDegraded: 1, wantReason: "relay_circuit_recovery_only", wantEffective: true},
+		{name: "legacy_half_open_probe_in_flight", state: RelayCircuitHalfOpen, probe: true, wantRecoveryOnly: 1, wantDegraded: 1, wantReason: "relay_circuit_recovery_only", wantEffective: true},
+		{name: "probation_is_recovery_only", state: RelayCircuitProbation, wantRecoveryOnly: 1, wantDegraded: 1, wantReason: "relay_circuit_recovery_only", wantEffective: true},
+		{name: "suspect_has_slots_but_is_not_normal", state: RelayCircuitSuspect, wantSchedulable: 1, wantSuspect: 1, wantDegraded: 1, wantReason: "relay_circuit_suspect", wantEffective: true},
+		{name: "guardian_and_circuit_degraded_once", state: RelayCircuitOpen, openUntil: time.Now().Add(time.Minute), guardianDegraded: true, wantCircuitOpen: 1, wantDegraded: 1, wantReason: "relay_circuit_open"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1907,13 +1948,267 @@ func TestRelayGuardianHealthReportsCircuitRecoveryWithoutDoubleCounting(t *testi
 			store.relayCircuit = breaker
 
 			health, relay := store.RelayGuardianHealth()
-			if relay.Schedulable != tt.wantSchedulable || relay.Degraded != tt.wantDegraded {
+			if relay.GroupID != 7 || relay.Schedulable != tt.wantSchedulable || relay.NormalSchedulable != tt.wantNormal ||
+				relay.Suspect != tt.wantSuspect || relay.RecoveryOnly != tt.wantRecoveryOnly ||
+				relay.CircuitOpen != tt.wantCircuitOpen || relay.Degraded != tt.wantDegraded {
 				t.Fatalf("relay summary=%+v", relay)
+			}
+			if tt.wantEffective && relay.EffectiveAvailableSlots <= 0 {
+				t.Fatalf("relay has no expected effective slots: %+v", relay)
 			}
 			if tt.wantReason != "" && !containsString(health.Reasons, tt.wantReason) {
 				t.Fatalf("health=%+v missing %q", health, tt.wantReason)
 			}
 		})
+	}
+}
+
+func TestRelayGuardianHealthGuardianEnforceDistinguishesBlockedAndRecoveryCapacity(t *testing.T) {
+	tests := []struct {
+		name             string
+		state            RelayGuardianState
+		until            time.Time
+		probe            bool
+		wantSlots        int64
+		wantRecoveryOnly int
+	}{
+		{name: "active_quarantine", state: RelayGuardianQuarantined, until: time.Now().Add(time.Minute)},
+		{name: "expired_quarantine_becomes_recovery", state: RelayGuardianQuarantined, until: time.Now().Add(-time.Minute), wantSlots: 1, wantRecoveryOnly: 1},
+		{name: "half_open_idle", state: RelayGuardianHalfOpen, wantSlots: 1, wantRecoveryOnly: 1},
+		{name: "half_open_probe_in_flight", state: RelayGuardianHalfOpen, probe: true, wantRecoveryOnly: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+			guardian.mu.Lock()
+			guardian.loaded[51] = true
+			state := guardian.stateLocked(51)
+			state.State = tt.state
+			state.QuarantineUntil = tt.until
+			state.halfOpenInFlight = tt.probe
+			guardian.mu.Unlock()
+
+			_, relay := store.RelayGuardianHealth()
+			if relay.Schedulable != 0 || relay.NormalSchedulable != 0 || relay.RecoveryOnly != tt.wantRecoveryOnly ||
+				relay.EffectiveAvailableSlots != tt.wantSlots {
+				t.Fatalf("Guardian enforce state capacity mismatch: %+v", relay)
+			}
+		})
+	}
+}
+
+func TestRelayGuardianHealthCircuitProbationRetainsOnlyBoundedEffectiveSlots(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+	guardian.mu.Lock()
+	guardian.loaded[51] = true
+	guardian.mu.Unlock()
+	breaker := store.relayCircuitManager()
+	breaker.mu.Lock()
+	breaker.loaded[51] = true
+	state := breaker.stateLocked(51)
+	state.state = RelayCircuitProbation
+	state.admissionLimit = 3
+	breaker.mu.Unlock()
+
+	_, relay := store.RelayGuardianHealth()
+	if relay.Schedulable != 0 || relay.NormalSchedulable != 0 || relay.RecoveryOnly != 1 || relay.EffectiveAvailableSlots != 3 {
+		t.Fatalf("circuit probation capacity summary=%+v", relay)
+	}
+}
+
+func TestRelayGuardianHealthHighConcurrencySuspectRetainsBoundedSlots(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+	guardian.mu.Lock()
+	guardian.loaded[51] = true
+	guardian.mu.Unlock()
+	account := store.accountsByID[51]
+	atomic.StoreInt64(&account.ActiveRequests, 95)
+	breaker := store.relayCircuitManager()
+	breaker.mu.Lock()
+	breaker.loaded[51] = true
+	state := breaker.stateLocked(51)
+	state.state = RelayCircuitSuspect
+	state.admissionLimit = 20
+	state.inFlight = 0
+	state.limitedInFlight = 0
+	breaker.mu.Unlock()
+
+	_, relay := store.RelayGuardianHealth()
+	if relay.Suspect != 1 || relay.Schedulable != 1 || relay.NormalSchedulable != 0 || relay.EffectiveAvailableSlots != 5 {
+		t.Fatalf("high-concurrency suspect lost bounded slots: %+v", relay)
+	}
+}
+
+func TestRelayGuardianHealthGuardianProbationIsBoundedRecoveryOnly(t *testing.T) {
+	for _, percent := range []int{10, 50} {
+		t.Run(fmt.Sprintf("percent_%d", percent), func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+			account := store.accountsByID[51]
+			atomic.StoreInt64(&account.ActiveRequests, 3)
+			guardian.mu.Lock()
+			guardian.loaded[51] = true
+			state := guardian.stateLocked(51)
+			state.State = RelayGuardianProbation
+			state.ProbationPercent = percent
+			relayGuardianApplySchedulingHint(account, state)
+			guardian.mu.Unlock()
+
+			_, relay := store.RelayGuardianHealth()
+			expectedSlots := int64(percent - 3)
+			if relay.Probation != 1 || relay.RecoveryOnly != 1 || relay.Schedulable != 0 ||
+				relay.NormalSchedulable != 0 || relay.EffectiveAvailableSlots != expectedSlots {
+				t.Fatalf("Guardian probation summary=%+v", relay)
+			}
+		})
+	}
+}
+
+func TestRelayGuardianHealthTemporaryBypassIsNeverNormalRecoveryProof(t *testing.T) {
+	tests := []struct {
+		name             string
+		bypassUntil      time.Time
+		quarantineUntil  time.Time
+		wantSchedulable  int
+		wantRecoveryOnly int
+		wantSlots        int64
+	}{
+		{name: "active_override", bypassUntil: time.Now().Add(time.Minute), quarantineUntil: time.Now().Add(time.Hour), wantSchedulable: 1, wantRecoveryOnly: 1, wantSlots: 100},
+		{name: "expired_returns_to_quarantine", bypassUntil: time.Now().Add(-time.Minute), quarantineUntil: time.Now().Add(time.Hour)},
+		{name: "expired_returns_to_half_open", bypassUntil: time.Now().Add(-time.Minute), quarantineUntil: time.Now().Add(-time.Second), wantRecoveryOnly: 1, wantSlots: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+			guardian.mu.Lock()
+			guardian.loaded[51] = true
+			state := guardian.stateLocked(51)
+			state.State = RelayGuardianTemporaryBypass
+			state.TemporaryBypassUntil = tt.bypassUntil
+			state.QuarantineUntil = tt.quarantineUntil
+			guardian.mu.Unlock()
+
+			health, relay := store.RelayGuardianHealth()
+			if relay.Schedulable != tt.wantSchedulable || relay.NormalSchedulable != 0 ||
+				relay.RecoveryOnly != tt.wantRecoveryOnly || relay.EffectiveAvailableSlots != tt.wantSlots || relay.Degraded != 1 {
+				t.Fatalf("temporary bypass health summary=%+v", relay)
+			}
+			if !containsString(health.Reasons, "relay_guardian_temporary_bypass") {
+				t.Fatalf("temporary bypass reason missing: %+v", health)
+			}
+		})
+	}
+}
+
+func TestRelayGuardianHealthNonEnforceIgnoresStaleExecutionState(t *testing.T) {
+	tests := []struct {
+		name  string
+		mode  RelayGuardianMode
+		state RelayGuardianState
+	}{
+		{name: "off_quarantined", mode: RelayGuardianOff, state: RelayGuardianQuarantined},
+		{name: "off_probation", mode: RelayGuardianOff, state: RelayGuardianProbation},
+		{name: "monitor_half_open", mode: RelayGuardianMonitor, state: RelayGuardianHalfOpen},
+		{name: "monitor_temporary_bypass", mode: RelayGuardianMonitor, state: RelayGuardianTemporaryBypass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newRelayCircuitTestClock()
+			store, guardian := newGuardianTestStore(t, tt.mode, clock, 51)
+			account := store.accountsByID[51]
+			guardian.mu.Lock()
+			guardian.loaded[51] = true
+			state := guardian.stateLocked(51)
+			state.State = tt.state
+			state.QuarantineUntil = clock.Now().Add(time.Hour)
+			state.TemporaryBypassUntil = clock.Now().Add(time.Hour)
+			state.ProbationPercent = 10
+			state.LastResort = true
+			state.LastResortCap = 1
+			relayGuardianApplySchedulingHint(account, state)
+			guardian.mu.Unlock()
+
+			health, relay := store.RelayGuardianHealth()
+			if relay.Schedulable != 1 || relay.NormalSchedulable != 1 || relay.RecoveryOnly != 0 ||
+				relay.Quarantined != 0 || relay.Probation != 0 || relay.LastResort != 0 || relay.Degraded != 0 ||
+				relay.EffectiveAvailableSlots != 100 {
+				t.Fatalf("non-enforce stale Guardian state changed capacity: health=%+v relay=%+v", health, relay)
+			}
+			if containsString(health.Reasons, "relay_guardian_recovery_only") ||
+				containsString(health.Reasons, "relay_guardian_temporary_bypass") ||
+				containsString(health.Reasons, "relay_last_resort") {
+				t.Fatalf("non-enforce stale Guardian reason leaked: %+v", health)
+			}
+		})
+	}
+}
+
+func TestRelayGuardianHealthRecoveryOnlyDeduplicatesGuardianAndCircuit(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+	account := store.accountsByID[51]
+	guardian.mu.Lock()
+	guardian.loaded[51] = true
+	guardianState := guardian.stateLocked(51)
+	guardianState.State = RelayGuardianProbation
+	guardianState.ProbationPercent = 50
+	relayGuardianApplySchedulingHint(account, guardianState)
+	guardian.mu.Unlock()
+	breaker := store.relayCircuitManager()
+	breaker.mu.Lock()
+	breaker.loaded[51] = true
+	circuitState := breaker.stateLocked(51)
+	circuitState.state = RelayCircuitProbation
+	circuitState.admissionLimit = 3
+	circuitState.inFlight = 1
+	circuitState.limitedInFlight = 1
+	breaker.mu.Unlock()
+
+	_, relay := store.RelayGuardianHealth()
+	if relay.Probation != 1 || relay.RecoveryOnly != 1 || relay.Schedulable != 0 ||
+		relay.NormalSchedulable != 0 || relay.EffectiveAvailableSlots != 2 {
+		t.Fatalf("overlapping probation summary=%+v", relay)
+	}
+}
+
+func TestRelayGuardianHealthCountsLastResortWithoutCallingItNormal(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianEnforce, clock, 51)
+	guardian.mu.Lock()
+	guardian.loaded[51] = true
+	guardian.stateLocked(51).LastResort = true
+	guardian.mu.Unlock()
+
+	health, relay := store.RelayGuardianHealth()
+	if relay.Schedulable != 1 || relay.NormalSchedulable != 0 || relay.LastResort != 1 || relay.EffectiveAvailableSlots <= 0 {
+		t.Fatalf("last-resort capacity summary=%+v", relay)
+	}
+	if health.Status != "degraded" || !containsString(health.Reasons, "relay_last_resort") {
+		t.Fatalf("last-resort health=%+v", health)
+	}
+}
+
+func TestRelayGuardianHealthDoesNotCountSaturatedSuspectAsSchedulable(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51)
+	guardian.mu.Lock()
+	guardian.loaded[51] = true
+	guardian.mu.Unlock()
+	account := store.accountsByID[51]
+	atomic.StoreInt64(&account.ActiveRequests, account.GetDynamicConcurrencyLimit())
+	breaker := store.relayCircuitManager()
+	breaker.mu.Lock()
+	breaker.loaded[51] = true
+	breaker.stateLocked(51).state = RelayCircuitSuspect
+	breaker.mu.Unlock()
+
+	_, relay := store.RelayGuardianHealth()
+	if relay.Suspect != 1 || relay.Schedulable != 0 || relay.NormalSchedulable != 0 || relay.EffectiveAvailableSlots != 0 {
+		t.Fatalf("saturated suspect summary=%+v", relay)
 	}
 }
 
@@ -2207,7 +2502,7 @@ func TestRelayGuardianRuntimeLoadFailureIsUnknownFailClosedAndHealthHasNoIO(t *t
 	}
 }
 
-func TestRelayGuardianMonitorRuntimeUnknownIsDegradedButDoesNotFenceTraffic(t *testing.T) {
+func TestRelayGuardianMonitorRuntimeUnknownDoesNotDegradeCapacity(t *testing.T) {
 	clock := newRelayCircuitTestClock()
 	base := cache.NewMemory(10)
 	defer base.Close()
@@ -2224,7 +2519,8 @@ func TestRelayGuardianMonitorRuntimeUnknownIsDegradedButDoesNotFenceTraffic(t *t
 	if failing.gets.Load() != before {
 		t.Fatal("monitor health performed runtime cache IO")
 	}
-	if health.Status != "degraded" || !containsString(health.Reasons, "guardian_runtime_state_unavailable") || relay.Degraded == 0 || relay.Schedulable != relay.Enabled {
+	if containsString(health.Reasons, "guardian_runtime_state_unavailable") || relay.Degraded != 0 ||
+		relay.Schedulable != relay.Enabled || relay.NormalSchedulable != relay.Enabled {
 		t.Fatalf("monitor unknown health=%+v relay=%+v", health, relay)
 	}
 }

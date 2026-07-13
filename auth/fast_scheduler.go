@@ -309,8 +309,8 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	for {
 		changed := false
 		// Ordering is strict and matches the slow/lazy scheduler:
-		// Guardian class -> scheduler_priority -> health tier -> in-segment policy.
-		// Reading Guardian class from the account keeps hint changes immediately
+		// availability class -> scheduler_priority -> health tier -> in-segment policy.
+		// Reading the combined Guardian/circuit class keeps changes immediately
 		// visible without a rebuild.
 		for _, expectedLastResort := range [...]bool{false, true} {
 			for _, priority := range s.priorities {
@@ -378,7 +378,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 	classLen := 0
 	for idx := rangeStart; idx < rangeEnd; idx++ {
 		entry := bucket[idx]
-		if entry.acc != nil && entry.acc.relayGuardianLastResort() == expectedLastResort {
+		if entry.acc != nil && entry.acc.relayAvailabilityLastResort() == expectedLastResort {
 			classLen++
 		}
 	}
@@ -397,7 +397,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 				continue
 			}
 			hintToken := entry.acc.relayGuardianSchedulingToken()
-			if (hintToken&relayGuardianHintLastResortBit != 0) != expectedLastResort {
+			if entry.acc.relayAvailabilityLastResort() != expectedLastResort {
 				continue
 			}
 			inPass := (pass == 0 && ordinal >= startOrdinal) || (pass == 1 && ordinal < startOrdinal)
@@ -419,7 +419,7 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 			// while the check was in progress; the next scan will classify it from
 			// the new atomic token.
 			if current := entry.acc.relayGuardianSchedulingToken(); current != hintToken ||
-				(current&relayGuardianHintLastResortBit != 0) != expectedLastResort {
+				entry.acc.relayAvailabilityLastResort() != expectedLastResort {
 				continue
 			}
 			if filter != nil && !filter(entry.acc) {
@@ -442,6 +442,10 @@ func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, expected
 				continue
 			}
 			if !s.tryAcquireAccount(entry.acc, limit, hintToken) {
+				continue
+			}
+			if entry.acc.relayAvailabilityLastResort() != expectedLastResort {
+				s.Release(entry.acc)
 				continue
 			}
 			return entry.acc, false
