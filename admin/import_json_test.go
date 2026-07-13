@@ -954,6 +954,33 @@ func TestAddAccountStreamReportsProgressAndProbesAfterRefresh(t *testing.T) {
 			t.Fatalf("usage probes = %v, want 2 accounts probed", seen)
 		}
 	}
+
+	// AddAccount records account_events asynchronously. Wait for both durable
+	// writes before the TempDir cleanup closes and removes the SQLite database;
+	// otherwise the event goroutines can recreate WAL files during RemoveAll.
+	eventDeadline := time.Now().Add(2 * time.Second)
+	for {
+		points, err := db.GetAccountEventTrend(
+			context.Background(),
+			time.Now().Add(-time.Hour),
+			time.Now().Add(time.Hour),
+			60,
+		)
+		if err != nil {
+			t.Fatalf("GetAccountEventTrend: %v", err)
+		}
+		added := 0
+		for _, point := range points {
+			added += point.Added
+		}
+		if added == 2 {
+			break
+		}
+		if time.Now().After(eventDeadline) {
+			t.Fatalf("durable added account events = %d, want 2", added)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func newMultipartJSONRequest(t *testing.T, filename string, content string) *http.Request {
