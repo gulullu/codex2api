@@ -345,6 +345,47 @@ func TestResponsesSuccessClearsOnlyUsageCooldownWhenIgnored(t *testing.T) {
 	}
 }
 
+func TestConfirmResponsesAvailableSinceRespectsLatestRateLimit(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &Account{DBID: 107, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	store.AddAccount(account)
+
+	staleRequestStartedAt := time.Now()
+	store.MarkCooldown(account, time.Hour, "rate_limited")
+	if store.ConfirmResponsesAvailableSince(account, staleRequestStartedAt) {
+		t.Fatal("a request started before the latest rate limit must not clear its cooldown")
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("newer rate-limit evidence should keep the account unavailable")
+	}
+
+	account.mu.RLock()
+	freshRequestStartedAt := account.LastRateLimitedAt.Add(time.Nanosecond)
+	account.mu.RUnlock()
+	if !store.ConfirmResponsesAvailableSince(account, freshRequestStartedAt) {
+		t.Fatal("a request started after the latest rate limit should clear its cooldown")
+	}
+	if account.HasActiveCooldown() || !account.IsAvailable() {
+		t.Fatal("fresh successful Responses evidence should restore account availability")
+	}
+
+	store.MarkCooldown(account, time.Hour, "rate_limited")
+	account.mu.RLock()
+	equalBoundary := account.LastRateLimitedAt
+	account.mu.RUnlock()
+	if store.ConfirmResponsesAvailableSince(account, equalBoundary) {
+		t.Fatal("request-start evidence equal to the latest rate limit must remain stale")
+	}
+	if !store.ConfirmResponsesAvailable(account) {
+		t.Fatal("call-time compatibility evidence should clear an equal coarse-clock boundary")
+	}
+}
+
 func TestNeedsUsageProbeRateLimitedAllowsResetCreditsRefresh(t *testing.T) {
 	// 429 冷却 + 重置次数从未探测过（stale）：应允许探针（wham-only）刷新「主动重置次数」。
 	acc := &Account{

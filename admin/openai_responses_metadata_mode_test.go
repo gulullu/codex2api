@@ -156,6 +156,51 @@ func TestAddOpenAIResponsesCodexClientMetadataModeDefaultsAndValidation(t *testi
 	})
 }
 
+func TestAddOpenAIResponsesConcurrencyBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		value      string
+		wantStatus int
+	}{
+		{name: "maximum accepted", value: "10000", wantStatus: http.StatusOK},
+		{name: "above maximum rejected", value: "10001", wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			db := newTestAdminDB(t)
+			store := auth.NewStore(db, nil, nil)
+			handler := &Handler{db: db, store: store}
+
+			recorder := invokeOpenAIResponsesJSONHandler(t, http.MethodPost, "/api/admin/accounts/openai-responses", nil, addOpenAIResponsesAccountReq{
+				Name:                    "responses-boundary",
+				BaseURL:                 "https://relay.example.com",
+				APIKey:                  "relay-token-" + tc.value,
+				Models:                  []string{"gpt-5.5"},
+				BaseConcurrencyOverride: json.RawMessage(tc.value),
+			}, handler.AddOpenAIResponsesAccount)
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, tc.wantStatus, recorder.Body.String())
+			}
+			if tc.wantStatus != http.StatusOK {
+				return
+			}
+			var added struct {
+				ID int64 `json:"id"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &added); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			row, err := db.GetAccountByID(context.Background(), added.ID)
+			if err != nil {
+				t.Fatalf("GetAccountByID(%d): %v", added.ID, err)
+			}
+			if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 10000 {
+				t.Fatalf("base concurrency = %+v, want 10000", row.BaseConcurrencyOverride)
+			}
+		})
+	}
+}
+
 func TestAddOpenAIResponsesCopiesSchedulerMetadataAtomically(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)

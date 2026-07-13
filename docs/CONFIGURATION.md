@@ -59,6 +59,8 @@ Codex2API 采用三层配置架构：
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
+| `CODEX_WS_CONTINUATION_MAX_CONNECTIONS_GLOBAL` | 否 | `512` | `previous_response_id` 续链保留的全局 bound-idle WS 物理连接上限，范围 `1..4096`，非法值回退默认值；超限按每条连接最新 live binding 的单调代次淘汰最旧连接 |
+| `CODEX_WS_CONTINUATION_MAX_CONNECTIONS_PER_ACCOUNT` | 否 | `128` | 单个动态账号可保留的 bound-idle WS 物理连接上限，范围 `1..4096`，非法值回退默认值，并向下收敛到全局上限；账号 ID 无需预配置 |
 | `CODEX_SESSION_AFFINITY_TTL` | 否 | `1h` | Codex 会话到账号/代理的黏性 TTL，支持 `1h`、`90m` 或秒数 |
 | `CODEX_ENCRYPTED_CONTEXT_AFFINITY_ENABLED` | 否 | `false` | 仅对携带 Responses `encrypted_content` 的请求优先选择其原上游账号；独立于普通会话黏性 |
 | `CODEX_ENCRYPTED_CONTEXT_AFFINITY_TTL` | 否 | `24h` | 加密上下文账号归属的缓存 TTL，支持 Go duration，最大 7 天 |
@@ -139,6 +141,8 @@ Codex2API 采用三层配置架构：
 | `GlobalRPM` | int | 0 | 0-∞ | 全局每分钟请求限制，0 表示不限 |
 | `MaxRetries` | int | 3 | 0-10 | 请求失败最大重试次数 |
 | `MaxRateLimitRetries` | int | 2 | 0-10 | 遇到 429 限流时的最大额外重试次数 |
+| `RetryIntervalMS` | int | 0 | 0-30000 | 普通重试前等待的毫秒数；`0` 保持立即重试 |
+| `TransportRetryPolicy` | string | `rotate` | `rotate` / `sticky` | 传输错误重试时换号，或保留同一账号重试 |
 | `FastSchedulerEnabled` | bool | false | - | 启用快速调度器 |
 | `CodexForceWebsocket` | bool | false | - | 强制 Codex 上游走 WebSocket 长连接（复用连接池），更接近官方 CLI 体验；关闭时走原有 HTTP 请求 |
 | `CodexWSKeepaliveEnabled` | bool | false | - | 启用上游 WS 空闲连接保活（后台仅发 Ping，不发起新请求、不消耗账号额度） |
@@ -147,6 +151,9 @@ Codex2API 采用三层配置架构：
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
 | `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 静默换号最大重试次数 |
 | `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）或 `remaining_quota`（优先使用用量少的账号） |
+| `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（50 次、5 分钟或账号不健康时重新挑号）、`off`（每次重选）、`strict`（长期粘连） |
+
+调度优先级先决定账号层级，同一优先级内再比较健康档位、调度分和当前负载；会话亲和只负责复用已绑定账号。多个最终用户共享同一个 API Key 时，下游可传 `X-Codex2API-Affinity-Key`，值会先哈希且仅用于本地账号绑定，不会转发给上游。
 
 ### 测试配置
 
@@ -173,11 +180,22 @@ Codex2API 采用三层配置架构：
 | `credit_skip_usage_window` | bool | false | 跳过 7 天/5 小时用量窗口惩罚（适用于信用账号） |
 | `score_bias_override` | int/null | null | 手工覆盖调度权重分，`null` 跟随套餐默认 |
 | `base_concurrency_override` | int/null | null | 手工覆盖基础并发值，`null` 时先继承所属分组的最小有效值，再回退到全局默认 |
+| `scheduler_priority` | int/null | null | 严格调度优先级（`-100..100`）；`null` 恢复默认值 `0` |
 | `skip_warm_tier` | bool | false | 跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
+
+账号列表的批量编辑支持分数偏置、基础并发、调度优先级、标签和分组。勾选某个数值字段但保持输入为空时，会发送 `null`，将该字段重置为继承值或默认值；未勾选的字段保持不变。
 
 ### 分组级基础并发
 
 账号分组可设置 `base_concurrency_override`（`1..50`，`null` 表示不覆盖）。基础并发按“账号显式覆盖 > 所属分组中最小的有效值 > 全局 `max_concurrency`”解析；最终动态并发仍会受健康档位、用量保护和智能配速限制。
+
+### WebSocket 连接池与 1009 降级
+
+- 每个账号的普通上游 WebSocket 容量（活跃/在途连接、待建连接、无续链绑定的空闲连接）受其当前 `DynamicConcurrencyLimit` 限制。
+- `previous_response_id` 依赖原 WS 的 bound-idle 连接使用独立双预算：默认全局 512、单账号 128、绑定 TTL 5 分钟；超过预算按每条连接最新 live binding 的进程内单调代次淘汰最旧续链连接（到期时间只负责 TTL）。4096 是 response binding ID 表上限，不是额外的物理连接预算；满表会先清过期/失效项，仍满时替换最旧 Bind 代次。
+- 普通容量收敛只淘汰无绑定空闲连接；续链预算收敛只淘汰 bound-idle 连接。当前请求使用的连接和其他活跃连接在两条路径中都不会被中断。
+- 上游在尚未向下游输出内容时返回 close 1009，或本地读取触发等价的 read-limit 错误，网关会保留同一账号租约和已解析代理，最多降级一次 HTTP。
+- 1009 属于传输限制，不降低账号健康度，也不触发鉴权探针；一旦已向下游输出内容，就不会再发起 HTTP 降级，避免重复请求和重复计费。
 
 ### 连接池配置
 

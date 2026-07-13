@@ -3,6 +3,7 @@ package wsrelay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1294,6 +1295,32 @@ func TestProbeSkipsRoundtripAfterRecentInbound(t *testing.T) {
 	wc.touchInbound()
 	if !manager.probe(wc) {
 		t.Fatal("probe must trust a clean connection with recent inbound activity without a ping roundtrip")
+	}
+}
+
+func TestControlPongRefreshesSocketKeepalive(t *testing.T) {
+	session := NewSession(1, nil)
+	session.SetConnected(true)
+	wc := &WsConnection{session: session}
+	wc.SetState(StateConnected)
+	stale := time.Now().Add(-IdleTimeout - time.Second).UnixNano()
+	wc.lastUsed.Store(stale)
+
+	for i := 0; i < 10; i++ {
+		wc.handleControlPong(fmt.Sprintf("pong-%d", i))
+	}
+
+	if got := wc.lastUsed.Load(); got <= stale {
+		t.Fatalf("lastUsed after repeated control Pongs = %d, want newer than %d", got, stale)
+	}
+	if wc.IsExpired() {
+		t.Fatal("repeated control Pongs did not preserve socket keepalive")
+	}
+	if wc.lastInbound.Load() == 0 {
+		t.Fatal("control Pong did not update transport inbound liveness")
+	}
+	if session.IsExpired() {
+		t.Fatal("control Pong did not update session transport liveness")
 	}
 }
 

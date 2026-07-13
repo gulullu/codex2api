@@ -135,6 +135,9 @@ func runWSTransportRetryScenario(t *testing.T, policy string) (first, second int
 	}
 
 	handler, store := newRetryTestHandler(t)
+	// Request-local transport stickiness must not depend on cross-request
+	// session affinity. Production may disable affinity independently.
+	store.SetAffinityMode(auth.AffinityModeOff)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
 	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", PlanType: "pro", AccountID: "acct-2"})
 	store.SetRetryIntervalMS(10)

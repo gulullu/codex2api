@@ -176,7 +176,7 @@ func TestResponsesWebSocketTransparentStreamRetryPersistsFailedAttempt(t *testin
 
 	err = handler.streamResponsesWSUpstream(
 		ctx, nil, resp, account, inactiveRelayCircuitAttempt(), "", "affinity", "gpt-5.4", "gpt-5.4", "gpt-5.4", "", "", "owner", "", time.Now(), 0,
-		newFirstTokenTimeoutGuard(0, func() {}), true, false, true,
+		newFirstTokenTimeoutGuard(0, func() {}), true, false, true, nil, 1,
 	)
 	if _, ok := err.(*responsesWSRetryableStreamError); !ok {
 		t.Fatalf("error = %T %v, want responsesWSRetryableStreamError", err, err)

@@ -632,7 +632,35 @@ func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput
 	}
 }
 
+const contextWebsocketHTTPFallbackAuditState = "websocketHTTPFallbackAuditState"
+
+func registerWebsocketHTTPFallbackAuditState(c *gin.Context, state *websocketHTTPFallbackState) {
+	if c == nil || state == nil {
+		return
+	}
+	c.Set(contextWebsocketHTTPFallbackAuditState, state)
+}
+
+// applyWebsocketHTTPFallbackAuditMetrics rewrites only the canonical,
+// user-visible usage row. Hidden retry/Guardian rows keep per-attempt timing,
+// and account health continues to receive the local HTTP attempt duration.
+func applyWebsocketHTTPFallbackAuditMetrics(c *gin.Context, input *database.UsageLogInput) {
+	if c == nil || input == nil || input.GuardianAttemptOnly || input.ViaWebsocket {
+		return
+	}
+	value, ok := c.Get(contextWebsocketHTTPFallbackAuditState)
+	if !ok {
+		return
+	}
+	state, ok := value.(*websocketHTTPFallbackState)
+	if !ok || state == nil || !state.ForceHTTP() {
+		return
+	}
+	input.DurationMs, input.FirstTokenMs = state.CumulativeHTTPMetrics(input.DurationMs, input.FirstTokenMs)
+}
+
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
+	applyWebsocketHTTPFallbackAuditMetrics(c, input)
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
@@ -907,7 +935,16 @@ func isWebsocketMessageTooBigError(err error) bool {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "message too big") || strings.Contains(msg, "close 1009")
+	return strings.Contains(msg, "message too big") ||
+		strings.Contains(msg, "close 1009") ||
+		strings.Contains(msg, "read limit exceeded")
+}
+
+func websocketMessageTooBigSource(message string) string {
+	if strings.Contains(strings.ToLower(message), "read limit exceeded") {
+		return "local_read_limit"
+	}
+	return "peer_close"
 }
 
 func isWebsocketPolicyViolationError(err error) bool {
@@ -926,7 +963,7 @@ func shouldFallbackWebsocketMessageTooBigToHTTP(outcome streamOutcome, useWebsoc
 	if wroteAnyBody || ctxErr != nil || writeErr != nil {
 		return false
 	}
-	return outcome.penalize
+	return true
 }
 
 func classifyTransportFailure(err error) string {
@@ -1017,12 +1054,13 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 		if kind == "" {
 			kind = "transport"
 		}
+		messageTooBig := kind == upstreamErrorKindMessageTooBig
 		return streamOutcome{
 			logStatusCode:     logStatusUpstreamStreamBreak,
 			failureKind:       kind,
 			failureMessage:    fmt.Sprintf("上游流读取失败: %v", readErr),
-			penalize:          kind != upstreamErrorKindWebsocketPolicy,
-			verifyAccountAuth: isWebsocketUpstreamClose(readErr),
+			penalize:          kind != upstreamErrorKindWebsocketPolicy && !messageTooBig,
+			verifyAccountAuth: !messageTooBig && isWebsocketUpstreamClose(readErr),
 		}
 	}
 
@@ -1866,12 +1904,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
-	sessionID := ResolveSessionID(c.Request.Header, rawBody)
-	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	h.loadResponseRouteOwner(c, rawBody)
 	h.loadEncryptedContextAffinity(c, rawBody)
-	affinityKey := sessionAffinityKey(explicitSessionID, apiKeyID)
+	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, rawBody), apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -1932,7 +1969,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	var pendingFinalFailure *retryAttemptUsageSpec
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
-	forceHTTPAfterWSMessageTooBig := false
+	var wsHTTPFallback websocketHTTPFallbackState
+	registerWebsocketHTTPFallbackAuditState(c, &wsHTTPFallback)
+	var requestStickyRetry requestStickyRetryState
 	invalidEncryptedContentRetried := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
@@ -1945,7 +1984,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
+		if !retainedHTTPFallback {
+			selectionFilter := requestStickyRetry.AccountFilter(accountFilter)
+			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, selectionFilter, routeRequirement)
+			requestStickyRetry.Apply(account, &stickyProxyURL)
+		}
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
@@ -1986,12 +2030,17 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		if !retainedHTTPFallback {
+			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		}
 		setUpstreamAccountContext(c, account)
 		encryptedCapture := newEncryptedContextCapture(apiKeyID)
+		if wsHTTPFallback.ForceHTTP() {
+			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
+		}
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -2057,6 +2106,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 				}
 				kind := classifyTransportFailure(reqErr)
+				if wsHTTPFallback.ForceHTTP() {
+					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
+				}
 				retryable := shouldRetryTransportFailure(reqErr, kind)
 				shouldRetry := false
 				if retryable {
@@ -2091,6 +2143,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
 				if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				if stickyRetry {
+					requestStickyRetry.Retain(account, proxyURL)
 				}
 				circuitAttempt.Release(h.store, account)
 				if !stickyRetry {
@@ -2155,6 +2210,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			if resp.StatusCode != http.StatusOK {
 				stopTTFTGuard()
+				if wsHTTPFallback.ForceHTTP() {
+					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
+				}
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 
@@ -2387,6 +2445,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
+			if wsHTTPFallback.ForceHTTP() {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
+			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
@@ -2518,7 +2579,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
-				h.store.ConfirmResponsesAvailable(account)
+				h.store.ConfirmResponsesAvailableSince(account, start)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			if outcome.logStatusCode == http.StatusOK {
@@ -2530,7 +2591,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 
-		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -2557,9 +2618,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
+			}
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
-				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
-				forceHTTPAfterWSMessageTooBig = true
 				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses",
@@ -2573,8 +2635,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
 				}, reqErr, false)
-				circuitAttempt.Release(h.store, account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()), circuitAttempt, selectedDecision)
+				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := shouldRetryTransportFailure(reqErr, kind)
@@ -2610,6 +2673,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
 			if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
+			if stickyRetry {
+				requestStickyRetry.Retain(account, proxyURL)
 			}
 			circuitAttempt.Release(h.store, account)
 			if !stickyRetry {
@@ -2672,6 +2738,9 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
+			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
@@ -3027,9 +3096,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
+		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %s", attempt+1, account.ID(), outcome.failureMessage)
-			forceHTTPAfterWSMessageTooBig = true
 			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
@@ -3045,9 +3115,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
+			wsElapsed := time.Since(start)
 			resp.Body.Close()
-			circuitAttempt.Release(h.store, account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage), circuitAttempt, selectedDecision)
+			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
@@ -3190,7 +3261,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
-			h.store.ConfirmResponsesAvailable(account)
+			h.store.ConfirmResponsesAvailableSince(account, start)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		circuitAttempt.Release(h.store, account)
@@ -3271,12 +3342,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
-	sessionID := ResolveSessionID(c.Request.Header, rawBody)
-	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	h.loadResponseRouteOwner(c, rawBody)
 	h.loadEncryptedContextAffinity(c, rawBody)
-	affinityKey := sessionAffinityKey(explicitSessionID, apiKeyID)
+	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, rawBody), apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -3664,7 +3734,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		// compact（会话压缩续写）刻意保留确定性 IsolateCodexSessionID、不走 resolveUpstreamSessionID
 		// 的默认隔离：压缩本身是对同一会话的延续，需要稳定的 prompt_cache_key 维持缓存连续性。
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionIdentity.upstreamSeed)
 		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -4022,10 +4092,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 
-	sessionID := ResolveSessionID(c.Request.Header, codexBody)
-	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, codexBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
-	affinityKey := sessionAffinityKey(explicitSessionID, apiKeyID)
+	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, codexBody), apiKeyID)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -4038,7 +4107,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var pendingFinalFailure *retryAttemptUsageSpec
 	retryExclusions := newRetryAccountExclusions()
 	routeRequirement := promptDecision
-	forceHTTPAfterWSMessageTooBig := false
+	var wsHTTPFallback websocketHTTPFallbackState
+	registerWebsocketHTTPFallbackAuditState(c, &wsHTTPFallback)
+	var requestStickyRetry requestStickyRetryState
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -4050,7 +4121,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
+		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
+		if !retainedHTTPFallback {
+			selectionFilter := requestStickyRetry.AccountFilter(accountFilter)
+			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, selectionFilter, routeRequirement)
+			requestStickyRetry.Apply(account, &stickyProxyURL)
+		}
 		promptDecision = selectedDecision
 		if account == nil {
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
@@ -4079,12 +4155,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		if !retainedHTTPFallback {
+			h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		}
 		setUpstreamAccountContext(c, account)
+		if wsHTTPFallback.ForceHTTP() {
+			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
+		}
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
@@ -4111,7 +4192,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, useWebsocket)
 		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
 		// response.completed 拿到 usage（流式计费的关键）。
 		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
@@ -4149,9 +4230,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
+			}
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
-				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %v", attempt+1, account.ID(), reqErr)
-				forceHTTPAfterWSMessageTooBig = true
 				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/chat/completions",
@@ -4165,8 +4247,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
 				}, reqErr, false)
-				circuitAttempt.Release(h.store, account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()), circuitAttempt, selectedDecision)
+				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := shouldRetryTransportFailure(reqErr, kind)
@@ -4202,6 +4285,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
 			if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
+			if stickyRetry {
+				requestStickyRetry.Retain(account, proxyURL)
 			}
 			circuitAttempt.Release(h.store, account)
 			if !stickyRetry {
@@ -4264,6 +4350,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
+			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
+			}
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -4529,9 +4618,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
+			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
+		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %s", attempt+1, account.ID(), outcome.failureMessage)
-			forceHTTPAfterWSMessageTooBig = true
 			h.logTransparentStreamRetryFailure(c, retryAttemptUsageSpec{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/chat/completions",
@@ -4547,10 +4637,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
+			wsElapsed := time.Since(start)
 			resp.Body.Close()
-			circuitAttempt.FinishStreamOutcome(c.Request.Context(), outcome, isFirstTokenTimeoutOutcome(outcome))
-			circuitAttempt.Release(h.store, account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage), circuitAttempt, selectedDecision)
+			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {

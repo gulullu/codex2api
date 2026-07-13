@@ -2,11 +2,15 @@ package wsrelay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +37,10 @@ const (
 type WsConnection struct {
 	// WebSocket 连接
 	conn *websocket.Conn
+
+	// 创建/复用该连接的账号。仅用于读取当前动态并发上限，让 response_id
+	// 续链复用路径也能在账号上限下调后收敛空闲连接数。
+	account *auth.Account
 
 	// 会话
 	session *Session
@@ -68,6 +76,9 @@ type WsConnection struct {
 	readFailureOnce     sync.Once
 	controlHandlersOnce sync.Once
 	readState           *wsReadState
+	// promotionMu serializes a pre-publication read-pump failure with the
+	// handshake -> first lease -> pool publication transition.
+	promotionMu sync.Mutex
 
 	probeGateOnce sync.Once
 	probeGate     chan struct{}
@@ -225,6 +236,16 @@ type Manager struct {
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
 	stopOnce      sync.Once
+	cleanupWG     sync.WaitGroup
+
+	// lifecycleMu closes operation admission before Stop waits, avoiding the
+	// WaitGroup Add/Wait race. stopCtx cancels in-flight handshakes; Stop waits
+	// for admitted acquire/replace operations before the final closeAll sweep.
+	lifecycleMu sync.Mutex
+	stopped     bool
+	stopCtx     context.Context
+	stopCancel  context.CancelFunc
+	operationWG sync.WaitGroup
 
 	// 连接回调
 	onConnected    func(accountID int64, session *Session)
@@ -233,8 +254,21 @@ type Manager struct {
 	// 读写锁保护回调设置
 	mu sync.RWMutex
 
-	// pool key 级别串行化，避免同一逻辑 session 在 acquire 阶段竞争同一条连接
-	keyLocks sync.Map
+	// pool key 级别串行化，避免同一逻辑 session 在 acquire 阶段竞争同一条连接。
+	// 固定条带替代永不回收的 sync.Map，oneshot 随机 key 不再造成锁表增长；
+	// 极少量哈希碰撞只会保守地串行化不同 key，不影响正确性。
+	keyLocks [managerLockStripeCount]sync.Mutex
+	// replacementLocks make Remove+fresh Acquire one logical key operation.
+	// Normal key acquisitions pass through the corresponding gate before taking
+	// keyLocks; a replacement keeps the gate for its whole remove/redial cycle.
+	replacementLocks [managerLockStripeCount]sync.Mutex
+	// Account-level serialization keeps ordinary capacity strict across dynamic
+	// session/pool keys. Pending dials, active sockets (bound or not), and
+	// unbound idle sockets count here; bound-idle continuation sockets use the
+	// separately bounded global/per-account pool below.
+	accountLocks   [managerLockStripeCount]sync.Mutex
+	capacityMu     sync.Mutex
+	pendingCreates map[int64]int
 
 	// response_id -> 连接 绑定（续链亲和）。上游 chatgpt backend 无服务端存储时，
 	// previous_response_id 的上下文只存活在产生该响应的那条 WS 连接里；带续链 ID
@@ -242,13 +276,35 @@ type Manager struct {
 	// 参考 sub2api openai_ws_state_store 的 BindResponseConn/GetResponseConn。
 	respConnMu       sync.Mutex
 	respConnBindings map[string]responseConnBinding
+	// responseBindingGeneration is incremented under respConnMu for every
+	// published Bind. Unlike wall-clock expiry it cannot collide within one
+	// process, so continuation eviction can detect a concurrent rebind exactly.
+	responseBindingGeneration uint64
+	// continuationMu serializes cross-account bound-idle budget convergence.
+	// It is never acquired while an account lock is held.
+	continuationMu              sync.Mutex
+	continuationGlobalLimit     int
+	continuationPerAccountLimit int
 
 	// 可选的探活函数（用于测试替换），nil 时使用默认 probeConnection
 	probeFunc func(wc *WsConnection) bool
 
 	// 可选的保活 Ping 函数（用于测试替换），nil 时使用默认 SendHeartbeat
 	keepalivePingFunc func(wc *WsConnection) error
+
+	// 测试钩子：连接写入池后、首个 pending/read lease 建立前触发。
+	afterConnectionStored          func(wc *WsConnection)
+	afterReplacementRemoved        func(key string)
+	beforeCapacityEviction         func()
+	beforeContinuationRevalidation func(wc *WsConnection)
 }
+
+var ErrManagerStopped = errors.New("websocket manager stopped")
+
+// managerLockStripeCount must remain a power of two. Separate key/account
+// arrays prevent an unrelated key hash collision from participating in the
+// key -> account lock ordering used by acquire paths.
+const managerLockStripeCount = 1024
 
 // responseConnBinding 记录某个 response_id 由哪条连接产出。
 // conn 指针同时用作身份校验：同 poolKey 下连接被重建后旧绑定自动失效。
@@ -261,21 +317,55 @@ type responseConnBinding struct {
 	accountID  int64
 	apiKey     string
 	expiresAt  time.Time
+	generation uint64
 }
 
 const (
-	// responseConnBindingTTL 续链绑定的存活时间。上游空闲连接本身在 IdleTimeout
-	// (5min) 后被清理，绑定活得再久也无意义，与其对齐。
+	// responseConnBindingTTL is independent of physical Pong keepalive. Once it
+	// expires the socket loses continuation exemption and rejoins ordinary cap.
 	responseConnBindingTTL = IdleTimeout
 	// responseConnBindingMaxEntries 绑定表上限，防止内存膨胀。
 	responseConnBindingMaxEntries = 4096
+
+	defaultContinuationGlobalLimit     = 512
+	defaultContinuationPerAccountLimit = 128
+	minContinuationSocketLimit         = 1
+	maxContinuationSocketLimit         = responseConnBindingMaxEntries
 )
+
+const (
+	continuationGlobalLimitEnv     = "CODEX_WS_CONTINUATION_MAX_CONNECTIONS_GLOBAL"
+	continuationPerAccountLimitEnv = "CODEX_WS_CONTINUATION_MAX_CONNECTIONS_PER_ACCOUNT"
+)
+
+func parseContinuationSocketLimit(envName string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minContinuationSocketLimit || value > maxContinuationSocketLimit {
+		return fallback
+	}
+	return value
+}
+
+func continuationSocketLimitsFromEnv() (globalLimit int, perAccountLimit int) {
+	globalLimit = parseContinuationSocketLimit(continuationGlobalLimitEnv, defaultContinuationGlobalLimit)
+	perAccountLimit = parseContinuationSocketLimit(continuationPerAccountLimitEnv, defaultContinuationPerAccountLimit)
+	if perAccountLimit > globalLimit {
+		perAccountLimit = globalLimit
+	}
+	return globalLimit, perAccountLimit
+}
 
 // wsWriteBufferPool 在所有上游 WS 连接间共享写缓冲，降低高并发下的内存占用。
 var wsWriteBufferPool = &sync.Pool{}
 
 // NewManager 创建连接池管理器
 func NewManager() *Manager {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	continuationGlobalLimit, continuationPerAccountLimit := continuationSocketLimitsFromEnv()
 	m := &Manager{
 		dialer: &websocket.Dialer{
 			HandshakeTimeout:  HandshakeTimeout,
@@ -290,11 +380,16 @@ func NewManager() *Manager {
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		},
-		stopCleanup: make(chan struct{}),
+		stopCleanup:                 make(chan struct{}),
+		stopCtx:                     stopCtx,
+		stopCancel:                  stopCancel,
+		continuationGlobalLimit:     continuationGlobalLimit,
+		continuationPerAccountLimit: continuationPerAccountLimit,
 	}
 
 	// 启动后台清理
 	m.cleanupTicker = time.NewTicker(30 * time.Second)
+	m.cleanupWG.Add(1)
 	go m.cleanupLoop()
 
 	return m
@@ -302,6 +397,7 @@ func NewManager() *Manager {
 
 // cleanupLoop 定期清理过期连接
 func (m *Manager) cleanupLoop() {
+	defer m.cleanupWG.Done()
 	for {
 		select {
 		case <-m.cleanupTicker.C:
@@ -315,46 +411,96 @@ func (m *Manager) cleanupLoop() {
 
 // evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）
 func (m *Manager) evictExpired() {
-	m.connections.Range(func(key, value any) bool {
+	// Expire continuation bindings on every cleanup tick independently of the
+	// socket keepalive timestamp. Pong may keep a healthy socket reusable, but
+	// it cannot extend response affinity: once the binding expires, the socket
+	// rejoins ordinary per-account capacity and converges there.
+	m.pruneResponseConnBindings()
+	accounts := make(map[int64]*auth.Account)
+	m.connections.Range(func(_, value any) bool {
 		wc := value.(*WsConnection)
-		if wc.IsExpired() || !wc.IsConnected() || isRotatableOverAge(wc) {
-			m.connections.Delete(key)
-			wc.Close()
+		if wc.session == nil {
+			m.DiscardConnection(wc)
+			return true
 		}
+		// Serialize cleanup with promotion/reuse. In particular, do not observe
+		// the tiny Store -> first lease transition as an idle connection.
+		accountLock := m.accountLock(wc.session.AccountID)
+		accountLock.Lock()
+		if current, ok := m.connections.Load(wc.PoolKey); ok && current == wc {
+			if !wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
+				m.DiscardConnection(wc)
+			} else if wc.account != nil {
+				accounts[wc.session.AccountID] = wc.account
+			}
+		}
+		accountLock.Unlock()
 		return true
 	})
 
 	m.sessions.Range(func(key, value any) bool {
 		s := value.(*Session)
-		if s.IsExpired() || !s.IsConnected() {
-			m.sessions.Delete(key)
-			s.Close()
+		// A published session is owned by its current physical connection. Do
+		// not expire it independently by LastActiveAt: business frames update
+		// connection lastUsed, and a long quiet response may legitimately have
+		// an in-flight lease while neither timestamp changes. The account lock
+		// also makes this check atomic with successful connection promotion.
+		accountLock := m.accountLock(s.AccountID)
+		accountLock.Lock()
+		current, hasConnection := m.connections.Load(key)
+		wc, validConnection := current.(*WsConnection)
+		orphaned := !hasConnection || !validConnection || wc == nil || wc.session != s
+		if !s.IsConnected() || orphaned {
+			if m.sessions.CompareAndDelete(key, s) {
+				s.Close()
+			}
 		}
+		accountLock.Unlock()
 		return true
 	})
+
+	for accountID, account := range accounts {
+		accountLock := m.accountLock(accountID)
+		accountLock.Lock()
+		m.trimIdleAccountConnections(accountID, accountConnectionLimit(account), nil)
+		accountLock.Unlock()
+	}
+	// Cross-account continuation convergence is a top-level phase. Never call
+	// it while an account lock from ordinary capacity is held.
+	m.enforceContinuationSocketBudgets()
 }
 
 // Stop 停止管理器
 func (m *Manager) Stop() {
 	m.stopOnce.Do(func() {
+		m.lifecycleMu.Lock()
+		m.stopped = true
+		stopCancel := m.stopCancel
+		m.lifecycleMu.Unlock()
+		stopCancel()
 		close(m.stopCleanup)
+		m.cleanupWG.Wait()
+		m.operationWG.Wait()
+		// No admitted operation can Store or AddPending after this point. Waiting
+		// before the sweep is important because Session.Close is not a terminal
+		// admission gate: closing first could otherwise be followed by AddPending.
 		m.closeAll()
 	})
 }
 
 // closeAll 关闭所有连接
 func (m *Manager) closeAll() {
-	m.connections.Range(func(key, value any) bool {
+	m.connections.Range(func(_, value any) bool {
 		wc := value.(*WsConnection)
-		m.connections.Delete(key)
-		wc.Close()
+		m.DiscardConnection(wc)
 		return true
 	})
 
 	m.sessions.Range(func(key, value any) bool {
 		s := value.(*Session)
-		m.sessions.Delete(key)
-		s.Close()
+		if m.sessions.CompareAndDelete(key, s) {
+			s.Close()
+		}
 		return true
 	})
 }
@@ -387,15 +533,647 @@ func (m *Manager) getOnConnected() func(accountID int64, session *Session) {
 	return m.onConnected
 }
 
+func (m *Manager) beginOperation(ctx context.Context) (context.Context, func(), error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.lifecycleMu.Lock()
+	if m.stopped {
+		m.lifecycleMu.Unlock()
+		return nil, nil, ErrManagerStopped
+	}
+	m.operationWG.Add(1)
+	stopCtx := m.stopCtx
+	m.lifecycleMu.Unlock()
+
+	opCtx, cancel := context.WithCancel(ctx)
+	stopForward := context.AfterFunc(stopCtx, cancel)
+	select {
+	case <-stopCtx.Done():
+		cancel()
+	default:
+	}
+	var doneOnce sync.Once
+	done := func() {
+		doneOnce.Do(func() {
+			stopForward()
+			cancel()
+			m.operationWG.Done()
+		})
+	}
+	return opCtx, done, nil
+}
+
+func keyLockStripe(key string) uint64 {
+	// Inline FNV-1a avoids an allocation/interface on the hot acquire path.
+	const (
+		offset64 = uint64(14695981039346656037)
+		prime64  = uint64(1099511628211)
+	)
+	hash := offset64
+	for i := 0; i < len(key); i++ {
+		hash ^= uint64(key[i])
+		hash *= prime64
+	}
+	return hash & (managerLockStripeCount - 1)
+}
+
 func (m *Manager) keyLock(key string) *sync.Mutex {
-	if v, ok := m.keyLocks.Load(key); ok {
-		return v.(*sync.Mutex)
+	return &m.keyLocks[keyLockStripe(key)]
+}
+
+func (m *Manager) replacementLock(key string) *sync.Mutex {
+	return &m.replacementLocks[keyLockStripe(key)]
+}
+
+// lockPoolKey enters the replacement gate and then the ordinary key stripe.
+// Releasing the gate after keyLock is held lets normal operations run with the
+// same concurrency as before while a full replacement can exclude all of them.
+func (m *Manager) lockPoolKey(key string, keyLock *sync.Mutex) {
+	replacementLock := m.replacementLock(key)
+	replacementLock.Lock()
+	keyLock.Lock()
+	replacementLock.Unlock()
+}
+
+func (m *Manager) accountLock(accountID int64) *sync.Mutex {
+	// Fibonacci hashing spreads both sequential and sparse database IDs.
+	stripe := (uint64(accountID) * uint64(11400714819323198485)) & (managerLockStripeCount - 1)
+	return &m.accountLocks[stripe]
+}
+
+func accountConnectionLimit(account *auth.Account) int {
+	if account != nil {
+		if limit := account.GetDynamicConcurrencyLimit(); limit > 0 {
+			return int(limit)
+		}
 	}
-	mu := &sync.Mutex{}
-	if actual, loaded := m.keyLocks.LoadOrStore(key, mu); loaded {
-		return actual.(*sync.Mutex)
+	// 尚未完成调度快照初始化的账号保留原有槽位上限，生产请求进入账号池后
+	// DynamicConcurrencyLimit 会始终为正数。
+	return StatelessConnectionSlots
+}
+
+type idleAccountConnection struct {
+	wc       *WsConnection
+	lastUsed int64
+}
+
+type continuationBudgetCandidate struct {
+	wc               *WsConnection
+	accountID        int64
+	latestGeneration uint64
+}
+
+type continuationBudgetSnapshot struct {
+	latest     map[*WsConnection]uint64
+	candidates []continuationBudgetCandidate
+	perAccount map[int64]int
+}
+
+func (s continuationBudgetSnapshot) globalCount() int {
+	return len(s.candidates)
+}
+
+// latestLiveResponseBindingsLocked prunes unusable bindings and returns the
+// newest live Bind generation per physical connection. Callers hold
+// respConnMu. Expiry is used only for TTL; the monotonic generation is the
+// continuation LRU key and cannot collide like a wall-clock timestamp.
+func (m *Manager) latestLiveResponseBindingsLocked(now time.Time) map[*WsConnection]uint64 {
+	latest := make(map[*WsConnection]uint64)
+	for responseID, binding := range m.respConnBindings {
+		wc := binding.conn
+		if wc == nil || now.After(binding.expiresAt) || !wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
+			delete(m.respConnBindings, responseID)
+			continue
+		}
+		if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc {
+			delete(m.respConnBindings, responseID)
+			continue
+		}
+		if currentGeneration, ok := latest[wc]; !ok || binding.generation > currentGeneration {
+			latest[wc] = binding.generation
+		}
 	}
-	return mu
+	return latest
+}
+
+func (m *Manager) pruneResponseConnBindings() {
+	if m == nil {
+		return
+	}
+	m.respConnMu.Lock()
+	m.latestLiveResponseBindingsLocked(time.Now())
+	m.respConnMu.Unlock()
+}
+
+func (m *Manager) snapshotLiveResponseBindings() map[*WsConnection]uint64 {
+	if m == nil {
+		return map[*WsConnection]uint64{}
+	}
+	m.respConnMu.Lock()
+	latest := m.latestLiveResponseBindingsLocked(time.Now())
+	m.respConnMu.Unlock()
+	return latest
+}
+
+// continuationBudgetSnapshotLocked counts distinct live response-bound idle
+// sockets. Active sockets can still own older bindings, but they belong to
+// ordinary capacity and are never continuation-budget victims. Caller holds
+// respConnMu; the returned latest map shares no mutable binding objects.
+func (m *Manager) continuationBudgetSnapshotLocked(now time.Time) continuationBudgetSnapshot {
+	latest := m.latestLiveResponseBindingsLocked(now)
+	snapshot := continuationBudgetSnapshot{
+		latest:     latest,
+		candidates: make([]continuationBudgetCandidate, 0, len(latest)),
+		perAccount: make(map[int64]int),
+	}
+	for wc, generation := range latest {
+		if wc == nil || wc.session == nil || wc.session.PendingCount() != 0 || !wc.IsConnected() {
+			continue
+		}
+		accountID := wc.session.AccountID
+		snapshot.candidates = append(snapshot.candidates, continuationBudgetCandidate{
+			wc:               wc,
+			accountID:        accountID,
+			latestGeneration: generation,
+		})
+		snapshot.perAccount[accountID]++
+	}
+	return snapshot
+}
+
+func olderContinuationCandidate(left, right continuationBudgetCandidate) bool {
+	if left.latestGeneration != right.latestGeneration {
+		return left.latestGeneration < right.latestGeneration
+	}
+	return left.wc.PoolKey < right.wc.PoolKey
+}
+
+// selectContinuationBudgetVictim first repairs every per-account violation,
+// then the global violation. Within the eligible set it sacrifices the socket
+// whose newest live Bind generation is oldest, so one stale response ID cannot
+// make a connection with a newer continuation look old.
+func selectContinuationBudgetVictim(
+	snapshot continuationBudgetSnapshot,
+	globalLimit int,
+	perAccountLimit int,
+) (continuationBudgetCandidate, bool) {
+	var victim continuationBudgetCandidate
+	found := false
+	for _, candidate := range snapshot.candidates {
+		if snapshot.perAccount[candidate.accountID] <= perAccountLimit {
+			continue
+		}
+		if !found || olderContinuationCandidate(candidate, victim) {
+			victim = candidate
+			found = true
+		}
+	}
+	if found {
+		return victim, true
+	}
+	if snapshot.globalCount() <= globalLimit {
+		return continuationBudgetCandidate{}, false
+	}
+	for _, candidate := range snapshot.candidates {
+		if !found || olderContinuationCandidate(candidate, victim) {
+			victim = candidate
+			found = true
+		}
+	}
+	return victim, found
+}
+
+func (m *Manager) continuationSocketLimits() (globalLimit int, perAccountLimit int) {
+	globalLimit = m.continuationGlobalLimit
+	perAccountLimit = m.continuationPerAccountLimit
+	if globalLimit < minContinuationSocketLimit || globalLimit > maxContinuationSocketLimit {
+		globalLimit = defaultContinuationGlobalLimit
+	}
+	if perAccountLimit < minContinuationSocketLimit || perAccountLimit > maxContinuationSocketLimit {
+		perAccountLimit = defaultContinuationPerAccountLimit
+	}
+	if perAccountLimit > globalLimit {
+		perAccountLimit = globalLimit
+	}
+	return globalLimit, perAccountLimit
+}
+
+// discardContinuationBudgetCandidate re-locks one cross-account snapshot
+// candidate using the normal pool-key -> account -> binding order. It never
+// waits for those locks while holding respConnMu, revalidates both liveness and
+// LRU generation, removes map ownership and all bindings atomically, then
+// closes the socket only after every routing lock has been released.
+func (m *Manager) discardContinuationBudgetCandidate(
+	candidate continuationBudgetCandidate,
+	globalLimit int,
+	perAccountLimit int,
+) bool {
+	wc := candidate.wc
+	if wc == nil {
+		return false
+	}
+	keyLock := m.keyLock(wc.PoolKey)
+	m.lockPoolKey(wc.PoolKey, keyLock)
+	accountLock := m.accountLock(candidate.accountID)
+	accountLock.Lock()
+
+	m.respConnMu.Lock()
+	snapshot := m.continuationBudgetSnapshotLocked(time.Now())
+	currentVictim, overBudget := selectContinuationBudgetVictim(snapshot, globalLimit, perAccountLimit)
+	current, isCurrent := m.connections.Load(wc.PoolKey)
+	actualGeneration, stillBound := snapshot.latest[wc]
+	valid := overBudget && currentVictim.wc == wc && isCurrent && current == wc &&
+		wc.session != nil && wc.session.AccountID == candidate.accountID &&
+		wc.IsConnected() && wc.session.PendingCount() == 0 && stillBound &&
+		actualGeneration == candidate.latestGeneration
+	removed := false
+	if valid {
+		removed = m.connections.CompareAndDelete(wc.PoolKey, wc)
+		if removed {
+			m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
+			for responseID, binding := range m.respConnBindings {
+				if binding.conn == wc {
+					delete(m.respConnBindings, responseID)
+				}
+			}
+		}
+	}
+	m.respConnMu.Unlock()
+	accountLock.Unlock()
+	keyLock.Unlock()
+
+	if !removed {
+		return false
+	}
+	if wc.session != nil {
+		wc.session.Close()
+	}
+	_ = wc.Close()
+	return true
+}
+
+// enforceContinuationSocketBudgets serializes global convergence but never
+// nests continuationMu under accountLock. Each failed revalidation restarts
+// from a fresh cross-account snapshot, handling concurrent Bind/Acquire safely.
+func (m *Manager) enforceContinuationSocketBudgets() {
+	if m == nil {
+		return
+	}
+	globalLimit, perAccountLimit := m.continuationSocketLimits()
+	m.continuationMu.Lock()
+	defer m.continuationMu.Unlock()
+	for attempts := 0; attempts < responseConnBindingMaxEntries*2; attempts++ {
+		m.respConnMu.Lock()
+		snapshot := m.continuationBudgetSnapshotLocked(time.Now())
+		candidate, overBudget := selectContinuationBudgetVictim(snapshot, globalLimit, perAccountLimit)
+		m.respConnMu.Unlock()
+		if !overBudget {
+			return
+		}
+		if m.beforeContinuationRevalidation != nil {
+			m.beforeContinuationRevalidation(candidate.wc)
+		}
+		m.discardContinuationBudgetCandidate(candidate, globalLimit, perAccountLimit)
+	}
+}
+
+func (m *Manager) removeResponseConnBindings(wc *WsConnection) {
+	if m == nil || wc == nil {
+		return
+	}
+	m.removeResponseConnBindingsForConnections(map[*WsConnection]struct{}{wc: struct{}{}})
+}
+
+func (m *Manager) removeResponseConnBindingsForConnections(connections map[*WsConnection]struct{}) {
+	if m == nil || len(connections) == 0 {
+		return
+	}
+	m.respConnMu.Lock()
+	for responseID, binding := range m.respConnBindings {
+		if _, ok := connections[binding.conn]; ok {
+			delete(m.respConnBindings, responseID)
+		}
+	}
+	m.respConnMu.Unlock()
+}
+
+func (m *Manager) idleConnectionCanBeEvicted(wc *WsConnection, protected *WsConnection, protectedKey string) bool {
+	if wc == nil || wc == protected || (protectedKey != "" && wc.PoolKey == protectedKey) || wc.session == nil || wc.session.PendingCount() != 0 || !wc.IsConnected() {
+		return false
+	}
+	current, ok := m.connections.Load(wc.PoolKey)
+	return ok && current == wc
+}
+
+// discardOrdinaryIdleConnection atomically arbitrates ordinary-capacity
+// eviction against BindResponseConn. If the candidate acquired a live binding,
+// it has moved into the separately-budgeted continuation pool and is excluded
+// rather than closed. Otherwise it is removed while respConnMu prevents a
+// concurrent bind from publishing a stale pointer.
+func (m *Manager) discardOrdinaryIdleConnection(
+	wc *WsConnection,
+	protected *WsConnection,
+	protectedKey string,
+) (removed bool, becameBound bool) {
+	if !m.idleConnectionCanBeEvicted(wc, protected, protectedKey) {
+		return false, false
+	}
+	m.respConnMu.Lock()
+	latestBinding := m.latestLiveResponseBindingsLocked(time.Now())
+	if _, isBound := latestBinding[wc]; isBound {
+		m.respConnMu.Unlock()
+		return false, true
+	}
+	if !m.idleConnectionCanBeEvicted(wc, protected, protectedKey) {
+		m.respConnMu.Unlock()
+		return false, false
+	}
+	removed = m.connections.CompareAndDelete(wc.PoolKey, wc)
+	if removed && wc.session != nil {
+		m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
+	}
+	m.respConnMu.Unlock()
+	if !removed {
+		return false, false
+	}
+	if wc.session != nil {
+		wc.session.Close()
+	}
+	_ = wc.Close()
+	return true, false
+}
+
+// evictIdleAccountConnections converges ordinary capacity using only unbound
+// idle sockets. A raced binding moves the socket out of the ordinary count.
+func (m *Manager) evictIdleAccountConnections(
+	idle []idleAccountConnection,
+	protected *WsConnection,
+	protectedKey string,
+	shouldStop func() bool,
+	onEvicted func(),
+) {
+	if m.beforeCapacityEviction != nil {
+		m.beforeCapacityEviction()
+	}
+	sort.Slice(idle, func(i, j int) bool { return idle[i].lastUsed < idle[j].lastUsed })
+	for _, candidate := range idle {
+		if shouldStop() {
+			return
+		}
+		removed, becameBound := m.discardOrdinaryIdleConnection(candidate.wc, protected, protectedKey)
+		if removed || becameBound {
+			onEvicted()
+		}
+	}
+}
+
+// convergeAccountConnectionCapacity admits additional ordinary slots while
+// evicting only unbound idle sockets. If activating is non-nil, that existing
+// connection is protected and consumes an additional slot only when the same
+// binding snapshot classified it as bound-idle; an unbound idle connection is
+// already included in count. Caller holds this account's accountLock.
+func (m *Manager) convergeAccountConnectionCapacity(
+	accountID int64,
+	limit int,
+	protectedKey string,
+	activating *WsConnection,
+	pendingCreates int,
+	additionalSlots int,
+) bool {
+	if limit < 1 {
+		limit = 1
+	}
+	count := 0
+	stale := make([]*WsConnection, 0)
+	idle := make([]idleAccountConnection, 0)
+	activatingStale := false
+	bound := m.snapshotLiveResponseBindings()
+	m.connections.Range(func(_, value any) bool {
+		wc, ok := value.(*WsConnection)
+		if !ok || wc == nil || wc.session == nil || wc.session.AccountID != accountID {
+			return true
+		}
+		if !wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
+			stale = append(stale, wc)
+			if wc == activating {
+				activatingStale = true
+			}
+			return true
+		}
+		pending := wc.session.PendingCount()
+		if _, isBound := bound[wc]; isBound && pending == 0 {
+			return true
+		}
+		count++
+		if wc.PoolKey != protectedKey && pending == 0 {
+			idle = append(idle, idleAccountConnection{wc: wc, lastUsed: wc.lastUsed.Load()})
+		}
+		return true
+	})
+	if activating != nil {
+		if _, isBoundIdle := bound[activating]; isBoundIdle && activating.session != nil && activating.session.PendingCount() == 0 {
+			additionalSlots++
+		}
+	}
+	for _, wc := range stale {
+		m.DiscardConnection(wc)
+	}
+	if activatingStale {
+		return false
+	}
+	withinLimit := func() bool { return count+pendingCreates+additionalSlots <= limit }
+	if withinLimit() {
+		return true
+	}
+	m.evictIdleAccountConnections(
+		idle,
+		activating,
+		protectedKey,
+		withinLimit,
+		func() { count-- },
+	)
+	return withinLimit()
+}
+
+// ensureAccountConnectionCapacity reserves one new ordinary socket slot.
+func (m *Manager) ensureAccountConnectionCapacity(accountID int64, limit int, protectedKey string, pendingCreates int) bool {
+	return m.convergeAccountConnectionCapacity(accountID, limit, protectedKey, nil, pendingCreates, 1)
+}
+
+// trimIdleAccountConnections converges active sockets plus unbound idle sockets
+// to the dynamic limit. Bound-idle continuation sockets are excluded here and
+// converged by enforceContinuationSocketBudgets. The protected/current socket
+// and every other in-flight request are never interrupted.
+// 调用方必须持有该账号的 accountLock。
+func (m *Manager) trimIdleAccountConnections(accountID int64, limit int, protected *WsConnection) {
+	if limit < 1 {
+		limit = 1
+	}
+	count := 0
+	stale := make([]*WsConnection, 0)
+	idle := make([]idleAccountConnection, 0)
+	bound := m.snapshotLiveResponseBindings()
+	m.connections.Range(func(_, value any) bool {
+		wc, ok := value.(*WsConnection)
+		if !ok || wc == nil || wc.session == nil || wc.session.AccountID != accountID {
+			return true
+		}
+		if !wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
+			stale = append(stale, wc)
+			return true
+		}
+		pending := wc.session.PendingCount()
+		if _, isBound := bound[wc]; isBound && pending == 0 {
+			return true
+		}
+		count++
+		if wc != protected && pending == 0 {
+			idle = append(idle, idleAccountConnection{wc: wc, lastUsed: wc.lastUsed.Load()})
+		}
+		return true
+	})
+	for _, wc := range stale {
+		m.DiscardConnection(wc)
+	}
+	if count <= limit {
+		return
+	}
+
+	m.evictIdleAccountConnections(
+		idle,
+		protected,
+		"",
+		func() bool { return count <= limit },
+		func() { count-- },
+	)
+}
+
+// ensureConnectionActivationCapacity admits an existing idle socket as active
+// using one binding snapshot for both classification and counting. This avoids
+// double-counting unbound idle reuse and under-counting a raced bound-idle
+// activation. Current pending dials are part of admission. A last binding that
+// disappears immediately after the snapshot can reclassify one idle socket to
+// ordinary at the TTL boundary; combined physical capacity does not grow, and
+// Release/the periodic cleanup converges the ordinary label promptly.
+func (m *Manager) ensureConnectionActivationCapacity(accountID int64, limit int, wc *WsConnection) bool {
+	m.capacityMu.Lock()
+	pendingCreates := m.pendingCreates[accountID]
+	m.capacityMu.Unlock()
+	return m.convergeAccountConnectionCapacity(accountID, limit, wc.PoolKey, wc, pendingCreates, 0)
+}
+
+// reserveAccountConnectionCapacity must be called while holding accountLock.
+// It reads the limit at the reservation point so a scheduler tier change is
+// not masked by a value cached at the start of a longer acquire operation.
+func (m *Manager) reserveAccountConnectionCapacity(account *auth.Account, protectedKey string) bool {
+	accountID := account.ID()
+	limit := accountConnectionLimit(account)
+	m.capacityMu.Lock()
+	pending := m.pendingCreates[accountID]
+	m.capacityMu.Unlock()
+	if !m.ensureAccountConnectionCapacity(accountID, limit, protectedKey, pending) {
+		return false
+	}
+	m.capacityMu.Lock()
+	if m.pendingCreates == nil {
+		m.pendingCreates = make(map[int64]int)
+	}
+	m.pendingCreates[accountID]++
+	m.capacityMu.Unlock()
+	return true
+}
+
+func (m *Manager) releaseAccountConnectionCapacity(accountID int64) {
+	m.capacityMu.Lock()
+	if pending := m.pendingCreates[accountID]; pending <= 1 {
+		delete(m.pendingCreates, accountID)
+	} else {
+		m.pendingCreates[accountID] = pending - 1
+	}
+	m.capacityMu.Unlock()
+}
+
+// storeConnectionAndBeginReadLease atomically converts one pending dial
+// reservation into one stored connection with its first request lease. Without
+// the account lock around this transition, another pool key can observe the
+// same physical socket twice (stored + pending create), classify it as idle
+// before AddPendingRequest runs, and evict it while its creator is still
+// returning from the handshake.
+func (m *Manager) storeConnectionAndBeginReadLease(
+	ctx context.Context,
+	account *auth.Account,
+	accountLock *sync.Mutex,
+	wc *WsConnection,
+	sessionKey string,
+) (*PendingRequest, error) {
+	accountID := account.ID()
+	accountLock.Lock()
+	defer accountLock.Unlock()
+
+	select {
+	case <-ctx.Done():
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, ctx.Err()
+	default:
+	}
+
+	// A dial reservation can outlive the health-tier limit that admitted it.
+	// Revalidate the ordinary-cap budget at promotion time. Other pending dials
+	// run this check serially; bound-idle context remains separately budgeted.
+	if !m.ensureAccountConnectionCapacity(accountID, accountConnectionLimit(account), wc.PoolKey, 0) {
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, fmt.Errorf("promote websocket connection: current account connection limit reached")
+	}
+
+	// The permanent reader starts immediately after the handshake. Serialize
+	// its failure callback with promotion, establish the first lease before map
+	// publication, and revalidate both before and after Store so a peer that
+	// closes immediately cannot leave a dead session/connection visible.
+	wc.promotionMu.Lock()
+	defer wc.promotionMu.Unlock()
+	if !wc.IsConnected() || wc.session == nil || !wc.session.IsConnected() {
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, fmt.Errorf("promote websocket connection: connection closed before first lease")
+	}
+	pr, err := m.addPendingAndBeginReadLease(wc, sessionKey)
+	if err != nil {
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		wc.session.RemovePendingRequest(pr.RequestID)
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, ctx.Err()
+	default:
+	}
+	if !wc.IsConnected() || !wc.session.IsConnected() {
+		wc.session.RemovePendingRequest(pr.RequestID)
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, fmt.Errorf("promote websocket connection: connection closed before publication")
+	}
+	m.sessions.Store(wc.PoolKey, wc.session)
+	m.connections.Store(wc.PoolKey, wc)
+	if m.afterConnectionStored != nil {
+		m.afterConnectionStored(wc)
+	}
+	storedConnection, connectionStored := m.connections.Load(wc.PoolKey)
+	storedSession, sessionStored := m.sessions.Load(wc.PoolKey)
+	if !wc.IsConnected() || !wc.session.IsConnected() || !connectionStored || storedConnection != wc || !sessionStored || storedSession != wc.session {
+		wc.session.RemovePendingRequest(pr.RequestID)
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, fmt.Errorf("promote websocket connection: connection closed during publication")
+	}
+	m.releaseAccountConnectionCapacity(accountID)
+	return pr, nil
 }
 
 // AcquireConnection 获取或创建连接
@@ -408,26 +1186,81 @@ func (m *Manager) AcquireConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, *PendingRequest, error) {
+	opCtx, finishOperation, err := m.beginOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer finishOperation()
+	return m.acquireConnection(opCtx, account, wsURL, sessionKey, headers, proxyOverride, false)
+}
+
+func (m *Manager) acquireConnection(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	sessionKey string,
+	headers http.Header,
+	proxyOverride string,
+	replacementOwner bool,
+) (*WsConnection, *PendingRequest, error) {
 	key := m.poolKey(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
 	lock := m.keyLock(key)
+	accountLock := m.accountLock(account.ID())
 	wait := AcquireInitialBackoff
 	var waited time.Duration
 	var createLeaseFailures int
 
 	for {
-		lock.Lock()
+		if replacementOwner {
+			lock.Lock()
+		} else {
+			m.lockPoolKey(key, lock)
+		}
 		if v, ok := m.connections.Load(key); ok {
 			wc := v.(*WsConnection)
 			if canReuseConnection(wc) {
 				// 发送 Ping 探活，确认连接真正存活
 				if m.probe(wc) {
+					// 网络 probe 不持有账号锁。同账号其它 pool key 可以并行探活；
+					// probe 期间连接可能被账号容量裁剪，因此拿锁后必须复验。
+					accountLock.Lock()
+					current, exists := m.connections.Load(key)
+					if !exists || current != wc || !canReuseConnection(wc) {
+						accountLock.Unlock()
+						lock.Unlock()
+						continue
+					}
+					if !m.ensureConnectionActivationCapacity(account.ID(), accountConnectionLimit(account), wc) {
+						accountLock.Unlock()
+						lock.Unlock()
+						if waited >= AcquireMaxWait {
+							return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", AcquireMaxWait)
+						}
+						select {
+						case <-ctx.Done():
+							return nil, nil, ctx.Err()
+						case <-time.After(wait):
+						}
+						waited += wait
+						if wait < AcquireMaxBackoff {
+							wait *= 2
+							if wait > AcquireMaxBackoff {
+								wait = AcquireMaxBackoff
+							}
+						}
+						continue
+					}
 					pr, leaseErr := m.addPendingAndBeginReadLease(wc, sessionKey)
 					if leaseErr == nil {
+						wc.account = account
 						wc.Touch()
+						m.trimIdleAccountConnections(account.ID(), accountConnectionLimit(account), wc)
+						accountLock.Unlock()
 						lock.Unlock()
 						return wc, pr, nil
 					}
 					m.DiscardConnection(wc)
+					accountLock.Unlock()
 					lock.Unlock()
 					continue
 				}
@@ -436,7 +1269,7 @@ func (m *Manager) AcquireConnection(
 				lock.Unlock()
 				continue
 			}
-			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil && wc.session.PendingCount() > 0 && !isRotatableOverAge(wc) {
+			if wc.IsConnected() && wc.session != nil && wc.session.PendingCount() > 0 {
 				lock.Unlock()
 				// 连接被同 session 的前一个请求占用：指数退避轮询等待其空闲，
 				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
@@ -460,16 +1293,41 @@ func (m *Manager) AcquireConnection(
 			}
 			m.DiscardConnection(wc)
 		}
+		accountLock.Lock()
+		if !m.reserveAccountConnectionCapacity(account, key) {
+			accountLock.Unlock()
+			lock.Unlock()
+			if waited >= AcquireMaxWait {
+				return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", AcquireMaxWait)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			waited += wait
+			if wait < AcquireMaxBackoff {
+				wait *= 2
+				if wait > AcquireMaxBackoff {
+					wait = AcquireMaxBackoff
+				}
+			}
+			continue
+		}
+		// 容量已预留，拨号期间不再持有账号锁；其他 session 可以复用已有连接，
+		// 但会把本次 pending create 计入上限，避免并发握手越界。
+		accountLock.Unlock()
 
 		wc, err := m.createConnection(ctx, account, wsURL, sessionKey, headers, proxyOverride)
 		if err != nil {
+			m.releaseAccountConnectionCapacity(account.ID())
 			lock.Unlock()
 			return nil, nil, err
 		}
 
-		// 存储新连接并立即占位 pending request，避免返回后才记账产生竞态
-		m.connections.Store(key, wc)
-		pr, leaseErr := m.addPendingAndBeginReadLease(wc, sessionKey)
+		// 把 pending dial 原子转换为已存储连接 + 首个 request lease，避免同一
+		// 物理连接在 Store 到 AddPendingRequest 的窗口里被重复计数并误淘汰。
+		pr, leaseErr := m.storeConnectionAndBeginReadLease(ctx, account, accountLock, wc, sessionKey)
 		if leaseErr == nil {
 			if earlyErr := wc.waitForEarlyReadFailure(ctx, newConnectionReadFailureGrace); earlyErr != nil {
 				wc.session.RemovePendingRequest(pr.RequestID)
@@ -519,7 +1377,7 @@ const newConnectionReadFailureGrace = 5 * time.Millisecond
 
 // AcquireReusableConnection 在固定槽位内复用或创建连接，返回实际使用的 session key。
 // 第一遍只复用已存在且空闲的连接；第二遍在空槽位新建持久连接；槽位全忙时回退到
-// fallbackKey 的一次性连接，保持与原 stateless 行为一致的并发上限（无上限）。
+// fallbackKey 的临时连接。所有路径仍受账号动态并发对应的连接总数上限约束。
 func (m *Manager) AcquireReusableConnection(
 	ctx context.Context,
 	account *auth.Account,
@@ -530,29 +1388,57 @@ func (m *Manager) AcquireReusableConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, *PendingRequest, string, error) {
+	opCtx, finishOperation, err := m.beginOperation(ctx)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	defer finishOperation()
+	ctx = opCtx
+
 	proxyURL := effectiveProxyURL(account, proxyOverride)
+	accountLimit := accountConnectionLimit(account)
+	if slots < 1 || slots > accountLimit {
+		slots = accountLimit
+	}
+	accountLock := m.accountLock(account.ID())
 	// 第一遍：复用空闲连接（探活失败或已断开的顺手清理，让第二遍可以补位）
 	for i := 0; i < slots; i++ {
 		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
 		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
 		lock := m.keyLock(key)
-		lock.Lock()
+		m.lockPoolKey(key, lock)
 		if v, ok := m.connections.Load(key); ok {
 			wc := v.(*WsConnection)
 			if canReuseConnection(wc) {
 				if m.probe(wc) {
+					accountLock.Lock()
+					current, exists := m.connections.Load(key)
+					if !exists || current != wc || !canReuseConnection(wc) {
+						accountLock.Unlock()
+						lock.Unlock()
+						continue
+					}
+					if !m.ensureConnectionActivationCapacity(account.ID(), accountConnectionLimit(account), wc) {
+						accountLock.Unlock()
+						lock.Unlock()
+						continue
+					}
 					pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession)
 					if leaseErr == nil {
+						wc.account = account
 						wc.Touch()
+						m.trimIdleAccountConnections(account.ID(), accountConnectionLimit(account), wc)
+						accountLock.Unlock()
 						lock.Unlock()
 						return wc, pr, slotSession, nil
 					}
 					m.DiscardConnection(wc)
+					accountLock.Unlock()
 					lock.Unlock()
 					continue
 				}
 				m.DiscardConnection(wc)
-			} else if !wc.IsConnected() || wc.IsExpired() || isRotatableOverAge(wc) || wc.session == nil || wc.session.PendingCount() == 0 {
+			} else if !wc.IsConnected() || wc.session == nil || wc.session.PendingCount() == 0 {
 				m.DiscardConnection(wc)
 			}
 		}
@@ -563,18 +1449,30 @@ func (m *Manager) AcquireReusableConnection(
 		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
 		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
 		lock := m.keyLock(key)
-		lock.Lock()
+		m.lockPoolKey(key, lock)
 		if _, ok := m.connections.Load(key); ok {
 			lock.Unlock()
 			continue
 		}
+		accountLock.Lock()
+		if _, ok := m.connections.Load(key); ok {
+			accountLock.Unlock()
+			lock.Unlock()
+			continue
+		}
+		if !m.reserveAccountConnectionCapacity(account, key) {
+			accountLock.Unlock()
+			lock.Unlock()
+			continue
+		}
+		accountLock.Unlock()
 		wc, err := m.createConnection(ctx, account, wsURL, slotSession, headers, proxyOverride)
 		if err != nil {
+			m.releaseAccountConnectionCapacity(account.ID())
 			lock.Unlock()
 			return nil, nil, "", err
 		}
-		m.connections.Store(key, wc)
-		pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession)
+		pr, leaseErr := m.storeConnectionAndBeginReadLease(ctx, account, accountLock, wc, slotSession)
 		if leaseErr == nil {
 			if earlyErr := wc.waitForEarlyReadFailure(ctx, newConnectionReadFailureGrace); earlyErr != nil {
 				wc.session.RemovePendingRequest(pr.RequestID)
@@ -627,6 +1525,17 @@ func canReuseConnection(wc *WsConnection) bool {
 		return false
 	}
 	return wc.session.PendingCount() == 0 && wc.readPumpReusable()
+}
+
+// isEvictableIdleExpired distinguishes business-idle expiry from a long
+// in-flight response that happens to have emitted no data frames recently.
+// Pong normally refreshes lastUsed, but PendingCount remains the authoritative
+// guard if an otherwise healthy long response is quiet beyond the idle window.
+func isEvictableIdleExpired(wc *WsConnection) bool {
+	if wc == nil || !wc.IsExpired() {
+		return false
+	}
+	return wc.session == nil || wc.session.PendingCount() == 0
 }
 
 // isRotatableOverAge 连接已到龄且当前无在途请求，可安全轮转（销毁重建）。
@@ -692,33 +1601,72 @@ func (m *Manager) createConnection(
 		}
 	}
 
-	// 创建会话（先关闭旧 session 避免泄漏）
+	// gorilla/websocket's DialContext does not reliably interrupt the HTTP
+	// upgrade response read on every platform once the TCP dial has completed.
+	// Track the raw transport only for the handshake window and close it when
+	// the merged caller/manager context is canceled. The watcher is disarmed as
+	// soon as DialContext returns so operation cleanup cannot close a live WS.
+	baseNetDialContext := dialer.NetDialContext
+	if baseNetDialContext == nil {
+		baseNetDialContext = (&net.Dialer{}).DialContext
+	}
+	rawConnReady := make(chan net.Conn, 1)
+	handshakeDone := make(chan struct{})
+	dialer.NetDialContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		rawConn, err := baseNetDialContext(dialCtx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		rawConnReady <- rawConn
+		return rawConn, nil
+	}
+	cancelHandshake := context.AfterFunc(ctx, func() {
+		select {
+		case rawConn := <-rawConnReady:
+			_ = rawConn.Close()
+		case <-handshakeDone:
+		}
+	})
+
+	// 创建会话（先精确移除旧 session 避免泄漏）。新 session 在握手成功并
+	// 标记 connected 前不发布到 sessions；否则 30s cleanup 会把长握手中的
+	// Connected=false session 当失效项删除，握手随后成功却留下无 session 映射。
 	poolKey := m.poolKey(account.ID(), wsURL, sessionKey, proxyURL)
 	if oldSessionVal, ok := m.sessions.Load(poolKey); ok {
 		oldSession := oldSessionVal.(*Session)
-		oldSession.Close()
+		if m.sessions.CompareAndDelete(poolKey, oldSession) {
+			oldSession.Close()
+		}
 	}
 	session := NewSession(account.ID(), m)
 	if trimmed := strings.TrimSpace(sessionKey); trimmed != "" {
 		session.ID = trimmed
 	}
-	m.sessions.Store(poolKey, session)
 
 	// 拨号连接
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	close(handshakeDone)
+	cancelHandshake()
 	if err != nil {
-		m.sessions.Delete(poolKey)
 		session.Close()
 		// bad handshake 时 resp 常非空：附带上游 HTTP 状态/ body，便于测试连接定位。
 		return nil, formatDialHandshakeError(err, resp)
 	}
+	select {
+	case <-ctx.Done():
+		_ = conn.Close()
+		session.Close()
+		return nil, ctx.Err()
+	default:
+	}
 
 	// 创建连接包装
 	wc := NewWsConnection(conn, session, wsURL)
+	wc.account = account
 	wc.PoolKey = poolKey
 	wc.httpResp = resp
 	wc.onDisconnected = m.getOnDisconnected()
-	wc.onReadFailure = m.DiscardConnection
+	wc.onReadFailure = m.discardConnectionOnReadFailure
 	session.SetConnected(true)
 
 	// 控制帧处理器必须在唯一永久 reader 启动前安装。
@@ -734,25 +1682,54 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 		return
 	}
 	wc.Touch()
+	if wc.account == nil || wc.session == nil {
+		return
+	}
+	accountLock := m.accountLock(wc.session.AccountID)
+	accountLock.Lock()
+	if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc || !wc.IsConnected() {
+		accountLock.Unlock()
+		return
+	}
+	// A completed connection that obtained a response binding is excluded as
+	// continuation state. If the binding table was full (or no response ID was
+	// produced), it remains ordinary unbound idle capacity and converges here.
+	m.trimIdleAccountConnections(wc.session.AccountID, accountConnectionLimit(wc.account), wc)
+	accountLock.Unlock()
+	// The global continuation trim obtains account locks for arbitrary dynamic
+	// account IDs, so it must run only after releasing this account's lock.
+	m.enforceContinuationSocketBudgets()
 }
 
 // RemoveConnection 移除连接
 func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey string, proxyURL string) {
 	key := m.poolKey(accountID, wsURL, sessionKey, proxyURL)
-	if v, ok := m.connections.LoadAndDelete(key); ok {
-		wc := v.(*WsConnection)
-		wc.Close()
-	}
-	m.sessions.Delete(key)
+	lock := m.keyLock(key)
+	m.lockPoolKey(key, lock)
+	defer lock.Unlock()
+	m.removeConnectionByKeyLocked(key)
 }
 
-// DiscardConnection 关闭并从连接池移除一条坏连接。
-// 用于上游 WS 异常路径(read error / close 1006/1009/1011 / broken pipe / unexpected EOF)：
-// 关闭底层 socket 解决 CLOSE_WAIT 滞留，并把连接从 connections/sessions 移除，
-// 避免坏连接被 ReleaseConnection 归还后又被 canReuseConnection 误判为可复用。
-// 使用 CompareAndDelete 按本连接精确删除，防止误删同 PoolKey 下已重建的新连接。
-func (m *Manager) DiscardConnection(wc *WsConnection) {
-	if wc == nil {
+// removeConnectionByKeyLocked requires the pool-key lock. Pointer-safe
+// deletion prevents a stale remover from deleting a same-key replacement.
+func (m *Manager) removeConnectionByKeyLocked(key string) {
+	if v, ok := m.connections.LoadAndDelete(key); ok {
+		wc := v.(*WsConnection)
+		m.discardConnectionState(wc)
+		m.removeResponseConnBindings(wc)
+		return
+	}
+	if v, ok := m.sessions.LoadAndDelete(key); ok {
+		v.(*Session).Close()
+	}
+}
+
+// discardConnectionState first makes the connection impossible to select or
+// bind again, then closes its session and socket. Binding cleanup is kept
+// separate so account-capacity eviction can clean many connections with one
+// bounded binding-table scan.
+func (m *Manager) discardConnectionState(wc *WsConnection) {
+	if m == nil || wc == nil {
 		return
 	}
 	if wc.PoolKey != "" {
@@ -762,10 +1739,34 @@ func (m *Manager) DiscardConnection(wc *WsConnection) {
 		}
 	}
 	if wc.session != nil {
-		wc.session.StopHeartbeat()
-		wc.session.SetConnected(false)
+		wc.session.Close()
 	}
 	_ = wc.Close()
+}
+
+func (m *Manager) discardConnectionOnReadFailure(wc *WsConnection) {
+	if wc == nil {
+		return
+	}
+	wc.promotionMu.Lock()
+	m.DiscardConnection(wc)
+	wc.promotionMu.Unlock()
+}
+
+// DiscardConnection 关闭并从连接池移除一条坏连接。
+// 用于上游 WS 异常路径(read error / close 1006/1009/1011 / broken pipe / unexpected EOF)：
+// 关闭底层 socket 解决 CLOSE_WAIT 滞留，并把连接从 connections/sessions 移除，
+// 避免坏连接被 ReleaseConnection 归还后又被 canReuseConnection 误判为可复用。
+// 使用 CompareAndDelete 按本连接精确删除，防止误删同 PoolKey 下已重建的新连接。
+func (m *Manager) DiscardConnection(wc *WsConnection) {
+	if m == nil || wc == nil {
+		return
+	}
+	// Remove/close first. A concurrent BindResponseConn either publishes before
+	// this transition and is removed below, or observes the dead/non-current
+	// connection and refuses to publish a stale continuation binding.
+	m.discardConnectionState(wc)
+	m.removeResponseConnBindings(wc)
 }
 
 // BindResponseConn 记录 response_id 由哪条连接产出（续链亲和）。
@@ -776,25 +1777,51 @@ func (m *Manager) BindResponseConn(responseID string, wc *WsConnection, sessionK
 	}
 	now := time.Now()
 	m.respConnMu.Lock()
+	// Validate while holding the same mutex that protects publication. Discard
+	// removes the pool entry and closes the connection before taking this lock,
+	// so a bind racing with discard cannot resurrect a dead pointer.
+	if !wc.IsConnected() {
+		m.respConnMu.Unlock()
+		return
+	}
+	if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc {
+		m.respConnMu.Unlock()
+		return
+	}
 	if m.respConnBindings == nil {
 		m.respConnBindings = make(map[string]responseConnBinding, 64)
 	}
-	// 有界保护：先清一轮过期项，仍超限则拒绝新增（旧绑定比新绑定更可能被续链）。
-	if len(m.respConnBindings) >= responseConnBindingMaxEntries {
-		for k, b := range m.respConnBindings {
-			if now.After(b.expiresAt) {
-				delete(m.respConnBindings, k)
+	_, replacingExisting := m.respConnBindings[responseID]
+	if len(m.respConnBindings) >= responseConnBindingMaxEntries && !replacingExisting {
+		// High churn can fill the ID table with dead/non-current pointers before
+		// the periodic cleanup tick. Apply the full liveness predicate here.
+		m.latestLiveResponseBindingsLocked(now)
+	}
+	if len(m.respConnBindings) >= responseConnBindingMaxEntries && !replacingExisting {
+		// Expired/dead IDs were pruned above. Keep the hard 4096-ID ceiling while
+		// preferring the newest continuations: replace the oldest monotonic Bind
+		// generation instead of relying on wall-clock expiry or map iteration.
+		oldestID := ""
+		var oldestGeneration uint64
+		for existingID, binding := range m.respConnBindings {
+			if oldestID == "" || binding.generation < oldestGeneration ||
+				(binding.generation == oldestGeneration && existingID < oldestID) {
+				oldestID = existingID
+				oldestGeneration = binding.generation
 			}
 		}
-	}
-	if len(m.respConnBindings) < responseConnBindingMaxEntries {
-		m.respConnBindings[responseID] = responseConnBinding{
-			conn:       wc,
-			sessionKey: sessionKey,
-			accountID:  accountID,
-			apiKey:     apiKey,
-			expiresAt:  now.Add(responseConnBindingTTL),
+		if oldestID != "" {
+			delete(m.respConnBindings, oldestID)
 		}
+	}
+	m.responseBindingGeneration++
+	m.respConnBindings[responseID] = responseConnBinding{
+		conn:       wc,
+		sessionKey: sessionKey,
+		accountID:  accountID,
+		apiKey:     apiKey,
+		expiresAt:  now.Add(responseConnBindingTTL),
+		generation: m.responseBindingGeneration,
 	}
 	m.respConnMu.Unlock()
 }
@@ -835,14 +1862,21 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 // 调用方回退到常规 acquire 路径。忙时不等待：续链上下文虽在原连接，但排队会
 // 阻塞在前一个长响应后面，且该场景（同会话并发续链）极少，退化为缓存 miss 更稳。
 func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string) {
+	_, finishOperation, err := m.beginOperation(context.Background())
+	if err != nil {
+		return nil, nil, ""
+	}
+	defer finishOperation()
+
 	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
 	if wc == nil {
 		return nil, nil, ""
 	}
+	accountLock := m.accountLock(accountID)
 	lock := m.keyLock(wc.PoolKey)
-	lock.Lock()
+	m.lockPoolKey(wc.PoolKey, lock)
 	defer lock.Unlock()
-	// 加锁后复验：期间可能被其他请求占用或销毁。
+	// pool-key 加锁后复验：期间可能被其他请求占用或销毁。
 	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc {
 		return nil, nil, ""
 	}
@@ -856,12 +1890,25 @@ func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64,
 		m.DiscardConnection(wc)
 		return nil, nil, ""
 	}
+	// probe 可能等待网络，不能占用账号锁。拿到账号锁后再次复验，防止
+	// probe 期间连接被其它 pool key 的容量裁剪安全回收。
+	accountLock.Lock()
+	defer accountLock.Unlock()
+	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc || !canReuseConnection(wc) {
+		return nil, nil, ""
+	}
+	if !m.ensureConnectionActivationCapacity(accountID, accountConnectionLimit(wc.account), wc) {
+		return nil, nil, ""
+	}
 	pr, err := m.addPendingAndBeginReadLease(wc, sessionKey)
 	if err != nil {
 		m.DiscardConnection(wc)
 		return nil, nil, ""
 	}
 	wc.Touch()
+	if wc.account != nil {
+		m.trimIdleAccountConnections(accountID, accountConnectionLimit(wc.account), wc)
+	}
 	return wc, pr, sessionKey
 }
 
@@ -907,11 +1954,28 @@ func (m *Manager) ReplaceConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, *PendingRequest, error) {
-	// 先移除旧连接
-	m.RemoveConnection(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
+	opCtx, finishOperation, err := m.beginOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer finishOperation()
 
-	// 创建新连接
-	return m.AcquireConnection(ctx, account, wsURL, sessionKey, headers, proxyOverride)
+	key := m.poolKey(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
+	replacementLock := m.replacementLock(key)
+	replacementLock.Lock()
+	defer replacementLock.Unlock()
+
+	keyLock := m.keyLock(key)
+	keyLock.Lock()
+	m.removeConnectionByKeyLocked(key)
+	keyLock.Unlock()
+	if m.afterReplacementRemoved != nil {
+		m.afterReplacementRemoved(key)
+	}
+
+	// Keep the replacement gate through the fresh acquire. The internal path
+	// bypasses only that gate; it still uses the ordinary key/account locks.
+	return m.acquireConnection(opCtx, account, wsURL, sessionKey, headers, proxyOverride, true)
 }
 
 // SendHeartbeat 发送心跳 Ping

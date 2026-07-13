@@ -4286,8 +4286,9 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 		s.sessionBindings = make(map[string]sessionAffinity)
 	}
 	// 有界保护：过期绑定只在同 key 再次命中时才被动删除，对话结束后的绑定
-	// 永远不会再被查询、会静默泄漏。粘性键按内容种子派生（每段对话一个）后
-	// 键数量随对话数增长，超限时全量清一轮过期项。
+	// 永远不会再被查询、会静默泄漏。主 handler 仅为专用 affinity header 或
+	// 显式 session 标识建立绑定；键数量仍会随会话数增长，超限时全量清一轮
+	// 过期项。
 	if len(s.sessionBindings) >= maxSessionBindings {
 		for k, b := range s.sessionBindings {
 			if !b.expiresAt.After(now) {
@@ -6053,16 +6054,30 @@ func isUsageLimitCooldownReason(reason string) bool {
 	}
 }
 
-// ConfirmResponsesAvailable clears only a usage/rate-limit cooldown after a
-// completed Responses request succeeds. Authentication and unrelated error
-// states are intentionally untouched.
+// ConfirmResponsesAvailable preserves the original API for callers whose
+// success evidence is current at call time.
 func (s *Store) ConfirmResponsesAvailable(acc *Account) bool {
+	// Some platforms expose a wall-clock resolution coarser than a nanosecond.
+	// Treat this compatibility wrapper's call-time success as strictly newer
+	// than a rate-limit mark recorded in the same clock tick; real request paths
+	// pass their attempt start time to ConfirmResponsesAvailableSince instead.
+	return s.ConfirmResponsesAvailableSince(acc, time.Now().Add(time.Nanosecond))
+}
+
+// ConfirmResponsesAvailableSince clears only a usage/rate-limit cooldown when
+// a completed Responses request started after the latest rate-limit evidence.
+// A stale in-flight success must not undo a newer usage_limit_reached result.
+// Authentication and unrelated error states are intentionally untouched.
+func (s *Store) ConfirmResponsesAvailableSince(acc *Account, requestStartedAt time.Time) bool {
 	if s == nil || acc == nil {
 		return false
 	}
 
 	acc.mu.Lock()
-	if !acc.ignoreUsageLimitStatus || acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) {
+	if !acc.ignoreUsageLimitStatus ||
+		acc.Status != StatusCooldown ||
+		!isUsageLimitCooldownReason(acc.CooldownReason) ||
+		(!acc.LastRateLimitedAt.IsZero() && !requestStartedAt.After(acc.LastRateLimitedAt)) {
 		acc.mu.Unlock()
 		return false
 	}

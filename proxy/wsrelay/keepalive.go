@@ -40,7 +40,7 @@ func (m *Manager) PingIdleConnections() (pinged int, failed int) {
 		if !wc.IsConnected() {
 			return true
 		}
-		// 到龄连接不续命：Pong 会刷新 lastUsed 让连接永不空闲过期，最终撞上游
+		// 到龄连接不续命：Pong 会刷新 lastUsed 让连接保持可复用，但不能绕过
 		// 60 分钟寿命上限；跳过 Ping，交给 evictExpired 按到龄轮转销毁。
 		if wc.IsOverAge() {
 			return true

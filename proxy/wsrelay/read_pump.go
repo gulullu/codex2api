@@ -120,15 +120,22 @@ func (wc *WsConnection) installControlHandlers() {
 			)
 		})
 		wc.conn.SetPongHandler(func(appData string) error {
-			if wc.session != nil {
-				wc.session.HandlePong()
-			}
-			wc.Touch()
-			wc.touchInbound()
-			wc.notifyProbePong(appData)
+			wc.handleControlPong(appData)
 			return nil
 		})
 	})
+}
+
+func (wc *WsConnection) handleControlPong(appData string) {
+	if wc.session != nil {
+		wc.session.HandlePong()
+	}
+	// Preserve the official keepalive semantics: a successful Pong refreshes
+	// socket liveness. Continuation binding TTL is tracked independently and a
+	// bound-idle socket remains constrained by the separate socket budgets.
+	wc.Touch()
+	wc.touchInbound()
+	wc.notifyProbePong(appData)
 }
 
 // StartReadPump starts the connection's sole underlying WebSocket reader.
