@@ -364,6 +364,20 @@ settle interval and a second 600-second proof. These maintenance budgets cover
 observed in-flight requests, scheduler convergence, and async-log propagation
 without slowing the 10-second recurring failover loop.
 
+Scheduler convergence is deliberately asymmetric. Standby protection is not
+accepted until every current ready bucket exposes at least one active account
+whose PostgreSQL row and both Redis account projections (`sched:meta` and
+`sched:acc`) are schedulable. Disabling an account is accepted after two
+consecutive observations that
+PostgreSQL and both Redis projections expose it as unschedulable. sub2 checks
+those projections (and the current database row on fallback/acquire paths)
+before dispatch, so an old ZSET member cannot admit new work. Consumed outbox
+rows and bucket removal may trail this safety fence and are diagnostic cleanup
+state only; they never cause a logically paused standby to be reopened. Existing
+requests that entered before the pause may finish normally, while the primary
+maintenance drain remains a separate explicit proof when zero in-flight work is
+required.
+
 The sub2api endpoint does not expose atomic compare-and-set. A third-party write
 after the final FIFO sentinel/tuple check but before the primary API call is
 therefore an irreducible bounded race without an upstream CAS. The two primary

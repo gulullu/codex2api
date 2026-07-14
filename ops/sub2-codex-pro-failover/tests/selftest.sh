@@ -233,7 +233,12 @@ PY
     ;;
   outbox-count)
     [[ "${2:-}" == account_changed ]] || exit 1
-    printf '0\n'
+    id="$1"
+    if [[ -e "$FAKE_DIR/outbox_pending_$id" ]]; then
+      printf '1\n'
+    else
+      printf '0\n'
+    fi
     ;;
   buckets)
     [[ ! -e "$FAKE_DIR/buckets_fail" ]] || exit 2
@@ -251,10 +256,21 @@ PY
     [[ ! -e "$FAKE_DIR/snapshot_fail" ]] || exit 1
     id="$3"
     [[ ! -e "$FAKE_DIR/bucket_error_$id" ]] || exit 2
+    [[ ! -e "$FAKE_DIR/stale_bucket_contains_$id" ]] || exit 0
     awk -F '|' -v id="$id" '$1==id && $3=="active" && $4=="t" && $5=="t" {found=1} END {exit !found}' "$FAKE_DIR/members"
     ;;
   meta)
     id="$1"
+    [[ ! -e "$FAKE_DIR/meta_error_$id" ]] || exit 2
+    if [[ -e "$FAKE_DIR/meta_error_when_unsched_$id" ]] &&
+       awk -F '|' -v id="$id" '$1==id && $4=="f" {found=1} END {exit !found}' "$FAKE_DIR/members"; then
+      exit 2
+    fi
+    if [[ -e "$FAKE_DIR/count_meta_reads_$id" ]]; then
+      count=0
+      [[ ! -s "$FAKE_DIR/meta_read_count_$id" ]] || count="$(<"$FAKE_DIR/meta_read_count_$id")"
+      printf '%s\n' "$((count + 1))" >"$FAKE_DIR/meta_read_count_$id"
+    fi
     if [[ "$id" == "$bridge_id" && -s "$FAKE_DIR/bump_generation_on_meta_call" ]]; then
       count=0
       [[ ! -s "$FAKE_DIR/meta_call_count" ]] || count="$(<"$FAKE_DIR/meta_call_count")"
@@ -264,14 +280,17 @@ PY
         next_generation "$id" >/dev/null
       fi
     fi
-    python3 - "$FAKE_DIR/members" "$id" "$FAKE_DIR/meta_generation_$id" <<'PY'
-import json,sys
+    python3 - "$FAKE_DIR/members" "$id" "$FAKE_DIR/meta_generation_$id" "$FAKE_DIR/meta_sched_override_$id" <<'PY'
+import json,os,sys
 for line in open(sys.argv[1],encoding='utf-8'):
     p=line.rstrip('\n').split('|')
     if p[0] == sys.argv[2]:
+        schedulable=p[3] == 't'
+        if os.path.exists(sys.argv[4]):
+            schedulable=open(sys.argv[4],encoding='utf-8').read().strip() == 'true'
         print(json.dumps({
           'Status':p[2],
-          'Schedulable':p[3] == 't',
+          'Schedulable':schedulable,
           'RateLimitResetAt':None,
           'OverloadUntil':None if p[5] == 't' else '2999-01-01T00:00:00+00:00',
           'TempUnschedulableUntil':None,
@@ -282,9 +301,14 @@ for line in open(sys.argv[1],encoding='utf-8'):
 raise SystemExit(1)
 PY
     ;;
-  full-account)
+  full-account|full-account-state)
     id="$1"
-    if [[ "$id" == "$bridge_id" && -s "$FAKE_DIR/bump_cache_generation_on_full_account_call" ]]; then
+    [[ ! -e "$FAKE_DIR/full_account_error_$id" ]] || exit 2
+    if [[ -e "$FAKE_DIR/full_account_error_when_unsched_$id" ]] &&
+       awk -F '|' -v id="$id" '$1==id && $4=="f" {found=1} END {exit !found}' "$FAKE_DIR/members"; then
+      exit 2
+    fi
+    if [[ "$cmd" == full-account && "$id" == "$bridge_id" && -s "$FAKE_DIR/bump_cache_generation_on_full_account_call" ]]; then
       count=0
       [[ ! -s "$FAKE_DIR/full_account_call_count" ]] || count="$(<"$FAKE_DIR/full_account_call_count")"
       count=$((count + 1))
@@ -310,7 +334,7 @@ PY
           >"$FAKE_DIR/cache_generation_override_$id"
       fi
     fi
-    if [[ "$id" == "$bridge_id" && -s "$FAKE_DIR/bump_generation_on_full_account_call" ]]; then
+    if [[ "$cmd" == full-account && "$id" == "$bridge_id" && -s "$FAKE_DIR/bump_generation_on_full_account_call" ]]; then
       count=0
       [[ ! -s "$FAKE_DIR/full_account_call_count" ]] || count="$(<"$FAKE_DIR/full_account_call_count")"
       count=$((count + 1))
@@ -345,14 +369,17 @@ PY
     if [[ "$id" == "$bridge_id" && -s "$FAKE_DIR/cache_generation_override_$id" ]]; then
       generation_path="$FAKE_DIR/cache_generation_override_$id"
     fi
-    python3 - "$FAKE_DIR/members" "$id" "$generation_path" <<'PY'
-import json,sys
+    python3 - "$FAKE_DIR/members" "$id" "$generation_path" "$FAKE_DIR/full_account_sched_override_$id" <<'PY'
+import json,os,sys
 for line in open(sys.argv[1],encoding='utf-8'):
     p=line.rstrip('\n').split('|')
     if p[0] == sys.argv[2]:
+        schedulable=p[3] == 't'
+        if os.path.exists(sys.argv[4]):
+            schedulable=open(sys.argv[4],encoding='utf-8').read().strip() == 'true'
         print(json.dumps({
           'Status':p[2],
-          'Schedulable':p[3] == 't',
+          'Schedulable':schedulable,
           'UpdatedAt':open(sys.argv[3],encoding='utf-8').read().strip(),
         }))
         raise SystemExit(0)
@@ -780,6 +807,11 @@ EOF
     "$tmp/flip_after_close" "$tmp/unavailable_after_close" \
     "$tmp/normal_drop_after_close" "$tmp/wrapped-started" "$tmp/relay_evidence_fail"
 	rm -f "$tmp"/fail_open_* "$tmp"/bucket_error_*
+	rm -f "$tmp"/stale_bucket_contains_* "$tmp"/outbox_pending_* \
+	  "$tmp"/meta_sched_override_* "$tmp"/full_account_sched_override_* \
+	  "$tmp"/meta_error_* "$tmp"/full_account_error_* \
+	  "$tmp"/meta_error_when_unsched_* "$tmp"/full_account_error_when_unsched_* \
+	  "$tmp"/count_meta_reads_* "$tmp"/meta_read_count_*
   rm -f "$tmp"/started_open_* "$tmp"/wait_for_open_peer_* "$tmp"/saw_open_peer_* \
     "$tmp/backend-write.lock"
   rm -f "$tmp/buckets_fail" "$tmp/bucket_ready_error" "$tmp/health_fail" \
@@ -836,7 +868,7 @@ run_controller() {
     RELAY_AVAILABILITY_DETECTION_SECONDS=60 \
     RELAY_AVAILABILITY_THRESHOLD=2 \
     TELEMETRY_FAILURE_CONFIRMATIONS=2 \
-    SNAPSHOT_CONFIRMATIONS=1 \
+    SNAPSHOT_CONFIRMATIONS="${TEST_SNAPSHOT_CONFIRMATIONS:-1}" \
     SNAPSHOT_TIMEOUT_SECONDS="${TEST_SNAPSHOT_TIMEOUT_SECONDS:-2}" \
     MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS="${TEST_MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS:-2}" \
     MAINTENANCE_RECEIPT_TIMEOUT_SECONDS="${TEST_MAINTENANCE_RECEIPT_TIMEOUT_SECONDS:-3}" \
@@ -1268,6 +1300,119 @@ assert_eq t "$(member_schedulable 7693)" 'standby remains through healthy sample
 run_controller reconcile
 assert_eq f "$(member_schedulable 7693)" 'standby closes after proof windows plus 3 healthy samples'
 assert_no_forbidden_writes
+
+# A retained outbox row and an old bucket member are asynchronous cleanup
+# details, not evidence that a paused account can still receive new work. Once
+# DB, sched:meta and sched:acc all say false, closing succeeds without the
+# false->true oscillation seen with long-running production streams.
+reset_fixture
+sed -i 's/7693|\([^|]*\)|active|f|/7693|\1|active|t|/' "$tmp/members"
+run_controller reconcile
+age_recovery_state
+run_controller reconcile
+touch "$tmp/outbox_pending_7693" "$tmp/stale_bucket_contains_7693"
+touch "$tmp/count_meta_reads_7693"
+TEST_SNAPSHOT_CONFIRMATIONS=2
+run_controller reconcile
+unset TEST_SNAPSHOT_CONFIRMATIONS
+assert_eq f "$(member_schedulable 7693)" 'cleanup lag did not reopen a logically paused standby'
+assert_eq 'set:7693:false' "$(cat "$tmp/events")" 'cleanup lag produced one close and no reopen'
+if (( $(<"$tmp/meta_read_count_7693") < 2 )); then
+  printf 'FAIL: close was accepted without two scheduler-state confirmations\n' >&2
+  exit 1
+fi
+
+# Both Redis scheduler views are safety gates for a close. A stale true value
+# in either view makes the close unconfirmed and the controller reopens the
+# standby, while the timeout event identifies the failed projection.
+for stale_cache in meta full_account; do
+  reset_fixture
+  sed -i 's/7693|\([^|]*\)|active|f|/7693|\1|active|t|/' "$tmp/members"
+  run_controller reconcile
+  age_recovery_state
+  run_controller reconcile
+  printf 'true\n' >"$tmp/${stale_cache}_sched_override_7693"
+  TEST_SNAPSHOT_TIMEOUT_SECONDS=1
+  set +e
+  run_controller reconcile
+  stale_cache_rc=$?
+  set -e
+  unset TEST_SNAPSHOT_TIMEOUT_SECONDS
+  if (( stale_cache_rc == 0 )); then
+    printf 'FAIL: %s true cache was accepted as a confirmed close\n' "$stale_cache" >&2
+    exit 1
+  fi
+  assert_eq t "$(member_schedulable 7693)" "$stale_cache true cache forced a safe standby reopen"
+  assert_eq $'set:7693:false\nset:7693:true' "$(tail -n 2 "$tmp/events")" \
+    "$stale_cache mismatch close/reopen order"
+  python3 - "$tmp/controller.log" "$stale_cache" <<'PY'
+import json,sys
+events=[]
+for line in open(sys.argv[1],encoding='utf-8'):
+    try:
+        event=json.loads(line)
+    except Exception:
+        continue
+    if event.get('reason') == 'scheduler_snapshot_not_confirmed':
+        events.append(event)
+assert events
+snapshot=events[-1]['details']['snapshot']
+assert snapshot['db_ok'] is True
+assert snapshot['bucket_cleanup_complete'] is True
+assert snapshot['outbox_rows'] == 0
+if sys.argv[2] == 'meta':
+    assert snapshot['meta_ok'] is False and snapshot['full_ok'] is True
+else:
+    assert snapshot['meta_ok'] is True and snapshot['full_ok'] is False
+PY
+done
+
+# Read failures in either Redis scheduler view also fail closed. The recovery
+# attempt still writes the active standby back to true, but the controller does
+# not claim convergence while that cache remains unverifiable.
+for error_cache in meta full_account; do
+  reset_fixture
+  sed -i 's/7693|\([^|]*\)|active|f|/7693|\1|active|t|/' "$tmp/members"
+  run_controller reconcile
+  age_recovery_state
+  run_controller reconcile
+  touch "$tmp/${error_cache}_error_when_unsched_7693"
+  TEST_SNAPSHOT_TIMEOUT_SECONDS=1
+  set +e
+  run_controller reconcile
+  cache_error_rc=$?
+  set -e
+  unset TEST_SNAPSHOT_TIMEOUT_SECONDS
+  if (( cache_error_rc == 0 )); then
+    printf 'FAIL: %s read error was accepted as scheduler convergence\n' "$error_cache" >&2
+    exit 1
+  fi
+  assert_eq t "$(member_schedulable 7693)" "$error_cache read error issued fail-safe reopen"
+  assert_eq $'set:7693:false\nset:7693:true' "$(tail -n 2 "$tmp/events")" \
+    "$error_cache read error close/reopen order"
+done
+
+# Opening is intentionally stricter than closing: standby protection is not
+# declared until at least one active candidate has converged in DB, metadata,
+# full-account cache, and every current ready bucket.
+reset_fixture
+printf 'false\n' >"$tmp/full_account_sched_override_7693"
+printf 'ok|10|0|0|3|7|0|0|0|0|0|degraded\n' >"$tmp/health"
+TEST_SNAPSHOT_TIMEOUT_SECONDS=1
+set +e
+run_controller reconcile
+stale_open_rc=$?
+set -e
+unset TEST_SNAPSHOT_TIMEOUT_SECONDS
+if (( stale_open_rc == 0 )); then
+  printf 'FAIL: stale false full-account cache was accepted as a confirmed open\n' >&2
+  exit 1
+fi
+assert_eq t "$(member_schedulable 7693)" 'unconfirmed open left the active standby available rather than rolling it back'
+grep -Fq 'no_backup_reached_scheduler_snapshot' "$tmp/controller.log"
+rm -f "$tmp/full_account_sched_override_7693"
+run_controller reconcile
+assert_eq t "$(member_schedulable 7693)" 'open completed after the full account cache converged'
 
 # schedulable is global across groups. If a standby that is open during a
 # recovery generation becomes shared with another active group, the controller
@@ -1915,13 +2060,13 @@ assert_eq PAUSE_ACKED "$(marker_phase)" 'receipt query failure kept pause acknow
 assert_eq "$pause_acked_hash" "$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')" \
   'receipt query failure left marker byte-identical'
 test ! -e "$tmp/state/maintenance-ambiguous.json"
-touch "$tmp/snapshot_fail"
+touch "$tmp/full_account_error_7692"
 expect_controller_failure prepare-maintenance
 assert_eq PAUSE_ACKED "$(marker_phase)" 'snapshot read failure kept pause acknowledged'
 assert_eq "$pause_acked_hash" "$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')" \
   'snapshot read failure left marker byte-identical'
 test ! -e "$tmp/state/maintenance-ambiguous.json"
-rm -f "$tmp/snapshot_fail"
+rm -f "$tmp/full_account_error_7692"
 rm -f "$tmp/primary_busy"
 run_controller prepare-maintenance
 assert_eq OWNED "$(marker_phase)" 'busy drain retry reached owned without new pause'

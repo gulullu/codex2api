@@ -641,8 +641,9 @@ if a.get("AutoPauseOnExpired") and a.get("ExpiresAt") and not future(a.get("Expi
 # maintenance write to scheduler convergence.
 full_account_control_projection() {
   local account_id="$1"
+  local backend_command="${2:-full-account}"
   if [[ -n "$TEST_BACKEND" ]]; then
-    backend_call full-account "$account_id"
+    backend_call "$backend_command" "$account_id"
     return
   fi
   local lua
@@ -685,6 +686,39 @@ except Exception:
 ' "$expected" "$expected_updated_at"
 }
 
+# State-only scheduler fences intentionally do not bind an UpdatedAt generation.
+# Maintenance ownership calls full_account_control_matches directly with the
+# exact synchronous response timestamp; keeping the two reads distinct lets the
+# ownership state machine detect a later foreign generation instead of adopting
+# it as a new baseline.
+full_account_state_matches() {
+  local account_id="$1"
+  local expected="$2"
+  local projection
+  if [[ -n "$TEST_BACKEND" ]]; then
+    projection="$(backend_call full-account-state "$account_id")" || return 1
+  else
+    projection="$(full_account_control_projection "$account_id")" || return 1
+  fi
+  [[ -n "$projection" ]] || return 1
+  printf '%s' "$projection" | "$PYTHON_BIN" -c '
+import datetime as dt,json,sys
+expected=sys.argv[1] == "true"
+try:
+    account=json.load(sys.stdin)
+    if account.get("Status") != "active" or bool(account.get("Schedulable")) is not expected:
+        raise ValueError
+    raw=str(account.get("UpdatedAt") or "").strip()
+    if raw.endswith("Z"):
+        raw=raw[:-1]+"+00:00"
+    stamp=dt.datetime.fromisoformat(raw)
+    if stamp.tzinfo is None:
+        raise ValueError
+except Exception:
+    raise SystemExit(1)
+' "$expected"
+}
+
 all_buckets_contain_account() {
   local account_id="$1"
   local buckets
@@ -721,7 +755,8 @@ backups_ready_in_all_buckets() {
   local -a candidates=()
   local id
   for id in "${BACKUP_IDS[@]}"; do
-    if [[ "${MEMBER_SCHEDULABLE[$id]}" == "t" && "${MEMBER_RUNTIME_READY[$id]}" == "t" ]] && meta_matches "$id" true; then
+    if [[ "${MEMBER_SCHEDULABLE[$id]}" == "t" && "${MEMBER_RUNTIME_READY[$id]}" == "t" ]] &&
+       meta_matches "$id" true && full_account_state_matches "$id" true; then
       candidates+=("$id")
     fi
   done
@@ -769,32 +804,69 @@ wait_for_backups_ready() {
 account_snapshot_matches() {
   local account_id="$1"
   local expected="$2"
-  local db_ok=false outbox_ok=false meta_ok=false bucket_ok=false
+  local expected_updated_at="${3:-}"
+  local db_ok=false meta_ok=false full_ok=false bucket_ok=true
   if load_members && [[ "${MEMBER_SCHEDULABLE[$account_id]:-}" == "$([[ "$expected" == true ]] && printf t || printf f)" ]]; then
     db_ok=true
   fi
-  if [[ "$(query_outbox_count "$account_id" 2>/dev/null || printf 1)" == "0" ]]; then
-    outbox_ok=true
-  fi
   if meta_matches "$account_id" "$expected"; then
     meta_ok=true
+  fi
+  if [[ -n "$expected_updated_at" ]]; then
+    full_account_control_matches "$account_id" "$expected" "$expected_updated_at" && full_ok=true
+  elif full_account_state_matches "$account_id" "$expected"; then
+    full_ok=true
+  fi
+  if [[ "$expected" == true ]]; then
+    bucket_ok=false
+    all_buckets_contain_account "$account_id" && bucket_ok=true
+  fi
+  # Closing is a scheduler-state fence, not a topology-cleanup fence. sub2
+  # rechecks sched:meta for bucket candidates, sched:acc for sticky/account-id
+  # paths, and the database on fallback/acquire paths. Once all three current
+  # states are false, a stale ZSET member or a processed-but-not-deleted outbox row
+  # cannot admit a new request and must not cause the controller to reopen the
+  # standby. Opening remains stricter because the account must also be
+  # discoverable from every current ready bucket before it can protect traffic.
+  [[ "$db_ok" == true && "$meta_ok" == true && "$full_ok" == true && "$bucket_ok" == true ]]
+}
+
+account_snapshot_diagnostics_json() {
+  local account_id="$1"
+  local expected="$2"
+  local expected_updated_at="${3:-}"
+  local db_ok=false meta_ok=false full_ok=false bucket_ok=false
+  local outbox_rows=null
+  if load_members && [[ "${MEMBER_SCHEDULABLE[$account_id]:-}" == "$([[ "$expected" == true ]] && printf t || printf f)" ]]; then
+    db_ok=true
+  fi
+  meta_matches "$account_id" "$expected" && meta_ok=true
+  if [[ -n "$expected_updated_at" ]]; then
+    full_account_control_matches "$account_id" "$expected" "$expected_updated_at" && full_ok=true
+  else
+    full_account_state_matches "$account_id" "$expected" && full_ok=true
   fi
   if [[ "$expected" == true ]]; then
     all_buckets_contain_account "$account_id" && bucket_ok=true
   else
     all_buckets_exclude_account "$account_id" && bucket_ok=true
   fi
-  [[ "$db_ok" == true && "$outbox_ok" == true && "$meta_ok" == true && "$bucket_ok" == true ]]
+  local raw_outbox
+  raw_outbox="$(query_outbox_count "$account_id" 2>/dev/null || true)"
+  [[ "$raw_outbox" =~ ^[0-9]+$ ]] && outbox_rows="$raw_outbox"
+  printf '{"db_ok":%s,"meta_ok":%s,"full_ok":%s,"bucket_cleanup_complete":%s,"outbox_rows":%s}' \
+    "$db_ok" "$meta_ok" "$full_ok" "$bucket_ok" "$outbox_rows"
 }
 
 wait_for_account_snapshot() {
   local account_id="$1"
   local expected="$2"
   local snapshot_timeout="${3:-$SNAPSHOT_TIMEOUT_SECONDS}"
+  local expected_updated_at="${4:-}"
   local deadline=$((SECONDS + snapshot_timeout))
   local confirmations=0
   while (( SECONDS < deadline )); do
-    if account_snapshot_matches "$account_id" "$expected"; then
+    if account_snapshot_matches "$account_id" "$expected" "$expected_updated_at"; then
       confirmations=$((confirmations + 1))
       if (( confirmations >= SNAPSHOT_CONFIRMATIONS )); then
         return 0
@@ -1049,8 +1121,11 @@ set_schedulable_guarded() {
   }
   SCHEDULABLE_WRITE_PERFORMED=true
   wait_for_account_snapshot "$account_id" "$desired" "$snapshot_timeout" || {
+    local snapshot_diagnostics
+    snapshot_diagnostics="$(account_snapshot_diagnostics_json "$account_id" "$desired")"
     emit_event "critical" "set_schedulable" "scheduler_snapshot_not_confirmed" \
-      "$(printf '{"account_id":%s,"desired":%s}' "$(json_quote "$account_id")" "$desired")"
+      "$(printf '{"account_id":%s,"desired":%s,"snapshot":%s}' \
+        "$(json_quote "$account_id")" "$desired" "$snapshot_diagnostics")"
     return 1
   }
   load_members || true

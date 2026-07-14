@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.5.4+rb14-controller1 - 2026-07-14
+
+### RelayBases operations
+
+- Corrected the sub2 `codex-pro` controller's asymmetric scheduler-convergence proof. Pausing a standby now requires two consecutive confirmations from PostgreSQL, `sched:meta` and `sched:acc`, but no longer treats processed-but-not-deleted outbox rows or stale bucket membership as evidence that new work can still be dispatched. Opening remains fail-closed: every current ready bucket must expose at least one active standby whose database and both Redis projections have converged. Timeout events now expose each projection separately, and cache/cleanup-lag regressions are covered by the controller self-test. This is a controller-only hotfix; the rb14 codex2api image is unchanged.
+
 ## v2.5.4+rb14 - 2026-07-14
 
 ### RelayBases integration
