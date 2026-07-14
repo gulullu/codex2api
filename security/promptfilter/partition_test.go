@@ -172,6 +172,49 @@ func TestExtractRoutingPartitionsCountsButNeverScansOpaqueValuesOrMutatesBody(t 
 	}
 }
 
+func TestExtractRoutingPartitionsKeepsAnthropicToolResultsCoveredAndMediaOpaque(t *testing.T) {
+	imageData := strings.Repeat("IMAGE_BASE64_SENTINEL_", 200)
+	documentData := strings.Repeat("DOCUMENT_BASE64_SENTINEL_", 200)
+	body, err := json.Marshal(map[string]any{
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "USER_VISIBLE"},
+				map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": "tool-1",
+					"content": []any{
+						map[string]any{"type": "text", "text": "TOOL_RESULT_VISIBLE"},
+						map[string]any{"type": "image", "source": map[string]any{"type": "base64", "data": imageData}},
+						map[string]any{"type": "document", "source": map[string]any{"type": "base64", "data": documentData}},
+					},
+				},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	scan := ExtractRoutingPartitions(body, "/v1/messages")
+	if !strings.Contains(partitionText(t, scan, RoutingPartitionUser), "USER_VISIBLE") {
+		t.Fatal("visible user text was not retained")
+	}
+	if strings.Contains(partitionText(t, scan, RoutingPartitionUser), "TOOL_RESULT_VISIBLE") {
+		t.Fatal("tool result leaked into the user partition")
+	}
+	if !strings.Contains(partitionText(t, scan, RoutingPartitionOther), "TOOL_RESULT_VISIBLE") {
+		t.Fatal("Anthropic tool_result was omitted from the full-payload scan")
+	}
+	for _, partition := range scan.Partitions {
+		if strings.Contains(partition.Text, "IMAGE_BASE64_SENTINEL") || strings.Contains(partition.Text, "DOCUMENT_BASE64_SENTINEL") {
+			t.Fatalf("partition %s scanned opaque media bytes", partition.Name)
+		}
+	}
+	if scan.OpaqueBytes < len(imageData)+len(documentData) {
+		t.Fatalf("opaque bytes = %d, want at least %d", scan.OpaqueBytes, len(imageData)+len(documentData))
+	}
+}
+
 func TestExtractRoutingPartitionsScansOrdinaryDataSourceAndURLToolFields(t *testing.T) {
 	body := []byte(`{"tools":[{"name":"field_test","data":"DATA_FIELD_MARKER","source":"SOURCE_FIELD_MARKER","url":"URL_FIELD_MARKER","parameters":{"properties":{"payload":{"description":"SCHEMA_MARKER"}}}}]}`)
 	scan := ExtractRoutingPartitions(body, "/v1/responses")

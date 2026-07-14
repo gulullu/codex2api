@@ -191,17 +191,51 @@ func (db *DB) listCodexAuditCyberCasesPage(ctx context.Context, query CodexAudit
 	), page_request_ids AS MATERIALIZED (
 		SELECT logical_request_id FROM paged_candidates
 		WHERE COALESCE(logical_request_id, '') <> ''
-	), ranked_prompts AS (
+	), ranked_prompts AS MATERIALIZED (
 		SELECT p.*,
 		       ROW_NUMBER() OVER (
-			PARTITION BY p.logical_request_id
-			ORDER BY CASE COALESCE(p.source, '')
-				WHEN 'upstream_cyber_policy' THEN 0
-				WHEN 'local_filter' THEN 1
-				WHEN 'cyb_relay_routed' THEN 2
-				ELSE 3
-			END, p.id DESC
-		       ) AS prompt_rn
+		         PARTITION BY p.logical_request_id
+		         ORDER BY CASE
+		                    WHEN COALESCE(p.full_text, '') <> '' OR COALESCE(p.text_preview, '') <> '' THEN 0
+		                    ELSE 1
+		                  END,
+		                  CASE COALESCE(p.source, '')
+		                    WHEN 'upstream_cyber_policy' THEN 0
+		                    WHEN 'cyb_relay_routed' THEN 1
+		                    WHEN 'local_filter' THEN 2
+		                    ELSE 3
+		                  END, p.id DESC
+		       ) AS body_rn,
+		       ROW_NUMBER() OVER (
+		         PARTITION BY p.logical_request_id
+		         ORDER BY CASE
+		                    WHEN COALESCE(p.score, 0) <> 0
+		                      OR COALESCE(p.matched_patterns, '') NOT IN ('', '[]') THEN 0
+		                    ELSE 1
+		                  END,
+		                  CASE COALESCE(p.source, '')
+		                    WHEN 'local_filter' THEN 0
+		                    WHEN 'cyb_relay_routed' THEN 1
+		                    WHEN 'upstream_cyber_policy' THEN 2
+		                    ELSE 3
+		                  END, p.id DESC
+		       ) AS evidence_rn,
+		       ROW_NUMBER() OVER (
+		         PARTITION BY p.logical_request_id
+		         ORDER BY CASE
+		                    WHEN COALESCE(p.payload_bytes, 0) > 0
+		                      OR COALESCE(p.scanned_bytes, 0) > 0
+		                      OR COALESCE(p.scan_truncated, FALSE)
+		                      OR COALESCE(p.scan_details, '') NOT IN ('', '{}') THEN 0
+		                    ELSE 1
+		                  END,
+		                  CASE COALESCE(p.source, '')
+		                    WHEN 'upstream_cyber_policy' THEN 0
+		                    WHEN 'local_filter' THEN 1
+		                    WHEN 'cyb_relay_routed' THEN 2
+		                    ELSE 3
+		                  END, p.id DESC
+		       ) AS metadata_rn
 		FROM prompt_filter_logs p
 		JOIN page_request_ids ids ON ids.logical_request_id = p.logical_request_id
 	)
@@ -217,10 +251,12 @@ func (db *DB) listCodexAuditCyberCasesPage(ctx context.Context, query CodexAudit
 		       COALESCE(fu.client_ip, ''), COALESCE(fu.route_class, ''), COALESCE(fu.route_reason, ''),
 		       COALESCE(fu.route_source, ''), COALESCE(fu.route_signals, '[]'), COALESCE(fu.pin_kind, ''),
 		       COALESCE(fu.route_group_id, 0), COALESCE(fu.route_pinned, FALSE),
-		       COALESCE(p.id, 0), COALESCE(p.source, ''), COALESCE(p.score, 0), COALESCE(p.threshold_value, 0),
-		       COALESCE(p.matched_patterns, '[]'), COALESCE(p.text_preview, ''), COALESCE(p.full_text, ''),
-		       COALESCE(p.payload_bytes, 0), COALESCE(p.scanned_bytes, 0),
-		       COALESCE(p.scan_truncated, FALSE), COALESCE(p.scan_details, '{}')
+		       COALESCE(body_prompt.id, 0), COALESCE(body_prompt.source, ''),
+		       COALESCE(evidence_prompt.score, 0), COALESCE(evidence_prompt.threshold_value, 0),
+		       COALESCE(evidence_prompt.matched_patterns, '[]'),
+		       COALESCE(body_prompt.text_preview, ''), COALESCE(body_prompt.full_text, ''),
+		       COALESCE(metadata_prompt.payload_bytes, 0), COALESCE(metadata_prompt.scanned_bytes, 0),
+		       COALESCE(metadata_prompt.scan_truncated, FALSE), COALESCE(metadata_prompt.scan_details, '{}')
 		FROM paged_candidates c
 		JOIN usage_logs cu ON cu.id = c.last_cyber_id
 		JOIN final_usage fu ON (
@@ -229,7 +265,12 @@ func (db *DB) listCodexAuditCyberCasesPage(ctx context.Context, query CodexAudit
 		)
 		LEFT JOIN accounts ca ON ca.id = cu.account_id
 		LEFT JOIN accounts fa ON fa.id = fu.account_id
-		LEFT JOIN ranked_prompts p ON p.logical_request_id = c.logical_request_id AND p.prompt_rn = 1
+		LEFT JOIN ranked_prompts body_prompt
+		  ON body_prompt.logical_request_id = c.logical_request_id AND body_prompt.body_rn = 1
+		LEFT JOIN ranked_prompts evidence_prompt
+		  ON evidence_prompt.logical_request_id = c.logical_request_id AND evidence_prompt.evidence_rn = 1
+		LEFT JOIN ranked_prompts metadata_prompt
+		  ON metadata_prompt.logical_request_id = c.logical_request_id AND metadata_prompt.metadata_rn = 1
 		ORDER BY c.last_cyber_at DESC, c.last_cyber_id DESC
 	`, startArg, endArg, pageSize, (page-1)*pageSize)
 	if err != nil {

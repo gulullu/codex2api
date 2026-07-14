@@ -136,6 +136,9 @@ func collectConversationPartitions(result gjson.Result, directStringIsUser bool,
 	switch role {
 	case "user":
 		appendTextSegment(routingVisibleMessageText(result), user)
+		// Tool results and other safe non-user blocks can legally be nested in
+		// an Anthropic role=user message. Keep them covered, but isolated.
+		appendSafeUserNonVisibleContent(result.Get("content"), other)
 		return
 	case "system", "developer":
 		appendSafeMessageText(result, system)
@@ -160,6 +163,28 @@ func appendSafeMessageText(message gjson.Result, segments *[]string) {
 		collectSafeGJSONText(message.Get(field), &parts)
 	}
 	appendTextSegment(strings.Join(parts, "\n"), segments)
+}
+
+func appendSafeUserNonVisibleContent(result gjson.Result, segments *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if result.IsArray() {
+		for _, item := range result.Array() {
+			appendSafeUserNonVisibleContent(item, segments)
+		}
+		return
+	}
+	if !result.IsObject() || isOpaqueObject(result) {
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(result.Get("type").String())) {
+	case "", "message", "text", "input_text":
+		// Already captured by routingVisibleMessageText in the user partition.
+		return
+	default:
+		appendSafeResultSegment(result, segments)
+	}
 }
 
 func appendFairSegments(result gjson.Result, segments *[]string) {
@@ -245,7 +270,11 @@ func isOpaqueObject(result gjson.Result) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(result.Get("type").String())) {
-	case "image", "image_url", "input_image", "output_image", "audio", "input_audio", "output_audio", "file", "input_file", "computer_screenshot", "screenshot":
+	case "image", "image_url", "input_image", "output_image",
+		"audio", "input_audio", "output_audio",
+		"video", "input_video", "output_video",
+		"file", "input_file", "document", "input_document", "output_document", "pdf",
+		"computer_screenshot", "screenshot":
 		return true
 	default:
 		return false

@@ -107,6 +107,10 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: 'XSS 与路径穿越技术共现',
     description: '完整请求同时命中 XSS 与路径穿越技术规则，且折扣后分数达到 80，因此改走 Relay；不代表本地拦截。',
   },
+  local_sql_credential_exfiltration: {
+    label: 'SQL 注入与凭据提取共现',
+    description: '同一请求分区同时出现可执行 SQL 注入、操作性利用和凭据提取信号，因此改走 Relay。',
+  },
   encrypted_owner_hit: {
     label: '命中加密上下文原账号',
     description: '请求携带的加密上下文已找到原账号，并继续由该账号处理。',
