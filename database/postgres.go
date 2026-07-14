@@ -928,7 +928,11 @@ func (db *DB) migrate(ctx context.Context) error {
 				logical_request_id VARCHAR(128) DEFAULT '',
 				route_source VARCHAR(16) DEFAULT '',
 				route_signals TEXT DEFAULT '[]',
-				pin_kind VARCHAR(32) DEFAULT ''
+				pin_kind VARCHAR(32) DEFAULT '',
+				payload_bytes BIGINT DEFAULT 0,
+				scanned_bytes BIGINT DEFAULT 0,
+				scan_truncated BOOLEAN DEFAULT FALSE,
+				scan_details TEXT DEFAULT '{}'
 			);
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
@@ -945,6 +949,10 @@ func (db *DB) migrate(ctx context.Context) error {
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_source VARCHAR(16) DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS route_signals TEXT DEFAULT '[]';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS pin_kind VARCHAR(32) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS payload_bytes BIGINT DEFAULT 0;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS scanned_bytes BIGINT DEFAULT 0;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS scan_truncated BOOLEAN DEFAULT FALSE;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS scan_details TEXT DEFAULT '{}';
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_logical_request_created_at ON prompt_filter_logs(logical_request_id, created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_route_created_at ON prompt_filter_logs(route_class, route_source, created_at);

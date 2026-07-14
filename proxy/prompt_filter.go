@@ -2,9 +2,13 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/database"
@@ -19,14 +23,50 @@ const codexAmbientSuggestionClassifierPrefix = "Classify Codex ambient suggestio
 const codex55UnrestrictedInstructionsPatternName = "codex55_unrestricted_instructions"
 const promptCyberPolicyMessage = "This request was blocked by the content policy. Please rephrase and try again."
 const promptFilterUserTextRescueSignal = "user_text_rescue"
+const promptFilterSQLCredentialExfiltrationSignal = "local_sql_credential_exfiltration"
+const contextPromptFilterScanMeta = "promptFilterScanMeta"
 
 type promptFilterRouteScan struct {
-	Verdict   promptfilter.Verdict
-	FullText  string
-	AuditText string
-	CYBSignal bool
-	Signals   []string
+	Verdict       promptfilter.Verdict
+	FullText      string
+	AuditText     string
+	CYBSignal     bool
+	Signals       []string
+	PayloadBytes  int64
+	ScannedBytes  int64
+	ScanTruncated bool
+	ScanDetails   string
 }
+
+type promptFilterAuditScanMeta struct {
+	PayloadBytes  int64
+	ScannedBytes  int64
+	ScanTruncated bool
+	ScanDetails   string
+}
+
+type promptFilterPartitionScanDetails struct {
+	Version       int                               `json:"version"`
+	PayloadBytes  int                               `json:"payload_bytes"`
+	ScannedBytes  int                               `json:"scanned_bytes"`
+	ScanTruncated bool                              `json:"scan_truncated"`
+	OpaqueBytes   int                               `json:"opaque_bytes"`
+	Partitions    []promptFilterPartitionScanDetail `json:"partitions"`
+}
+
+type promptFilterPartitionScanDetail struct {
+	Name         string               `json:"name"`
+	BudgetBytes  int                  `json:"budget_bytes"`
+	SourceBytes  int                  `json:"source_bytes"`
+	ScannedBytes int                  `json:"scanned_bytes"`
+	Truncated    bool                 `json:"truncated"`
+	Score        int                  `json:"score"`
+	RawScore     int                  `json:"raw_score"`
+	Matched      []promptfilter.Match `json:"matched,omitempty"`
+	RouteSignals []string             `json:"route_signals,omitempty"`
+}
+
+var promptFilterSQLCredentialExtractionPattern = regexp.MustCompile(`(?i)\b(?:extract(?:s|ed|ing)?|dump(?:s|ed|ing)?|steal(?:s|ing)?|stole|exfiltrat(?:e|es|ed|ing|ion)|harvest(?:s|ed|ing)?|retriev(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|read(?:s|ing)?|leak(?:s|ed|ing)?)\b[^.!?\n]{0,160}\b(?:credentials?|password(?:_hash)?s?|passwds?|tokens?|api[_ -]?keys?|secrets?|cookies?|session[_ -]?tokens?)\b|\b(?:credentials?|password(?:_hash)?s?|passwds?|tokens?|api[_ -]?keys?|secrets?|cookies?|session[_ -]?tokens?)\b[^.!?\n]{0,100}\b(?:extract(?:s|ed|ing)?|dump(?:s|ed|ing)?|steal(?:s|ing)?|stole|exfiltrat(?:e|es|ed|ing|ion)|harvest(?:s|ed|ing)?|retriev(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|read(?:s|ing)?|leak(?:s|ed|ing)?)\b|(?:提取|导出|转储|窃取|获取|读取|泄露|外传)[^。！？\n]{0,100}(?:凭证|密码(?:哈希)?|口令|令牌|token|密钥|cookie)|(?:凭证|密码(?:哈希)?|口令|令牌|token|密钥|cookie)[^。！？\n]{0,80}(?:提取|导出|转储|窃取|获取|读取|泄露|外传)`)
 
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
@@ -56,6 +96,7 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
 	c.Set(contextPromptFilterText, scan.AuditText)
+	setPromptFilterScanContext(c, scan)
 	if nested, ok := takeNestedPromptRiskDecision(c); ok {
 		setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
 		return false
@@ -70,6 +111,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	scan := inspectPromptFilterText(text, endpoint, cfg)
 	c.Set(contextPromptFilterText, scan.AuditText)
+	setPromptFilterScanContext(c, scan)
 	return h.inspectCybRelayPrompt(c, nil, scan, endpoint, model)
 }
 
@@ -80,7 +122,20 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
 	c.Set(contextPromptFilterText, scan.AuditText)
+	setPromptFilterScanContext(c, scan)
 	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
+}
+
+func setPromptFilterScanContext(c *gin.Context, scan promptFilterRouteScan) {
+	if c == nil {
+		return
+	}
+	c.Set(contextPromptFilterScanMeta, promptFilterAuditScanMeta{
+		PayloadBytes:  scan.PayloadBytes,
+		ScannedBytes:  scan.ScannedBytes,
+		ScanTruncated: scan.ScanTruncated,
+		ScanDetails:   scan.ScanDetails,
+	})
 }
 
 var promptFilterExplicitHighRiskPatterns = map[string]struct{}{
@@ -127,6 +182,23 @@ func promptFilterExplicitHighRiskVerdict(verdict promptfilter.Verdict) bool {
 	return false
 }
 
+// promptFilterSQLCredentialExfiltrationVerdict fills one narrow, observed
+// routing gap. All three facts must coexist in the same independently scanned
+// partition; signals from system/tools/user are never combined to satisfy it.
+func promptFilterSQLCredentialExfiltrationVerdict(verdict promptfilter.Verdict, text string) bool {
+	hasSQLInjection := false
+	hasOperationalExploit := false
+	for _, match := range verdict.Matched {
+		switch match.Name {
+		case "sql_injection_attack":
+			hasSQLInjection = true
+		case "operational_exploit_request":
+			hasOperationalExploit = true
+		}
+	}
+	return hasSQLInjection && hasOperationalExploit && promptFilterSQLCredentialExtractionPattern.MatchString(text)
+}
+
 func cybRelayTextEndpoint(endpoint string) bool {
 	switch strings.ToLower(strings.TrimSpace(endpoint)) {
 	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/messages":
@@ -157,6 +229,9 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	if promptfilter.LooksLikeTechnicalCyberIntent(text) {
 		signals = append(signals, "technical_cyber_intent")
 	}
+	if promptFilterSQLCredentialExfiltrationVerdict(verdict, text) {
+		signals = append(signals, promptFilterSQLCredentialExfiltrationSignal)
+	}
 	// Only fill the evidence-backed gap below the normal routing threshold.
 	// Existing stronger signals retain their original, more specific reason.
 	if len(signals) == 0 && promptFilterMultiVectorWebAttackVerdict(verdict) {
@@ -168,44 +243,205 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 func inspectPromptFilterText(text string, endpoint string, cfg promptfilter.Config) promptFilterRouteScan {
 	verdict := promptfilter.InspectText(text, cfg)
 	cybSignal, signals := promptFilterCYBSignal(verdict, text, cfg, endpoint)
+	details := promptFilterPartitionScanDetails{
+		Version:      promptfilter.RoutingPartitionScanVersion,
+		PayloadBytes: len(text),
+		ScannedBytes: len(text),
+		Partitions: []promptFilterPartitionScanDetail{{
+			Name:         "text",
+			BudgetBytes:  len(text),
+			SourceBytes:  len(text),
+			ScannedBytes: len(text),
+			Score:        verdict.Score,
+			RawScore:     verdict.RawScore,
+			Matched:      verdict.Matched,
+			RouteSignals: signals,
+		}},
+	}
 	return promptFilterRouteScan{
-		Verdict:   verdict,
-		FullText:  text,
-		AuditText: text,
-		CYBSignal: cybSignal,
-		Signals:   signals,
+		Verdict:      verdict,
+		FullText:     text,
+		AuditText:    text,
+		CYBSignal:    cybSignal,
+		Signals:      signals,
+		PayloadBytes: int64(len(text)),
+		ScannedBytes: int64(len(text)),
+		ScanDetails:  marshalPromptFilterScanDetails(details),
 	}
 }
 
-// inspectPromptFilterPayload scans two independent text compartments. The
-// normal full-payload scan remains authoritative for system, tools and skills;
-// the input/messages scan prevents a long instructions+tools envelope from
-// pushing the current conversation out of the bounded full-text scan window.
-// Scores are deliberately merged by max rather than addition so the same rule
-// appearing in both compartments cannot inflate the routing score.
+// inspectPromptFilterPayload scans four independently budgeted compartments.
+// Every supported full-payload field remains covered, but scores and composite
+// routing rules are never assembled across compartments.
 func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilter.Config, userTextRescanEnabled bool) promptFilterRouteScan {
-	fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
-	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
 	if !userTextRescanEnabled || !cybRelayTextEndpoint(endpoint) {
+		fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+		fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
+		legacyBudget := cfg.MaxTextLength
+		if legacyBudget <= 0 {
+			legacyBudget = promptfilter.DefaultMaxTextLength
+		}
+		fullScan.PayloadBytes = int64(len(rawBody))
+		fullScan.ScanTruncated = len(fullText) >= legacyBudget
+		fullScan.ScanDetails = marshalPromptFilterScanDetails(promptFilterPartitionScanDetails{
+			Version:       promptfilter.RoutingPartitionScanVersion,
+			PayloadBytes:  len(rawBody),
+			ScannedBytes:  len(fullText),
+			ScanTruncated: fullScan.ScanTruncated,
+			Partitions: []promptFilterPartitionScanDetail{{
+				Name:         "legacy_full",
+				BudgetBytes:  legacyBudget,
+				SourceBytes:  len(fullText),
+				ScannedBytes: len(fullText),
+				Truncated:    fullScan.ScanTruncated,
+				Score:        fullScan.Verdict.Score,
+				RawScore:     fullScan.Verdict.RawScore,
+				Matched:      fullScan.Verdict.Matched,
+				RouteSignals: fullScan.Signals,
+			}},
+		})
 		return fullScan
 	}
 
-	userText := promptfilter.ExtractRoutingUserText(rawBody, endpoint, cfg.MaxTextLength)
-	userScan := inspectPromptFilterText(userText, endpoint, cfg)
-	merged := fullScan
-	merged.Verdict = mergePromptFilterVerdicts(fullScan.Verdict, userScan.Verdict)
-	merged.CYBSignal = fullScan.CYBSignal || userScan.CYBSignal
-	for _, signal := range userScan.Signals {
-		merged.Signals = appendUniqueRouteSignal(merged.Signals, signal)
+	partitioned := promptfilter.ExtractRoutingPartitions(rawBody, endpoint)
+	details := promptFilterPartitionScanDetails{
+		Version:       partitioned.Version,
+		PayloadBytes:  partitioned.PayloadBytes,
+		ScannedBytes:  partitioned.ScannedBytes,
+		ScanTruncated: partitioned.ScanTruncated,
+		OpaqueBytes:   partitioned.OpaqueBytes,
+		Partitions:    make([]promptFilterPartitionScanDetail, 0, len(partitioned.Partitions)),
 	}
-	if !fullScan.CYBSignal && userScan.CYBSignal {
-		merged.Signals = appendUniqueRouteSignal(merged.Signals, promptFilterUserTextRescueSignal)
-		// Persist the rescued input first: prompt-filter audit text has a
-		// prefix cap, while the full scan may already occupy its entire window.
-		merged.AuditText = strings.TrimSpace(userText + "\n--- full payload scan ---\n" + fullText)
-		merged.Verdict.TextPreview = userScan.Verdict.TextPreview
+
+	var merged promptFilterRouteScan
+	firstVerdict := true
+	userRouted := false
+	userText := ""
+	userPreview := ""
+	combinedParts := make([]string, 0, len(partitioned.Partitions))
+	partitionScans := make([]promptFilterRouteScan, len(partitioned.Partitions))
+	scanPartition := func(index int) {
+		partition := partitioned.Partitions[index]
+		partitionCfg := cfg
+		partitionCfg.MaxTextLength = partition.BudgetBytes
+		partitionVerdict := promptfilter.InspectText(partition.Text, partitionCfg)
+		partitionSignal, partitionSignals := promptFilterCYBSignal(partitionVerdict, partition.Text, partitionCfg, endpoint)
+		partitionScans[index] = promptFilterRouteScan{
+			Verdict:   partitionVerdict,
+			FullText:  partition.Text,
+			AuditText: partition.Text,
+			CYBSignal: partitionSignal,
+			Signals:   partitionSignals,
+		}
+	}
+	if partitioned.ScannedBytes >= 64*1024 {
+		var wait sync.WaitGroup
+		for index, partition := range partitioned.Partitions {
+			if strings.TrimSpace(partition.Text) == "" {
+				scanPartition(index)
+				continue
+			}
+			wait.Add(1)
+			go func(index int) {
+				defer wait.Done()
+				scanPartition(index)
+			}(index)
+		}
+		wait.Wait()
+	} else {
+		for index := range partitioned.Partitions {
+			scanPartition(index)
+		}
+	}
+	for index, partition := range partitioned.Partitions {
+		partitionScan := partitionScans[index]
+		if firstVerdict {
+			merged.Verdict = partitionScan.Verdict
+			firstVerdict = false
+		} else {
+			merged.Verdict = mergePromptFilterVerdicts(merged.Verdict, partitionScan.Verdict)
+		}
+		merged.CYBSignal = merged.CYBSignal || partitionScan.CYBSignal
+		for _, signal := range partitionScan.Signals {
+			merged.Signals = appendUniqueRouteSignal(merged.Signals, signal)
+		}
+		if partition.Name == promptfilter.RoutingPartitionUser {
+			userRouted = partitionScan.CYBSignal
+			userText = partition.Text
+			userPreview = partitionScan.Verdict.TextPreview
+		}
+		if strings.TrimSpace(partition.Text) != "" {
+			combinedParts = append(combinedParts, partition.Text)
+		}
+		details.Partitions = append(details.Partitions, promptFilterPartitionScanDetail{
+			Name:         partition.Name,
+			BudgetBytes:  partition.BudgetBytes,
+			SourceBytes:  partition.SourceBytes,
+			ScannedBytes: partition.ScannedBytes,
+			Truncated:    partition.Truncated,
+			Score:        partitionScan.Verdict.Score,
+			RawScore:     partitionScan.Verdict.RawScore,
+			Matched:      partitionScan.Verdict.Matched,
+			RouteSignals: partitionScan.Signals,
+		})
+	}
+	merged.FullText = strings.TrimSpace(strings.Join(combinedParts, "\n"))
+	merged.AuditText = merged.FullText
+	merged.PayloadBytes = int64(partitioned.PayloadBytes)
+	merged.ScannedBytes = int64(partitioned.ScannedBytes)
+	merged.ScanTruncated = partitioned.ScanTruncated
+	merged.ScanDetails = marshalPromptFilterScanDetails(details)
+
+	// Preserve the existing rescue marker without running a fifth rule scan:
+	// only mark the user signal as rescued when its bounded witness was absent
+	// from the legacy full-text window.
+	if userRouted {
+		legacyFullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+		if routingTextOutsideLegacyWindow(legacyFullText, userText) {
+			merged.Signals = appendUniqueRouteSignal(merged.Signals, promptFilterUserTextRescueSignal)
+			merged.AuditText = strings.TrimSpace(userText + "\n--- partitioned payload scan ---\n" + merged.FullText)
+			merged.Verdict.TextPreview = userPreview
+		}
 	}
 	return merged
+}
+
+func routingTextOutsideLegacyWindow(legacyFullText string, userText string) bool {
+	userText = strings.TrimSpace(userText)
+	if userText == "" {
+		return false
+	}
+	for _, witness := range routingTextWitnesses(userText) {
+		if witness != "" && strings.Contains(legacyFullText, witness) {
+			return false
+		}
+	}
+	return true
+}
+
+func routingTextWitnesses(text string) []string {
+	const witnessBytes = 128
+	text = strings.TrimSpace(text)
+	if len(text) <= witnessBytes {
+		return []string{text}
+	}
+	head := text[:witnessBytes]
+	for len(head) > 0 && !utf8.ValidString(head) {
+		head = head[:len(head)-1]
+	}
+	tail := text[len(text)-witnessBytes:]
+	for len(tail) > 0 && !utf8.ValidString(tail) {
+		tail = tail[1:]
+	}
+	return []string{head, tail}
+}
+
+func marshalPromptFilterScanDetails(details promptFilterPartitionScanDetails) string {
+	data, err := json.Marshal(details)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
 }
 
 func mergePromptFilterVerdicts(full promptfilter.Verdict, user promptfilter.Verdict) promptfilter.Verdict {
@@ -377,11 +613,30 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 	}
 	populatePromptFilterAPIKeyMeta(c, input)
 	populateCybPromptFilterRouteMeta(c, input)
+	populatePromptFilterScanMeta(c, input)
 	input.ClientRequestID = strings.TrimSpace(c.GetHeader("X-Client-Request-Id"))
 	input.LogicalRequestID = logicalRequestID(c)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = h.db.InsertPromptFilterLog(ctx, input)
+}
+
+func populatePromptFilterScanMeta(c *gin.Context, input *database.PromptFilterLogInput) {
+	if c == nil || input == nil {
+		return
+	}
+	value, exists := c.Get(contextPromptFilterScanMeta)
+	if !exists {
+		return
+	}
+	meta, ok := value.(promptFilterAuditScanMeta)
+	if !ok {
+		return
+	}
+	input.PayloadBytes = meta.PayloadBytes
+	input.ScannedBytes = meta.ScannedBytes
+	input.ScanTruncated = meta.ScanTruncated
+	input.ScanDetails = meta.ScanDetails
 }
 
 func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model string, body []byte) {

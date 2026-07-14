@@ -40,6 +40,10 @@ type PromptFilterLog struct {
 	RouteGroupID        int64               `json:"route_group_id"`
 	RoutePinned         bool                `json:"route_pinned"`
 	UpstreamAccountType string              `json:"upstream_account_type"`
+	PayloadBytes        int64               `json:"payload_bytes"`
+	ScannedBytes        int64               `json:"scanned_bytes"`
+	ScanTruncated       bool                `json:"scan_truncated"`
+	ScanDetails         string              `json:"scan_details"`
 	AuditAttempts       []CodexAuditAttempt `json:"audit_attempts,omitempty"`
 }
 
@@ -73,6 +77,10 @@ type PromptFilterLogInput struct {
 	RouteGroupID        int64
 	RoutePinned         bool
 	UpstreamAccountType string
+	PayloadBytes        int64
+	ScannedBytes        int64
+	ScanTruncated       bool
+	ScanDetails         string
 }
 
 type PromptFilterLogQuery struct {
@@ -103,14 +111,15 @@ func (db *DB) InsertPromptFilterLog(ctx context.Context, input *PromptFilterLogI
 			source, endpoint, model, action, mode, score, threshold_value, matched_patterns, text_preview,
 			api_key_id, api_key_name, api_key_masked, client_ip, error_code, review_model, review_flagged, review_error, full_text, client_request_id,
 			account_id, route_class, route_reason, route_source, route_signals, pin_kind, route_group_id, route_pinned, upstream_account_type,
-			logical_request_id
+			logical_request_id, payload_bytes, scanned_bytes, scan_truncated, scan_details
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
 	`, input.Source, input.Endpoint, input.Model, input.Action, input.Mode, input.Score, input.Threshold,
 		input.MatchedPatterns, input.TextPreview, input.APIKeyID, input.APIKeyName, input.APIKeyMasked, input.ClientIP, input.ErrorCode,
 		input.ReviewModel, input.ReviewFlagged, input.ReviewError, input.FullText, input.ClientRequestID,
 		input.AccountID, input.RouteClass, input.RouteReason, input.RouteSource, input.RouteSignals, input.PinKind,
-		input.RouteGroupID, input.RoutePinned, input.UpstreamAccountType, input.LogicalRequestID)
+		input.RouteGroupID, input.RoutePinned, input.UpstreamAccountType, input.LogicalRequestID,
+		input.PayloadBytes, input.ScannedBytes, input.ScanTruncated, input.ScanDetails)
 	return err
 }
 
@@ -152,7 +161,8 @@ func (db *DB) ListPromptFilterLogsPage(ctx context.Context, query PromptFilterLo
 		       COALESCE(client_request_id, ''), COALESCE(logical_request_id, ''),
 		       COALESCE(account_id, 0), COALESCE(route_class, ''), COALESCE(route_reason, ''),
 		       COALESCE(route_source, ''), COALESCE(route_signals, '[]'), COALESCE(pin_kind, ''), COALESCE(route_group_id, 0),
-		       COALESCE(route_pinned, false), COALESCE(upstream_account_type, '')
+		       COALESCE(route_pinned, false), COALESCE(upstream_account_type, ''),
+		       COALESCE(payload_bytes, 0), COALESCE(scanned_bytes, 0), COALESCE(scan_truncated, false), COALESCE(scan_details, '{}')
 		FROM prompt_filter_logs
 		`+where+`
 		ORDER BY id DESC
@@ -172,7 +182,8 @@ func (db *DB) ListPromptFilterLogsPage(ctx context.Context, query PromptFilterLo
 			&item.APIKeyMasked, &item.ClientIP, &item.ErrorCode, &item.ReviewModel, &item.ReviewFlagged, &item.ReviewError, &item.FullText,
 			&item.ClientRequestID, &item.LogicalRequestID,
 			&item.AccountID, &item.RouteClass, &item.RouteReason, &item.RouteSource, &item.RouteSignals, &item.PinKind,
-			&item.RouteGroupID, &item.RoutePinned, &item.UpstreamAccountType); err != nil {
+			&item.RouteGroupID, &item.RoutePinned, &item.UpstreamAccountType,
+			&item.PayloadBytes, &item.ScannedBytes, &item.ScanTruncated, &item.ScanDetails); err != nil {
 			return nil, 0, err
 		}
 		createdAt, err := parseDBTimeValue(createdAtRaw)

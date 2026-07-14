@@ -1054,6 +1054,7 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
 	c.Set(contextPromptFilterText, scan.AuditText)
+	setPromptFilterScanContext(c, scan)
 	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
 }
 

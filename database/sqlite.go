@@ -382,7 +382,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			logical_request_id TEXT DEFAULT '',
 			route_source TEXT DEFAULT '',
 			route_signals TEXT DEFAULT '[]',
-			pin_kind TEXT DEFAULT ''
+			pin_kind TEXT DEFAULT '',
+			payload_bytes INTEGER DEFAULT 0,
+			scanned_bytes INTEGER DEFAULT 0,
+			scan_truncated INTEGER DEFAULT 0,
+			scan_details TEXT DEFAULT '{}'
 		);`,
 	}
 	for _, stmt := range statements {
@@ -550,6 +554,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"prompt_filter_logs", "route_source", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "route_signals", "TEXT DEFAULT '[]'"},
 		{"prompt_filter_logs", "pin_kind", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "payload_bytes", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "scanned_bytes", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "scan_truncated", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "scan_details", "TEXT DEFAULT '{}'"},
 		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
 		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.118.0'"},
 		{"system_settings", "codex_user_agent_config", "TEXT DEFAULT '{}'"},

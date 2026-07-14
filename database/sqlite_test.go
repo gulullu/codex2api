@@ -713,6 +713,7 @@ func TestSQLiteMigratesCybRelayRoutingColumns(t *testing.T) {
 		},
 		"prompt_filter_logs": {
 			"account_id", "route_class", "route_reason", "route_group_id", "route_pinned", "upstream_account_type",
+			"payload_bytes", "scanned_bytes", "scan_truncated", "scan_details",
 		},
 	}
 	for table, names := range expected {
@@ -3201,6 +3202,10 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 		ReviewModel:         "omni-moderation-latest",
 		ReviewFlagged:       false,
 		ReviewError:         "temporary failure",
+		PayloadBytes:        765432,
+		ScannedBytes:        163840,
+		ScanTruncated:       true,
+		ScanDetails:         `{"version":1,"partitions":[{"name":"user"}]}`,
 		AccountID:           77,
 		RouteClass:          "cyb_relay",
 		RouteReason:         "technical_cyber_intent",
@@ -3224,6 +3229,9 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	}
 	if got.AccountID != 77 || got.RouteClass != "cyb_relay" || got.RouteReason != "technical_cyber_intent" || got.RouteGroupID != 42 || !got.RoutePinned || got.UpstreamAccountType != "openai_responses" {
 		t.Fatalf("route metadata = %+v", got)
+	}
+	if got.PayloadBytes != 765432 || got.ScannedBytes != 163840 || !got.ScanTruncated || got.ScanDetails != `{"version":1,"partitions":[{"name":"user"}]}` {
+		t.Fatalf("scan metadata = %+v", got)
 	}
 }
 
