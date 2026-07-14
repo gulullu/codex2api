@@ -115,6 +115,9 @@ M_PHASE=""
 M_RUN_ID=""
 M_PRIMARY_ACCOUNT_ID=""
 M_GROUP_ID=""
+M_GROUP_MEMBER_IDS=""
+M_BACKUP_ACCOUNT_IDS=""
+M_IDENTITY_DIGEST=""
 M_LOG_WATERMARK=""
 M_INCARNATION=""
 M_SINK_DROPPED=""
@@ -122,13 +125,27 @@ M_SINK_FAILED=""
 M_SINK_WRITTEN=""
 M_PAUSE_REQUEST_ID=""
 M_PAUSE_LOG_ID=""
+M_PAUSE_RESPONSE_CHECKPOINT="none"
+M_PAUSE_RESPONSE_UPDATED_AT=""
 M_SEAL_REQUEST_ID=""
 M_SEAL_LOG_ID=""
 M_SEAL_RESPONSE_UPDATED_AT=""
 M_RESTORE_REQUEST_ID=""
 M_RESTORE_LOG_ID=""
+M_RESTORE_RESPONSE_CHECKPOINT="none"
+M_RESTORE_RESPONSE_UPDATED_AT=""
 M_OWNED_UPDATED_AT=""
 M_OWNED_XMIN=""
+M_SIDECAR_ONLY=false
+M_AMBIGUITY_RUN_ID=""
+M_AMBIGUITY_PRIMARY_ACCOUNT_ID=""
+M_AMBIGUITY_GROUP_ID=""
+M_AMBIGUITY_GROUP_MEMBER_IDS=""
+M_AMBIGUITY_BACKUP_ACCOUNT_IDS=""
+M_AMBIGUITY_IDENTITY_DIGEST=""
+M_AMBIGUITY_PHASE=""
+M_AMBIGUITY_REASON=""
+M_AMBIGUITY_CREATED_AT=""
 MAINTENANCE_IDENTITY_ERROR=""
 MAINTENANCE_FOREIGN_FENCE_RESULT="unverifiable"
 MAINTENANCE_RECEIPT_RESULT="unverifiable"
@@ -442,6 +459,97 @@ load_members() {
   return 0
 }
 
+# Produce a stable, content-only snapshot of every current member that can
+# affect maintenance ownership.  Names and runtime-ready timestamps are
+# deliberately excluded; membership, status, schedulability, deletion state,
+# and active-group count are the control-plane fields that must stay stable
+# while an explicit ambiguity resolution is being proved.
+maintenance_group_membership_snapshot() {
+  load_members || return 1
+  (( ${#MEMBER_IDS[@]} > 0 )) || return 1
+  local id
+  for id in "${MEMBER_IDS[@]}"; do
+    printf '%s|%s|%s|%s|%s\n' "$id" \
+      "${MEMBER_STATUS[$id]}" "${MEMBER_SCHEDULABLE[$id]}" \
+      "${MEMBER_NOT_DELETED[$id]}" "${MEMBER_ACTIVE_GROUP_COUNT[$id]}"
+  done | LC_ALL=C sort -t '|' -k1,1n
+}
+
+# Canonical, immutable identity of the full live membership at maintenance
+# marker creation time.  Keep every account_groups row (including inactive or
+# deleted accounts); only the numeric IDs are sealed because a later account
+# DELETE may cascade the live membership row before its access log is fenced.
+loaded_group_member_ids() {
+  (( ${#MEMBER_IDS[@]} > 0 )) || return 1
+  local id
+  local -a ids=()
+  for id in "${MEMBER_IDS[@]}"; do
+    [[ "$id" =~ ^[1-9][0-9]{0,18}$ ]] || return 1
+    if (( ${#id} == 19 )) && [[ "$id" > "9223372036854775807" ]]; then
+      return 1
+    fi
+    ids+=("$id")
+  done
+  local canonical count
+  canonical="$(printf '%s\n' "${ids[@]}" | LC_ALL=C sort -n -u | paste -sd, -)" || return 1
+  count="$(tr ',' '\n' <<<"$canonical" | wc -l)" || return 1
+  (( count == ${#ids[@]} )) || return 1
+  [[ "$canonical" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+  printf '%s\n' "$canonical"
+}
+
+loaded_backup_account_ids() {
+  (( ${#BACKUP_IDS[@]} > 0 )) || return 1
+  local id
+  local -a ids=()
+  for id in "${BACKUP_IDS[@]}"; do
+    [[ "$id" =~ ^[1-9][0-9]{0,18}$ ]] || return 1
+    if (( ${#id} == 19 )) && [[ "$id" > "9223372036854775807" ]]; then
+      return 1
+    fi
+    [[ "$id" != "$BRIDGE_ACCOUNT_ID" ]] || return 1
+    ids+=("$id")
+  done
+  local canonical count
+  canonical="$(printf '%s\n' "${ids[@]}" | LC_ALL=C sort -n -u | paste -sd, -)" || return 1
+  count="$(tr ',' '\n' <<<"$canonical" | wc -l)" || return 1
+  (( count == ${#ids[@]} )) || return 1
+  [[ "$canonical" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+  printf '%s\n' "$canonical"
+}
+
+# Once a maintenance artifact exists, its backup collection is an authorization
+# boundary, not merely an audit field. A member that becomes eligible later was
+# never sealed by this run and must cause a zero-write abort. Sealed members
+# that later become ineligible are simply omitted; callers may only consider the
+# sealed/live-eligible intersection.
+scope_backup_ids_to_maintenance_identity() {
+  local action="${1:-maintenance_backup_scope}"
+  [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]] || return 0
+  [[ -n "$M_BACKUP_ACCOUNT_IDS" ]] || return 0
+  [[ "$M_BACKUP_ACCOUNT_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+  local sealed=",${M_BACKUP_ACCOUNT_IDS},"
+  local id
+  local -a scoped=()
+  for id in "${BACKUP_IDS[@]}"; do
+    if [[ "$sealed" != *",${id},"* ]]; then
+      emit_event "critical" "$action" "unsealed_backup_became_eligible" \
+        "$(printf '{"account_id":%s,"account_writes":0,"operator_action_required":true}' \
+          "$(json_quote "$id")")"
+      return 2
+    fi
+    scoped+=("$id")
+  done
+  BACKUP_IDS=("${scoped[@]}")
+}
+
+verify_sidecar_backup_identity() {
+  [[ "$M_SIDECAR_ONLY" == true ]] || return 0
+  local current_backup_ids
+  current_backup_ids="$(loaded_backup_account_ids)" || return 1
+  [[ "$current_backup_ids" == "$M_BACKUP_ACCOUNT_IDS" ]]
+}
+
 primary_is_group_member() {
   [[ -n "${MEMBER_STATUS[$BRIDGE_ACCOUNT_ID]+x}" ]]
 }
@@ -472,6 +580,30 @@ verify_maintenance_group_identity() {
   if ! primary_is_exclusive_group_member; then
     emit_event "critical" "maintenance_group_fence" "configured_primary_group_membership_not_exclusive" \
       '{"operator_action_required":true}'
+    return 2
+  fi
+  if [[ -n "$M_GROUP_MEMBER_IDS" ]]; then
+    local current_member_ids
+    current_member_ids="$(loaded_group_member_ids)" || return 1
+    if [[ "$current_member_ids" != "$M_GROUP_MEMBER_IDS" ]]; then
+      emit_event "critical" "maintenance_group_fence" \
+        "maintenance_group_membership_changed" \
+        '{"operator_action_required":true}'
+      return 2
+    fi
+  fi
+  local backup_scope_rc=0
+  scope_backup_ids_to_maintenance_identity "maintenance_group_fence" || backup_scope_rc=$?
+  if (( backup_scope_rc != 0 )); then
+    if (( backup_scope_rc != 2 )); then
+      emit_event "critical" "maintenance_group_fence" \
+        "maintenance_backup_identity_unverifiable" '{"account_writes":0}'
+    fi
+    (( backup_scope_rc == 2 )) && return 2 || return 1
+  fi
+  if ! verify_sidecar_backup_identity; then
+    emit_event "critical" "maintenance_group_fence" "sidecar_backup_identity_changed" \
+      '{"operator_action_required":true,"account_writes":0}'
     return 2
   fi
 }
@@ -752,6 +884,7 @@ all_buckets_exclude_account() {
 
 backups_ready_in_all_buckets() {
   load_members || return 1
+  scope_backup_ids_to_maintenance_identity "backup_readiness" || return $?
   local -a candidates=()
   local id
   for id in "${BACKUP_IDS[@]}"; do
@@ -1085,6 +1218,7 @@ set_schedulable_guarded() {
   SCHEDULABLE_WRITE_PERFORMED=false
   [[ "$snapshot_timeout" =~ ^[1-9][0-9]*$ ]] || return 1
   load_members || return 1
+  scope_backup_ids_to_maintenance_identity "set_schedulable" || return 1
   [[ "${MEMBER_STATUS[$account_id]:-}" == "active" && "${MEMBER_NOT_DELETED[$account_id]:-}" == "t" ]] || {
     emit_event "critical" "set_schedulable" "account_not_active_or_deleted" \
       "$(printf '{"account_id":%s,"desired":%s}' "$(json_quote "$account_id")" "$desired")"
@@ -1134,9 +1268,38 @@ set_schedulable_guarded() {
 		  "$(json_quote "$account_id")" "$(json_quote "$(account_name "$account_id")")" "$desired")"
 }
 
+backup_open_target_live_eligible() {
+  local account_id="$1"
+
+  # Re-read the authoritative inventory in the child that will issue the POST.
+  # Maintenance also re-proves the sealed full-group identity at this boundary.
+  if [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]]; then
+    [[ "$M_GROUP_ID" =~ ^[1-9][0-9]*$ && -n "$M_BACKUP_ACCOUNT_IDS" ]] || return 1
+    verify_maintenance_group_identity "$M_GROUP_ID" || return 1
+  else
+    load_members || return 1
+  fi
+  scope_backup_ids_to_maintenance_identity "backup_open_submit_fence" || return 1
+
+  [[ "$account_id" != "$BRIDGE_ACCOUNT_ID" &&
+     "${MEMBER_STATUS[$account_id]:-}" == active &&
+     "${MEMBER_NOT_DELETED[$account_id]:-}" == t &&
+     "${MEMBER_ACTIVE_GROUP_COUNT[$account_id]:-0}" == 1 ]] || return 1
+  if [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]]; then
+    [[ ",${M_BACKUP_ACCOUNT_IDS}," == *",${account_id},"* ]] || return 1
+  fi
+
+  local id
+  for id in "${BACKUP_IDS[@]}"; do
+    [[ "$id" == "$account_id" ]] && return 0
+  done
+  return 1
+}
+
 open_backups() {
 	local snapshot_timeout="${1:-$SNAPSHOT_TIMEOUT_SECONDS}"
 	load_members || return 1
+	scope_backup_ids_to_maintenance_identity "open_backups" || return 1
 	local id
 	local eligible="${#BACKUP_IDS[@]}"
 	local attempted=0
@@ -1257,6 +1420,18 @@ open_backups() {
 				if [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]]; then
 					backup_request_id="c2m-${M_RUN_ID}-b-${id}"
 				fi
+				if [[ -n "$TEST_BACKEND" ]]; then
+					backend_call before-backup-open-submit "$id" || exit 1
+				fi
+				if ! backup_open_target_live_eligible "$id"; then
+					emit_event "degraded" "open_backups" \
+					  "backup_live_revalidation_failed_at_submit" \
+					  "$(printf '{"account_id":%s,"account_writes":0}' "$(json_quote "$id")")"
+					exit 1
+				fi
+				# Another actor may already have opened the still-eligible account.
+				# In that case the safe result is no controller POST.
+				[[ "${MEMBER_SCHEDULABLE[$id]:-}" != t ]] || exit 0
 				api_set_schedulable_with_header "$id" true "$shared_header" \
 				  "$request_timeout" "$backup_request_id"
 			) &
@@ -1325,6 +1500,7 @@ recovery_conditions_hold() {
 
 close_backups() {
   load_members || return 1
+  scope_backup_ids_to_maintenance_identity "close_backups" || return 1
   # schedulable is global to an account, not scoped to one group.  If a
   # standby opened by an earlier run is later attached to another active
   # group, closing it could break that group, while ignoring it and declaring
@@ -1994,31 +2170,75 @@ WHERE id > ${watermark}
 foreign_account_mutation_count() {
   local watermark="$1"
   local upper_log_id="$2"
-  shift 2
+  local provisional_restore_log_id="${3:-}"
+  (( $# <= 3 )) || return 1
   [[ "$watermark" =~ ^[0-9]+$ && "$upper_log_id" =~ ^[1-9][0-9]*$ ]] || return 1
-  local allowed_sql="" request_id
-  for request_id in "$@"; do
-    [[ -n "$request_id" ]] || continue
-    [[ "$request_id" =~ ^codex2api-maint-[a-f0-9-]{36}-(pause|seal|restore)$ ]] || return 1
-    if [[ -n "$allowed_sql" ]]; then
-      allowed_sql+=","
+  [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]] || return 1
+
+  local restore_log_id="$M_RESTORE_LOG_ID"
+  local restore_allow_2xx=false
+  if [[ -n "$provisional_restore_log_id" ]]; then
+    [[ "$M_PHASE" =~ ^(RESTORE_ACKED|RESTORE_AMBIGUOUS)$ &&
+       "$provisional_restore_log_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -z "$restore_log_id" || "$restore_log_id" == "$provisional_restore_log_id" ]] || return 1
+    restore_log_id="$provisional_restore_log_id"
+    restore_allow_2xx=true
+  elif [[ "$M_RESTORE_RESPONSE_CHECKPOINT" == explicitly_resolved ]]; then
+    restore_allow_2xx=true
+  fi
+
+  local primary_write_exemption=""
+  if [[ -n "$M_PAUSE_REQUEST_ID" || -n "$M_PAUSE_LOG_ID" ]]; then
+    [[ "$M_PAUSE_REQUEST_ID" =~ ^codex2api-maint-[a-f0-9-]{36}-pause$ &&
+       "$M_PAUSE_LOG_ID" =~ ^[1-9][0-9]*$ ]] || return 1
+    primary_write_exemption+=" OR (
+      id=${M_PAUSE_LOG_ID}
+      AND request_id='${M_PAUSE_REQUEST_ID}'
+      AND extra->>'method'='POST'
+      AND extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable'
+      AND extra->>'status_code'='200'
+    )"
+  fi
+  if [[ -n "$M_SEAL_REQUEST_ID" || -n "$M_SEAL_LOG_ID" ]]; then
+    [[ "$M_SEAL_REQUEST_ID" =~ ^codex2api-maint-[a-f0-9-]{36}-seal$ &&
+       "$M_SEAL_LOG_ID" =~ ^[1-9][0-9]*$ ]] || return 1
+    primary_write_exemption+=" OR (
+      id=${M_SEAL_LOG_ID}
+      AND request_id='${M_SEAL_REQUEST_ID}'
+      AND extra->>'method'='POST'
+      AND extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable'
+      AND extra->>'status_code'='200'
+    )"
+  fi
+  if [[ -n "$M_RESTORE_REQUEST_ID" || -n "$restore_log_id" ]]; then
+    [[ "$M_RESTORE_REQUEST_ID" =~ ^codex2api-maint-[a-f0-9-]{36}-restore$ &&
+       "$restore_log_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    local restore_status_sql="extra->>'status_code'='200'"
+    if [[ "$restore_allow_2xx" == true ]]; then
+      restore_status_sql="COALESCE(extra->>'status_code','') ~ '^2[0-9][0-9]$'"
     fi
-    allowed_sql+="'${request_id}'"
-  done
+    primary_write_exemption+=" OR (
+      id=${restore_log_id}
+      AND request_id='${M_RESTORE_REQUEST_ID}'
+      AND extra->>'method'='POST'
+      AND extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable'
+      AND ${restore_status_sql}
+    )"
+  fi
+
   if [[ -n "$TEST_BACKEND" ]]; then
     backend_call foreign-mutation-count "$watermark" "$upper_log_id" "$BRIDGE_ACCOUNT_ID" \
-      "${M_PAUSE_REQUEST_ID:-}" "${M_SEAL_REQUEST_ID:-}" "${M_RESTORE_REQUEST_ID:-}" \
-      "$M_RUN_ID"
+      "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" \
+      "$M_RESTORE_REQUEST_ID" "$restore_log_id" "$restore_allow_2xx"
     return
   fi
   [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]] || return 1
-  local primary_write_exemption=""
-  if [[ -n "$allowed_sql" ]]; then
-    primary_write_exemption="OR (
-      extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable'
-      AND COALESCE(request_id IN (${allowed_sql}), FALSE)
-    )"
+  [[ "$M_GROUP_ID" =~ ^[1-9][0-9]{0,18}$ ]] || return 1
+  if (( ${#M_GROUP_ID} == 19 )) && [[ "$M_GROUP_ID" > "9223372036854775807" ]]; then
+    return 1
   fi
+  [[ "$M_GROUP_MEMBER_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+  [[ "$M_BACKUP_ACCOUNT_IDS" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
   db_query "
 SELECT COUNT(*)
 FROM ops_system_logs
@@ -2034,19 +2254,18 @@ WHERE id > ${watermark}
     ELSE FALSE
   END
   AND NOT (
-    extra->>'method'='POST'
-    AND extra->>'path' ~ '^/api/v1/admin/accounts/[1-9][0-9]{0,18}/schedulable$'
-    AND (SUBSTRING(extra->>'path' FROM '^/api/v1/admin/accounts/([1-9][0-9]{0,18})/schedulable$'))::NUMERIC
-        <= 9223372036854775807
-    AND (
-      FALSE
-      ${primary_write_exemption}
-      OR (
-        extra->>'path' <> '/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable'
-        AND request_id = (
-          'c2m-${M_RUN_ID}-b-' ||
-          SUBSTRING(extra->>'path' FROM '^/api/v1/admin/accounts/([1-9][0-9]{0,18})/schedulable$')
-        )
+    (
+      extra->>'method'='POST'
+      AND extra->>'path'='/api/v1/admin/accounts/today-stats/batch'
+    )
+    OR (
+      extra->>'method'='POST'
+      AND extra->>'path' ~ '^/api/v1/admin/accounts/[1-9][0-9]{0,18}/schedulable$'
+      AND (SUBSTRING(extra->>'path' FROM '^/api/v1/admin/accounts/([1-9][0-9]{0,18})/schedulable$'))::NUMERIC
+          <= 9223372036854775807
+      AND (
+        FALSE
+        ${primary_write_exemption}
       )
     )
   );"
@@ -2172,9 +2391,42 @@ verify_maintenance_receipt() {
   return 2
 }
 
+# Explicit ambiguity resolution may adopt only one durably logged successful
+# restore.  It intentionally accepts the complete 2xx class because the live
+# account and scheduler proof below remains authoritative; ordinary automatic
+# maintenance continues to require its existing structurally valid HTTP 200
+# response and exact 200 receipt.
+unique_successful_restore_receipt() {
+  local request_id="$1"
+  local watermark="$2"
+  local record count log_id status
+  record="$(maintenance_receipt_record "$request_id" "$watermark")" || return 1
+  IFS='|' read -r count log_id status <<<"$record"
+  [[ "$count" == 1 && "$log_id" =~ ^[1-9][0-9]*$ && "$status" =~ ^2[0-9][0-9]$ ]] || return 2
+  printf '%s\n' "$log_id"
+}
+
+verify_successful_restore_receipt() {
+  local request_id="$1"
+  local expected_log_id="$2"
+  local watermark="$3"
+  local log_id rc=0
+  [[ "$expected_log_id" =~ ^[1-9][0-9]*$ ]] || return 2
+  log_id="$(unique_successful_restore_receipt "$request_id" "$watermark")" || rc=$?
+  (( rc == 0 )) || return "$rc"
+  [[ "$log_id" == "$expected_log_id" ]] || return 2
+}
+
 verify_no_foreign_mutations() {
+  local provisional_restore_log_id="${1:-}"
+  (( $# <= 1 )) || return 1
   MAINTENANCE_FOREIGN_FENCE_RESULT="unverifiable"
-  local logging_rc=0 runtime_rc=0 sentinel_rc=0
+  local logging_rc=0 runtime_rc=0 sentinel_rc=0 group_rc=0
+  verify_maintenance_group_identity "$M_GROUP_ID" || group_rc=$?
+  if (( group_rc != 0 )); then
+    [[ "$group_rc" == 2 ]] && MAINTENANCE_FOREIGN_FENCE_RESULT="group_evidence_conflict"
+    (( group_rc == 2 )) && return 2 || return 1
+  fi
   verify_runtime_logging_evidence || logging_rc=$?
   if (( logging_rc != 0 )); then
     [[ "$logging_rc" == 2 ]] && MAINTENANCE_FOREIGN_FENCE_RESULT="logging_evidence_conflict"
@@ -2197,11 +2449,17 @@ verify_no_foreign_mutations() {
     (( sentinel_rc == 2 )) && return 2 || return 1
   fi
   count="$(foreign_account_mutation_count "$M_LOG_WATERMARK" "$fence_log_id" \
-    "$M_PAUSE_REQUEST_ID" "$M_SEAL_REQUEST_ID" "$M_RESTORE_REQUEST_ID")" || return 1
+    "$provisional_restore_log_id")" || return 1
   [[ "$count" =~ ^[0-9]+$ ]] || return 1
   if (( count > 0 )); then
     MAINTENANCE_FOREIGN_FENCE_RESULT="foreign_mutation_confirmed"
     return 2
+  fi
+  group_rc=0
+  verify_maintenance_group_identity "$M_GROUP_ID" || group_rc=$?
+  if (( group_rc != 0 )); then
+    [[ "$group_rc" == 2 ]] && MAINTENANCE_FOREIGN_FENCE_RESULT="group_evidence_conflict"
+    (( group_rc == 2 )) && return 2 || return 1
   fi
   runtime_rc=0
   verify_runtime_evidence "$M_INCARNATION" "$M_SINK_DROPPED" \
@@ -2281,14 +2539,42 @@ verify_primary_disabled_version() {
   [[ "${current##*|}" == "$expected_xmin" ]]
 }
 
+compute_maintenance_identity_digest() {
+  "$PYTHON_BIN" - "$M_RUN_ID" "$M_PRIMARY_ACCOUNT_ID" "$M_GROUP_ID" \
+    "$M_GROUP_MEMBER_IDS" "$M_BACKUP_ACCOUNT_IDS" "$M_LOG_WATERMARK" \
+    "$M_INCARNATION" "$M_SINK_DROPPED" "$M_SINK_FAILED" "$M_SINK_WRITTEN" <<'PY'
+import hashlib,json,sys
+(run_id,primary,group_id,members,backups,watermark,incarnation,
+ dropped,failed,written)=sys.argv[1:]
+payload={
+  'schema_version':7,
+  'run_id':run_id,
+  'primary_account_id':int(primary),
+  'group_id':int(group_id),
+  'group_member_ids':[int(v) for v in members.split(',')],
+  'backup_account_ids':[int(v) for v in backups.split(',')],
+  'log_watermark':int(watermark),
+  'sub2_incarnation':incarnation,
+  'sink_dropped_base':int(dropped),
+  'sink_failed_base':int(failed),
+  'sink_written_base':int(written),
+}
+canonical=json.dumps(payload,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
+print(hashlib.sha256(canonical).hexdigest())
+PY
+}
+
 maintenance_state_line() {
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$M_PHASE" "$M_RUN_ID" "$M_PRIMARY_ACCOUNT_ID" "$M_GROUP_ID" \
+    "$M_GROUP_MEMBER_IDS" "$M_BACKUP_ACCOUNT_IDS" "$M_IDENTITY_DIGEST" \
     "$M_LOG_WATERMARK" "$M_INCARNATION" \
     "$M_SINK_DROPPED" "$M_SINK_FAILED" "$M_SINK_WRITTEN" \
-    "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" "$M_SEAL_REQUEST_ID" \
+    "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" "$M_PAUSE_RESPONSE_CHECKPOINT" \
+    "$M_PAUSE_RESPONSE_UPDATED_AT" "$M_SEAL_REQUEST_ID" \
     "$M_SEAL_LOG_ID" "$M_SEAL_RESPONSE_UPDATED_AT" "$M_RESTORE_REQUEST_ID" \
-    "$M_RESTORE_LOG_ID" "$M_OWNED_UPDATED_AT" "$M_OWNED_XMIN"
+    "$M_RESTORE_LOG_ID" "$M_RESTORE_RESPONSE_CHECKPOINT" \
+    "$M_RESTORE_RESPONSE_UPDATED_AT" "$M_OWNED_UPDATED_AT" "$M_OWNED_XMIN"
 }
 
 write_maintenance_marker() {
@@ -2302,15 +2588,20 @@ write_maintenance_marker() {
   local tmp
   tmp="$(mktemp "$STATE_DIR/maintenance.XXXXXX")"
   if ! "$PYTHON_BIN" - "$tmp" "$MAINTENANCE_FILE" "$next_phase" "$M_RUN_ID" \
-    "$M_PRIMARY_ACCOUNT_ID" "$M_GROUP_ID" \
-    "$M_LOG_WATERMARK" "$M_INCARNATION" "$M_SINK_DROPPED" "$M_SINK_FAILED" \
+    "$M_PRIMARY_ACCOUNT_ID" "$M_GROUP_ID" "$M_GROUP_MEMBER_IDS" \
+    "$M_BACKUP_ACCOUNT_IDS" "$M_IDENTITY_DIGEST" "$M_LOG_WATERMARK" \
+    "$M_INCARNATION" "$M_SINK_DROPPED" "$M_SINK_FAILED" \
     "$M_SINK_WRITTEN" "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" \
+    "$M_PAUSE_RESPONSE_CHECKPOINT" "$M_PAUSE_RESPONSE_UPDATED_AT" \
     "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" "$M_SEAL_RESPONSE_UPDATED_AT" \
-    "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" "$M_OWNED_UPDATED_AT" \
-    "$M_OWNED_XMIN" "$reason" <<'PY'
-import datetime as dt,json,os,re,sys,uuid
-(tmp,path,phase,run_id,primary_account_id,group_id,watermark,incarnation,dropped,failed,written,
- pause_req,pause_log,seal_req,seal_log,seal_response_at,restore_req,restore_log,
+    "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" \
+    "$M_RESTORE_RESPONSE_CHECKPOINT" "$M_RESTORE_RESPONSE_UPDATED_AT" \
+    "$M_OWNED_UPDATED_AT" "$M_OWNED_XMIN" "$reason" <<'PY'
+import datetime as dt,hashlib,json,os,re,sys,uuid
+(tmp,path,phase,run_id,primary_account_id,group_id,member_ids_csv,backup_ids_csv,
+ identity_digest,watermark,incarnation,dropped,failed,written,pause_req,pause_log,
+ pause_checkpoint,pause_response_at,seal_req,seal_log,seal_response_at,
+ restore_req,restore_log,restore_checkpoint,restore_response_at,
  owned_at,owned_xmin,reason)=sys.argv[1:]
 allowed={
   'PREPARING','EXTERNAL_PAUSED','PAUSE_INTENT','PAUSE_ACKED','SEAL_INTENT',
@@ -2324,16 +2615,54 @@ if (not primary_account_id.isdigit() or int(primary_account_id) <= 0 or
     int(primary_account_id) > maximum or not group_id.isdigit() or
     int(group_id) <= 0 or int(group_id) > maximum):
     raise SystemExit(1)
-if not all(v.isdigit() for v in (watermark,dropped,failed,written)):
+member_tokens=member_ids_csv.split(',')
+if (not member_tokens or any(not value.isdigit() or int(value)<=0 or int(value)>maximum
+                             for value in member_tokens)):
     raise SystemExit(1)
-if not incarnation or len(incarnation) > 200 or '|' in incarnation or not incarnation.isascii():
+member_ids=[int(value) for value in member_tokens]
+if member_ids != sorted(set(member_ids)) or int(primary_account_id) not in member_ids:
     raise SystemExit(1)
+if member_ids_csv != ','.join(str(value) for value in member_ids):
+    raise SystemExit(1)
+backup_tokens=backup_ids_csv.split(',')
+if (not backup_tokens or any(not value.isdigit() or int(value)<=0 or int(value)>maximum
+                             for value in backup_tokens)):
+    raise SystemExit(1)
+backup_ids=[int(value) for value in backup_tokens]
+if (backup_ids != sorted(set(backup_ids)) or int(primary_account_id) in backup_ids or
+    any(value not in member_ids for value in backup_ids)):
+    raise SystemExit(1)
+if backup_ids_csv != ','.join(str(value) for value in backup_ids):
+    raise SystemExit(1)
+if not re.fullmatch(r'[a-f0-9]{64}',identity_digest):
+    raise SystemExit(1)
+if not all(value.isdigit() for value in (watermark,dropped,failed,written)):
+    raise SystemExit(1)
+if not incarnation or len(incarnation)>200 or '|' in incarnation or not incarnation.isascii():
+    raise SystemExit(1)
+identity_payload={
+  'schema_version':7,
+  'run_id':run_id,
+  'primary_account_id':int(primary_account_id),
+  'group_id':int(group_id),
+  'group_member_ids':member_ids,
+  'backup_account_ids':backup_ids,
+  'log_watermark':int(watermark),
+  'sub2_incarnation':incarnation,
+  'sink_dropped_base':int(dropped),
+  'sink_failed_base':int(failed),
+  'sink_written_base':int(written),
+}
+canonical=json.dumps(identity_payload,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
+if hashlib.sha256(canonical).hexdigest() != identity_digest:
+    raise SystemExit(1)
+
 req_re=re.compile(r'^codex2api-maint-[a-f0-9-]{36}-(pause|seal|restore)$')
 for value in (pause_req,seal_req,restore_req):
-    if value and (len(value) > 64 or not value.isascii() or not req_re.fullmatch(value)):
+    if value and (len(value)>64 or not value.isascii() or not req_re.fullmatch(value)):
         raise SystemExit(1)
 for value in (pause_log,seal_log,restore_log,owned_xmin):
-    if value and (not value.isdigit() or int(value) <= 0):
+    if value and (not value.isdigit() or int(value)<=0):
         raise SystemExit(1)
 def valid_stamp(value):
     if not value:
@@ -2342,56 +2671,114 @@ def valid_stamp(value):
     stamp=dt.datetime.fromisoformat(raw)
     if stamp.tzinfo is None:
         raise ValueError('timestamp must carry timezone')
-    canonical=stamp.astimezone(dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00','Z')
-    return canonical == value
-for value in (seal_response_at,owned_at):
+    canonical_stamp=stamp.astimezone(dt.timezone.utc).isoformat(
+        timespec='microseconds').replace('+00:00','Z')
+    return canonical_stamp == value
+for value in (pause_response_at,seal_response_at,restore_response_at,owned_at):
     if not valid_stamp(value):
         raise SystemExit(1)
-if phase in {'PREPARING','EXTERNAL_PAUSED'} and any((pause_req,pause_log,seal_req,seal_log,seal_response_at,restore_req,restore_log,owned_at,owned_xmin)):
+pause_states={'none','pending','validated','transport_or_non200','invalid'}
+restore_states=pause_states|{'explicitly_resolved'}
+if pause_checkpoint not in pause_states or restore_checkpoint not in restore_states:
     raise SystemExit(1)
-if phase == 'PAUSE_INTENT' and (not pause_req or any((pause_log,seal_req,seal_log,seal_response_at,restore_req,restore_log,owned_at,owned_xmin))):
+if (pause_checkpoint == 'validated') != bool(pause_response_at):
     raise SystemExit(1)
-if phase == 'PAUSE_ACKED' and (not pause_req or not pause_log or any((seal_req,seal_log,seal_response_at,restore_req,restore_log,owned_at,owned_xmin))):
+if (restore_checkpoint == 'validated') != bool(restore_response_at):
     raise SystemExit(1)
-if phase == 'SEAL_INTENT' and (not pause_req or not pause_log or not seal_req or any((seal_log,restore_req,restore_log,owned_at,owned_xmin))):
-    raise SystemExit(1)
-if phase == 'SEAL_ACKED' and (not pause_req or not pause_log or not seal_req or not seal_log or not seal_response_at or any((restore_req,restore_log,owned_at,owned_xmin))):
-    raise SystemExit(1)
-if phase == 'PAUSE_AMBIGUOUS' and (not pause_req or any((restore_req,restore_log,owned_at,owned_xmin))):
-    raise SystemExit(1)
-if phase in {'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}:
-    if not all((pause_req,pause_log,seal_req,seal_log,seal_response_at,owned_at,owned_xmin)):
+
+if phase in {'PREPARING','EXTERNAL_PAUSED'}:
+    if (pause_checkpoint != 'none' or restore_checkpoint != 'none' or
+        any((pause_req,pause_log,pause_response_at,seal_req,seal_log,seal_response_at,
+             restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
         raise SystemExit(1)
-if phase == 'OWNED' and any((restore_req,restore_log)):
-    raise SystemExit(1)
-if phase == 'RESTORE_INTENT' and (not restore_req or restore_log):
-    raise SystemExit(1)
-if phase in {'RESTORE_ACKED','RESTORED'} and (not restore_req or not restore_log):
-    raise SystemExit(1)
-if phase == 'RESTORE_AMBIGUOUS' and not restore_req:
-    raise SystemExit(1)
+elif phase == 'PAUSE_INTENT':
+    if (not pause_req or pause_log or pause_checkpoint == 'none' or
+        restore_checkpoint != 'none' or
+        any((seal_req,seal_log,seal_response_at,restore_req,restore_log,
+             restore_response_at,owned_at,owned_xmin))):
+        raise SystemExit(1)
+elif phase == 'PAUSE_ACKED':
+    if (not pause_req or not pause_log or pause_checkpoint != 'validated' or
+        restore_checkpoint != 'none' or
+        any((seal_req,seal_log,seal_response_at,restore_req,restore_log,
+             restore_response_at,owned_at,owned_xmin))):
+        raise SystemExit(1)
+elif phase == 'SEAL_INTENT':
+    if (not pause_req or not pause_log or pause_checkpoint != 'validated' or
+        not seal_req or seal_log or restore_checkpoint != 'none' or
+        any((restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+        raise SystemExit(1)
+elif phase == 'SEAL_ACKED':
+    if (not all((pause_req,pause_log,pause_response_at,seal_req,seal_log,
+                 seal_response_at)) or pause_checkpoint != 'validated' or
+        restore_checkpoint != 'none' or
+        any((restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+        raise SystemExit(1)
+elif phase == 'PAUSE_AMBIGUOUS':
+    if (not pause_req or pause_checkpoint == 'none' or restore_checkpoint != 'none' or
+        any((restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+        raise SystemExit(1)
+    if pause_log and pause_checkpoint != 'validated':
+        raise SystemExit(1)
+    if seal_log and (not seal_req or not seal_response_at):
+        raise SystemExit(1)
+    if seal_response_at and not seal_req:
+        raise SystemExit(1)
+elif phase in {'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}:
+    if (not all((pause_req,pause_log,pause_response_at,seal_req,seal_log,
+                 seal_response_at,owned_at,owned_xmin)) or
+        pause_checkpoint != 'validated'):
+        raise SystemExit(1)
+    if phase == 'OWNED':
+        if restore_checkpoint != 'none' or any((restore_req,restore_log,restore_response_at)):
+            raise SystemExit(1)
+    elif phase == 'RESTORE_INTENT':
+        if not restore_req or restore_log or restore_checkpoint == 'none':
+            raise SystemExit(1)
+    elif phase in {'RESTORE_ACKED','RESTORED'}:
+        if (not restore_req or not restore_log or
+            restore_checkpoint not in {'validated','explicitly_resolved'}):
+            raise SystemExit(1)
+    elif phase == 'RESTORE_AMBIGUOUS':
+        if not restore_req or restore_checkpoint == 'none':
+            raise SystemExit(1)
+        if restore_log and restore_checkpoint not in {'validated','explicitly_resolved'}:
+            raise SystemExit(1)
+
 started_at=None
 try:
     old=json.load(open(path,encoding='utf-8'))
-    if old.get('schema_version') == 5 and old.get('run_id') == run_id:
-        immutable=(str(old.get('primary_account_id')),str(old.get('group_id')),
-                   str(old.get('log_watermark')),str(old.get('sub2_incarnation')),
-                   str(old.get('sink_dropped_base')),str(old.get('sink_failed_base')),
-                   str(old.get('sink_written_base')))
-        if immutable != (primary_account_id,group_id,watermark,incarnation,dropped,failed,written):
-            raise ValueError('immutable maintenance evidence changed')
-        started_at=old.get('started_at')
+    if old.get('schema_version') != 7 or old.get('run_id') != run_id:
+        raise ValueError('maintenance marker identity changed')
+    old_members=old.get('group_member_ids')
+    old_backups=old.get('backup_account_ids')
+    immutable=(
+      str(old.get('primary_account_id')),str(old.get('group_id')),
+      ','.join(str(value) for value in old_members) if isinstance(old_members,list) else '',
+      ','.join(str(value) for value in old_backups) if isinstance(old_backups,list) else '',
+      str(old.get('identity_digest') or ''),str(old.get('log_watermark')),
+      str(old.get('sub2_incarnation')),str(old.get('sink_dropped_base')),
+      str(old.get('sink_failed_base')),str(old.get('sink_written_base')),
+    )
+    expected=(primary_account_id,group_id,member_ids_csv,backup_ids_csv,identity_digest,
+              watermark,incarnation,dropped,failed,written)
+    if immutable != expected:
+        raise ValueError('immutable maintenance evidence changed')
+    started_at=old.get('started_at')
 except FileNotFoundError:
     pass
 except Exception:
     raise SystemExit(1)
 now=dt.datetime.now(dt.timezone.utc).isoformat()
 owned=phase in {'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS'}
-p={
-  'schema_version':5,
+payload={
+  'schema_version':7,
   'run_id':run_id,
   'primary_account_id':int(primary_account_id),
   'group_id':int(group_id),
+  'group_member_ids':member_ids,
+  'backup_account_ids':backup_ids,
+  'identity_digest':identity_digest,
   'phase':phase,
   'started_at':started_at or now,
   'updated_at':now,
@@ -2403,11 +2790,15 @@ p={
   'sink_written_base':int(written),
   'pause_request_id':pause_req or None,
   'pause_log_id':int(pause_log) if pause_log else None,
+  'pause_response_checkpoint':pause_checkpoint,
+  'pause_response_updated_at':pause_response_at or None,
   'seal_request_id':seal_req or None,
   'seal_log_id':int(seal_log) if seal_log else None,
   'seal_response_updated_at':seal_response_at or None,
   'restore_request_id':restore_req or None,
   'restore_log_id':int(restore_log) if restore_log else None,
+  'restore_response_checkpoint':restore_checkpoint,
+  'restore_response_updated_at':restore_response_at or None,
   'owned_updated_at':owned_at or None,
   'owned_xmin':owned_xmin or None,
   'primary_disabled_by_maintenance':owned,
@@ -2415,7 +2806,7 @@ p={
   'pending_primary_row_version':None,
 }
 with open(tmp,'w',encoding='utf-8') as f:
-    json.dump(p,f,ensure_ascii=False,sort_keys=True)
+    json.dump(payload,f,ensure_ascii=False,sort_keys=True)
     f.write('\n')
     f.flush()
     os.fsync(f.fileno())
@@ -2458,32 +2849,73 @@ finally:
 PY
 }
 
+remove_maintenance_ambiguity() {
+  "$PYTHON_BIN" - "$MAINTENANCE_AMBIGUITY_FILE" <<'PY'
+import os,sys
+path=sys.argv[1]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    raise SystemExit(1)
+fd=os.open(os.path.dirname(path),os.O_RDONLY|os.O_DIRECTORY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
 persist_maintenance_ambiguity() {
   local reason="$1"
   "$PYTHON_BIN" - "$MAINTENANCE_AMBIGUITY_FILE" "$M_RUN_ID" "$M_PHASE" "$reason" \
-    "$M_PRIMARY_ACCOUNT_ID" "$M_GROUP_ID" <<'PY'
+    "$M_PRIMARY_ACCOUNT_ID" "$M_GROUP_ID" "$M_GROUP_MEMBER_IDS" \
+    "$M_BACKUP_ACCOUNT_IDS" "$M_IDENTITY_DIGEST" <<'PY'
 import datetime as dt,json,os,re,sys,tempfile,uuid
-path,run_id,phase,reason,primary_account_id,group_id=sys.argv[1:]
+(path,run_id,phase,reason,primary_account_id,group_id,member_ids_csv,
+ backup_ids_csv,identity_digest)=sys.argv[1:]
 if str(uuid.UUID(run_id)) != run_id:
     raise SystemExit(1)
-if phase not in {'PAUSE_INTENT','PAUSE_ACKED','SEAL_INTENT','SEAL_ACKED','PAUSE_AMBIGUOUS',
-                 'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}:
+allowed={'PAUSE_INTENT','PAUSE_ACKED','SEAL_INTENT','SEAL_ACKED','PAUSE_AMBIGUOUS',
+         'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}
+if phase not in allowed:
     raise SystemExit(1)
 if not reason or len(reason)>300 or not reason.isascii() or not re.fullmatch(r'[a-z0-9_]+',reason):
     raise SystemExit(1)
 maximum=9223372036854775807
-if (not primary_account_id.isdigit() or int(primary_account_id) <= 0 or
-    int(primary_account_id) > maximum or not group_id.isdigit() or
-    int(group_id) <= 0 or int(group_id) > maximum):
+if (not primary_account_id.isdigit() or int(primary_account_id)<=0 or
+    int(primary_account_id)>maximum or not group_id.isdigit() or
+    int(group_id)<=0 or int(group_id)>maximum):
+    raise SystemExit(1)
+def parse_ids(value):
+    tokens=value.split(',')
+    if (not tokens or any(not token.isdigit() or int(token)<=0 or int(token)>maximum
+                          for token in tokens)):
+        raise ValueError
+    result=[int(token) for token in tokens]
+    if result != sorted(set(result)) or value != ','.join(str(item) for item in result):
+        raise ValueError
+    return result
+try:
+    member_ids=parse_ids(member_ids_csv)
+    backup_ids=parse_ids(backup_ids_csv)
+except ValueError:
+    raise SystemExit(1)
+if (int(primary_account_id) not in member_ids or int(primary_account_id) in backup_ids or
+    any(value not in member_ids for value in backup_ids) or
+    not re.fullmatch(r'[a-f0-9]{64}',identity_digest)):
     raise SystemExit(1)
 payload={
-  'schema_version':2,
+  'schema_version':3,
   'run_id':run_id,
   'primary_account_id':int(primary_account_id),
   'group_id':int(group_id),
+  'group_member_ids':member_ids,
+  'backup_account_ids':backup_ids,
+  'identity_digest':identity_digest,
   'phase':phase,
   'reason':reason,
-  'created_at':dt.datetime.now(dt.timezone.utc).isoformat(),
+  'created_at':dt.datetime.now(dt.timezone.utc).isoformat(
+      timespec='microseconds').replace('+00:00','Z'),
 }
 fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='maintenance-ambiguous.')
 try:
@@ -2511,36 +2943,70 @@ load_maintenance_ambiguity_identity() {
   [[ -s "$MAINTENANCE_AMBIGUITY_FILE" ]] || return 1
   local identity
   identity="$("$PYTHON_BIN" - "$MAINTENANCE_AMBIGUITY_FILE" <<'PY'
-import json,sys,uuid
+import datetime as dt,json,re,sys,uuid
 try:
     p=json.load(open(sys.argv[1],encoding='utf-8'))
-    if p.get('schema_version') != 2:
+    if p.get('schema_version') != 3:
         raise ValueError
     run_id=str(uuid.UUID(str(p.get('run_id') or '')))
     primary=str(p.get('primary_account_id') or '')
     group_id=str(p.get('group_id') or '')
+    phase=str(p.get('phase') or '')
+    reason=str(p.get('reason') or '')
+    created_at=str(p.get('created_at') or '')
+    identity_digest=str(p.get('identity_digest') or '')
     maximum=9223372036854775807
     if (not primary.isdigit() or int(primary)<=0 or int(primary)>maximum or
         not group_id.isdigit() or int(group_id)<=0 or int(group_id)>maximum):
         raise ValueError
-    print(run_id+'|'+primary+'|'+group_id)
+    def parse_ids(name):
+        values=p.get(name)
+        if (not isinstance(values,list) or not values or
+            any(type(value) is not int or value<=0 or value>maximum for value in values) or
+            values != sorted(set(values))):
+            raise ValueError
+        return values
+    member_ids=parse_ids('group_member_ids')
+    backup_ids=parse_ids('backup_account_ids')
+    if (int(primary) not in member_ids or int(primary) in backup_ids or
+        any(value not in member_ids for value in backup_ids) or
+        not re.fullmatch(r'[a-f0-9]{64}',identity_digest)):
+        raise ValueError
+    allowed={'PAUSE_INTENT','PAUSE_ACKED','SEAL_INTENT','SEAL_ACKED','PAUSE_AMBIGUOUS',
+             'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}
+    if (phase not in allowed or not reason or len(reason)>300 or not reason.isascii() or
+        not re.fullmatch(r'[a-z0-9_]+',reason)):
+        raise ValueError
+    raw=created_at[:-1]+'+00:00' if created_at.endswith('Z') else created_at
+    stamp=dt.datetime.fromisoformat(raw)
+    if stamp.tzinfo is None:
+        raise ValueError
+    canonical=stamp.astimezone(dt.timezone.utc).isoformat(
+        timespec='microseconds').replace('+00:00','Z')
+    if canonical != created_at:
+        raise ValueError
+    print('|'.join((
+      run_id,primary,group_id,','.join(str(value) for value in member_ids),
+      ','.join(str(value) for value in backup_ids),identity_digest,
+      phase,reason,created_at,
+    )))
 except Exception:
     raise SystemExit(1)
 PY
 )" || return 1
-  IFS='|' read -r M_RUN_ID M_PRIMARY_ACCOUNT_ID M_GROUP_ID <<<"$identity"
-  [[ "$M_RUN_ID|$M_PRIMARY_ACCOUNT_ID|$M_GROUP_ID" == "$identity" ]]
+  IFS='|' read -r M_AMBIGUITY_RUN_ID M_AMBIGUITY_PRIMARY_ACCOUNT_ID \
+    M_AMBIGUITY_GROUP_ID M_AMBIGUITY_GROUP_MEMBER_IDS \
+    M_AMBIGUITY_BACKUP_ACCOUNT_IDS M_AMBIGUITY_IDENTITY_DIGEST \
+    M_AMBIGUITY_PHASE M_AMBIGUITY_REASON M_AMBIGUITY_CREATED_AT <<<"$identity"
+  [[ "$M_AMBIGUITY_RUN_ID|$M_AMBIGUITY_PRIMARY_ACCOUNT_ID|$M_AMBIGUITY_GROUP_ID|$M_AMBIGUITY_GROUP_MEMBER_IDS|$M_AMBIGUITY_BACKUP_ACCOUNT_IDS|$M_AMBIGUITY_IDENTITY_DIGEST|$M_AMBIGUITY_PHASE|$M_AMBIGUITY_REASON|$M_AMBIGUITY_CREATED_AT" == "$identity" ]]
 }
-
 read_maintenance_state() {
-  [[ -s "$MAINTENANCE_FILE" ]] || {
-    return 1
-  }
+  [[ -s "$MAINTENANCE_FILE" ]] || return 1
   "$PYTHON_BIN" - "$MAINTENANCE_FILE" <<'PY'
-import datetime as dt,json,re,sys,uuid
+import datetime as dt,hashlib,json,re,sys,uuid
 try:
     p=json.load(open(sys.argv[1],encoding='utf-8'))
-    if p.get('schema_version') != 5:
+    if p.get('schema_version') != 7:
         raise ValueError
     phase=str(p.get('phase') or '')
     allowed={
@@ -2554,77 +3020,185 @@ try:
     primary_account_id=str(p.get('primary_account_id') or '')
     group_id=str(p.get('group_id') or '')
     maximum=9223372036854775807
-    if (not primary_account_id.isdigit() or int(primary_account_id) <= 0 or
-        int(primary_account_id) > maximum or not group_id.isdigit() or
-        int(group_id) <= 0 or int(group_id) > maximum):
+    if (not primary_account_id.isdigit() or int(primary_account_id)<=0 or
+        int(primary_account_id)>maximum or not group_id.isdigit() or
+        int(group_id)<=0 or int(group_id)>maximum):
         raise ValueError
+    def parse_ids(name):
+        values=p.get(name)
+        if (not isinstance(values,list) or not values or
+            any(type(value) is not int or value<=0 or value>maximum for value in values) or
+            values != sorted(set(values))):
+            raise ValueError
+        return values
+    member_ids=parse_ids('group_member_ids')
+    backup_ids=parse_ids('backup_account_ids')
+    if (int(primary_account_id) not in member_ids or
+        int(primary_account_id) in backup_ids or
+        any(value not in member_ids for value in backup_ids)):
+        raise ValueError
+    member_ids_csv=','.join(str(value) for value in member_ids)
+    backup_ids_csv=','.join(str(value) for value in backup_ids)
     numeric=('log_watermark','sink_dropped_base','sink_failed_base','sink_written_base')
-    nums=[str(p.get(k)) for k in numeric]
-    if not all(v.isdigit() for v in nums):
+    if any(type(p.get(name)) is not int or p.get(name)<0 for name in numeric):
         raise ValueError
+    nums=[str(p.get(name)) for name in numeric]
     incarnation=str(p.get('sub2_incarnation') or '')
     if not incarnation or len(incarnation)>200 or '|' in incarnation or not incarnation.isascii():
         raise ValueError
-    fields=[
-      str(p.get('pause_request_id') or ''),str(p.get('pause_log_id') or ''),
-      str(p.get('seal_request_id') or ''),str(p.get('seal_log_id') or ''),
-      str(p.get('seal_response_updated_at') or ''),str(p.get('restore_request_id') or ''),
-      str(p.get('restore_log_id') or ''),str(p.get('owned_updated_at') or ''),
-      str(p.get('owned_xmin') or ''),
-    ]
+    identity_digest=str(p.get('identity_digest') or '')
+    if not re.fullmatch(r'[a-f0-9]{64}',identity_digest):
+        raise ValueError
+    identity_payload={
+      'schema_version':7,
+      'run_id':run_id,
+      'primary_account_id':int(primary_account_id),
+      'group_id':int(group_id),
+      'group_member_ids':member_ids,
+      'backup_account_ids':backup_ids,
+      'log_watermark':int(nums[0]),
+      'sub2_incarnation':incarnation,
+      'sink_dropped_base':int(nums[1]),
+      'sink_failed_base':int(nums[2]),
+      'sink_written_base':int(nums[3]),
+    }
+    canonical=json.dumps(identity_payload,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
+    if hashlib.sha256(canonical).hexdigest() != identity_digest:
+        raise ValueError
+
+    pause_req=str(p.get('pause_request_id') or '')
+    pause_log=str(p.get('pause_log_id') or '')
+    pause_checkpoint=str(p.get('pause_response_checkpoint') or '')
+    pause_response_at=str(p.get('pause_response_updated_at') or '')
+    seal_req=str(p.get('seal_request_id') or '')
+    seal_log=str(p.get('seal_log_id') or '')
+    seal_response_at=str(p.get('seal_response_updated_at') or '')
+    restore_req=str(p.get('restore_request_id') or '')
+    restore_log=str(p.get('restore_log_id') or '')
+    restore_checkpoint=str(p.get('restore_response_checkpoint') or '')
+    restore_response_at=str(p.get('restore_response_updated_at') or '')
+    owned_at=str(p.get('owned_updated_at') or '')
+    owned_xmin=str(p.get('owned_xmin') or '')
     req_re=re.compile(r'^codex2api-maint-[a-f0-9-]{36}-(pause|seal|restore)$')
-    for value in (fields[0],fields[2],fields[5]):
+    for value in (pause_req,seal_req,restore_req):
         if value and (len(value)>64 or not value.isascii() or not req_re.fullmatch(value)):
             raise ValueError
-    for value in (fields[1],fields[3],fields[6],fields[8]):
+    for value in (pause_log,seal_log,restore_log,owned_xmin):
         if value and (not value.isdigit() or int(value)<=0):
             raise ValueError
-    for value in (fields[4],fields[7]):
-        if value:
-            raw=value[:-1]+'+00:00' if value.endswith('Z') else value
-            stamp=dt.datetime.fromisoformat(raw)
-            if stamp.tzinfo is None:
-                raise ValueError
-            if stamp.astimezone(dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00','Z') != value:
-                raise ValueError
-    pause_req,pause_log,seal_req,seal_log,seal_response_at,restore_req,restore_log,owned_at,owned_xmin=fields
-    if phase in {'PREPARING','EXTERNAL_PAUSED'} and any(fields):
-        raise ValueError
-    if phase == 'PAUSE_INTENT' and (not pause_req or any(fields[1:])):
-        raise ValueError
-    if phase == 'PAUSE_ACKED' and (not pause_req or not pause_log or any(fields[2:])):
-        raise ValueError
-    if phase == 'SEAL_INTENT' and (not pause_req or not pause_log or not seal_req or any((seal_log,restore_req,restore_log,owned_at,owned_xmin))):
-        raise ValueError
-    if phase == 'SEAL_ACKED' and (not all((pause_req,pause_log,seal_req,seal_log,seal_response_at)) or any(fields[5:])):
-        raise ValueError
-    if phase == 'PAUSE_AMBIGUOUS' and (not pause_req or any((restore_req,restore_log,owned_at,owned_xmin))):
-        raise ValueError
-    if phase in {'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}:
-        if not all((pause_req,pause_log,seal_req,seal_log,seal_response_at,owned_at,owned_xmin)):
+    def valid_stamp(value):
+        if not value:
+            return True
+        raw=value[:-1]+'+00:00' if value.endswith('Z') else value
+        stamp=dt.datetime.fromisoformat(raw)
+        if stamp.tzinfo is None:
             raise ValueError
-    if phase == 'OWNED' and any((restore_req,restore_log)):
+        canonical_stamp=stamp.astimezone(dt.timezone.utc).isoformat(
+            timespec='microseconds').replace('+00:00','Z')
+        return canonical_stamp == value
+    for value in (pause_response_at,seal_response_at,restore_response_at,owned_at):
+        if not valid_stamp(value):
+            raise ValueError
+    pause_states={'none','pending','validated','transport_or_non200','invalid'}
+    restore_states=pause_states|{'explicitly_resolved'}
+    if pause_checkpoint not in pause_states or restore_checkpoint not in restore_states:
         raise ValueError
-    if phase == 'RESTORE_INTENT' and (not restore_req or restore_log):
+    if (pause_checkpoint == 'validated') != bool(pause_response_at):
         raise ValueError
-    if phase in {'RESTORE_ACKED','RESTORED'} and (not restore_req or not restore_log):
+    if (restore_checkpoint == 'validated') != bool(restore_response_at):
         raise ValueError
-    if phase == 'RESTORE_AMBIGUOUS' and not restore_req:
+
+    if phase in {'PREPARING','EXTERNAL_PAUSED'}:
+        if (pause_checkpoint != 'none' or restore_checkpoint != 'none' or
+            any((pause_req,pause_log,pause_response_at,seal_req,seal_log,seal_response_at,
+                 restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+            raise ValueError
+    elif phase == 'PAUSE_INTENT':
+        if (not pause_req or pause_log or pause_checkpoint == 'none' or
+            restore_checkpoint != 'none' or
+            any((seal_req,seal_log,seal_response_at,restore_req,restore_log,
+                 restore_response_at,owned_at,owned_xmin))):
+            raise ValueError
+    elif phase == 'PAUSE_ACKED':
+        if (not pause_req or not pause_log or pause_checkpoint != 'validated' or
+            restore_checkpoint != 'none' or
+            any((seal_req,seal_log,seal_response_at,restore_req,restore_log,
+                 restore_response_at,owned_at,owned_xmin))):
+            raise ValueError
+    elif phase == 'SEAL_INTENT':
+        if (not pause_req or not pause_log or pause_checkpoint != 'validated' or
+            not seal_req or seal_log or restore_checkpoint != 'none' or
+            any((restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+            raise ValueError
+    elif phase == 'SEAL_ACKED':
+        if (not all((pause_req,pause_log,pause_response_at,seal_req,seal_log,
+                     seal_response_at)) or pause_checkpoint != 'validated' or
+            restore_checkpoint != 'none' or
+            any((restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+            raise ValueError
+    elif phase == 'PAUSE_AMBIGUOUS':
+        if (not pause_req or pause_checkpoint == 'none' or restore_checkpoint != 'none' or
+            any((restore_req,restore_log,restore_response_at,owned_at,owned_xmin))):
+            raise ValueError
+        if pause_log and pause_checkpoint != 'validated':
+            raise ValueError
+        if seal_log and (not seal_req or not seal_response_at):
+            raise ValueError
+        if seal_response_at and not seal_req:
+            raise ValueError
+    elif phase in {'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS','RESTORED'}:
+        if (not all((pause_req,pause_log,pause_response_at,seal_req,seal_log,
+                     seal_response_at,owned_at,owned_xmin)) or
+            pause_checkpoint != 'validated'):
+            raise ValueError
+        if phase == 'OWNED':
+            if restore_checkpoint != 'none' or any((restore_req,restore_log,restore_response_at)):
+                raise ValueError
+        elif phase == 'RESTORE_INTENT':
+            if not restore_req or restore_log or restore_checkpoint == 'none':
+                raise ValueError
+        elif phase in {'RESTORE_ACKED','RESTORED'}:
+            if (not restore_req or not restore_log or
+                restore_checkpoint not in {'validated','explicitly_resolved'}):
+                raise ValueError
+        elif phase == 'RESTORE_AMBIGUOUS':
+            if not restore_req or restore_checkpoint == 'none':
+                raise ValueError
+            if restore_log and restore_checkpoint not in {'validated','explicitly_resolved'}:
+                raise ValueError
+
+    owned=phase in {'OWNED','RESTORE_INTENT','RESTORE_ACKED','RESTORE_AMBIGUOUS'}
+    if p.get('primary_disabled_by_maintenance') is not owned:
         raise ValueError
-    print('|'.join((phase,run_id,primary_account_id,group_id,nums[0],incarnation,nums[1],nums[2],nums[3],*fields)))
+    if str(p.get('primary_row_version') or '') != owned_xmin:
+        raise ValueError
+    if p.get('pending_primary_row_version') is not None:
+        raise ValueError
+    fields=(
+      pause_req,pause_log,pause_checkpoint,pause_response_at,
+      seal_req,seal_log,seal_response_at,
+      restore_req,restore_log,restore_checkpoint,restore_response_at,
+      owned_at,owned_xmin,
+    )
+    print('|'.join((
+      phase,run_id,primary_account_id,group_id,member_ids_csv,backup_ids_csv,
+      identity_digest,nums[0],incarnation,nums[1],nums[2],nums[3],*fields,
+    )))
 except Exception:
     raise SystemExit(1)
 PY
 }
-
 load_maintenance_state() {
   local state
   state="$(read_maintenance_state)" || return 1
   IFS='|' read -r M_PHASE M_RUN_ID M_PRIMARY_ACCOUNT_ID M_GROUP_ID \
+    M_GROUP_MEMBER_IDS M_BACKUP_ACCOUNT_IDS M_IDENTITY_DIGEST \
     M_LOG_WATERMARK M_INCARNATION \
     M_SINK_DROPPED M_SINK_FAILED M_SINK_WRITTEN M_PAUSE_REQUEST_ID \
-    M_PAUSE_LOG_ID M_SEAL_REQUEST_ID M_SEAL_LOG_ID M_SEAL_RESPONSE_UPDATED_AT \
-    M_RESTORE_REQUEST_ID M_RESTORE_LOG_ID M_OWNED_UPDATED_AT M_OWNED_XMIN <<<"$state"
+    M_PAUSE_LOG_ID M_PAUSE_RESPONSE_CHECKPOINT M_PAUSE_RESPONSE_UPDATED_AT \
+    M_SEAL_REQUEST_ID M_SEAL_LOG_ID M_SEAL_RESPONSE_UPDATED_AT \
+    M_RESTORE_REQUEST_ID M_RESTORE_LOG_ID M_RESTORE_RESPONSE_CHECKPOINT \
+    M_RESTORE_RESPONSE_UPDATED_AT M_OWNED_UPDATED_AT M_OWNED_XMIN <<<"$state"
   [[ "$(maintenance_state_line)" == "$state" ]]
 }
 
@@ -2634,7 +3208,15 @@ maintenance_identity_matches_current() {
 
 validate_maintenance_artifact_identity() {
   MAINTENANCE_IDENTITY_ERROR=""
-  local marker_run="" marker_primary="" marker_group=""
+  M_SIDECAR_ONLY=false
+  M_AMBIGUITY_RUN_ID=""
+  M_AMBIGUITY_PRIMARY_ACCOUNT_ID=""
+  M_AMBIGUITY_GROUP_ID=""
+  M_AMBIGUITY_GROUP_MEMBER_IDS=""
+  M_AMBIGUITY_BACKUP_ACCOUNT_IDS=""
+  M_AMBIGUITY_IDENTITY_DIGEST=""
+  local marker_run="" marker_primary="" marker_group="" marker_members=""
+  local marker_backups="" marker_digest="" marker_phase=""
   if [[ -e "$MAINTENANCE_FILE" ]]; then
     if ! load_maintenance_state; then
       MAINTENANCE_IDENTITY_ERROR="maintenance_marker_identity_missing_or_invalid"
@@ -2643,6 +3225,10 @@ validate_maintenance_artifact_identity() {
     marker_run="$M_RUN_ID"
     marker_primary="$M_PRIMARY_ACCOUNT_ID"
     marker_group="$M_GROUP_ID"
+    marker_members="$M_GROUP_MEMBER_IDS"
+    marker_backups="$M_BACKUP_ACCOUNT_IDS"
+    marker_digest="$M_IDENTITY_DIGEST"
+    marker_phase="$M_PHASE"
   fi
   if [[ -e "$MAINTENANCE_AMBIGUITY_FILE" ]]; then
     if ! load_maintenance_ambiguity_identity; then
@@ -2650,10 +3236,45 @@ validate_maintenance_artifact_identity() {
       return 1
     fi
     if [[ -n "$marker_primary" ]] &&
-       [[ "$M_RUN_ID" != "$marker_run" || "$M_PRIMARY_ACCOUNT_ID" != "$marker_primary" ||
-          "$M_GROUP_ID" != "$marker_group" ]]; then
+       [[ "$M_AMBIGUITY_RUN_ID" != "$marker_run" ||
+          "$M_AMBIGUITY_PRIMARY_ACCOUNT_ID" != "$marker_primary" ||
+          "$M_AMBIGUITY_GROUP_ID" != "$marker_group" ||
+          "$M_AMBIGUITY_GROUP_MEMBER_IDS" != "$marker_members" ||
+          "$M_AMBIGUITY_BACKUP_ACCOUNT_IDS" != "$marker_backups" ||
+          "$M_AMBIGUITY_IDENTITY_DIGEST" != "$marker_digest" ]]; then
       MAINTENANCE_IDENTITY_ERROR="maintenance_artifact_identity_conflict"
       return 1
+    fi
+    if [[ -n "$marker_phase" ]]; then
+      case "$marker_phase" in
+        PAUSE_AMBIGUOUS)
+          [[ "$M_AMBIGUITY_PHASE" =~ ^(PAUSE_INTENT|PAUSE_ACKED|SEAL_INTENT|SEAL_ACKED|PAUSE_AMBIGUOUS)$ ]] || {
+            MAINTENANCE_IDENTITY_ERROR="maintenance_artifact_phase_conflict"
+            return 1
+          }
+          ;;
+        RESTORE_AMBIGUOUS|RESTORE_ACKED)
+          [[ "$M_AMBIGUITY_PHASE" =~ ^(RESTORE_INTENT|RESTORE_ACKED|RESTORE_AMBIGUOUS|RESTORED)$ ]] || {
+            MAINTENANCE_IDENTITY_ERROR="maintenance_artifact_phase_conflict"
+            return 1
+          }
+          ;;
+        *)
+          [[ "$M_AMBIGUITY_PHASE" == "$marker_phase" ]] || {
+            MAINTENANCE_IDENTITY_ERROR="maintenance_artifact_phase_conflict"
+            return 1
+          }
+          ;;
+      esac
+    else
+      M_RUN_ID="$M_AMBIGUITY_RUN_ID"
+      M_PRIMARY_ACCOUNT_ID="$M_AMBIGUITY_PRIMARY_ACCOUNT_ID"
+      M_GROUP_ID="$M_AMBIGUITY_GROUP_ID"
+      M_GROUP_MEMBER_IDS="$M_AMBIGUITY_GROUP_MEMBER_IDS"
+      M_BACKUP_ACCOUNT_IDS="$M_AMBIGUITY_BACKUP_ACCOUNT_IDS"
+      M_IDENTITY_DIGEST="$M_AMBIGUITY_IDENTITY_DIGEST"
+      M_PHASE="$M_AMBIGUITY_PHASE"
+      M_SIDECAR_ONLY=true
     fi
   fi
   if ! maintenance_identity_matches_current; then
@@ -2679,6 +3300,83 @@ transition_maintenance_marker() {
   [[ "$persisted" == "$expected_state" ]] || return 1
   write_maintenance_marker "$next_phase"
 }
+PRIMARY_RESPONSE_CHECKPOINT_OUTCOME=""
+
+maintenance_test_barrier_after_primary_response() {
+  local action="$1"
+  local prefix="${MAINTENANCE_TEST_RESPONSE_BARRIER_PREFIX:-}"
+  [[ -n "$TEST_BACKEND" && -n "$prefix" ]] || return 0
+  [[ "$action" == pause || "$action" == restore ]] || return 1
+  : >"${prefix}.${action}.reached" || return 1
+  while [[ ! -e "${prefix}.${action}.release" ]]; do
+    sleep 0.05
+  done
+}
+
+persist_primary_response_checkpoint() {
+  local action="$1"
+  local api_rc="$2"
+  local phase before checkpoint response_updated_at=""
+  case "$api_rc" in
+    0)
+      if [[ "$SCHEDULABLE_WRITE_HTTP_OK" == true && -n "$SCHEDULABLE_WRITE_UPDATED_AT" ]]; then
+        checkpoint="validated"
+        response_updated_at="$SCHEDULABLE_WRITE_UPDATED_AT"
+      else
+        checkpoint="invalid"
+      fi
+      ;;
+    1) checkpoint="transport_or_non200" ;;
+    2) checkpoint="invalid" ;;
+    *) checkpoint="invalid" ;;
+  esac
+  PRIMARY_RESPONSE_CHECKPOINT_OUTCOME="$checkpoint"
+  case "$action" in
+    pause)
+      phase=PAUSE_INTENT
+      [[ "$M_PHASE" == "$phase" ]] || return 1
+      before="$(maintenance_state_line)"
+      M_PAUSE_RESPONSE_CHECKPOINT="$checkpoint"
+      M_PAUSE_RESPONSE_UPDATED_AT="$response_updated_at"
+      ;;
+    restore)
+      phase=RESTORE_INTENT
+      [[ "$M_PHASE" == "$phase" ]] || return 1
+      before="$(maintenance_state_line)"
+      M_RESTORE_RESPONSE_CHECKPOINT="$checkpoint"
+      M_RESTORE_RESPONSE_UPDATED_AT="$response_updated_at"
+      ;;
+    *) return 1 ;;
+  esac
+  transition_maintenance_marker "$phase" "$phase" "$before"
+}
+
+wait_for_restored_primary_snapshot() {
+  case "$M_RESTORE_RESPONSE_CHECKPOINT" in
+    validated)
+      wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" true \
+        "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" "$M_RESTORE_RESPONSE_UPDATED_AT"
+      ;;
+    explicitly_resolved)
+      wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" true \
+        "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+restored_primary_snapshot_matches() {
+  case "$M_RESTORE_RESPONSE_CHECKPOINT" in
+    validated)
+      account_snapshot_matches "$BRIDGE_ACCOUNT_ID" true "$M_RESTORE_RESPONSE_UPDATED_AT"
+      ;;
+    explicitly_resolved)
+      account_snapshot_matches "$BRIDGE_ACCOUNT_ID" true
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 
 now_rfc3339() {
   date --iso-8601=seconds
@@ -3194,6 +3892,21 @@ guard_finish_recorded_receipt() {
   return 1
 }
 
+guard_finish_restore_receipt() {
+  local request_id="$1"
+  local log_id="$2"
+  local rc=0
+  verify_successful_restore_receipt "$request_id" "$log_id" \
+    "$M_LOG_WATERMARK" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) retryable_maintenance_evidence_failure "finish_maintenance" \
+         "recorded_restore_receipt_temporarily_unverifiable" ;;
+    2) mark_restore_ambiguous "recorded_restore_receipt_definitive_conflict" || true ;;
+  esac
+  return 1
+}
+
 guard_owned_recorded_receipt() {
   local request_id="$1"
   local log_id="$2"
@@ -3412,10 +4125,42 @@ preflight_maintenance_request_id() {
   [[ "$count" == 0 ]]
 }
 
+adopt_seal_intent_receipt() {
+  [[ "$M_PHASE" == SEAL_INTENT ]] || return 0
+
+  # A receipt proves only the asynchronous access-log completion. The validated
+  # synchronous response generation must already be durable before this INTENT
+  # can be adopted; never substitute the current database generation.
+  if [[ -z "$M_SEAL_RESPONSE_UPDATED_AT" ]]; then
+    mark_pause_ambiguous "ownership_seal_response_generation_not_persisted" || true
+    return 2
+  fi
+
+  local receipt_rc=0 log_id before
+  log_id="$(wait_for_maintenance_receipt "$M_SEAL_REQUEST_ID" "$M_LOG_WATERMARK" \
+    "$M_INCARNATION" "$M_SINK_DROPPED" "$M_SINK_FAILED" "$M_SINK_WRITTEN")" || receipt_rc=$?
+  if (( receipt_rc != 0 )); then
+    case "$receipt_rc" in
+      1) mark_pause_ambiguous "ownership_seal_receipt_timeout_backups_left_open" || true ;;
+      2) mark_pause_ambiguous "ownership_seal_receipt_definitive_conflict" || true ;;
+      3) retryable_maintenance_evidence_failure "prepare_maintenance" \
+           "ownership_seal_receipt_temporarily_unverifiable" || true ;;
+      *) mark_pause_ambiguous "ownership_seal_receipt_internal_error" || true ;;
+    esac
+    return 2
+  fi
+
+  before="$(maintenance_state_line)"
+  M_SEAL_LOG_ID="$log_id"
+  transition_maintenance_marker SEAL_INTENT SEAL_ACKED "$before" || return 2
+}
+
 prepare_maintenance() {
   discover_group || return 2
   local initial_group_id="$GROUP_ID"
   local health queue dropped failed written bootstrap_watermark bootstrap_fence_id bootstrap_fence_log_id
+  local initial_member_ids="" current_member_ids=""
+  local initial_backup_ids="" current_backup_ids=""
   load_members || return 2
   if primary_is_group_member && ! primary_is_exclusive_group_member; then
     emit_event "critical" "prepare_maintenance" \
@@ -3438,6 +4183,18 @@ prepare_maintenance() {
   if [[ -e "$MAINTENANCE_FILE" ]]; then
     : # Identity validation above also loaded and structurally validated it.
   else
+    initial_member_ids="$(loaded_group_member_ids)" || {
+      emit_event "critical" "prepare_maintenance" \
+        "initial_group_membership_seal_unverifiable_primary_unchanged" \
+        '{"account_writes":0}'
+      return 2
+    }
+    initial_backup_ids="$(loaded_backup_account_ids)" || {
+      emit_event "critical" "prepare_maintenance" \
+        "initial_backup_identity_seal_unverifiable_primary_unchanged" \
+        '{"account_writes":0}'
+      return 2
+    }
     open_backups "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || {
       emit_event "critical" "prepare_maintenance" \
         "backup_takeover_not_ready_primary_unchanged" '{}'
@@ -3448,6 +4205,15 @@ prepare_maintenance() {
         "group_changed_after_backup_open_primary_unchanged" '{}'
       return 2
     }
+    current_member_ids="$(loaded_group_member_ids)" || return 2
+    current_backup_ids="$(loaded_backup_account_ids)" || return 2
+    if [[ "$current_member_ids" != "$initial_member_ids" ||
+          "$current_backup_ids" != "$initial_backup_ids" ]]; then
+      emit_event "critical" "prepare_maintenance" \
+        "sealed_maintenance_identity_changed_after_backup_open_primary_unchanged" \
+        '{"account_writes":0}'
+      return 2
+    fi
     verify_runtime_logging_evidence || {
       emit_event "critical" "prepare_maintenance" \
         "runtime_logging_cannot_prove_info_unsampled_primary_unchanged" '{}'
@@ -3476,19 +4242,35 @@ prepare_maintenance() {
         "group_changed_before_maintenance_marker_primary_unchanged" '{}'
       return 2
     }
+    current_member_ids="$(loaded_group_member_ids)" || return 2
+    current_backup_ids="$(loaded_backup_account_ids)" || return 2
+    if [[ "$current_member_ids" != "$initial_member_ids" ||
+          "$current_backup_ids" != "$initial_backup_ids" ]]; then
+      emit_event "critical" "prepare_maintenance" \
+        "sealed_maintenance_identity_changed_before_maintenance_marker_primary_unchanged" \
+        '{"account_writes":0}'
+      return 2
+    fi
     M_LOG_WATERMARK="$bootstrap_fence_log_id"
     M_PHASE=PREPARING
     M_PRIMARY_ACCOUNT_ID="$BRIDGE_ACCOUNT_ID"
     M_GROUP_ID="$initial_group_id"
+    M_GROUP_MEMBER_IDS="$initial_member_ids"
+    M_BACKUP_ACCOUNT_IDS="$initial_backup_ids"
     M_PAUSE_REQUEST_ID=""
     M_PAUSE_LOG_ID=""
+    M_PAUSE_RESPONSE_CHECKPOINT="none"
+    M_PAUSE_RESPONSE_UPDATED_AT=""
     M_SEAL_REQUEST_ID=""
     M_SEAL_LOG_ID=""
     M_SEAL_RESPONSE_UPDATED_AT=""
     M_RESTORE_REQUEST_ID=""
     M_RESTORE_LOG_ID=""
+    M_RESTORE_RESPONSE_CHECKPOINT="none"
+    M_RESTORE_RESPONSE_UPDATED_AT=""
     M_OWNED_UPDATED_AT=""
     M_OWNED_XMIN=""
+    M_IDENTITY_DIGEST="$(compute_maintenance_identity_digest)" || return 2
     write_maintenance_marker PREPARING || return 2
   fi
   guard_maintenance_group_identity "prepare_maintenance" true || return 2
@@ -3570,11 +4352,25 @@ prepare_maintenance() {
         }
         before="$(maintenance_state_line)"
         M_PAUSE_REQUEST_ID="$request_id"
+        M_PAUSE_RESPONSE_CHECKPOINT="pending"
+        M_PAUSE_RESPONSE_UPDATED_AT=""
         transition_maintenance_marker PREPARING PAUSE_INTENT "$before" || return 2
         api_rc=0
         api_set_primary_schedulable "$BRIDGE_ACCOUNT_ID" false "$M_PAUSE_REQUEST_ID" || api_rc=$?
-        if (( api_rc == 2 )); then
-          mark_pause_ambiguous "primary_pause_response_invalid_backups_left_open"
+        maintenance_test_barrier_after_primary_response pause || {
+          mark_pause_ambiguous "primary_pause_response_barrier_failed_backups_left_open" || true
+          return 2
+        }
+        persist_primary_response_checkpoint pause "$api_rc" || {
+          mark_pause_ambiguous "primary_pause_response_checkpoint_persist_failed" || true
+          return 2
+        }
+        if [[ "$PRIMARY_RESPONSE_CHECKPOINT_OUTCOME" != validated ]]; then
+          if [[ "$PRIMARY_RESPONSE_CHECKPOINT_OUTCOME" == transport_or_non200 ]]; then
+            mark_pause_ambiguous "primary_pause_transport_or_non200_backups_left_open" || true
+          else
+            mark_pause_ambiguous "primary_pause_response_invalid_backups_left_open" || true
+          fi
           return 2
         fi
       else
@@ -3616,6 +4412,15 @@ prepare_maintenance() {
   esac
 
   if [[ "$M_PHASE" == PAUSE_INTENT ]]; then
+    if [[ "$M_PAUSE_RESPONSE_CHECKPOINT" != validated ]]; then
+      case "$M_PAUSE_RESPONSE_CHECKPOINT" in
+        pending) mark_pause_ambiguous "primary_pause_response_pending_requires_resolution" || true ;;
+        transport_or_non200) mark_pause_ambiguous "primary_pause_transport_or_non200_requires_resolution" || true ;;
+        invalid) mark_pause_ambiguous "primary_pause_invalid_response_requires_resolution" || true ;;
+        *) mark_pause_ambiguous "primary_pause_response_checkpoint_invalid" || true ;;
+      esac
+      return 2
+    fi
     receipt_rc=0
     log_id="$(wait_for_maintenance_receipt "$M_PAUSE_REQUEST_ID" "$M_LOG_WATERMARK" \
       "$M_INCARNATION" "$M_SINK_DROPPED" "$M_SINK_FAILED" "$M_SINK_WRITTEN")" || receipt_rc=$?
@@ -3634,6 +4439,14 @@ prepare_maintenance() {
     transition_maintenance_marker PAUSE_INTENT PAUSE_ACKED "$before" || return 2
   fi
 
+  # A resumed seal INTENT has no recorded log id yet, so it must adopt its
+  # unique durable receipt before any foreign-write fence or drain proof. The
+  # adoption never resubmits the seal and creates the exact log-id tuple used by
+  # every later exemption.
+  if [[ "$M_PHASE" == SEAL_INTENT ]]; then
+    adopt_seal_intent_receipt || return 2
+  fi
+
   if [[ "$M_PHASE" == PAUSE_ACKED ]]; then
     guard_prepare_recorded_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" || return 2
     guard_prepare_foreign_fence || return 2
@@ -3647,7 +4460,8 @@ prepare_maintenance() {
         "primary_pause_state_temporarily_unverifiable" || true
       return 2
     fi
-    wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" false "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || {
+    wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" false \
+      "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" "$M_PAUSE_RESPONSE_UPDATED_AT" || {
       retryable_maintenance_evidence_failure "prepare_maintenance" \
         "primary_pause_snapshot_temporarily_unverifiable" || true
       return 2
@@ -3733,30 +4547,7 @@ prepare_maintenance() {
   fi
 
   if [[ "$M_PHASE" == SEAL_INTENT ]]; then
-    receipt_rc=0
-    log_id="$(wait_for_maintenance_receipt "$M_SEAL_REQUEST_ID" "$M_LOG_WATERMARK" \
-      "$M_INCARNATION" "$M_SINK_DROPPED" "$M_SINK_FAILED" "$M_SINK_WRITTEN")" || receipt_rc=$?
-    if (( receipt_rc != 0 )); then
-      case "$receipt_rc" in
-        1) mark_pause_ambiguous "ownership_seal_receipt_timeout_backups_left_open" || true ;;
-        2) mark_pause_ambiguous "ownership_seal_receipt_definitive_conflict" || true ;;
-        3) retryable_maintenance_evidence_failure "prepare_maintenance" \
-             "ownership_seal_receipt_temporarily_unverifiable" || true ;;
-        *) mark_pause_ambiguous "ownership_seal_receipt_internal_error" || true ;;
-      esac
-      return 2
-    fi
-    if [[ -z "$M_SEAL_RESPONSE_UPDATED_AT" ]]; then
-      # The durable receipt proves the request completed, but it does not carry
-      # the response generation.  Never adopt the current DB timestamp here: a
-      # concurrent writer could have changed it after this seal.  The validated
-      # response checkpoint must have been persisted before the receipt wait.
-      mark_pause_ambiguous "ownership_seal_response_generation_not_persisted" || true
-      return 2
-    fi
-    before="$(maintenance_state_line)"
-    M_SEAL_LOG_ID="$log_id"
-    transition_maintenance_marker SEAL_INTENT SEAL_ACKED "$before" || return 2
+    adopt_seal_intent_receipt || return 2
   fi
 
   if [[ "$M_PHASE" == SEAL_ACKED ]]; then
@@ -3939,11 +4730,25 @@ finish_maintenance() {
       }
       before="$(maintenance_state_line)"
       M_RESTORE_REQUEST_ID="$request_id"
+      M_RESTORE_RESPONSE_CHECKPOINT="pending"
+      M_RESTORE_RESPONSE_UPDATED_AT=""
       transition_maintenance_marker OWNED RESTORE_INTENT "$before" || return 2
       api_rc=0
       api_set_primary_schedulable "$BRIDGE_ACCOUNT_ID" true "$M_RESTORE_REQUEST_ID" || api_rc=$?
-      if (( api_rc == 2 )); then
-        mark_restore_ambiguous "primary_restore_response_invalid_backups_left_open"
+      maintenance_test_barrier_after_primary_response restore || {
+        mark_restore_ambiguous "primary_restore_response_barrier_failed_backups_left_open" || true
+        return 2
+      }
+      persist_primary_response_checkpoint restore "$api_rc" || {
+        mark_restore_ambiguous "primary_restore_response_checkpoint_persist_failed" || true
+        return 2
+      }
+      if [[ "$PRIMARY_RESPONSE_CHECKPOINT_OUTCOME" != validated ]]; then
+        if [[ "$PRIMARY_RESPONSE_CHECKPOINT_OUTCOME" == transport_or_non200 ]]; then
+          mark_restore_ambiguous "primary_restore_transport_or_non200_backups_left_open" || true
+        else
+          mark_restore_ambiguous "primary_restore_response_invalid_backups_left_open" || true
+        fi
         return 2
       fi
       ;;
@@ -4006,6 +4811,15 @@ finish_maintenance() {
   esac
 
   if [[ "$M_PHASE" == RESTORE_INTENT ]]; then
+    if [[ "$M_RESTORE_RESPONSE_CHECKPOINT" != validated ]]; then
+      case "$M_RESTORE_RESPONSE_CHECKPOINT" in
+        pending) mark_restore_ambiguous "primary_restore_response_pending_requires_resolution" || true ;;
+        transport_or_non200) mark_restore_ambiguous "primary_restore_transport_or_non200_requires_resolution" || true ;;
+        invalid) mark_restore_ambiguous "primary_restore_invalid_response_requires_resolution" || true ;;
+        *) mark_restore_ambiguous "primary_restore_response_checkpoint_invalid" || true ;;
+      esac
+      return 2
+    fi
     guard_maintenance_group_identity "finish_maintenance" true || return 2
     receipt_rc=0
     log_id="$(wait_for_maintenance_receipt "$M_RESTORE_REQUEST_ID" "$M_LOG_WATERMARK" \
@@ -4030,7 +4844,7 @@ finish_maintenance() {
     guard_maintenance_group_identity "finish_maintenance" true || return 2
     guard_finish_recorded_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" || return 2
     guard_finish_recorded_receipt "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" || return 2
-    guard_finish_recorded_receipt "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" || return 2
+    guard_finish_restore_receipt "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" || return 2
     guard_finish_foreign_fence || return 2
     local restored_state_rc=0
     classify_primary_api_state true || restored_state_rc=$?
@@ -4042,7 +4856,7 @@ finish_maintenance() {
         "primary_restore_state_temporarily_unverifiable" || true
       return 2
     fi
-    wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" true "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" &&
+    wait_for_restored_primary_snapshot &&
     load_members &&
     [[ "${MEMBER_STATUS[$BRIDGE_ACCOUNT_ID]:-}" == active &&
        "${MEMBER_NOT_DELETED[$BRIDGE_ACCOUNT_ID]:-}" == t &&
@@ -4062,8 +4876,8 @@ finish_maintenance() {
     guard_finish_foreign_fence || return 2
     guard_finish_recorded_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" || return 2
     guard_finish_recorded_receipt "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" || return 2
-    guard_finish_recorded_receipt "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" || return 2
-    account_snapshot_matches "$BRIDGE_ACCOUNT_ID" true || {
+    guard_finish_restore_receipt "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" || return 2
+    restored_primary_snapshot_matches || {
       retryable_maintenance_evidence_failure "finish_maintenance" \
         "restored_final_snapshot_temporarily_unverifiable" || true
       return 2
@@ -4082,7 +4896,7 @@ finish_maintenance() {
   if [[ "$M_PHASE" == RESTORED ]]; then
     guard_finish_recorded_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" || return 2
     guard_finish_recorded_receipt "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" || return 2
-    guard_finish_recorded_receipt "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" || return 2
+    guard_finish_restore_receipt "$M_RESTORE_REQUEST_ID" "$M_RESTORE_LOG_ID" || return 2
   fi
   remove_maintenance_marker
 
@@ -4105,6 +4919,161 @@ finish_maintenance() {
   write_state "recovery_pending" 0 "maintenance_finished" "$(now_rfc3339)"
   emit_event "ok" "finish_maintenance" "primary_restored_recovery_confirmation_started" \
     "$(printf '{"required_confirmations":%s}' "$RECOVERY_CONFIRMATIONS")"
+}
+
+# Resolve only the narrow case where a restore was already issued and sticky
+# ambiguity prevented the normal state machine from adopting it. This command
+# never sends a schedulability mutation. It removes the poison sidecar only
+# after two FIFO fences, an unchanged full membership snapshot, unique durable
+# 2xx restore evidence, and live primary convergence all agree.
+resolve_restore_ambiguity() {
+  local action="resolve_restore_ambiguity"
+  discover_group || return 2
+  if [[ ! -e "$MAINTENANCE_FILE" || ! -e "$MAINTENANCE_AMBIGUITY_FILE" ]]; then
+    emit_event "critical" "$action" "restore_ambiguity_artifacts_required" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  fi
+  if ! validate_maintenance_artifact_identity; then
+    reject_maintenance_identity_mismatch "$action"
+    return 2
+  fi
+  guard_maintenance_group_identity "$action" true || return 2
+  [[ "$M_AMBIGUITY_PHASE" =~ ^(RESTORE_INTENT|RESTORE_ACKED|RESTORE_AMBIGUOUS|RESTORED)$ ]] || {
+    emit_event "critical" "$action" "restore_ambiguity_sidecar_phase_invalid" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  case "$M_PHASE" in
+    RESTORE_AMBIGUOUS|RESTORE_ACKED) ;;
+    *)
+      emit_event "critical" "$action" "maintenance_phase_not_resolvable" \
+        "$(printf '{\"phase\":%s,\"account_writes\":0}' "$(json_quote "$M_PHASE")")"
+      return 2
+      ;;
+  esac
+  [[ -n "$M_RESTORE_REQUEST_ID" ]] || {
+    emit_event "critical" "$action" "restore_request_evidence_missing" '{"account_writes":0}'
+    return 2
+  }
+
+  local membership_before membership_after receipt_log_id receipt_check
+  membership_before="$(maintenance_group_membership_snapshot)" || {
+    emit_event "critical" "$action" "membership_snapshot_unverifiable" '{"account_writes":0}'
+    return 2
+  }
+
+  local receipt_rc=0
+  verify_maintenance_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" \
+    "$M_LOG_WATERMARK" || receipt_rc=$?
+  (( receipt_rc == 0 )) || {
+    emit_event "critical" "$action" "pause_receipt_not_uniquely_valid" '{"account_writes":0}'
+    return 2
+  }
+  receipt_rc=0
+  verify_maintenance_receipt "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" \
+    "$M_LOG_WATERMARK" || receipt_rc=$?
+  (( receipt_rc == 0 )) || {
+    emit_event "critical" "$action" "seal_receipt_not_uniquely_valid" '{"account_writes":0}'
+    return 2
+  }
+  receipt_rc=0
+  receipt_log_id="$(unique_successful_restore_receipt "$M_RESTORE_REQUEST_ID" \
+    "$M_LOG_WATERMARK")" || receipt_rc=$?
+  (( receipt_rc == 0 )) || {
+    emit_event "critical" "$action" "restore_receipt_not_unique_2xx" '{"account_writes":0}'
+    return 2
+  }
+  if [[ -n "$M_RESTORE_LOG_ID" && "$M_RESTORE_LOG_ID" != "$receipt_log_id" ]]; then
+    emit_event "critical" "$action" "restore_receipt_log_id_conflict" '{"account_writes":0}'
+    return 2
+  fi
+
+  local fence_rc=0 primary_rc=0
+  verify_no_foreign_mutations "$receipt_log_id" || fence_rc=$?
+  (( fence_rc == 0 )) || {
+    emit_event "critical" "$action" "restore_ambiguity_foreign_fence_not_clean" \
+      "$(printf '{\"fence_result\":%s,\"account_writes\":0}' \
+        "$(json_quote "$MAINTENANCE_FOREIGN_FENCE_RESULT")")"
+    return 2
+  }
+  classify_primary_api_state true || primary_rc=$?
+  (( primary_rc == 0 )) || {
+    emit_event "critical" "$action" "restored_primary_api_state_not_proven" '{"account_writes":0}'
+    return 2
+  }
+  wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" true \
+    "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || {
+    emit_event "critical" "$action" "restored_primary_scheduler_state_not_proven" \
+      '{"account_writes":0}'
+    return 2
+  }
+  guard_maintenance_group_identity "$action" true || return 2
+  membership_after="$(maintenance_group_membership_snapshot)" || return 2
+  if [[ "$membership_after" != "$membership_before" ]]; then
+    emit_event "critical" "$action" "maintenance_group_membership_changed" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  fi
+
+  # Close races created while the first live state proof was running. The
+  # second sentinel orders every earlier admin event before the final snapshot.
+  fence_rc=0
+  verify_no_foreign_mutations "$receipt_log_id" || fence_rc=$?
+  (( fence_rc == 0 )) || {
+    emit_event "critical" "$action" "restore_ambiguity_final_foreign_fence_not_clean" \
+      "$(printf '{\"fence_result\":%s,\"account_writes\":0}' \
+        "$(json_quote "$MAINTENANCE_FOREIGN_FENCE_RESULT")")"
+    return 2
+  }
+  receipt_rc=0
+  receipt_check="$(unique_successful_restore_receipt "$M_RESTORE_REQUEST_ID" \
+    "$M_LOG_WATERMARK")" || receipt_rc=$?
+  [[ "$receipt_rc" == 0 && "$receipt_check" == "$receipt_log_id" ]] || {
+    emit_event "critical" "$action" "restore_receipt_changed_during_resolution" \
+      '{"account_writes":0}'
+    return 2
+  }
+  primary_rc=0
+  classify_primary_api_state true || primary_rc=$?
+  (( primary_rc == 0 )) || {
+    emit_event "critical" "$action" "restored_primary_final_state_not_proven" \
+      '{"account_writes":0}'
+    return 2
+  }
+  wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" true \
+    "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || return 2
+  guard_maintenance_group_identity "$action" true || return 2
+  membership_after="$(maintenance_group_membership_snapshot)" || return 2
+  if [[ "$membership_after" != "$membership_before" ]]; then
+    emit_event "critical" "$action" "maintenance_group_membership_changed_at_commit" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  fi
+
+  local before source_phase
+  source_phase="$M_PHASE"
+  before="$(maintenance_state_line)"
+  M_RESTORE_LOG_ID="$receipt_log_id"
+  M_RESTORE_RESPONSE_CHECKPOINT="explicitly_resolved"
+  M_RESTORE_RESPONSE_UPDATED_AT=""
+  transition_maintenance_marker "$source_phase" RESTORE_ACKED "$before" || {
+    emit_event "critical" "$action" "restore_evidence_transition_failed" \
+      '{"account_writes":0,"retryable":true}'
+    return 2
+  }
+  [[ "$M_PHASE" == RESTORE_ACKED &&
+     "$M_RESTORE_LOG_ID" == "$receipt_log_id" &&
+     "$M_RESTORE_RESPONSE_CHECKPOINT" == explicitly_resolved &&
+     -z "$M_RESTORE_RESPONSE_UPDATED_AT" ]] || return 2
+  remove_maintenance_ambiguity || {
+    emit_event "critical" "$action" "ambiguity_sidecar_remove_failed" \
+      '{"account_writes":0,"retryable":true}'
+    return 2
+  }
+  emit_event "ok" "$action" "restore_ambiguity_resolved_from_evidence" \
+    "$(printf '{\"restore_log_id\":%s,\"phase\":\"RESTORE_ACKED\",\"account_writes\":0}' \
+      "$receipt_log_id")"
 }
 
 status_command() {
@@ -4151,17 +5120,17 @@ status_command() {
 }
 
 usage() {
-  printf 'usage: %s {reconcile|status|prepare-maintenance|finish-maintenance}\n' "$0" >&2
+  printf 'usage: %s {reconcile|status|prepare-maintenance|finish-maintenance|resolve-restore-ambiguity}\n' "$0" >&2
 }
 
 command="${1:-reconcile}"
 case "$command" in
-  reconcile|status|prepare-maintenance|finish-maintenance) ;;
+  reconcile|status|prepare-maintenance|finish-maintenance|resolve-restore-ambiguity) ;;
   *) usage; exit 64 ;;
 esac
 
 case "$command" in
-  prepare-maintenance|finish-maintenance)
+  prepare-maintenance|finish-maintenance|resolve-restore-ambiguity)
     if ! "$FLOCK_BIN" --wait "$LOCK_WAIT_SECONDS" 9; then
       emit_event "critical" "$command" "controller_lock_timeout" \
         "$(printf '{"wait_seconds":%s}' "$LOCK_WAIT_SECONDS")"
@@ -4186,4 +5155,5 @@ case "$command" in
   status) status_command ;;
   prepare-maintenance) prepare_maintenance ;;
   finish-maintenance) finish_maintenance ;;
+  resolve-restore-ambiguity) resolve_restore_ambiguity ;;
 esac

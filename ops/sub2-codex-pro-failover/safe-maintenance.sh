@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  printf 'usage: %s -- command [args...]\n' "$0"
+}
+
 if (( $# == 0 )); then
-  printf 'usage: %s -- command [args...]\n' "$0" >&2
+  usage >&2
   exit 64
 fi
-if [[ "$1" == "--" ]]; then
-  shift
-fi
-if (( $# == 0 )); then
-  printf 'maintenance command is required\n' >&2
-  exit 64
-fi
+case "$1" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --)
+    shift
+    if (( $# == 0 )); then
+      printf 'maintenance command is required\n' >&2
+      usage >&2
+      exit 64
+    fi
+    ;;
+  -*)
+    printf 'unknown option: %s\n' "$1" >&2
+    usage >&2
+    exit 64
+    ;;
+esac
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${FAILOVER_CONTROLLER_BIN:-}" ]]; then

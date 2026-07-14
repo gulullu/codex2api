@@ -161,7 +161,7 @@ State is stored in `state.json`:
 ```
 
 This operational guardian state intentionally remains schema 3; it is distinct
-from the schema-v5 maintenance ownership marker described below.
+from the schema-v7 maintenance ownership marker described below.
 
 Schema versions 1 through 3 are read for rollback compatibility. A missing,
 malformed, timestamp-invalid, or unknown-version state file is treated as lost
@@ -187,10 +187,10 @@ it verifies sub2api runtime logging is `debug` or `info` with sampling disabled,
 records the sub2 container incarnation and sink drop/failure counters, submits a
 high-entropy read-only FIFO sentinel, waits for that sentinel's exact durable
 `http.access` receipt, and uses its log id as the maintenance watermark. It then
-writes the schema-v5 marker. This ordering keeps the controller's own initial
+writes the schema-v7 marker. This ordering keeps the controller's own initial
 standby writes outside the ownership audit window.
 
-The schema-v5 maintenance marker is a write-ahead state machine:
+The schema-v7 maintenance marker is a write-ahead state machine:
 
 ```text
 PREPARING -> EXTERNAL_PAUSED
@@ -201,34 +201,66 @@ pre-ownership failure -> PAUSE_AMBIGUOUS
 restore failure -> RESTORE_AMBIGUOUS
 ```
 
-The marker immutably binds its run id to the configured primary account id and
-the discovered sub2api group id. The ambiguity sidecar carries the same identity
-and run id. Every later prepare, finish, reconcile, or status process validates
-all present artifacts against each other and against its current configuration
-before any account write. A changed config, legacy unbound artifact, malformed
-identity, or marker/sidecar conflict fails closed with an operator-required
-event and zero account writes; it is never adopted as ownership or passed to
-generic fail-open rebuild logic. Primary-account rotation is therefore allowed
-only when no maintenance marker or ambiguity sidecar exists.
+Schema v7 deliberately does not adopt any active schema-v1 through schema-v6
+maintenance marker, and sidecar schema v3 does not adopt schema-v1 or schema-v2.
+Before upgrading the controller, the release gate must prove that both
+`maintenance.json` and `maintenance-ambiguous.json` are absent. If either is
+present, finish or reconcile that lifecycle with the old controller first;
+replacing it in place would fail closed and leave standby protection open.
+
+The marker immutably binds its run id to the configured primary account id, the
+discovered sub2api group id, the sorted complete set of member account IDs, and
+the sorted active/non-deleted backup IDs seen at marker creation. The full member
+set includes inactive/deleted members and prevents a later account DELETE from
+escaping the fence after its membership row is cascade-deleted. A SHA-256 digest
+covers those collections plus the runtime/log watermark baseline. Sidecar schema
+v3 copies both collections and the same digest. When both artifacts exist they
+must match exactly. When only the sidecar survives, the current primary, group,
+full member IDs, and active backup IDs must exactly match its sealed identity
+before even a standby-open write is allowed. Any drift, changed config, legacy
+or malformed artifact, or marker/sidecar conflict fails closed with an
+operator-required event and zero account writes; it is never adopted as
+ownership or passed to generic fail-open rebuild logic. Primary-account rotation
+is therefore allowed only when no maintenance marker or ambiguity sidecar exists.
+
+Once a marker exists, every standby readiness check and every standby
+schedulable write is restricted to the marker's sealed backup IDs intersected
+with the still-active/non-deleted backup inventory. A sealed standby that later
+becomes ineligible is skipped and is never reactivated or changed. Conversely,
+an inactive member that becomes newly eligible was not part of the sealed
+maintenance backup collection: prepare, finish, reconcile, and status all stop
+with an operator-required zero-write event before touching the primary. The
+controller never opens, closes, or adopts that unsealed account merely because
+it is now eligible.
 
 Every primary mutation has a fresh random request id no longer than 64 ASCII
-characters. The controller proves that id is absent before use and writes the
-corresponding `*_INTENT` atomically before submitting the request. A synchronous
-HTTP 200 is structurally validated for account id, schedulable value, active
-status and timezone-aware `updated_at`. The asynchronous logger must then
-produce exactly one durable `http.access` row with the same request id, method,
-path and status 200. Receipt evaluation has four outcomes: exact success;
-bounded absence at the 90-second deadline; a structured definitive conflict
-such as duplicate/non-200 evidence; or a temporarily unverifiable read. A
-read-side database, runtime-control, or receipt-query failure retains the exact
-INTENT byte-for-byte and a later invocation only rechecks that request id; it
-does not replay the primary write. Deadline expiry and definitive conflict are
-sticky because the already-issued write cannot be adopted safely.
+characters. The controller proves that id is absent before use and atomically
+writes the corresponding `*_INTENT` with response checkpoint `pending` before
+submitting the request. After the call returns, a same-phase compare-and-swap
+persists exactly one result: `validated` plus the canonical response `updated_at`,
+`transport_or_non200`, or `invalid`. A synchronous HTTP 200 is validated for
+account id, schedulable value, active status and timezone-aware `updated_at`.
+Only a durably persisted `validated` checkpoint may continue automatically. A
+crash that leaves `pending`, or any transport/non-200/malformed outcome, creates
+the poison sidecar before any receipt lookup on the next invocation; a receipt
+alone can never erase the missing response-body evidence.
 
-The idempotent ownership seal is stricter: immediately after its validated 200
-response, the controller atomically checkpoints that response's `updated_at`
-generation while remaining in `SEAL_INTENT`, then waits for the durable receipt.
-This makes a read-outage restart safe without resending the seal. If the response
+After a validated checkpoint, the asynchronous logger must produce exactly one
+durable `http.access` row with the same request id, method, path and status 200.
+Receipt evaluation has four outcomes: exact success; bounded absence at the
+90-second deadline; a structured definitive conflict such as duplicate/non-200
+evidence; or a temporarily unverifiable read. A read-side database,
+runtime-control, or receipt-query failure retains the exact validated INTENT and
+a later invocation only rechecks that request id; it does not replay the primary
+write. Deadline expiry and definitive conflict are sticky.
+
+The idempotent ownership seal also atomically checkpoints its validated response
+`updated_at` while remaining in `SEAL_INTENT`, before waiting for the durable
+receipt. Pause convergence is bound to the pause response generation before the
+drain, and ordinary restore convergence is bound to the restore response
+generation. The explicit restore-ambiguity resolver records
+`explicitly_resolved` with no fabricated response timestamp after its stronger
+repeated receipt, FIFO-fence, membership and live-state proof. If the response
 generation was not durably checkpointed, a later receipt is insufficient—the
 controller poisons the run rather than guessing the current database timestamp.
 
@@ -249,15 +281,34 @@ sink worker. The controller scans from the bootstrap watermark through that
 sentinel log id. Every mutating `/api/v1/admin/%` request is a foreign conflict
 except:
 
-- this run's exact pause, seal or restore POST to the configured primary
-  `/accounts/<primary>/schedulable`; and
-- this controller's exact standby-open POST to
-  `/accounts/<other-id>/schedulable`, only when the request id is
-  `c2m-<this-run-uuid>-b-<other-id>`, `other-id` is the same canonical positive
-  PostgreSQL bigint in the path, and the target is not the configured primary.
+- a pause, seal, or restore POST to the configured primary only when its exact
+  durable tuple--log id, persisted marker request id, method, primary account
+  path, and HTTP 200 status--matches that operation's receipt recorded in the
+  marker;
+- while explicitly resolving restore ambiguity, the one unique 2xx restore
+  candidate is allowed only as a call-scoped exact tuple containing its candidate
+  log id, marker request id, method, and primary path in both foreign-write
+  fences; it is not persisted or adopted until the final marker compare-and-swap;
+- the exact read-only `POST /api/v1/admin/accounts/today-stats/batch`.
+
+There is deliberately no post-watermark standby-write exemption based on a
+`c2m-<run>-b-<account>` request-id pattern: a request-id-shaped string is not a
+durable ownership receipt. Initial normal standby opens occur before the
+watermark and therefore remain outside the audit window. A marker-time safety
+reopen may preserve service, but any such post-watermark standby write poisons
+ownership and later restoration fails closed because schema v7 has no exact
+standby receipt manifest.
+
+Every account-item `PUT`, `PATCH`, or `DELETE` remains fail-closed. A
+current-state query cannot prove that an account was not added to and removed
+from the group inside the maintenance window, so terminal state is never used
+as a substitute for mutation history.
 
 Bulk import/update, log cleanup, runtime-logging changes, malformed account-id
-paths and future unknown admin mutations therefore fail closed. A completed
+paths, primary/member account changes, group changes, and future unknown admin
+mutations therefore fail closed. Failure to discover the unique active group or
+to read its live membership also fails closed; it can never turn an account
+write into an exemption. A completed
 HTTP 4xx admin request is a confirmed rejection and remains auditable but is not
 classified as a completed mutation; 2xx writes and 5xx/missing-status outcomes
 remain fenced. If that completed foreign event is durably ordered before the
@@ -292,10 +343,14 @@ SUB2_ADMIN_KEY_FILE=/root/.sub2api_admin.key \
 
 state=/var/lib/codex2api-sub2-codex-pro-failover
 test ! -e "$state/maintenance-ambiguous.json"
-jq -e '.schema_version == 5 and .phase == "PREPARING" and
+jq -e '.schema_version == 7 and .phase == "PREPARING" and
   .pause_request_id == null and .pause_log_id == null and
+  .pause_response_checkpoint == "none" and
+  .pause_response_updated_at == null and
   .seal_request_id == null and .seal_log_id == null and
-  .restore_request_id == null and .restore_log_id == null' \
+  .restore_request_id == null and .restore_log_id == null and
+  .restore_response_checkpoint == "none" and
+  .restore_response_updated_at == null' \
   "$state/maintenance.json"
 ```
 
@@ -339,13 +394,45 @@ Any known ambiguous outcome is first recorded in an independently fsynced
 `maintenance-ambiguous.json` poison sidecar and, where the current phase has a
 main-marker ambiguity transition, then reflected in that marker. Even if the
 main-marker replacement fails, later prepare/finish calls refuse to
-recover the intent. Only a structurally valid schema-v5 marker or schema-v2
-sidecar whose run, primary and group identities agree is actionable maintenance
-evidence; reconciliation keeps eligible exclusive standbys open and never
-clears a valid sidecar automatically. A malformed, unknown-version, legacy
-unbound, identity-mismatched, or mutually conflicting artifact causes a
-read-only operator-required abort with zero account writes. Such artifacts are
-never upgraded into ownership or passed through generic lost-state recovery.
+recover the intent. Only a structurally valid schema-v7 marker or schema-v3
+sidecar is actionable maintenance evidence. When both exist, their run, primary,
+group, full member IDs, backup IDs, digest and lifecycle phases must agree. A
+standalone sidecar additionally requires the current full member and active
+backup sets to equal its sealed collections before reconciliation can open a
+standby. Reconciliation never clears a valid sidecar automatically. A malformed,
+unknown-version, legacy, identity-mismatched, drifted, or mutually conflicting
+artifact causes a read-only operator-required abort with zero account writes.
+Such artifacts are never upgraded into ownership or passed through generic
+lost-state recovery.
+
+`RESTORE_AMBIGUOUS` has one explicit evidence-backed recovery path; it is never
+used automatically by `finish-maintenance`:
+
+```bash
+sub2-codex-pro-failover resolve-restore-ambiguity
+sub2-codex-pro-failover finish-maintenance
+```
+
+The resolver issues no account write. It requires the identity-bound marker and
+restore-phase poison sidecar (including a valid reason and timestamp), exact
+unique pause/seal receipts, exactly one durable 2xx receipt
+for the already-issued restore request, a live active and schedulable primary,
+an unchanged full group-member control snapshot, and two clean FIFO foreign
+mutation fences. Primary/member, bulk, group, malformed, or unknown writes still
+block it. The candidate's exact log id is passed only to those two fence calls,
+and uniqueness is proved again around them; it is never pre-adopted into the
+marker. A second row with the same request id, a different log id, a 5xx or
+missing status, or an intervening reverse/ABA write is therefore foreign even
+when the final visible schedulable value looks correct. On success, and only in
+the final marker compare-and-swap, the controller records `RESTORE_ACKED` with
+`restore_response_checkpoint=explicitly_resolved`, leaves the response
+generation empty, and then removes only the ambiguity sidecar. The ordinary
+finish path rechecks health and all evidence before it can clear the maintenance
+marker. Duplicate/non-2xx receipts, an unschedulable primary, group drift, a
+non-restore sidecar phase, or any unverifiable evidence leave both artifacts
+intact. After adoption, ordinary finish continues to
+validate that same unique 2xx restore receipt; pause, seal, and all automatic
+receipt paths remain strict HTTP 200.
 
 An account already paused before this run becomes `EXTERNAL_PAUSED`. The
 controller never adopts or restores it. Finish retains the marker and standby
@@ -353,9 +440,14 @@ protection until an external actor restores the primary; it may then observe
 full scheduler convergence and clear the marker without issuing a primary
 write. For an `OWNED` run, finish restores the primary only after the exact
 receipts, FIFO foreign-write fence, logging/sink/incarnation evidence, scheduler
-state and recorded database tuple still agree. If the only standby became
-inactive or deleted, a healthy owned primary is still restored and that standby
-is never modified; the result is recorded as primary-only recovery.
+state and recorded database tuple still agree. A standby that becomes inactive
+but remains in the same group is never reactivated or modified; a healthy owned
+primary may still be restored as primary-only recovery. Removing or deleting a
+sealed member changes the group identity and now fails closed for operator
+reconciliation, even if account deletion already cascaded its membership row. A
+previously inactive member that becomes an active backup during the sealed run
+is likewise never opened or closed: its absence from the sealed backup
+collection forces the zero-write operator path before primary restoration.
 
 Explicit prepare/finish operations use 90-second scheduler-snapshot and receipt
 budgets. Normal timer reconciliation keeps its 20-second snapshot budget, and
@@ -384,6 +476,15 @@ therefore an irreducible bounded race without an upstream CAS. The two primary
 writes themselves are also not one database/outbox/cache transaction. Crash,
 timeout, malformed-response, logger-loss, runtime-restart and longer concurrent
 admin-write windows fail closed as described above.
+
+Each parallel standby-open child now reloads the live inventory and revalidates
+active, non-deleted, single-group and sealed eligibility immediately before its
+POST. This closes the parent-snapshot-to-child-submit window, but eligibility
+can still change in the final microseconds between that last read and the write.
+Absolute mutual exclusion requires a sub2 service-side compare-and-set or lease
+that binds the POST to the validated eligibility generation; this controller
+hardening does not add that server primitive.
+
 Maintenance commands wait a bounded 30 seconds for the shared controller lock
 and fail non-zero on contention. Timer reconciliation and status commands may
 instead skip harmlessly when another run owns the lock.
@@ -398,6 +499,10 @@ The wrapper performs the same sequence around one command:
 ```bash
 safe-maintenance -- docker compose up -d --no-deps --force-recreate codex2api
 ```
+
+`safe-maintenance -h` and `safe-maintenance --help` are pure help paths. Missing
+commands and unknown wrapper options exit 64 before creating runtime state,
+taking a lifecycle lock, reading primary configuration, or calling prepare.
 
 If the wrapped command or recovery validation fails, the marker and standbys are
 intentionally left in place. This controller never calls a legacy bridge-reset

@@ -386,6 +386,31 @@ for line in open(sys.argv[1],encoding='utf-8'):
 raise SystemExit(1)
 PY
     ;;
+  before-backup-open-submit)
+    id="$1"
+    flip_file="$FAKE_DIR/inactivate_backup_at_submit_$id"
+    if [[ -e "$flip_file" ]]; then
+      exec 8>"$FAKE_DIR/backend-write.lock"
+      flock 8
+      python3 - "$FAKE_DIR/members" "$id" <<'PY'
+import os,sys,tempfile
+path,account_id=sys.argv[1:]
+rows=[]
+for line in open(path,encoding='utf-8'):
+    p=line.rstrip('\n').split('|')
+    if p[0] == account_id:
+        p[2]='inactive'
+        p[3]='f'
+        p[5]='f'
+    rows.append('|'.join(p))
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='members.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    f.write('\n'.join(rows)+'\n')
+os.replace(tmp,path)
+PY
+      rm -f "$flip_file"
+    fi
+    ;;
   set-schedulable|set-schedulable-receipted|set-schedulable-requested)
     receipted=false
     requested=false
@@ -645,7 +670,15 @@ PY
       foreign_path="$(cat "$FAKE_DIR/foreign_before_sentinel_path" 2>/dev/null || printf '/api/v1/admin/accounts/%s/schedulable' "$bridge_id")"
       foreign_request_id="$(cat "$FAKE_DIR/foreign_before_sentinel_request_id" 2>/dev/null || printf 'foreign-before-fence-%s' "$(date +%s%N)")"
       foreign_status="$(cat "$FAKE_DIR/foreign_before_sentinel_status" 2>/dev/null || printf 200)"
-      append_access_log "$foreign_request_id" "$foreign_status" "$foreign_path" POST
+      foreign_method="$(cat "$FAKE_DIR/foreign_before_sentinel_method" 2>/dev/null || printf POST)"
+      if [[ -s "$FAKE_DIR/remove_member_before_foreign_sentinel" ]]; then
+        removed_id="$(<"$FAKE_DIR/remove_member_before_foreign_sentinel")"
+        sed -i "/^${removed_id}|/d" "$FAKE_DIR/members"
+      fi
+      if [[ -s "$FAKE_DIR/add_member_before_foreign_sentinel" ]]; then
+        cat "$FAKE_DIR/add_member_before_foreign_sentinel" >>"$FAKE_DIR/members"
+      fi
+      append_access_log "$foreign_request_id" "$foreign_status" "$foreign_path" "$foreign_method"
     fi
     background_count="$(cat "$FAKE_DIR/background_access_per_sentinel" 2>/dev/null || printf 0)"
     for ((i=0; i<background_count; i++)); do
@@ -715,26 +748,49 @@ PY
     upper_log_id="$2"
     account_id="$3"
     pause_id="${4:-}"
-    seal_id="${5:-}"
-    restore_id="${6:-}"
-    run_id="${7:-}"
-    foreign_count="$(awk -F '|' -v watermark="$watermark" -v upper_log_id="$upper_log_id" -v account_id="$account_id" \
-      -v pause_id="$pause_id" -v seal_id="$seal_id" -v restore_id="$restore_id" -v run_id="$run_id" '
+    pause_log_id="${5:-}"
+    seal_id="${6:-}"
+    seal_log_id="${7:-}"
+    restore_id="${8:-}"
+    restore_log_id="${9:-}"
+    restore_allow_2xx="${10:-false}"
+    foreign_count="$(awk -F '|' -v watermark="$watermark" -v upper_log_id="$upper_log_id" \
+      -v account_id="$account_id" -v pause_id="$pause_id" -v pause_log_id="$pause_log_id" \
+      -v seal_id="$seal_id" -v seal_log_id="$seal_log_id" \
+      -v restore_id="$restore_id" -v restore_log_id="$restore_log_id" \
+      -v restore_allow_2xx="$restore_allow_2xx" '
       function mutating(method) { return method=="POST" || method=="PUT" || method=="PATCH" || method=="DELETE" }
-      function owned(row_request_id,path,method) {
-        prefix="/api/v1/admin/accounts/"; suffix="/schedulable"
-        if (method!="POST" || index(path,prefix)!=1 || substr(path,length(path)-length(suffix)+1)!=suffix) return 0
-        token=substr(path,length(prefix)+1,length(path)-length(prefix)-length(suffix))
-        if (token!~/^[1-9][0-9]*$/ || length(token)>19 ||
-            (length(token)==19 && ("x" token)>("x9223372036854775807"))) return 0
-        if (path=="/api/v1/admin/accounts/" account_id "/schedulable")
-          return row_request_id==pause_id || row_request_id==seal_id || row_request_id==restore_id
-        return row_request_id=="c2m-" run_id "-b-" token
+      function positive_bigint(token) {
+        return token~/^[1-9][0-9]*$/ && length(token)<=19 &&
+          !(length(token)==19 && ("x" token)>("x9223372036854775807"))
+      }
+      function harmless_external(path,method) {
+        return method=="POST" && path=="/api/v1/admin/accounts/today-stats/batch"
+      }
+      function owned(row_log_id,row_request_id,path,method,status) {
+        if (method!="POST" || path!="/api/v1/admin/accounts/" account_id "/schedulable") return 0
+        if (row_log_id==pause_log_id && row_request_id==pause_id && status=="200") return 1
+        if (row_log_id==seal_log_id && row_request_id==seal_id && status=="200") return 1
+        if (row_log_id==restore_log_id && row_request_id==restore_id) {
+          if (restore_allow_2xx=="true") return status~/^2[0-9][0-9]$/
+          return status=="200"
+        }
+        return 0
+      }
+      BEGIN {
+        if (restore_allow_2xx!="true" && restore_allow_2xx!="false") exit 2
+        if ((pause_id=="") != (pause_log_id=="") ||
+            (seal_id=="") != (seal_log_id=="") ||
+            (restore_id=="") != (restore_log_id=="")) exit 2
+        if ((pause_log_id!="" && !positive_bigint(pause_log_id)) ||
+            (seal_log_id!="" && !positive_bigint(seal_log_id)) ||
+            (restore_log_id!="" && !positive_bigint(restore_log_id))) exit 2
+        count=0
       }
       $1>watermark && $1<=upper_log_id && $6=="http.access" && $7=="http request completed" &&
       !($3~/^[0-9][0-9][0-9]$/ && $3>=400 && $3<=499) && mutating($5) &&
       index($4,"/api/v1/admin/")==1 &&
-      !owned($2,$4,$5) {count++}
+      !owned($1,$2,$4,$5,$3) && !harmless_external($4,$5) {count++}
       END {print count+0}' "$FAKE_DIR/access_logs")"
     printf '%s\n' "$foreign_count"
     ;;
@@ -813,13 +869,14 @@ EOF
 	  "$tmp"/meta_error_when_unsched_* "$tmp"/full_account_error_when_unsched_* \
 	  "$tmp"/count_meta_reads_* "$tmp"/meta_read_count_*
   rm -f "$tmp"/started_open_* "$tmp"/wait_for_open_peer_* "$tmp"/saw_open_peer_* \
-    "$tmp/backend-write.lock"
+    "$tmp"/inactivate_backup_at_submit_* "$tmp/backend-write.lock"
   rm -f "$tmp/buckets_fail" "$tmp/bucket_ready_error" "$tmp/health_fail" \
     "$tmp/external_pause_on_list_call" "$tmp/list_members_count" \
     "$tmp/bump_xmin_on_snapshot_call" "$tmp/primary_snapshot_count" \
     "$tmp/inactivate_backup_on_list_call" "$tmp/backup_list_members_count"
   rm -f "$tmp/apply_then_fail" "$tmp/bad_primary_response" \
     "$tmp/block_after_primary_apply" "$tmp/primary_apply_blocked" "$tmp/release_primary_apply" \
+    "$tmp"/response-barrier.* \
     "$tmp/bucket_error_after_primary_pause" "$tmp/bucket_error_after_primary_restore" \
     "$tmp/bump_generation_on_meta_call" "$tmp/meta_call_count" "$tmp/snapshot_not_ready_until" \
     "$tmp/bump_generation_on_full_account_call" \
@@ -830,7 +887,8 @@ EOF
     "$tmp/receipt_status_override" "$tmp/omit_next_receipt_clean" \
     "$tmp/inject_foreign_before_sentinel_once" "$tmp/background_access_per_sentinel" \
     "$tmp/foreign_before_sentinel_path" "$tmp/foreign_before_sentinel_request_id" \
-    "$tmp/foreign_before_sentinel_status"
+    "$tmp/foreign_before_sentinel_status" "$tmp/foreign_before_sentinel_method" \
+    "$tmp/remove_member_before_foreign_sentinel" "$tmp/add_member_before_foreign_sentinel"
   rm -f "$tmp/runtime_logging_count" "$tmp/close_backup_on_runtime_logging_call" \
     "$tmp/close_backup_on_first_drain" "$tmp/discover_group_count" \
     "$tmp/flip_group_on_discover_call" "$tmp/flip_group_on_first_drain" \
@@ -854,6 +912,7 @@ run_controller() {
     FAKE_BRIDGE_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
     FAILOVER_TEST_BACKEND="$backend" \
     FAILOVER_TEST_FAIL_MAINTENANCE_MARKER_WRITE_NUMBER="${TEST_FAIL_MARKER_WRITE_NUMBER:-0}" \
+    MAINTENANCE_TEST_RESPONSE_BARRIER_PREFIX="${TEST_RESPONSE_BARRIER_PREFIX:-}" \
     FAILOVER_STATE_DIR="$tmp/state" \
     FAILOVER_RUNTIME_DIR="$tmp/run" \
     BRIDGE_ACCOUNT_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
@@ -915,6 +974,7 @@ start_controller_background() {
   FAKE_DIR="$tmp" \
     FAKE_BRIDGE_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
     FAILOVER_TEST_BACKEND="$backend" \
+    MAINTENANCE_TEST_RESPONSE_BARRIER_PREFIX="${TEST_RESPONSE_BARRIER_PREFIX:-}" \
     FAILOVER_STATE_DIR="$tmp/state" \
     FAILOVER_RUNTIME_DIR="$tmp/run" \
     BRIDGE_ACCOUNT_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
@@ -1074,6 +1134,27 @@ assert_eq t "$(member_schedulable 7694)" 'later active standby opened after reva
 assert_eq 'set:7694:true' "$(cat "$tmp/events")" 'revalidation skipped stale account and changed only healthy peer'
 grep -Fq 'backup_became_ineligible_before_submit' "$tmp/controller.log"
 assert_no_forbidden_writes
+
+# Each parallel child re-loads live eligibility immediately before its POST.
+# This hook flips 7693 after the parent's batch check but before the child's
+# submit fence; the stale target receives no schedulable write.
+reset_fixture
+cat >>"$tmp/members" <<EOF
+7694|$(encode_name standby-after-submit-flip)|active|f|t|t|1
+EOF
+touch "$tmp/inactivate_backup_at_submit_7693"
+rm -f "$tmp/state/state.json"
+TEST_BACKUP_OPEN_PARALLELISM=1
+run_controller reconcile
+unset TEST_BACKUP_OPEN_PARALLELISM
+assert_eq inactive "$(awk -F '|' '$1==7693 {print $3}' "$tmp/members")" \
+  'submit-time operator transition preserved inactive status'
+assert_eq f "$(member_schedulable 7693)" 'submit-time stale standby was not enabled'
+assert_eq t "$(member_schedulable 7694)" 'submit-time live peer still opened'
+assert_eq 'set:7694:true' "$(cat "$tmp/events")" \
+  'child submit fence allowed only the live eligible peer write'
+grep -Fq 'backup_live_revalidation_failed_at_submit' "$tmp/controller.log"
+assert_no_forbidden_writes
 if grep -Eq 'status_code[[:space:]]*=[[:space:]]*500|status_code[[:space:]]+IN[[:space:]]*\([^)]*500' "$controller"; then
   printf 'FAIL: ordinary upstream 500 entered the terminal failover stream\n' >&2
   exit 1
@@ -1097,6 +1178,37 @@ if grep -Fq 'X-Api-Key: $key"' "$controller"; then
 fi
 grep -Fq 'trap cleanup_current_sensitive_files EXIT' "$controller"
 grep -Fq 'cleanup_stale_sensitive_files' "$controller"
+
+# Help and argument errors are pure parser paths. They must return before the
+# wrapper creates a runtime directory, takes a lock, reads primary config, or
+# invokes prepare-maintenance.
+for help_option in -h --help; do
+  help_runtime="$tmp/wrapper-parse-${help_option#-}"
+  rm -rf "$help_runtime"
+  FAILOVER_CONTROLLER_BIN="$tmp/controller-must-not-run" \
+  FAILOVER_RUNTIME_DIR="$help_runtime" \
+  FAILOVER_CONFIG_FILE="$tmp/config-must-not-be-read" \
+    bash "$wrapper" "$help_option" >"$tmp/wrapper-help.log" 2>&1
+  grep -Fq 'usage:' "$tmp/wrapper-help.log"
+  test ! -e "$help_runtime"
+done
+
+set +e
+FAILOVER_CONTROLLER_BIN="$tmp/controller-must-not-run" \
+FAILOVER_RUNTIME_DIR="$tmp/wrapper-parse-empty" \
+FAILOVER_CONFIG_FILE="$tmp/config-must-not-be-read" \
+  bash "$wrapper" >"$tmp/wrapper-empty.log" 2>&1
+wrapper_empty_rc=$?
+FAILOVER_CONTROLLER_BIN="$tmp/controller-must-not-run" \
+FAILOVER_RUNTIME_DIR="$tmp/wrapper-parse-unknown" \
+FAILOVER_CONFIG_FILE="$tmp/config-must-not-be-read" \
+  bash "$wrapper" --unknown-maintenance-option >"$tmp/wrapper-unknown.log" 2>&1
+wrapper_unknown_rc=$?
+set -e
+assert_eq 64 "$wrapper_empty_rc" 'wrapper rejected an absent maintenance command'
+assert_eq 64 "$wrapper_unknown_rc" 'wrapper rejected an unknown option before prepare'
+test ! -e "$tmp/wrapper-parse-empty"
+test ! -e "$tmp/wrapper-parse-unknown"
 
 # safe-maintenance owns an independent lifecycle lock across prepare, the
 # wrapped rebuild, and finish. A second manual deployment must be rejected.
@@ -1313,8 +1425,12 @@ run_controller reconcile
 touch "$tmp/outbox_pending_7693" "$tmp/stale_bucket_contains_7693"
 touch "$tmp/count_meta_reads_7693"
 TEST_SNAPSHOT_CONFIRMATIONS=2
+# Two one-second polling intervals can straddle a SECONDS boundary; give the
+# deterministic two-confirmation test enough wall-clock budget without changing
+# the controller's production defaults.
+TEST_SNAPSHOT_TIMEOUT_SECONDS=4
 run_controller reconcile
-unset TEST_SNAPSHOT_CONFIRMATIONS
+unset TEST_SNAPSHOT_CONFIRMATIONS TEST_SNAPSHOT_TIMEOUT_SECONDS
 assert_eq f "$(member_schedulable 7693)" 'cleanup lag did not reopen a logically paused standby'
 assert_eq 'set:7693:false' "$(cat "$tmp/events")" 'cleanup lag produced one close and no reopen'
 if (( $(<"$tmp/meta_read_count_7693") < 2 )); then
@@ -1787,7 +1903,15 @@ grep -Fq 'readonly MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS="${MAINTENANCE_SNAPSHOT_
 grep -Fq 'readonly MAINTENANCE_RECEIPT_TIMEOUT_SECONDS="${MAINTENANCE_RECEIPT_TIMEOUT_SECONDS:-90}"' "$controller"
 grep -Fq 'readonly MAINTENANCE_DRAIN_SETTLE_SECONDS="${MAINTENANCE_DRAIN_SETTLE_SECONDS:-10}"' "$controller"
 grep -Fq "extra->>'path' LIKE '/api/v1/admin/%'" "$controller"
-grep -Fq "COALESCE(request_id IN (" "$controller"
+foreign_contract="$(awk '/^foreign_account_mutation_count\(\)/,/^}/' "$controller")"
+grep -Fq 'id=${M_PAUSE_LOG_ID}' <<<"$foreign_contract"
+grep -Fq 'id=${M_SEAL_LOG_ID}' <<<"$foreign_contract"
+grep -Fq 'local provisional_restore_log_id="${3:-}"' <<<"$foreign_contract"
+if grep -Fq 'request_id IN' <<<"$foreign_contract" ||
+   grep -Fq 'c2m-' <<<"$foreign_contract"; then
+  printf 'FAIL: foreign mutation fence still has a request-id-pattern exemption\n' >&2
+  exit 1
+fi
 grep -Fq 'MAINTENANCE_AMBIGUITY_FILE' "$controller"
 grep -Fq '[[ "$desired" == true && "$account_id" != "$BRIDGE_ACCOUNT_ID"' "$controller"
 grep -Fq 'readonly FAILOVER_CONFIG_FILE="${FAILOVER_CONFIG_FILE:-/etc/default/codex2api-sub2-codex-pro-failover}"' "$controller"
@@ -1993,6 +2117,25 @@ done
 unset TEST_BRIDGE_ACCOUNT_ID
 assert_eq f "$(member_schedulable 7694)" 'PREPARING config mismatch did not guess a third standby'
 
+# The marker boundary seals backup authorization before the primary write. An
+# inactive member becoming eligible after PREPARING is never opened or adopted.
+reset_fixture
+TEST_FAIL_MARKER_WRITE_NUMBER=2
+expect_controller_failure prepare-maintenance
+unset TEST_FAIL_MARKER_WRITE_NUMBER
+assert_eq PREPARING "$(marker_phase)" 'failed pause-intent CAS retained preparing marker'
+assert_eq t "$(member_schedulable 7692)" 'pause-intent CAS failure left primary schedulable'
+sed -i 's/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' "$tmp/members"
+sealed_events_before="$(wc -l <"$tmp/events")"
+for sealed_command in prepare-maintenance finish-maintenance reconcile status; do
+  expect_controller_failure "$sealed_command"
+  assert_eq "$sealed_events_before" "$(wc -l <"$tmp/events")" \
+    "newly eligible unsealed backup $sealed_command made zero account writes"
+done
+assert_eq t "$(member_schedulable 7692)" 'unsealed backup drift never paused primary'
+assert_eq f "$(member_schedulable 7845)" 'unsealed backup drift never opened new backup'
+grep -Fq 'unsealed_backup_became_eligible' "$tmp/controller.log"
+
 # Transient group, inventory, primary-API, and foreign-log reads inside the
 # drain loop reset the zero-sample streak but recover within the drain budget.
 reset_fixture
@@ -2013,6 +2156,12 @@ reset_fixture
 touch "$tmp/fail_next_receipt_record"
 expect_controller_failure prepare-maintenance
 assert_eq PAUSE_INTENT "$(marker_phase)" 'pause receipt read outage kept pause intent'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['pause_response_checkpoint'] == 'validated'
+assert p['pause_response_updated_at']
+PY
 test ! -e "$tmp/state/maintenance-ambiguous.json"
 assert_eq 1 "$(event_count '^set:7692:false$')" 'pause receipt outage issued one pause only'
 run_controller prepare-maintenance
@@ -2031,9 +2180,15 @@ p=json.load(open(sys.argv[1],encoding='utf-8'))
 assert p['seal_response_updated_at']
 PY
 assert_eq 2 "$(event_count '^set:7692:false$')" 'seal receipt outage issued pause plus one seal'
+assert_eq 1 "$(awk -F '|' '$2 ~ /-seal$/ && $3=="200" && \
+  $4=="/api/v1/admin/accounts/7692/schedulable" && $5=="POST" {n++} \
+  END {print n+0}' "$tmp/access_logs")" 'seal receipt outage logged exactly one seal write'
 run_controller prepare-maintenance
 assert_eq OWNED "$(marker_phase)" 'seal intent retry adopted exact receipt and reached owned'
 assert_eq 2 "$(event_count '^set:7692:false$')" 'seal intent retry did not replay seal'
+assert_eq 1 "$(awk -F '|' '$2 ~ /-seal$/ && $3=="200" && \
+  $4=="/api/v1/admin/accounts/7692/schedulable" && $5=="POST" {n++} \
+  END {print n+0}' "$tmp/access_logs")" 'seal intent retry retained exactly one seal write'
 run_controller finish-maintenance
 
 reset_fixture
@@ -2139,11 +2294,24 @@ assert_eq t "$(member_schedulable 7693)" 'maintenance opened dynamic standby fir
 assert_eq f "$(member_schedulable 7692)" 'maintenance paused primary'
 assert_eq 2 "$(event_count '^set:7692:false$')" 'prepare issued exactly pause plus seal'
 python3 - "$tmp/state/maintenance.json" <<'PY'
-import json,re,sys
+import hashlib,json,re,sys
 p=json.load(open(sys.argv[1],encoding='utf-8'))
-assert p['schema_version'] == 5
+assert p['schema_version'] == 7
 assert p['primary_account_id'] == 7692
 assert p['group_id'] == 12
+assert p['group_member_ids'] == [7692,7693,7845,7850]
+assert p['backup_account_ids'] == [7693]
+identity={key:p[key] for key in (
+  'schema_version','run_id','primary_account_id','group_id','group_member_ids',
+  'backup_account_ids','log_watermark','sub2_incarnation','sink_dropped_base',
+  'sink_failed_base','sink_written_base',
+)}
+canonical=json.dumps(identity,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
+assert p['identity_digest'] == hashlib.sha256(canonical).hexdigest()
+assert p['pause_response_checkpoint'] == 'validated'
+assert p['pause_response_updated_at']
+assert p['restore_response_checkpoint'] == 'none'
+assert p['restore_response_updated_at'] is None
 assert p['phase'] == 'OWNED'
 assert p['primary_disabled_by_maintenance'] is True
 for kind in ('pause','seal'):
@@ -2186,6 +2354,29 @@ assert_eq f "$(member_schedulable 7692)" 'OWNED mismatch did not restore old pri
 assert_eq t "$(member_schedulable 7693)" 'OWNED mismatch did not pause newly configured primary'
 assert_eq t "$(member_schedulable 7694)" 'third standby was opened by original maintenance preparation only'
 
+# The sealed full membership is part of marker identity, not advisory metadata.
+# A syntactically valid but changed set cannot be adopted by a later process.
+reset_fixture
+run_controller prepare-maintenance
+identity_events_before="$(wc -l <"$tmp/events")"
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,os,sys,tempfile
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['group_member_ids']=[7692,7693,7845]
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='maintenance-tamper.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(p,f,sort_keys=True)
+    f.write('\n')
+os.replace(tmp,path)
+PY
+expect_controller_failure status
+assert_eq "$identity_events_before" "$(wc -l <"$tmp/events")" \
+  'changed sealed member identity made zero account writes'
+expect_controller_failure finish-maintenance
+assert_eq "$identity_events_before" "$(wc -l <"$tmp/events")" \
+  'changed sealed member identity could not restore primary'
+
 # Transient group discovery or membership reads never poison an otherwise valid
 # OWNED artifact. status is strictly read-only and finish can be retried.
 reset_fixture
@@ -2206,18 +2397,52 @@ assert_eq "$owned_hash" "$(sha256sum "$tmp/state/maintenance.json" | awk '{print
 test ! -e "$tmp/state/maintenance-ambiguous.json"
 assert_eq "$owned_events" "$(wc -l <"$tmp/events")" 'transient status read made zero account writes'
 run_controller finish-maintenance
-
-# A timer process loads the valid marker before reopening a drifted standby, so
-# its post-watermark write carries the same run-scoped backup id and cannot make
-# finish accuse the controller of a foreign mutation.
+# A timer may reopen a sealed standby to preserve service after marker creation,
+# but that post-watermark write has no receipt manifest in the marker. It is
+# therefore never guessed as controller-owned and later ownership fails closed.
 reset_fixture
 run_controller prepare-maintenance
 sed -i 's/7693|\([^|]*\)|active|t|t|t/7693|\1|active|f|t|t/' "$tmp/members"
 run_controller reconcile
 assert_eq t "$(member_schedulable 7693)" 'timer reopened maintenance standby'
 grep -Eq 'c2m-[a-f0-9-]{36}-b-7693' "$tmp/access_logs"
-run_controller finish-maintenance
-assert_eq t "$(member_schedulable 7692)" 'finish accepted its own timer backup reopen'
+expect_controller_failure finish-maintenance
+assert_eq f "$(member_schedulable 7692)" 'post-watermark backup reopen did not authorize restore'
+test -s "$tmp/state/maintenance-ambiguous.json"
+grep -Fq 'foreign_admin_mutation_confirmed_after_ownership' "$tmp/controller.log"
+
+# A marker-present controller may use only its sealed backup collection. A
+# formerly inactive member becoming eligible blocks every entry point before
+# either the primary or any backup is written.
+reset_fixture
+run_controller prepare-maintenance
+sed -i 's/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' "$tmp/members"
+sealed_events_before="$(wc -l <"$tmp/events")"
+for sealed_command in prepare-maintenance finish-maintenance reconcile status; do
+  expect_controller_failure "$sealed_command"
+  assert_eq "$sealed_events_before" "$(wc -l <"$tmp/events")" \
+    "owned unsealed backup $sealed_command made zero account writes"
+done
+assert_eq f "$(member_schedulable 7692)" 'owned primary remained paused on unsealed drift'
+assert_eq t "$(member_schedulable 7693)" 'sealed backup remained untouched on unsealed drift'
+assert_eq f "$(member_schedulable 7845)" 'new unsealed backup was never opened'
+grep -Fq 'unsealed_backup_became_eligible' "$tmp/controller.log"
+
+# An externally opened, newly eligible member is not adopted and is not closed.
+# The external write is outside the captured authorization collection.
+reset_fixture
+run_controller prepare-maintenance
+sed -i 's/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' "$tmp/members"
+FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 \
+  "$backend" set-schedulable-receipted 7845 true external-new-eligible >/dev/null
+sealed_events_before="$(wc -l <"$tmp/events")"
+for sealed_command in prepare-maintenance finish-maintenance reconcile status; do
+  expect_controller_failure "$sealed_command"
+  assert_eq "$sealed_events_before" "$(wc -l <"$tmp/events")" \
+    "externally opened unsealed backup $sealed_command made zero controller writes"
+done
+assert_eq f "$(member_schedulable 7692)" 'external unsealed backup never authorized restore'
+assert_eq t "$(member_schedulable 7845)" 'controller did not close external unsealed backup'
 
 # A primary that was already paused is never adopted or actively restored. The
 # marker and standby remain until an external actor restores it.
@@ -2257,14 +2482,22 @@ assert_eq f "$(member_schedulable 7692)" 'external mismatch did not restore old 
 assert_eq t "$(member_schedulable 7693)" 'external mismatch did not pause newly configured primary'
 assert_eq t "$(member_schedulable 7694)" 'third standby was opened by original external preparation only'
 
-# A transport timeout after a committed pause is recovered only by its exact
-# durable 200 access receipt; the request is never replayed.
+# A transport/non-200 pause result is never auto-adopted from its receipt. The
+# durable checkpoint and sidecar keep the applied outcome sticky without replay.
 reset_fixture
 printf '1\n' >"$tmp/apply_then_fail_on_receipted_call"
-run_controller prepare-maintenance
-assert_eq OWNED "$(marker_phase)" 'pause timeout with exact receipt reached owned'
-assert_eq 2 "$(event_count '^set:7692:false$')" 'pause timeout was not replayed'
-run_controller finish-maintenance
+expect_controller_failure prepare-maintenance
+assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" 'pause transport result became sticky ambiguity'
+test -s "$tmp/state/maintenance-ambiguous.json"
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['pause_response_checkpoint'] == 'transport_or_non200'
+assert p['pause_response_updated_at'] is None
+PY
+assert_eq 1 "$(event_count '^set:7692:false$')" 'pause transport result was submitted once'
+expect_controller_failure prepare-maintenance
+assert_eq 1 "$(event_count '^set:7692:false$')" 'pause transport ambiguity was not replayed'
 
 # Missing, dropped, failed, duplicate, or non-200 receipts fail closed and leave
 # the standby open. No case can become OWNED.
@@ -2297,11 +2530,38 @@ for bad_response in invalid-json wrong-id wrong-desired missing-generation; do
   test -s "$tmp/state/maintenance-ambiguous.json"
   assert_eq 1 "$(<"$tmp/receipted_call_count")" "bad response $bad_response stopped before seal"
 done
+# A crash after a valid HTTP body was parsed but before the durable checkpoint
+# leaves PAUSE_INTENT=pending. A later process poisons first and never adopts the
+# receipt or replays the request.
+reset_fixture
+TEST_RESPONSE_BARRIER_PREFIX="$tmp/response-barrier"
+start_controller_background prepare-maintenance
+wait_for_marker "$tmp/response-barrier.pause.reached" "$CONTROLLER_PID" 8
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['phase'] == 'PAUSE_INTENT'
+assert p['pause_response_checkpoint'] == 'pending'
+assert p['pause_response_updated_at'] is None
+PY
+kill -KILL "$CONTROLLER_PID" 2>/dev/null || true
+set +e
+wait "$CONTROLLER_PID" 2>/dev/null
+set -e
+unset TEST_RESPONSE_BARRIER_PREFIX
+pause_calls_before="$(event_count '^set:7692:false$')"
+expect_controller_failure prepare-maintenance
+assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" \
+  'pause response/checkpoint crash gap became sticky ambiguity'
+assert_eq "$pause_calls_before" "$(event_count '^set:7692:false$')" \
+  'pause response/checkpoint crash gap did not replay request'
+test -s "$tmp/state/maintenance-ambiguous.json"
+
 
 # If the PAUSE_ACKED marker fsync/readback fails after the API receipt, the
 # durable PAUSE_INTENT is resumed by the same request id with no duplicate call.
 reset_fixture
-TEST_FAIL_MARKER_WRITE_NUMBER=3
+TEST_FAIL_MARKER_WRITE_NUMBER=4
 expect_controller_failure prepare-maintenance
 unset TEST_FAIL_MARKER_WRITE_NUMBER
 assert_eq PAUSE_INTENT "$(marker_phase)" 'failed ACK persistence retained pause intent'
@@ -2315,7 +2575,7 @@ run_controller finish-maintenance
 # sidecar prevents a later process from recovering the still-INTENT marker.
 reset_fixture
 printf 'invalid-json\n' >"$tmp/bad_primary_response"
-TEST_FAIL_MARKER_WRITE_NUMBER=3
+TEST_FAIL_MARKER_WRITE_NUMBER=4
 expect_controller_failure prepare-maintenance
 unset TEST_FAIL_MARKER_WRITE_NUMBER
 assert_eq PAUSE_INTENT "$(marker_phase)" 'main marker stayed intent after injected ambiguity write failure'
@@ -2352,9 +2612,87 @@ run_controller prepare-maintenance
 assert_eq OWNED "$(marker_phase)" 'pre-pause foreign read retry reached OWNED'
 run_controller finish-maintenance
 
+# The known today-stats POST is read-only despite its method.
+reset_fixture
+touch "$tmp/inject_foreign_before_sentinel_once"
+printf 'POST\n' >"$tmp/foreign_before_sentinel_method"
+printf '/api/v1/admin/accounts/today-stats/batch\n' >"$tmp/foreign_before_sentinel_path"
+printf 'harmless-before-fence\n' >"$tmp/foreign_before_sentinel_request_id"
+run_controller prepare-maintenance
+assert_eq OWNED "$(marker_phase)" 'read-only today-stats did not poison ownership'
+test ! -e "$tmp/state/maintenance-ambiguous.json"
+run_controller finish-maintenance
+
+# Account deletion can cascade account_groups before the access receipt is
+# queried.  The marker's sealed full member set still fences that former member
+# even though it has disappeared from the current inventory.
+reset_fixture
+touch "$tmp/inject_foreign_before_sentinel_once"
+printf 'DELETE\n' >"$tmp/foreign_before_sentinel_method"
+printf '/api/v1/admin/accounts/7693\n' >"$tmp/foreign_before_sentinel_path"
+printf '7693\n' >"$tmp/remove_member_before_foreign_sentinel"
+printf 'former-member-delete\n' >"$tmp/foreign_before_sentinel_request_id"
+expect_controller_failure prepare-maintenance
+assert_eq PREPARING "$(marker_phase)" 'cascaded former-member delete remained fenced'
+assert_eq 0 "$(event_count '^set:7692:false$')" \
+  'cascaded former-member delete caused no primary write'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['schema_version'] == 7
+assert p['group_member_ids'] == [7692,7693,7845,7850]
+assert p['backup_account_ids'] == [7693]
+assert len(p['identity_digest']) == 64
+PY
+
+# Conversely, a newly added live member is protected by the current inventory
+# even though it was not present in the immutable marker set.
+reset_fixture
+touch "$tmp/inject_foreign_before_sentinel_once"
+printf 'PUT\n' >"$tmp/foreign_before_sentinel_method"
+printf '/api/v1/admin/accounts/9004\n' >"$tmp/foreign_before_sentinel_path"
+printf 'new-member-update\n' >"$tmp/foreign_before_sentinel_request_id"
+printf '9004|%s|active|f|t|t|1\n' "$(encode_name newly-added)" \
+  >"$tmp/add_member_before_foreign_sentinel"
+expect_controller_failure prepare-maintenance
+assert_eq PREPARING "$(marker_phase)" 'new live member update remained fenced'
+assert_eq 0 "$(event_count '^set:7692:false$')" \
+  'new live member update caused no primary write'
+
+# Every account-item mutation is fail-closed, including an apparently unrelated
+# dynamic id: endpoint access logs cannot prove that the account was not added
+# and removed again inside the same fence window. Bulk and group writes are
+# equally protected. Each is stopped before the primary pause.
+while IFS='|' read -r protected_method protected_path; do
+  reset_fixture
+  touch "$tmp/inject_foreign_before_sentinel_once"
+  printf '%s\n' "$protected_method" >"$tmp/foreign_before_sentinel_method"
+  printf '%s\n' "$protected_path" >"$tmp/foreign_before_sentinel_path"
+  printf 'protected-before-fence\n' >"$tmp/foreign_before_sentinel_request_id"
+  expect_controller_failure prepare-maintenance
+  assert_eq PREPARING "$(marker_phase)" \
+    "protected $protected_method $protected_path remained fenced"
+  assert_eq 0 "$(event_count '^set:7692:false$')" \
+    "protected $protected_method $protected_path caused no primary write"
+  assert_eq t "$(member_schedulable 7692)" \
+    "protected $protected_method $protected_path left primary schedulable"
+  assert_eq t "$(member_schedulable 7693)" \
+    "protected $protected_method $protected_path kept standby protection"
+  test ! -e "$tmp/state/maintenance-ambiguous.json"
+done <<'EOF'
+PUT|/api/v1/admin/accounts/7692
+DELETE|/api/v1/admin/accounts/7693
+PUT|/api/v1/admin/accounts/9001
+PATCH|/api/v1/admin/accounts/9002
+DELETE|/api/v1/admin/accounts/9003
+POST|/api/v1/admin/accounts/bulk-update
+PUT|/api/v1/admin/groups/12
+POST|/api/v1/admin/groups/12/accounts/9004
+EOF
+
 # The sentinel catches any prior admin mutation, including log cleanup and an
 # unknown future endpoint. Even a canonical non-primary schedulable POST is
-# foreign unless its request id exactly matches this run and path account.
+# foreign after the watermark; a c2m-shaped request id is never ownership proof.
 for foreign_path in \
   '/api/v1/admin/accounts/7692/schedulable' \
   '/api/v1/admin/accounts/07692/schedulable' \
@@ -2449,6 +2787,62 @@ printf '/api/v1/admin/accounts/bulk-update\n' >"$tmp/foreign_before_sentinel_pat
 expect_controller_failure finish-maintenance
 assert_eq 0 "$(event_count '^set:7692:true$')" 'owned id reuse on bulk did not restore primary'
 test -e "$tmp/state/maintenance.json"
+# Exact request ids are insufficient authority. A second primary receipt with
+# the same request id but a different log id (successful or 5xx) is foreign.
+for replay_status in 200 500; do
+  reset_fixture
+  run_controller prepare-maintenance
+  python3 - "$tmp/state/maintenance.json" "$tmp/foreign_before_sentinel_request_id" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+open(sys.argv[2],'w',encoding='utf-8').write(p['pause_request_id']+'\n')
+PY
+  touch "$tmp/inject_foreign_before_sentinel_once"
+  printf '/api/v1/admin/accounts/7692/schedulable\n' >"$tmp/foreign_before_sentinel_path"
+  printf '%s\n' "$replay_status" >"$tmp/foreign_before_sentinel_status"
+  expect_controller_failure finish-maintenance
+  assert_eq 0 "$(event_count '^set:7692:true$')" \
+    "primary request-id replay ${replay_status} did not restore primary"
+  grep -Fq 'foreign_admin_mutation_confirmed_after_ownership' "$tmp/controller.log"
+done
+
+# Post-watermark backup writes are never inferred as controller-owned from a
+# c2m request-id pattern. This applies to both sealed and unsealed account ids.
+for replay_backup_id in 7693 7845; do
+  reset_fixture
+  run_controller prepare-maintenance
+  python3 - "$tmp/state/maintenance.json" "$tmp/foreign_before_sentinel_request_id" \
+    "$replay_backup_id" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+open(sys.argv[2],'w',encoding='utf-8').write(
+    f'c2m-{p["run_id"]}-b-{sys.argv[3]}\n')
+PY
+  touch "$tmp/inject_foreign_before_sentinel_once"
+  printf '/api/v1/admin/accounts/%s/schedulable\n' "$replay_backup_id" \
+    >"$tmp/foreign_before_sentinel_path"
+  expect_controller_failure finish-maintenance
+  assert_eq 0 "$(event_count '^set:7692:true$')" \
+    "backup c2m replay ${replay_backup_id} did not restore primary"
+  grep -Fq 'foreign_admin_mutation_confirmed_after_ownership' "$tmp/controller.log"
+done
+
+# A true->false external ABA leaves the visible primary state unchanged but
+# changes its database generation and remains a definitive ownership conflict.
+reset_fixture
+run_controller prepare-maintenance
+touch "$tmp/allow_external_primary_write"
+FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 FAILOVER_STATE_DIR="$tmp/state" \
+  "$backend" set-schedulable-receipted 7692 true external-aba-open >/dev/null
+FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 FAILOVER_STATE_DIR="$tmp/state" \
+  "$backend" set-schedulable-receipted 7692 false external-aba-close >/dev/null
+aba_true_writes_before="$(event_count '^set:7692:true$')"
+expect_controller_failure finish-maintenance
+assert_eq "$aba_true_writes_before" "$(event_count '^set:7692:true$')" \
+  'external ABA did not trigger a controller restore'
+assert_eq f "$(member_schedulable 7692)" 'external ABA ended at the original visible state'
+test -s "$tmp/state/maintenance-ambiguous.json"
+
 
 # Sink loss/failure, sub2 process reincarnation, and a changed DB/full-cache
 # control tuple invalidate ownership before any restore request.
@@ -2512,9 +2906,9 @@ grep -Fq 'owned_primary_tuple_definitive_conflict' "$tmp/controller.log"
 # If the first scheduler confirmation changes the authoritative DB tuple after
 # it was fenced, the post-mismatch DB re-read makes the ambiguity sticky.
 reset_fixture
-printf '1\n' >"$tmp/bump_generation_on_full_account_call"
+printf '2\n' >"$tmp/bump_generation_on_full_account_call"
 expect_controller_failure prepare-maintenance
-assert_eq '1|SEAL_ACKED' "$(<"$tmp/full_account_injection_phase")" \
+assert_eq '2|SEAL_ACKED' "$(<"$tmp/full_account_injection_phase")" \
   'first scheduler confirmation injected during seal acknowledged'
 assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" \
   'first scheduler confirmation DB tuple change became ambiguous'
@@ -2527,9 +2921,9 @@ assert_eq "$primary_posts_before" "$(event_count '^set:7692:false$')" \
 # The same fence applies to a DB tuple change injected only during the second
 # scheduler confirmation, after the first confirmation had succeeded.
 reset_fixture
-printf '2\n' >"$tmp/bump_generation_on_full_account_call"
+printf '3\n' >"$tmp/bump_generation_on_full_account_call"
 expect_controller_failure prepare-maintenance
-assert_eq '2|SEAL_ACKED' "$(<"$tmp/full_account_injection_phase")" \
+assert_eq '3|SEAL_ACKED' "$(<"$tmp/full_account_injection_phase")" \
   'second scheduler confirmation injected during seal acknowledged'
 assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" \
   'second scheduler confirmation DB tuple change became ambiguous'
@@ -2543,9 +2937,9 @@ assert_eq "$primary_posts_before" "$(event_count '^set:7692:false$')" \
 # propagation uncertainty, not proof of a competing database write. It remains
 # retryable at SEAL_ACKED and can complete after the projection converges.
 reset_fixture
-printf '1\n' >"$tmp/bump_cache_generation_on_full_account_call"
+printf '2\n' >"$tmp/bump_cache_generation_on_full_account_call"
 expect_controller_failure prepare-maintenance
-assert_eq '1|SEAL_ACKED' "$(<"$tmp/full_account_injection_phase")" \
+assert_eq '2|SEAL_ACKED' "$(<"$tmp/full_account_injection_phase")" \
   'cache-only mismatch injected during seal acknowledged'
 assert_eq SEAL_ACKED "$(marker_phase)" 'cache-only generation mismatch kept seal acknowledged'
 test ! -e "$tmp/state/maintenance-ambiguous.json"
@@ -2555,13 +2949,31 @@ run_controller prepare-maintenance
 assert_eq OWNED "$(marker_phase)" 'cache projection convergence reached owned on retry'
 run_controller finish-maintenance
 
-# Restore transport failure is recoverable only from its exact durable receipt
-# plus observed healthy/schedulable state; the restore request is not replayed.
+# Restore transport/non-200 evidence is sticky for ordinary finish. The explicit
+# resolver may adopt the unique applied 2xx receipt only after repeated live proof.
 reset_fixture
 run_controller prepare-maintenance
 printf '3\n' >"$tmp/apply_then_fail_on_receipted_call"
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" 'restore transport result became sticky ambiguity'
+test -s "$tmp/state/maintenance-ambiguous.json"
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['restore_response_checkpoint'] == 'transport_or_non200'
+assert p['restore_response_updated_at'] is None
+PY
+assert_eq 1 "$(event_count '^set:7692:true$')" 'restore transport result used one committed request'
+run_controller resolve-restore-ambiguity
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['phase'] == 'RESTORE_ACKED'
+assert p['restore_response_checkpoint'] == 'explicitly_resolved'
+assert p['restore_response_updated_at'] is None
+PY
 run_controller finish-maintenance
-assert_eq 1 "$(event_count '^set:7692:true$')" 'restore timeout used one committed request'
+assert_eq 1 "$(event_count '^set:7692:true$')" 'explicit transport resolution made no extra restore write'
 test ! -e "$tmp/state/maintenance.json"
 
 reset_fixture
@@ -2569,11 +2981,146 @@ run_controller prepare-maintenance
 touch "$tmp/fail_next_restore_receipt_record"
 expect_controller_failure finish-maintenance
 assert_eq RESTORE_INTENT "$(marker_phase)" 'restore receipt read outage kept restore intent'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['restore_response_checkpoint'] == 'validated'
+assert p['restore_response_updated_at']
+PY
 test ! -e "$tmp/state/maintenance-ambiguous.json"
 assert_eq 1 "$(event_count '^set:7692:true$')" 'restore receipt outage issued one restore only'
 run_controller finish-maintenance
 assert_eq 1 "$(event_count '^set:7692:true$')" 'restore intent retry did not replay restore'
 test ! -e "$tmp/state/maintenance.json"
+
+# A crash after a valid restore body was parsed but before checkpoint fsync
+# leaves pending intent. Ordinary finish poisons it without replay; only the
+# explicit resolver may adopt the unique receipt after its repeated live proof.
+reset_fixture
+run_controller prepare-maintenance
+TEST_RESPONSE_BARRIER_PREFIX="$tmp/response-barrier"
+start_controller_background finish-maintenance
+wait_for_marker "$tmp/response-barrier.restore.reached" "$CONTROLLER_PID" 8
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['phase'] == 'RESTORE_INTENT'
+assert p['restore_response_checkpoint'] == 'pending'
+assert p['restore_response_updated_at'] is None
+PY
+kill -KILL "$CONTROLLER_PID" 2>/dev/null || true
+set +e
+wait "$CONTROLLER_PID" 2>/dev/null
+set -e
+unset TEST_RESPONSE_BARRIER_PREFIX
+restore_writes_before="$(event_count '^set:7692:true$')"
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'restore response/checkpoint crash gap became sticky ambiguity'
+assert_eq "$restore_writes_before" "$(event_count '^set:7692:true$')" \
+  'restore response/checkpoint crash gap did not replay request'
+test -s "$tmp/state/maintenance-ambiguous.json"
+run_controller resolve-restore-ambiguity
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['phase'] == 'RESTORE_ACKED'
+assert p['restore_response_checkpoint'] == 'explicitly_resolved'
+assert p['restore_response_updated_at'] is None
+PY
+run_controller finish-maintenance
+assert_eq "$restore_writes_before" "$(event_count '^set:7692:true$')" \
+  'explicit crash-gap resolution made zero account writes'
+test ! -e "$tmp/state/maintenance.json"
+
+# A malformed synchronous restore 2xx remains sticky and is never adopted by
+# finish-maintenance. The explicit resolver may adopt it only from one durable
+# 2xx receipt plus repeated live group/primary/fence proof, without replaying
+# the restore write.
+reset_fixture
+run_controller prepare-maintenance
+printf 'invalid-json\n' >"$tmp/bad_primary_response"
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'malformed restore response remained sticky ambiguity'
+test -s "$tmp/state/maintenance-ambiguous.json"
+assert_eq t "$(member_schedulable 7692)" 'malformed restore had actually restored primary'
+assert_eq 1 "$(event_count '^set:7692:true$')" 'malformed restore issued exactly once'
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'ordinary finish did not auto-adopt malformed 2xx'
+assert_eq 1 "$(event_count '^set:7692:true$')" \
+  'ordinary finish did not replay malformed restore'
+run_controller resolve-restore-ambiguity
+assert_eq RESTORE_ACKED "$(marker_phase)" \
+  'explicit evidence resolver adopted unique restore receipt'
+test ! -e "$tmp/state/maintenance-ambiguous.json"
+assert_eq 1 "$(event_count '^set:7692:true$')" \
+  'explicit evidence resolver made zero account writes'
+run_controller finish-maintenance
+test ! -e "$tmp/state/maintenance.json"
+
+# Explicit reconciliation accepts the unique successful 2xx class, not only
+# 200. The ordinary finish path must preserve that adopted evidence rather than
+# re-poisoning a valid 204 receipt.
+reset_fixture
+run_controller prepare-maintenance
+printf 'invalid-json\n' >"$tmp/bad_primary_response"
+printf '204\n' >"$tmp/receipt_status_override"
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'malformed restore 204 became sticky ambiguity'
+run_controller resolve-restore-ambiguity
+assert_eq RESTORE_ACKED "$(marker_phase)" \
+  'explicit resolver adopted unique restore 204'
+test ! -e "$tmp/state/maintenance-ambiguous.json"
+assert_eq 1 "$(event_count '^set:7692:true$')" \
+  '204 resolver made zero account writes'
+run_controller finish-maintenance
+test ! -e "$tmp/state/maintenance.json"
+assert_eq 1 "$(event_count '^set:7692:true$')" \
+  'finish retained adopted restore 204 without replay'
+
+# A poison sidecar's phase/reason/timestamp are validated evidence. A
+# same-run sidecar relabeled as a pause ambiguity can never be deleted by the
+# restore-only explicit resolver.
+reset_fixture
+run_controller prepare-maintenance
+printf 'invalid-json\n' >"$tmp/bad_primary_response"
+expect_controller_failure finish-maintenance
+python3 - "$tmp/state/maintenance-ambiguous.json" <<'PY'
+import json,os,sys,tempfile
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['phase']='PAUSE_INTENT'
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='ambiguity-tamper.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(p,f,sort_keys=True)
+    f.write('\n')
+os.replace(tmp,path)
+PY
+restore_writes_before="$(event_count '^set:7692:true$')"
+expect_controller_failure resolve-restore-ambiguity
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'mismatched sidecar phase left restore marker unresolved'
+test -s "$tmp/state/maintenance-ambiguous.json"
+assert_eq "$restore_writes_before" "$(event_count '^set:7692:true$')" \
+  'mismatched sidecar phase resolver made zero account writes'
+
+# Duplicate 2xx receipts can never be reconciled by the explicit command.
+reset_fixture
+run_controller prepare-maintenance
+printf 'invalid-json\n' >"$tmp/bad_primary_response"
+touch "$tmp/duplicate_next_receipt"
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'duplicate malformed restore became sticky ambiguity'
+expect_controller_failure resolve-restore-ambiguity
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'duplicate restore receipt remained unresolved'
+test -s "$tmp/state/maintenance-ambiguous.json"
+assert_eq 1 "$(event_count '^set:7692:true$')" \
+  'duplicate receipt resolution made no extra account write'
 
 # A group replacement immediately after the owned restore write is a confirmed
 # post-write identity conflict. Keep the primary restored, poison the run, and
@@ -2586,6 +3133,11 @@ assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" 'restore-time group replacement be
 assert_eq t "$(member_schedulable 7692)" 'restore-time group replacement kept primary restored'
 assert_eq 1 "$(event_count '^set:7692:true$')" 'restore-time group replacement used one restore write'
 test -s "$tmp/state/maintenance-ambiguous.json"
+expect_controller_failure resolve-restore-ambiguity
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'group replacement could not be explicitly reconciled'
+assert_eq 1 "$(event_count '^set:7692:true$')" \
+  'group replacement resolver made zero account writes'
 
 # A maintenance-opened standby can later become shared with another active
 # group. Restore the owned primary, but retain the RESTORED marker/manual state;
@@ -2629,6 +3181,11 @@ expect_controller_failure finish-maintenance
 assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" 'external re-pause became restore ambiguous'
 assert_eq "$restore_writes_before" "$(event_count '^set:7692:true$')" 'external re-pause caused no duplicate restore'
 test -s "$tmp/state/maintenance-ambiguous.json"
+expect_controller_failure resolve-restore-ambiguity
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'unschedulable primary blocked explicit restore reconciliation'
+assert_eq "$restore_writes_before" "$(event_count '^set:7692:true$')" \
+  'failed explicit reconciliation made zero account writes'
 
 # If the only standby becomes inactive during maintenance, a healthy OWNED
 # primary is still restored. The controller never changes status or re-enables
@@ -2702,6 +3259,18 @@ fi
 reset_fixture
 touch "$tmp/omit_next_receipt_clean"
 expect_controller_failure prepare-maintenance
+python3 - "$tmp/state/maintenance.json" "$tmp/state/maintenance-ambiguous.json" <<'PY'
+import json,re,sys
+marker=json.load(open(sys.argv[1],encoding='utf-8'))
+sidecar=json.load(open(sys.argv[2],encoding='utf-8'))
+assert sidecar['schema_version'] == 3
+assert sidecar['group_member_ids'] == [7692,7693,7845,7850]
+assert sidecar['backup_account_ids'] == [7693]
+assert re.fullmatch(r'[a-f0-9]{64}',sidecar['identity_digest'])
+for key in ('run_id','primary_account_id','group_id','group_member_ids',
+            'backup_account_ids','identity_digest'):
+    assert sidecar[key] == marker[key], (key,sidecar[key],marker[key])
+PY
 sidecar_run="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$tmp/state/maintenance-ambiguous.json")"
 rm -f "$tmp/state/maintenance.json"
 sed -i 's/7693|\([^|]*\)|active|t|t|t/7693|\1|active|f|t|t/' "$tmp/members"
@@ -2710,6 +3279,22 @@ assert_eq t "$(member_schedulable 7693)" 'bound sidecar-only reconcile reopened 
 grep -Fq "c2m-${sidecar_run}-b-7693" "$tmp/access_logs"
 assert_eq maintenance "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$tmp/state/state.json")" \
   'bound sidecar-only reconcile retained maintenance mode'
+
+# A standalone sidecar is not authority to write against a changed backup
+# collection, even when the full group-member ID collection is unchanged.
+reset_fixture
+touch "$tmp/omit_next_receipt_clean"
+expect_controller_failure prepare-maintenance
+rm -f "$tmp/state/maintenance.json"
+sed -i \
+  's/7693|\([^|]*\)|active|t|t|t/7693|\1|active|f|t|t/; s/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' \
+  "$tmp/members"
+rotation_events_before="$(wc -l <"$tmp/events")"
+expect_controller_failure reconcile
+assert_eq "$rotation_events_before" "$(wc -l <"$tmp/events")" \
+  'sidecar backup-identity drift made zero account writes'
+assert_eq f "$(member_schedulable 7693)" 'identity drift did not reopen sealed backup'
+assert_eq f "$(member_schedulable 7845)" 'identity drift did not open newly active backup'
 
 reset_fixture
 cat >>"$tmp/members" <<EOF
@@ -2744,29 +3329,150 @@ rotation_events_before="$(wc -l <"$tmp/events")"
 expect_controller_failure reconcile
 assert_eq "$rotation_events_before" "$(wc -l <"$tmp/events")" 'conflicting sidecar run id made zero account writes'
 
-# Legacy/unknown markers and unbound sidecars are never upgraded into ownership
-# and cannot safely identify a standby. They fail closed with zero account
-# writes while preserving the artifact for operator action.
-reset_fixture
-cat >"$tmp/state/maintenance.json" <<'JSON'
-{"schema_version":3,"run_id":"11111111-1111-1111-1111-111111111111","phase":"OWNED","primary_disabled_by_maintenance":true}
-JSON
-expect_controller_failure prepare-maintenance
-assert_eq t "$(member_schedulable 7692)" 'legacy marker never changed primary'
-assert_eq f "$(member_schedulable 7693)" 'legacy marker made no guessed standby write'
-assert_eq '' "$(cat "$tmp/events")" 'legacy marker made zero account writes'
-test -e "$tmp/state/maintenance.json"
+# Both artifacts must agree on the sealed backup collection and digest. Each
+# conflict stays read-only across every maintenance entrypoint.
+for identity_conflict in backup_collection digest; do
+  reset_fixture
+  touch "$tmp/omit_next_receipt_clean"
+  expect_controller_failure prepare-maintenance
+  python3 - "$tmp/state/maintenance-ambiguous.json" "$identity_conflict" <<'PY'
+import json,sys
+path,kind=sys.argv[1:]
+p=json.load(open(path,encoding='utf-8'))
+if kind == 'backup_collection':
+    p['backup_account_ids']=[7845]
+elif kind == 'digest':
+    p['identity_digest']='0'*64
+else:
+    raise SystemExit(kind)
+open(path,'w',encoding='utf-8').write(json.dumps(p,sort_keys=True)+'\n')
+PY
+  identity_events_before="$(wc -l <"$tmp/events")"
+  for identity_command in prepare-maintenance finish-maintenance reconcile status \
+      resolve-restore-ambiguity; do
+    expect_controller_failure "$identity_command"
+    assert_eq "$identity_events_before" "$(wc -l <"$tmp/events")" \
+      "marker/sidecar $identity_conflict conflict $identity_command made zero account writes"
+  done
+  test -e "$tmp/state/maintenance.json"
+  test -e "$tmp/state/maintenance-ambiguous.json"
+done
 
+# The explicit resolver validates both artifacts before considering restore
+# evidence. Build one real RESTORE_AMBIGUOUS pair, then prove every legacy or
+# unknown schema on either artifact is a read-only rejection that preserves both
+# files byte-for-byte.
 reset_fixture
-cat >"$tmp/state/maintenance-ambiguous.json" <<'JSON'
-{"schema_version":1,"run_id":"11111111-1111-1111-1111-111111111111","phase":"PAUSE_INTENT","reason":"test","created_at":"2026-07-14T00:00:00+00:00"}
-JSON
-rm -f "$tmp/state/state.json"
-expect_controller_failure reconcile
-assert_eq f "$(member_schedulable 7693)" 'legacy sidecar made no guessed standby write'
-assert_eq '' "$(cat "$tmp/events")" 'legacy sidecar made zero account writes'
-test ! -e "$tmp/state/state.json"
-test -e "$tmp/state/maintenance-ambiguous.json"
+run_controller prepare-maintenance
+printf 'invalid-json\n' >"$tmp/bad_primary_response"
+expect_controller_failure finish-maintenance
+assert_eq RESTORE_AMBIGUOUS "$(marker_phase)" \
+  'resolver schema matrix built a restore-ambiguous marker'
+test -s "$tmp/state/maintenance-ambiguous.json"
+cp "$tmp/state/maintenance.json" "$tmp/resolver-schema-marker.baseline"
+cp "$tmp/state/maintenance-ambiguous.json" "$tmp/resolver-schema-sidecar.baseline"
+
+for schema_version in 1 2 3 4 5 6 99; do
+  reset_fixture
+  cp "$tmp/resolver-schema-marker.baseline" "$tmp/state/maintenance.json"
+  cp "$tmp/resolver-schema-sidecar.baseline" "$tmp/state/maintenance-ambiguous.json"
+  python3 - "$tmp/state/maintenance.json" "$schema_version" <<'PY'
+import json,sys
+path,version=sys.argv[1],int(sys.argv[2])
+p=json.load(open(path,encoding='utf-8'))
+p['schema_version']=version
+open(path,'w',encoding='utf-8').write(json.dumps(p,sort_keys=True)+'\n')
+PY
+  marker_hash_before="$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')"
+  sidecar_hash_before="$(sha256sum "$tmp/state/maintenance-ambiguous.json" | awk '{print $1}')"
+  resolver_events_before="$(wc -l <"$tmp/events")"
+  expect_controller_failure resolve-restore-ambiguity
+  assert_eq "$resolver_events_before" "$(wc -l <"$tmp/events")" \
+    "resolver marker schema $schema_version made zero account writes"
+  assert_eq "$marker_hash_before" \
+    "$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')" \
+    "resolver marker schema $schema_version preserved marker bytes"
+  assert_eq "$sidecar_hash_before" \
+    "$(sha256sum "$tmp/state/maintenance-ambiguous.json" | awk '{print $1}')" \
+    "resolver marker schema $schema_version preserved sidecar bytes"
+done
+
+for schema_version in 1 2 99; do
+  reset_fixture
+  cp "$tmp/resolver-schema-marker.baseline" "$tmp/state/maintenance.json"
+  cp "$tmp/resolver-schema-sidecar.baseline" "$tmp/state/maintenance-ambiguous.json"
+  python3 - "$tmp/state/maintenance-ambiguous.json" "$schema_version" <<'PY'
+import json,sys
+path,version=sys.argv[1],int(sys.argv[2])
+p=json.load(open(path,encoding='utf-8'))
+p['schema_version']=version
+open(path,'w',encoding='utf-8').write(json.dumps(p,sort_keys=True)+'\n')
+PY
+  marker_hash_before="$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')"
+  sidecar_hash_before="$(sha256sum "$tmp/state/maintenance-ambiguous.json" | awk '{print $1}')"
+  resolver_events_before="$(wc -l <"$tmp/events")"
+  expect_controller_failure resolve-restore-ambiguity
+  assert_eq "$resolver_events_before" "$(wc -l <"$tmp/events")" \
+    "resolver sidecar schema $schema_version made zero account writes"
+  assert_eq "$marker_hash_before" \
+    "$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')" \
+    "resolver sidecar schema $schema_version preserved marker bytes"
+  assert_eq "$sidecar_hash_before" \
+    "$(sha256sum "$tmp/state/maintenance-ambiguous.json" | awk '{print $1}')" \
+    "resolver sidecar schema $schema_version preserved sidecar bytes"
+done
+
+# Every pre-v7/unknown marker and every pre-v3/unknown sidecar is rejected by
+# every maintenance entrypoint. None is upgraded, rewritten, or used to guess a
+# standby; the original artifact remains for operator action.
+for schema_version in 1 2 3 4 5 6 99; do
+  reset_fixture
+  python3 - "$tmp/state/maintenance.json" "$schema_version" <<'PY'
+import json,sys
+path,version=sys.argv[1],int(sys.argv[2])
+payload={
+  'schema_version':version,
+  'run_id':'11111111-1111-1111-1111-111111111111',
+  'phase':'OWNED',
+  'primary_disabled_by_maintenance':True,
+}
+open(path,'w',encoding='utf-8').write(json.dumps(payload,sort_keys=True)+'\n')
+PY
+  legacy_events_before="$(wc -l <"$tmp/events")"
+  for legacy_command in prepare-maintenance finish-maintenance reconcile status; do
+    expect_controller_failure "$legacy_command"
+    assert_eq "$legacy_events_before" "$(wc -l <"$tmp/events")" \
+      "marker schema $schema_version $legacy_command made zero account writes"
+  done
+  assert_eq t "$(member_schedulable 7692)" "marker schema $schema_version preserved primary"
+  assert_eq f "$(member_schedulable 7693)" "marker schema $schema_version did not guess standby"
+  test -e "$tmp/state/maintenance.json"
+done
+
+for schema_version in 1 2 99; do
+  reset_fixture
+  python3 - "$tmp/state/maintenance-ambiguous.json" "$schema_version" <<'PY'
+import json,sys
+path,version=sys.argv[1],int(sys.argv[2])
+payload={
+  'schema_version':version,
+  'run_id':'11111111-1111-1111-1111-111111111111',
+  'phase':'PAUSE_INTENT',
+  'reason':'test',
+  'created_at':'2026-07-14T00:00:00.000000Z',
+}
+open(path,'w',encoding='utf-8').write(json.dumps(payload,sort_keys=True)+'\n')
+PY
+  legacy_events_before="$(wc -l <"$tmp/events")"
+  for legacy_command in prepare-maintenance finish-maintenance reconcile status; do
+    expect_controller_failure "$legacy_command"
+    assert_eq "$legacy_events_before" "$(wc -l <"$tmp/events")" \
+      "sidecar schema $schema_version $legacy_command made zero account writes"
+  done
+  assert_eq t "$(member_schedulable 7692)" "sidecar schema $schema_version preserved primary"
+  assert_eq f "$(member_schedulable 7693)" "sidecar schema $schema_version did not guess standby"
+  test -e "$tmp/state/maintenance-ambiguous.json"
+done
 
 # A pre-pause snapshot failure never reaches the primary mutation.
 reset_fixture
