@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.5.4+rb15 - 2026-07-15
+
+### RelayBases integration
+
+- Rebuilt the OAuth-miss and Relay-CYB case files on canonical `usage_logs`: one case now represents one logical request, retry attempts are shown separately, account names come from the actual upstream attempt, and prompt text is attached only by an exact non-empty `logical_request_id`. Guardian-only attempts and unrelated OpenAI Responses accounts cannot leak into either case scope; legacy rows remain explicitly unattributed instead of using time-neighbour guesses.
+- Retired the production time-window enrichment path and added a sealed, resumable cleanup workflow for its historical attribution prefixes. Cleanup is dry-run by default, requires an exact snapshot count and digest for execution, uses row-level compare-and-swap, and retains an immutable rollback relation and manifest.
+- Replaced the single global prompt window with fixed, independently budgeted user, system, tools and other partitions while retaining full-payload routing coverage. Opaque encrypted/media blobs are excluded from text scoring, exact SQL-injection plus credential-extraction combinations receive a dedicated Relay signal, and malformed or unsupported payloads fall back fail-closed to the legacy scanner. Local rules remain routing-only and never block a request.
+- Added exact scan-coverage metadata to canonical case files. Operators see a compact scanned-versus-payload byte summary and truncation state instead of raw internal JSON, making oversized-request coverage auditable without trusting a truncated preview.
+- Hardened the sub2 `codex-pro` maintenance controller with dynamically sealed group and eligible-backup identities, fail-closed account mutation fencing, durable pause/restore response-validation checkpoints, and explicit ambiguity reconciliation that never performs account writes. Unknown or legacy markers, membership drift and crash-window evidence gaps leave backups open and require operator proof rather than replaying a primary mutation.
+- Relay Health Guardian remains in `monitor`; enforcement is a separate milestone after a fresh 24-hour clean production soak and an explicit approval.
+
 ## v2.5.4+rb14-controller1 - 2026-07-14
 
 ### RelayBases operations
