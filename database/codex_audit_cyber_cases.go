@@ -54,6 +54,10 @@ type CodexAuditCyberCase struct {
 	MatchedPatterns       string              `json:"matched_patterns"`
 	TextPreview           string              `json:"text_preview"`
 	FullText              string              `json:"full_text"`
+	PayloadBytes          int64               `json:"payload_bytes"`
+	ScannedBytes          int64               `json:"scanned_bytes"`
+	ScanTruncated         bool                `json:"scan_truncated"`
+	ScanDetails           string              `json:"scan_details"`
 	ContentClassification string              `json:"content_classification"`
 	Attempts              []CodexAuditAttempt `json:"attempts"`
 }
@@ -214,7 +218,9 @@ func (db *DB) listCodexAuditCyberCasesPage(ctx context.Context, query CodexAudit
 		       COALESCE(fu.route_source, ''), COALESCE(fu.route_signals, '[]'), COALESCE(fu.pin_kind, ''),
 		       COALESCE(fu.route_group_id, 0), COALESCE(fu.route_pinned, FALSE),
 		       COALESCE(p.id, 0), COALESCE(p.source, ''), COALESCE(p.score, 0), COALESCE(p.threshold_value, 0),
-		       COALESCE(p.matched_patterns, '[]'), COALESCE(p.text_preview, ''), COALESCE(p.full_text, '')
+		       COALESCE(p.matched_patterns, '[]'), COALESCE(p.text_preview, ''), COALESCE(p.full_text, ''),
+		       COALESCE(p.payload_bytes, 0), COALESCE(p.scanned_bytes, 0),
+		       COALESCE(p.scan_truncated, FALSE), COALESCE(p.scan_details, '{}')
 		FROM paged_candidates c
 		JOIN usage_logs cu ON cu.id = c.last_cyber_id
 		JOIN final_usage fu ON (
@@ -244,6 +250,7 @@ func (db *DB) listCodexAuditCyberCasesPage(ctx context.Context, query CodexAudit
 			&item.RouteClass, &item.RouteReason, &item.RouteSource, &item.RouteSignals, &item.PinKind,
 			&item.RouteGroupID, &item.RoutePinned, &item.PromptLogID, &item.PromptSource, &item.Score,
 			&item.Threshold, &item.MatchedPatterns, &item.TextPreview, &item.FullText,
+			&item.PayloadBytes, &item.ScannedBytes, &item.ScanTruncated, &item.ScanDetails,
 		); err != nil {
 			return nil, err
 		}

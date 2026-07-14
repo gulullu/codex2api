@@ -21,7 +21,7 @@ import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import type { AccountRow, CodexAuditCyberCase, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
 import { formatCodexAuditHealthScore, getCodexAuditFindings, getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
-import { stripLegacyAuditAttribution } from '../lib/codexAuditCase'
+import { formatAuditScanCoverage, stripLegacyAuditAttribution } from '../lib/codexAuditCase'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -608,6 +608,7 @@ function CyberCaseRow({ item }: { item: CodexAuditCyberCase }) {
   const scopeLabel = item.scope === 'oauth' ? 'OAuth 保护漏放' : 'Relay 上游 CYB'
   const inbound = item.inbound_endpoint || item.endpoint || '-'
   const upstream = item.upstream_endpoint || '-'
+  const scanCoverage = formatAuditScanCoverage(item)
   return (
     <div className="min-w-0 rounded-lg border border-border/60 bg-background/70">
       <button
@@ -643,6 +644,7 @@ function CyberCaseRow({ item }: { item: CodexAuditCyberCase }) {
           <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px]">
             <Badge variant="outline" className="bg-background/70">{cyberContentLabel(item.content_classification)}</Badge>
             <span className="text-muted-foreground">{formatNumber(item.cyber_attempts)} 次 cyber_policy · {formatNumber(item.attempt_count)} 次上游调用</span>
+            {scanCoverage ? <span className="text-muted-foreground">扫描范围：{scanCoverage}</span> : null}
             {item.legacy ? <span className="text-amber-700 dark:text-amber-300">历史记录无 logical_request_id，未猜测正文或用户归属</span> : null}
           </div>
           {item.attempts?.length ? (

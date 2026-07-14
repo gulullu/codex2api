@@ -85,6 +85,8 @@ func TestCodexAuditCyberCasesUseCanonicalUsageAndExactPromptJoin(t *testing.T) {
 		Model: "gpt-effective", Score: 95, Threshold: 100,
 		MatchedPatterns: `["operational_exploit_request","sql_injection_attack"]`,
 		TextPreview:     "exact prompt", FullText: "Write a SQL injection payload that extracts the first user's password.",
+		PayloadBytes: 765432, ScannedBytes: 163840, ScanTruncated: true,
+		ScanDetails: `{"version":1,"mode":"partitioned_json","payload_bytes":765432,"scanned_bytes":163840,"scan_truncated":true}`,
 	}); err != nil {
 		t.Fatalf("insert exact prompt: %v", err)
 	}
@@ -137,6 +139,9 @@ func TestCodexAuditCyberCasesUseCanonicalUsageAndExactPromptJoin(t *testing.T) {
 	if retry.TextPreview != "exact prompt" || strings.Contains(retry.FullText, "wrong nearby") {
 		t.Fatalf("prompt join was not exact: preview=%q full=%q", retry.TextPreview, retry.FullText)
 	}
+	if retry.PayloadBytes != 765432 || retry.ScannedBytes != 163840 || !retry.ScanTruncated || !strings.Contains(retry.ScanDetails, `"mode":"partitioned_json"`) {
+		t.Fatalf("scan metadata join was not exact: %+v", retry)
+	}
 	if retry.ContentClassification != "confirmed_route_gap" {
 		t.Fatalf("content classification = %q, want confirmed_route_gap", retry.ContentClassification)
 	}
@@ -145,7 +150,7 @@ func TestCodexAuditCyberCasesUseCanonicalUsageAndExactPromptJoin(t *testing.T) {
 		t.Fatalf("associated hidden attempt timeline = %+v", hidden)
 	}
 	legacy := oauthItems["legacy"]
-	if legacy == nil || !legacy.Legacy || legacy.AttemptCount != 1 || legacy.PromptLogID != 0 || legacy.TextPreview != "" {
+	if legacy == nil || !legacy.Legacy || legacy.AttemptCount != 1 || legacy.PromptLogID != 0 || legacy.TextPreview != "" || legacy.PayloadBytes != 0 || legacy.ScannedBytes != 0 || legacy.ScanTruncated || legacy.ScanDetails != "{}" {
 		t.Fatalf("legacy case must stay row-scoped without guessed prompt: %+v", legacy)
 	}
 

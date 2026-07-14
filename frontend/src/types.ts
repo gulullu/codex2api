@@ -1001,6 +1001,10 @@ export interface CodexAuditCyberCase {
   matched_patterns: string
   text_preview: string
   full_text: string
+  payload_bytes: number
+  scanned_bytes: number
+  scan_truncated: boolean
+  scan_details: string
   content_classification: 'confirmed_route_gap' | 'local_rule_hit' | 'unconfirmed' | string
   attempts: CodexAuditAttempt[]
 }
