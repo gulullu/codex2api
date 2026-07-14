@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func legacyBlock(source, suffix string, withNewAPI bool) (string, string) {
@@ -13,16 +14,24 @@ func legacyBlock(source, suffix string, withNewAPI bool) (string, string) {
 	newAPILine := ""
 	previewTag := "alice"
 	if withNewAPI {
-		newAPILine = "new-api 用户: bob (id=7 bob@example.test) 【多候选,存疑】\n"
-		previewTag += "→na:bob"
+		newAPILine = legacyNewAPIPrefix + "bob (id=7 bob@example.test) " +
+			"\u3010\u591a\u5019\u9009,\u5b58\u7591\u3011\n"
+		previewTag += "\u2192na:bob"
 	}
-	full := "【归属】\n" +
-		"sub2 用户: alice alice@example.test\n" +
+	full := legacyFullHeader +
+		legacySub2Prefix + "alice alice@example.test\n" +
 		newAPILine +
-		"池子账号: pool@example.test\n" +
-		"类型: " + typ + "\n\n" + suffix
-	preview := "『sub2:" + previewTag + "』 " + suffix
+		legacyPoolPrefix + "pool@example.test\n" +
+		legacyTypePrefix + typ + "\n\n" + suffix
+	preview := legacyPreviewHeader + previewTag + legacyPreviewTerminator + suffix
 	return full, preview
+}
+
+func TestMarkerConstantsMatchRetiredWriter(t *testing.T) {
+	if legacyFullHeader != "\u3010\u5f52\u5c5e\u3011\n" ||
+		legacyPreviewHeader != "\u300esub2:" || legacyPreviewTerminator != "\u300f " {
+		t.Fatal("marker constants do not match retired writer")
+	}
 }
 
 func TestStripLegacyEnrichment(t *testing.T) {
@@ -62,10 +71,10 @@ func TestStripLegacyEnrichmentRejectsNonExactMarkers(t *testing.T) {
 		{name: "marker in middle", full: "prefix" + validFull, preview: validPreview, source: "local_filter"},
 		{name: "preview in middle", full: validFull, preview: "prefix" + validPreview, source: "local_filter"},
 		{name: "source type mismatch", full: validFull, preview: validPreview, source: "upstream_cyber_policy"},
-		{name: "unknown line", full: strings.Replace(validFull, "池子账号: ", "账号: ", 1), preview: validPreview, source: "local_filter"},
+		{name: "unknown line", full: strings.Replace(validFull, legacyPoolPrefix, "account: ", 1), preview: validPreview, source: "local_filter"},
 		{name: "missing separator", full: strings.Replace(validFull, "\n\npayload", "\npayload", 1), preview: validPreview, source: "local_filter"},
-		{name: "oversized block", full: "【归属】\nsub2 用户: " + strings.Repeat("x", maxLegacyFullPrefix) + "\n池子账号: x\n类型: " + legacyLocalType + "\n\npayload", preview: validPreview, source: "local_filter"},
-		{name: "oversized tag", full: validFull, preview: "『sub2:" + strings.Repeat("x", maxLegacyPreviewPrefix) + "』 payload", source: "local_filter"},
+		{name: "oversized block", full: legacyFullHeader + legacySub2Prefix + strings.Repeat("x", maxLegacyFullPrefix) + "\n" + legacyPoolPrefix + "x\n" + legacyTypePrefix + legacyLocalType + "\n\npayload", preview: validPreview, source: "local_filter"},
+		{name: "oversized tag", full: validFull, preview: legacyPreviewHeader + strings.Repeat("x", maxLegacyPreviewPrefix) + legacyPreviewTerminator + "payload", source: "local_filter"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,7 +97,9 @@ func TestDecideRecordCleanupAndRollback(t *testing.T) {
 		originalFullMD5:      md5String(full),
 		originalPreviewMD5:   md5String(preview),
 		liveExists:           true,
+		liveFullValid:        true,
 		liveFullText:         full,
+		livePreviewValid:     true,
 		liveTextPreview:      preview,
 	}
 	if got := decideRecord(base, operationCleanup); got.category != "pending_cleanup" {
@@ -116,6 +127,7 @@ func TestDecideRecordCleanupAndRollback(t *testing.T) {
 func TestDecideRecordRejectsUnsafeBackup(t *testing.T) {
 	full, preview := legacyBlock("local_filter", "payload", false)
 	base := recordInput{
+		source:               "local_filter",
 		markerPair:           true,
 		originalFullValid:    true,
 		originalFullText:     full,
@@ -124,7 +136,9 @@ func TestDecideRecordRejectsUnsafeBackup(t *testing.T) {
 		originalFullMD5:      md5String(full),
 		originalPreviewMD5:   md5String(preview),
 		liveExists:           true,
+		liveFullValid:        true,
 		liveFullText:         full,
+		livePreviewValid:     true,
 		liveTextPreview:      preview,
 	}
 
@@ -153,18 +167,45 @@ func TestDecideRecordRejectsUnsafeBackup(t *testing.T) {
 	}
 }
 
+func TestDecideRecordPreservesNullSemantics(t *testing.T) {
+	full, preview := legacyBlock("local_filter", "", false)
+	input := recordInput{
+		source:               "local_filter",
+		markerPair:           true,
+		originalFullValid:    true,
+		originalFullText:     full,
+		originalPreviewValid: true,
+		originalTextPreview:  preview,
+		originalFullMD5:      md5String(full),
+		originalPreviewMD5:   md5String(preview),
+		liveExists:           true,
+		liveFullValid:        false,
+		livePreviewValid:     true,
+		liveTextPreview:      preview,
+	}
+	if got := decideRecord(input, operationCleanup); got.category != "live_content_drift" {
+		t.Fatalf("NULL live full_text collapsed into empty text: category = %q", got.category)
+	}
+}
+
 func TestParseOptionsDefaultsToDryRun(t *testing.T) {
-	opts, err := parseOptions([]string{"--backup-table", "public.ops_rb15_enrich_backup_20260715_031815"})
+	opts, err := parseOptions([]string{
+		"--backup-table", "public.ops_rb15_enrich_backup_20260715_031815",
+		"--manifest-table", "public.ops_rb15_enrich_manifest_20260715_031815",
+	})
 	if err != nil {
 		t.Fatalf("parseOptions() error = %v", err)
 	}
 	if opts.execute || opts.operation != operationCleanup {
 		t.Fatalf("unexpected defaults: execute=%v operation=%v", opts.execute, opts.operation)
 	}
+	if opts.batchDeadline != 100*time.Second {
+		t.Fatalf("batch deadline = %v", opts.batchDeadline)
+	}
 }
 
 func TestParseOptionsWriteGuards(t *testing.T) {
-	base := []string{"--backup-table", "ops_backup", "--execute"}
+	base := []string{"--backup-table", "ops_backup", "--manifest-table", "ops_manifest", "--execute"}
 	if _, err := parseOptions(base); err == nil {
 		t.Fatalf("execute without frozen snapshot unexpectedly succeeded")
 	}

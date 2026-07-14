@@ -9,15 +9,21 @@ import (
 	"unicode/utf8"
 )
 
+// Keep marker literals ASCII-only. The retired Python writer emitted the
+// Unicode text represented by these escapes.
 const (
-	legacyFullHeader        = "【归属】\n"
-	legacyPreviewHeader     = "『sub2:"
-	legacyPreviewTerminator = "』 "
+	legacyFullHeader        = "\u3010\u5f52\u5c5e\u3011\n"
+	legacyPreviewHeader     = "\u300esub2:"
+	legacyPreviewTerminator = "\u300f "
 	maxLegacyFullPrefix     = 4096
 	maxLegacyPreviewPrefix  = 2048
 
-	legacyMissType  = "真漏放(上游拦→账号风险)"
-	legacyLocalType = "本地拦(我们拦下,返回官方文案)"
+	legacySub2Prefix   = "sub2 \u7528\u6237: "
+	legacyNewAPIPrefix = "new-api \u7528\u6237: "
+	legacyPoolPrefix   = "\u6c60\u5b50\u8d26\u53f7: "
+	legacyTypePrefix   = "\u7c7b\u578b: "
+	legacyMissType     = "\u771f\u6f0f\u653e(\u4e0a\u6e38\u62e6\u2192\u8d26\u53f7\u98ce\u9669)"
+	legacyLocalType    = "\u672c\u5730\u62e6(\u6211\u4eec\u62e6\u4e0b,\u8fd4\u56de\u5b98\u65b9\u6587\u6848)"
 )
 
 type stripResult struct {
@@ -51,27 +57,26 @@ func stripLegacyEnrichment(source, fullText, textPreview string) (stripResult, e
 	if len(blockLines) != 3 && len(blockLines) != 4 {
 		return stripResult{}, errors.New("full_marker_line_count_invalid")
 	}
-	if !validLegacyLine(blockLines[0], "sub2 用户: ", true) {
+	if !validLegacyLine(blockLines[0], legacySub2Prefix, true) {
 		return stripResult{}, errors.New("sub2_line_invalid")
 	}
 
 	poolIndex := 1
 	if len(blockLines) == 4 {
-		if !validLegacyLine(blockLines[1], "new-api 用户: ", true) {
+		if !validLegacyLine(blockLines[1], legacyNewAPIPrefix, true) {
 			return stripResult{}, errors.New("new_api_line_invalid")
 		}
 		poolIndex = 2
 	}
-	if !validLegacyLine(blockLines[poolIndex], "池子账号: ", false) {
+	if !validLegacyLine(blockLines[poolIndex], legacyPoolPrefix, false) {
 		return stripResult{}, errors.New("pool_line_invalid")
 	}
 
-	typePrefix := "类型: "
 	typeLine := blockLines[poolIndex+1]
-	if !strings.HasPrefix(typeLine, typePrefix) {
+	if !strings.HasPrefix(typeLine, legacyTypePrefix) {
 		return stripResult{}, errors.New("type_line_invalid")
 	}
-	legacyType := strings.TrimPrefix(typeLine, typePrefix)
+	legacyType := strings.TrimPrefix(typeLine, legacyTypePrefix)
 	expectedType := legacyLocalType
 	if source == "upstream_cyber_policy" {
 		expectedType = legacyMissType
@@ -170,7 +175,9 @@ type recordInput struct {
 	originalFullMD5      string
 	originalPreviewMD5   string
 	liveExists           bool
+	liveFullValid        bool
 	liveFullText         string
+	livePreviewValid     bool
 	liveTextPreview      string
 }
 
@@ -215,10 +222,12 @@ func decideRecord(input recordInput, op operation) recordDecision {
 		return decision
 	}
 
-	liveFullMD5 := md5String(input.liveFullText)
-	livePreviewMD5 := md5String(input.liveTextPreview)
-	liveIsOriginal := liveFullMD5 == originalFullMD5 && livePreviewMD5 == originalPreviewMD5
-	liveIsClean := liveFullMD5 == stripped.cleanFullMD5 && livePreviewMD5 == stripped.cleanPreviewMD5
+	liveIsOriginal := input.liveFullValid && input.livePreviewValid &&
+		input.liveFullText == input.originalFullText &&
+		input.liveTextPreview == input.originalTextPreview
+	liveIsClean := input.liveFullValid && input.livePreviewValid &&
+		input.liveFullText == stripped.cleanFullText &&
+		input.liveTextPreview == stripped.cleanTextPreview
 
 	switch op {
 	case operationCleanup:

@@ -24,14 +24,18 @@ import (
 )
 
 const (
-	targetTable        = `public.prompt_filter_logs`
-	toolVersion        = "rb15-v1"
-	advisoryLockKey    = int64(5927309398729187913)
-	defaultBatchSize   = 200
-	maxBatchSize       = 500
-	defaultStmtTimeout = 5 * time.Second
-	defaultLockTimeout = 2 * time.Second
-	minimumCandidateID = int64(-1 << 63)
+	targetTable          = `public.prompt_filter_logs`
+	toolVersion          = "rb15-v2"
+	parserVersion        = "rb15-marker-v1"
+	predicateVersion     = "rb15-strict-v1"
+	advisoryLockKey      = int64(5927309398729187913)
+	defaultBatchSize     = 200
+	maxBatchSize         = 500
+	defaultStmtTimeout   = 5 * time.Second
+	defaultLockTimeout   = 2 * time.Second
+	defaultBatchDeadline = 100 * time.Second
+	defaultUnlockTimeout = 2 * time.Second
+	minimumCandidateID   = int64(-1 << 63)
 )
 
 var identifierPart = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
@@ -39,20 +43,51 @@ var identifierPart = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
 type options struct {
 	backupTable             string
 	backupTableSQL          string
+	manifestTable           string
+	manifestTableSQL        string
 	execute                 bool
 	operation               operation
 	batchSize               int
 	statementTimeout        time.Duration
 	lockTimeout             time.Duration
+	batchDeadline           time.Duration
 	expectedRows            int
 	expectedCandidateDigest string
+	testBeforeMutation      func(context.Context, []backupLiveRow) error
 }
 
 type candidateMeta struct {
-	id         int64
-	fullMD5    sql.NullString
-	previewMD5 sql.NullString
-	markerPair bool
+	id                 int64
+	source             sql.NullString
+	fullMD5            sql.NullString
+	previewMD5         sql.NullString
+	markerPair         bool
+	sourceSupported    bool
+	fullParseSafe      bool
+	previewParseSafe   bool
+	typeSourceSafe     bool
+	fullPrefixBytes    int
+	previewPrefixBytes int
+}
+
+type relationIdentity struct {
+	DatabaseOID         int64 `json:"database_oid"`
+	TargetRelID         int64 `json:"target_relid"`
+	TargetRelFileNode   int64 `json:"target_relfilenode"`
+	BackupRelID         int64 `json:"backup_relid"`
+	BackupRelFileNode   int64 `json:"backup_relfilenode"`
+	ManifestRelID       int64 `json:"manifest_relid"`
+	ManifestRelFileNode int64 `json:"manifest_relfilenode"`
+}
+
+type snapshotManifest struct {
+	ParserVersion    string           `json:"parser_version"`
+	PredicateVersion string           `json:"predicate_version"`
+	TargetTable      string           `json:"target_table"`
+	BackupTable      string           `json:"backup_table"`
+	CandidateCount   int              `json:"candidate_count"`
+	Sealed           bool             `json:"sealed"`
+	Identity         relationIdentity `json:"identity"`
 }
 
 type candidateSnapshot struct {
@@ -71,6 +106,8 @@ type report struct {
 	Mode              string            `json:"mode"`
 	BackupTable       string            `json:"backup_table"`
 	TargetTable       string            `json:"target_table"`
+	ManifestTable     string            `json:"manifest_table"`
+	Manifest          snapshotManifest  `json:"manifest"`
 	CandidateSnapshot candidateSnapshot `json:"candidate_snapshot"`
 	Preflight         *phaseReport      `json:"preflight,omitempty"`
 	WriteReady        bool              `json:"write_ready"`
@@ -120,11 +157,13 @@ func parseOptions(args []string) (options, error) {
 	var opts options
 	var rollback bool
 	fs.StringVar(&opts.backupTable, "backup-table", "", "explicit frozen backup table")
+	fs.StringVar(&opts.manifestTable, "manifest-table", "", "sealed manifest table paired with the backup")
 	fs.BoolVar(&opts.execute, "execute", false, "apply the selected operation; default is dry-run")
 	fs.BoolVar(&rollback, "rollback", false, "select restore-from-backup operation; still dry-run unless --execute")
 	fs.IntVar(&opts.batchSize, "batch-size", defaultBatchSize, "rows per transaction")
 	fs.DurationVar(&opts.statementTimeout, "statement-timeout", defaultStmtTimeout, "PostgreSQL statement timeout")
 	fs.DurationVar(&opts.lockTimeout, "lock-timeout", defaultLockTimeout, "PostgreSQL lock timeout")
+	fs.DurationVar(&opts.batchDeadline, "batch-deadline", defaultBatchDeadline, "total deadline for each read or mutation batch")
 	fs.IntVar(&opts.expectedRows, "expected-rows", 0, "required exact candidate count for writes")
 	fs.StringVar(&opts.expectedCandidateDigest, "expected-candidate-digest", "", "required dry-run candidate digest for writes")
 	if err := fs.Parse(args); err != nil {
@@ -144,6 +183,18 @@ func parseOptions(args []string) (options, error) {
 	if strings.EqualFold(strings.TrimSpace(opts.backupTable), targetTable) {
 		return options{}, errors.New("backup table cannot be the target table")
 	}
+	if strings.TrimSpace(opts.manifestTable) == "" {
+		return options{}, errors.New("--manifest-table is required")
+	}
+	quoted, err = quoteQualifiedIdentifier(opts.manifestTable)
+	if err != nil {
+		return options{}, fmt.Errorf("invalid --manifest-table: %w", err)
+	}
+	opts.manifestTableSQL = quoted
+	if strings.EqualFold(strings.TrimSpace(opts.manifestTable), targetTable) ||
+		strings.EqualFold(strings.TrimSpace(opts.manifestTable), strings.TrimSpace(opts.backupTable)) {
+		return options{}, errors.New("manifest table must differ from target and backup tables")
+	}
 	if rollback {
 		opts.operation = operationRollback
 	} else {
@@ -157,6 +208,9 @@ func parseOptions(args []string) (options, error) {
 	}
 	if opts.lockTimeout < 100*time.Millisecond || opts.lockTimeout > 30*time.Second {
 		return options{}, errors.New("--lock-timeout must be between 100ms and 30s")
+	}
+	if opts.batchDeadline < time.Second || opts.batchDeadline > 10*time.Minute {
+		return options{}, errors.New("--batch-deadline must be between 1s and 10m")
 	}
 	if opts.execute {
 		if opts.expectedRows < 1 {
@@ -195,10 +249,11 @@ func run(ctx context.Context, opts options) (report, error) {
 		mode = opts.operation.String() + "-execute"
 	}
 	result := report{
-		ToolVersion: toolVersion,
-		Mode:        mode,
-		BackupTable: opts.backupTable,
-		TargetTable: targetTable,
+		ToolVersion:   toolVersion,
+		Mode:          mode,
+		BackupTable:   opts.backupTable,
+		TargetTable:   targetTable,
+		ManifestTable: opts.manifestTable,
 	}
 
 	dsn, err := databaseDSNFromEnv()
@@ -231,10 +286,20 @@ func run(ctx context.Context, opts options) (report, error) {
 		if !locked {
 			return result, errors.New("another rb15 enrichment cleanup process holds the advisory lock")
 		}
-		defer releaseAdvisoryLock(context.Background(), conn)
+		defer func() {
+			unlockCtx, cancel := context.WithTimeout(context.Background(), defaultUnlockTimeout)
+			defer cancel()
+			releaseAdvisoryLock(unlockCtx, conn)
+		}()
 	}
 
-	snapshot, err := loadCandidateSnapshot(ctx, conn, opts)
+	manifest, err := loadAndValidateManifest(ctx, conn, opts)
+	if err != nil {
+		return result, err
+	}
+	result.Manifest = manifest
+
+	snapshot, err := loadCandidateSnapshot(ctx, conn, opts, manifest)
 	if err != nil {
 		return result, err
 	}
@@ -275,7 +340,14 @@ func run(ctx context.Context, opts options) (report, error) {
 		return result, err
 	}
 
-	postSnapshot, err := loadCandidateSnapshot(ctx, conn, opts)
+	postManifest, err := loadAndValidateManifest(ctx, conn, opts)
+	if err != nil {
+		return result, err
+	}
+	if postManifest != manifest {
+		return result, errors.New("sealed manifest changed during execution")
+	}
+	postSnapshot, err := loadCandidateSnapshot(ctx, conn, opts, postManifest)
 	if err != nil {
 		return result, err
 	}
@@ -348,7 +420,96 @@ func releaseAdvisoryLock(ctx context.Context, conn *sql.Conn) {
 	_ = conn.QueryRowContext(ctx, `select pg_advisory_unlock($1)`, advisoryLockKey).Scan(&released)
 }
 
-func loadCandidateSnapshot(ctx context.Context, conn *sql.Conn, opts options) (candidateSnapshot, error) {
+func loadAndValidateManifest(ctx context.Context, conn *sql.Conn, opts options) (snapshotManifest, error) {
+	var manifest snapshotManifest
+	var sealedAt sql.NullTime
+	query := fmt.Sprintf(`
+select parser_version, predicate_version, target_table, backup_table,
+       candidate_count, sealed, sealed_at,
+	       database_oid::bigint, target_relid::bigint, target_relfilenode::bigint,
+	       backup_relid::bigint, backup_relfilenode::bigint,
+	       manifest_relid::bigint, manifest_relfilenode::bigint
+from %s
+where manifest_key = 'rb15'`, opts.manifestTableSQL)
+	err := conn.QueryRowContext(ctx, query).Scan(
+		&manifest.ParserVersion, &manifest.PredicateVersion,
+		&manifest.TargetTable, &manifest.BackupTable,
+		&manifest.CandidateCount, &manifest.Sealed, &sealedAt,
+		&manifest.Identity.DatabaseOID, &manifest.Identity.TargetRelID,
+		&manifest.Identity.TargetRelFileNode, &manifest.Identity.BackupRelID,
+		&manifest.Identity.BackupRelFileNode, &manifest.Identity.ManifestRelID,
+		&manifest.Identity.ManifestRelFileNode,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return snapshotManifest{}, errors.New("sealed manifest row rb15 is missing")
+	}
+	if err != nil {
+		return snapshotManifest{}, fmt.Errorf("read sealed manifest: %w", err)
+	}
+	if !manifest.Sealed || !sealedAt.Valid {
+		return snapshotManifest{}, errors.New("manifest is not sealed")
+	}
+	if manifest.ParserVersion != parserVersion || manifest.PredicateVersion != predicateVersion {
+		return snapshotManifest{}, fmt.Errorf("manifest parser/predicate version mismatch: got %s/%s", manifest.ParserVersion, manifest.PredicateVersion)
+	}
+	if !sameQualifiedTable(manifest.TargetTable, targetTable) ||
+		!sameQualifiedTable(manifest.BackupTable, opts.backupTable) {
+		return snapshotManifest{}, errors.New("manifest table names do not match requested target/backup")
+	}
+	if manifest.CandidateCount < 1 {
+		return snapshotManifest{}, errors.New("manifest candidate count must be positive")
+	}
+	current, err := currentRelationIdentity(ctx, conn, opts.backupTable, opts.manifestTable)
+	if err != nil {
+		return snapshotManifest{}, err
+	}
+	if current != manifest.Identity {
+		return snapshotManifest{}, errors.New("database or relation identity changed since snapshot sealing")
+	}
+	return manifest, nil
+}
+
+func currentRelationIdentity(ctx context.Context, conn *sql.Conn, backupTable, manifestTable string) (relationIdentity, error) {
+	var identity relationIdentity
+	err := conn.QueryRowContext(ctx, `
+select d.oid::bigint,
+	       t.oid::bigint, t.relfilenode::bigint,
+	       b.oid::bigint, b.relfilenode::bigint,
+	       m.oid::bigint, m.relfilenode::bigint
+from pg_database d
+join pg_class t on t.oid = to_regclass($1)
+	join pg_class b on b.oid = to_regclass($2)
+	join pg_class m on m.oid = to_regclass($3)
+	where d.datname = current_database()`,
+		targetTable, normalizedQualifiedTable(backupTable), normalizedQualifiedTable(manifestTable),
+	).Scan(
+		&identity.DatabaseOID,
+		&identity.TargetRelID, &identity.TargetRelFileNode,
+		&identity.BackupRelID, &identity.BackupRelFileNode,
+		&identity.ManifestRelID, &identity.ManifestRelFileNode,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return relationIdentity{}, errors.New("target, backup, or manifest relation does not exist")
+	}
+	if err != nil {
+		return relationIdentity{}, fmt.Errorf("read relation identity: %w", err)
+	}
+	return identity, nil
+}
+
+func normalizedQualifiedTable(value string) string {
+	parts := strings.Split(strings.TrimSpace(value), ".")
+	if len(parts) == 1 {
+		return "public." + parts[0]
+	}
+	return strings.Join(parts, ".")
+}
+
+func sameQualifiedTable(a, b string) bool {
+	return strings.EqualFold(normalizedQualifiedTable(a), normalizedQualifiedTable(b))
+}
+
+func loadCandidateSnapshot(ctx context.Context, conn *sql.Conn, opts options, manifest snapshotManifest) (candidateSnapshot, error) {
 	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return candidateSnapshot{}, fmt.Errorf("begin candidate snapshot: %w", err)
@@ -357,7 +518,12 @@ func loadCandidateSnapshot(ctx context.Context, conn *sql.Conn, opts options) (c
 	if err := setLocalTimeouts(ctx, tx, opts); err != nil {
 		return candidateSnapshot{}, err
 	}
-	query := fmt.Sprintf(`select id, original_full_md5, original_preview_md5, marker_pair from %s order by id`, opts.backupTableSQL)
+	query := fmt.Sprintf(`
+select id, source, original_full_md5, original_preview_md5, marker_pair,
+       source_supported, full_parse_safe, preview_parse_safe, type_source_safe,
+       full_prefix_bytes, preview_prefix_bytes
+from %s
+order by id`, opts.backupTableSQL)
 	rows, err := tx.QueryContext(ctx, query)
 	if err != nil {
 		return candidateSnapshot{}, fmt.Errorf("read candidate snapshot: %w", err)
@@ -366,8 +532,18 @@ func loadCandidateSnapshot(ctx context.Context, conn *sql.Conn, opts options) (c
 	var candidates []candidateMeta
 	for rows.Next() {
 		var item candidateMeta
-		if err := rows.Scan(&item.id, &item.fullMD5, &item.previewMD5, &item.markerPair); err != nil {
+		if err := rows.Scan(
+			&item.id, &item.source, &item.fullMD5, &item.previewMD5, &item.markerPair,
+			&item.sourceSupported, &item.fullParseSafe, &item.previewParseSafe,
+			&item.typeSourceSafe, &item.fullPrefixBytes, &item.previewPrefixBytes,
+		); err != nil {
 			return candidateSnapshot{}, fmt.Errorf("scan candidate snapshot: %w", err)
+		}
+		if !item.source.Valid || !item.markerPair || !item.sourceSupported ||
+			!item.fullParseSafe || !item.previewParseSafe || !item.typeSourceSafe ||
+			item.fullPrefixBytes < 1 || item.fullPrefixBytes > maxLegacyFullPrefix ||
+			item.previewPrefixBytes < 1 || item.previewPrefixBytes > maxLegacyPreviewPrefix {
+			return candidateSnapshot{}, fmt.Errorf("backup candidate %d failed sealed parse-safety assertions", item.id)
 		}
 		candidates = append(candidates, item)
 	}
@@ -383,15 +559,22 @@ func loadCandidateSnapshot(ctx context.Context, conn *sql.Conn, opts options) (c
 		}
 	}
 	h := sha256.New()
+	writeRelationIdentityDigest(h, manifest.Identity)
 	for _, item := range candidates {
 		writeDigestInt64(h, item.id)
+		writeDigestNullable(h, item.source)
 		writeDigestNullable(h, item.fullMD5)
 		writeDigestNullable(h, item.previewMD5)
-		if item.markerPair {
-			_, _ = io.WriteString(h, "1\n")
-		} else {
-			_, _ = io.WriteString(h, "0\n")
-		}
+		writeDigestBool(h, item.markerPair)
+		writeDigestBool(h, item.sourceSupported)
+		writeDigestBool(h, item.fullParseSafe)
+		writeDigestBool(h, item.previewParseSafe)
+		writeDigestBool(h, item.typeSourceSafe)
+		writeDigestInt64(h, int64(item.fullPrefixBytes))
+		writeDigestInt64(h, int64(item.previewPrefixBytes))
+	}
+	if len(candidates) != manifest.CandidateCount {
+		return candidateSnapshot{}, fmt.Errorf("sealed manifest candidate count %d does not match backup count %d", manifest.CandidateCount, len(candidates))
 	}
 	return candidateSnapshot{Count: len(candidates), Digest: hex.EncodeToString(h.Sum(nil))}, nil
 }
@@ -427,15 +610,17 @@ func scanPhase(ctx context.Context, conn *sql.Conn, opts options) (phaseReport, 
 }
 
 func loadBatch(ctx context.Context, conn *sql.Conn, opts options, lastID int64, readOnly bool) ([]backupLiveRow, error) {
-	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: readOnly})
+	batchCtx, cancel := context.WithTimeout(ctx, opts.batchDeadline)
+	defer cancel()
+	tx, err := conn.BeginTx(batchCtx, &sql.TxOptions{ReadOnly: readOnly})
 	if err != nil {
 		return nil, fmt.Errorf("begin batch read: %w", err)
 	}
 	defer tx.Rollback()
-	if err := setLocalTimeouts(ctx, tx, opts); err != nil {
+	if err := setLocalTimeouts(batchCtx, tx, opts); err != nil {
 		return nil, err
 	}
-	items, err := queryBatch(ctx, tx, opts, lastID)
+	items, err := queryBatch(batchCtx, tx, opts, lastID)
 	if err != nil {
 		return nil, err
 	}
@@ -491,7 +676,9 @@ func toRecordInput(item backupLiveRow) recordInput {
 		originalFullMD5:      item.originalFullMD5.String,
 		originalPreviewMD5:   item.originalPreviewMD5.String,
 		liveExists:           item.liveID.Valid,
+		liveFullValid:        item.liveFullText.Valid,
 		liveFullText:         item.liveFullText.String,
+		livePreviewValid:     item.liveTextPreview.Valid,
 		liveTextPreview:      item.liveTextPreview.String,
 	}
 }
@@ -528,21 +715,26 @@ func mutate(ctx context.Context, conn *sql.Conn, opts options) (int, error) {
 	lastID := minimumCandidateID
 	mutated := 0
 	for {
-		tx, err := conn.BeginTx(ctx, &sql.TxOptions{})
+		batchCtx, cancel := context.WithTimeout(ctx, opts.batchDeadline)
+		tx, err := conn.BeginTx(batchCtx, &sql.TxOptions{})
 		if err != nil {
+			cancel()
 			return mutated, fmt.Errorf("begin mutation batch: %w", err)
 		}
-		if err := setLocalTimeouts(ctx, tx, opts); err != nil {
+		if err := setLocalTimeouts(batchCtx, tx, opts); err != nil {
 			tx.Rollback()
+			cancel()
 			return mutated, err
 		}
-		batch, err := queryBatch(ctx, tx, opts, lastID)
+		batch, err := queryBatch(batchCtx, tx, opts, lastID)
 		if err != nil {
 			tx.Rollback()
+			cancel()
 			return mutated, err
 		}
 		if len(batch) == 0 {
 			tx.Rollback()
+			cancel()
 			break
 		}
 
@@ -551,7 +743,15 @@ func mutate(ctx context.Context, conn *sql.Conn, opts options) (int, error) {
 			decisions[i] = decideRecord(toRecordInput(item), opts.operation)
 			if !isWritableCategory(decisions[i].category, opts.operation) {
 				tx.Rollback()
+				cancel()
 				return mutated, fmt.Errorf("mutation batch rejected id %d in category %s", item.id, decisions[i].category)
+			}
+		}
+		if opts.testBeforeMutation != nil {
+			if err := opts.testBeforeMutation(batchCtx, batch); err != nil {
+				tx.Rollback()
+				cancel()
+				return mutated, fmt.Errorf("before mutation hook: %w", err)
 			}
 		}
 
@@ -561,41 +761,43 @@ func mutate(ctx context.Context, conn *sql.Conn, opts options) (int, error) {
 			if isAlreadyCategory(decision.category, opts.operation) {
 				continue
 			}
-			fromFullMD5, fromPreviewMD5 := decision.originalFullMD5, decision.originalPreviewMD5
 			toFull, toPreview := decision.cleanFullText, decision.cleanTextPreview
-			expectedToFullMD5, expectedToPreviewMD5 := decision.cleanFullMD5, decision.cleanPreviewMD5
 			if opts.operation == operationRollback {
-				fromFullMD5, fromPreviewMD5 = decision.cleanFullMD5, decision.cleanPreviewMD5
 				toFull, toPreview = item.originalFullText.String, item.originalTextPreview.String
-				expectedToFullMD5, expectedToPreviewMD5 = decision.originalFullMD5, decision.originalPreviewMD5
 			}
-			var returnedFullMD5, returnedPreviewMD5 string
-			err := tx.QueryRowContext(ctx, `
+			var returnedFull, returnedPreview sql.NullString
+			err := tx.QueryRowContext(batchCtx, `
 update public.prompt_filter_logs
 set full_text = $1, text_preview = $2
 where id = $3
-  and md5(coalesce(full_text, '')) = $4
-  and md5(coalesce(text_preview, '')) = $5
-returning md5(coalesce(full_text, '')), md5(coalesce(text_preview, ''))`,
-				toFull, toPreview, item.id, fromFullMD5, fromPreviewMD5,
-			).Scan(&returnedFullMD5, &returnedPreviewMD5)
+  and full_text is not distinct from $4::text
+  and text_preview is not distinct from $5::text
+returning full_text, text_preview`,
+				toFull, toPreview, item.id,
+				nullStringValue(item.liveFullText), nullStringValue(item.liveTextPreview),
+			).Scan(&returnedFull, &returnedPreview)
 			if errors.Is(err, sql.ErrNoRows) {
 				tx.Rollback()
+				cancel()
 				return mutated, fmt.Errorf("conditional update conflict for id %d", item.id)
 			}
 			if err != nil {
 				tx.Rollback()
+				cancel()
 				return mutated, fmt.Errorf("update id %d: %w", item.id, err)
 			}
-			if returnedFullMD5 != expectedToFullMD5 || returnedPreviewMD5 != expectedToPreviewMD5 {
+			if !returnedFull.Valid || !returnedPreview.Valid || returnedFull.String != toFull || returnedPreview.String != toPreview {
 				tx.Rollback()
-				return mutated, fmt.Errorf("suffix hash assertion failed for id %d", item.id)
+				cancel()
+				return mutated, fmt.Errorf("exact returned-value assertion failed for id %d", item.id)
 			}
 			batchMutated++
 		}
 		if err := tx.Commit(); err != nil {
+			cancel()
 			return mutated, fmt.Errorf("commit mutation batch: %w", err)
 		}
+		cancel()
 		mutated += batchMutated
 		lastID = batch[len(batch)-1].id
 	}
@@ -643,4 +845,29 @@ func writeDigestNullable(w io.Writer, value sql.NullString) {
 	_, _ = io.WriteString(w, "1:")
 	_, _ = io.WriteString(w, value.String)
 	_, _ = io.WriteString(w, "\x00")
+}
+
+func writeDigestBool(w io.Writer, value bool) {
+	if value {
+		_, _ = io.WriteString(w, "1\x00")
+		return
+	}
+	_, _ = io.WriteString(w, "0\x00")
+}
+
+func writeRelationIdentityDigest(w io.Writer, identity relationIdentity) {
+	writeDigestInt64(w, identity.DatabaseOID)
+	writeDigestInt64(w, identity.TargetRelID)
+	writeDigestInt64(w, identity.TargetRelFileNode)
+	writeDigestInt64(w, identity.BackupRelID)
+	writeDigestInt64(w, identity.BackupRelFileNode)
+	writeDigestInt64(w, identity.ManifestRelID)
+	writeDigestInt64(w, identity.ManifestRelFileNode)
+}
+
+func nullStringValue(value sql.NullString) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.String
 }
