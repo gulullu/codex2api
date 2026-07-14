@@ -34,12 +34,22 @@ type CodexAuditCasesPage struct {
 type CodexAuditAttempt struct {
 	AccountID         int64     `json:"account_id"`
 	AccountName       string    `json:"account_name"`
+	AccountType       string    `json:"account_type"`
 	StatusCode        int       `json:"status_code"`
 	AttemptIndex      int       `json:"attempt_index"`
 	IsRetryAttempt    bool      `json:"is_retry_attempt"`
 	UpstreamErrorKind string    `json:"upstream_error_kind"`
 	ErrorMessage      string    `json:"error_message"`
+	RouteClass        string    `json:"route_class"`
+	RouteReason       string    `json:"route_reason"`
 	RouteSource       string    `json:"route_source"`
+	RouteSignals      string    `json:"route_signals"`
+	PinKind           string    `json:"pin_kind"`
+	RouteGroupID      int64     `json:"route_group_id"`
+	RoutePinned       bool      `json:"route_pinned"`
+	InboundEndpoint   string    `json:"inbound_endpoint"`
+	UpstreamEndpoint  string    `json:"upstream_endpoint"`
+	Model             string    `json:"model"`
 	CreatedAt         time.Time `json:"created_at"`
 }
 
@@ -166,8 +176,11 @@ func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID strin
 		)
 		SELECT COALESCE(u.account_id, 0), COALESCE(a.name, ''), COALESCE(u.status_code, 0),
 		       COALESCE(u.attempt_index, 0), COALESCE(u.is_retry_attempt, false),
-		       COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-		       COALESCE(u.route_source, ''), u.created_at
+		       COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''), COALESCE(u.upstream_account_type, ''),
+		       COALESCE(u.route_class, ''), COALESCE(u.route_reason, ''), COALESCE(u.route_source, ''),
+		       COALESCE(u.route_signals, '[]'), COALESCE(u.pin_kind, ''), COALESCE(u.route_group_id, 0),
+		       COALESCE(u.route_pinned, false), COALESCE(u.inbound_endpoint, ''), COALESCE(u.upstream_endpoint, ''),
+		       COALESCE(NULLIF(u.effective_model, ''), u.model, ''), u.created_at
 		FROM usage_logs u
 		LEFT JOIN accounts a ON a.id = u.account_id
 		WHERE u.logical_request_id = $1 AND u.created_at >= $2 AND u.created_at <= $3
@@ -190,7 +203,10 @@ func (db *DB) listCodexAuditAttempts(ctx context.Context, logicalRequestID strin
 		var item CodexAuditAttempt
 		var createdAtRaw any
 		if err := rows.Scan(&item.AccountID, &item.AccountName, &item.StatusCode, &item.AttemptIndex,
-			&item.IsRetryAttempt, &item.UpstreamErrorKind, &item.ErrorMessage, &item.RouteSource, &createdAtRaw); err != nil {
+			&item.IsRetryAttempt, &item.UpstreamErrorKind, &item.ErrorMessage, &item.AccountType,
+			&item.RouteClass, &item.RouteReason, &item.RouteSource, &item.RouteSignals, &item.PinKind,
+			&item.RouteGroupID, &item.RoutePinned, &item.InboundEndpoint, &item.UpstreamEndpoint,
+			&item.Model, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdAtRaw)

@@ -940,13 +940,69 @@ export interface PromptFilterLog {
 export interface CodexAuditAttempt {
   account_id: number
   account_name: string
+  account_type: string
   status_code: number
   attempt_index: number
   is_retry_attempt: boolean
   upstream_error_kind: string
   error_message: string
+  route_class: string
+  route_reason: string
   route_source: string
+  route_signals: string
+  pin_kind: string
+  route_group_id: number
+  route_pinned: boolean
+  inbound_endpoint: string
+  upstream_endpoint: string
+  model: string
   created_at: ISODateString
+}
+
+export interface CodexAuditCyberCase {
+  id: number
+  audit_request_id: string
+  logical_request_id: string
+  legacy: boolean
+  scope: 'oauth' | 'relay'
+  created_at: ISODateString
+  cyber_attempts: number
+  attempt_count: number
+  cyber_account_id: number
+  cyber_account_name: string
+  cyber_account_type: string
+  cyber_status_code: number
+  cyber_error_message: string
+  final_usage_id: number
+  final_created_at: ISODateString
+  final_account_id: number
+  final_account_name: string
+  final_account_type: string
+  final_status_code: number
+  endpoint: string
+  inbound_endpoint: string
+  upstream_endpoint: string
+  model: string
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  client_ip: string
+  route_class: string
+  route_reason: string
+  route_source: string
+  route_signals: string
+  pin_kind: string
+  route_group_id: number
+  route_pinned: boolean
+  prompt_log_id: number
+  prompt_source: string
+  score: number
+  threshold: number
+  matched_patterns: string
+  text_preview: string
+  full_text: string
+  content_classification: 'confirmed_route_gap' | 'local_rule_hit' | 'unconfirmed' | string
+  attempts: CodexAuditAttempt[]
 }
 
 export interface PromptFilterLogsResponse {
@@ -1125,8 +1181,8 @@ export interface CodexAuditReport {
   relay_routes: CodexAuditRelayRouteRow[]
   route_signals: CodexAuditRouteSignalRow[]
   route_samples: PromptFilterLog[]
-  oauth_cyber_cases: PromptFilterLog[]
-  relay_cyber_cases: PromptFilterLog[]
+  oauth_cyber_cases: CodexAuditCyberCase[]
+  relay_cyber_cases: CodexAuditCyberCase[]
   suspicious_samples: PromptFilterLog[]
   probe_observed: CodexAuditProbeRow[]
   probe_short_circuits: CodexAuditProbeRow[]
@@ -1143,6 +1199,15 @@ export type CodexAuditCaseKind = 'relay_route' | 'session_bleed' | 'oauth_cyber'
 
 export interface CodexAuditCasesResponse {
   items: PromptFilterLog[]
+  total: number
+  page: number
+  page_size: number
+  window_start: string
+  window_end: string
+}
+
+export interface CodexAuditCyberCasesResponse {
+  items: CodexAuditCyberCase[]
   total: number
   page: number
   page_size: number

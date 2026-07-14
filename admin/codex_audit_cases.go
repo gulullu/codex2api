@@ -32,13 +32,23 @@ func (h *Handler) GetCodexAuditCases(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
 	defer cancel()
-	page, err := h.db.ListCodexAuditCasesPage(ctx, database.CodexAuditCasesQuery{
+	query := database.CodexAuditCasesQuery{
 		Kind:     kind,
 		Start:    start,
 		End:      end,
 		Page:     positiveQueryInt(c, "page", 1),
 		PageSize: positiveQueryInt(c, "page_size", 10),
-	})
+	}
+	if kind == database.CodexAuditCaseOAuthCyber || kind == database.CodexAuditCaseRelayCyber {
+		page, err := h.db.ListCodexAuditCyberCasesPage(ctx, query)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, page)
+		return
+	}
+	page, err := h.db.ListCodexAuditCasesPage(ctx, query)
 	if err != nil {
 		writeInternalError(c, err)
 		return

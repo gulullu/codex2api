@@ -723,6 +723,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_logical_request_created_at ON usage_logs(logical_request_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_route_created_at ON usage_logs(route_class, route_source, created_at);
+	CREATE INDEX IF NOT EXISTS idx_usage_logs_cyber_scope_created_at
+		ON usage_logs(upstream_account_type, created_at DESC, id DESC)
+		INCLUDE (logical_request_id, route_class, route_group_id, guardian_attempt_only, attempt_index)
+		WHERE upstream_error_kind = 'cyber_policy';
 
 	CREATE TABLE IF NOT EXISTS api_keys (
 		id         SERIAL PRIMARY KEY,

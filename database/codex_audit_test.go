@@ -843,6 +843,22 @@ func TestCodexAuditReportAggregatesSixRelayCyberCasesWithoutOAuthLeakage(t *test
 		t.Fatalf("relay cyber report = requests:%d attempts:%d cases:%d, want 6/6/6",
 			report.Summary.RelayCyberRequests, report.Summary.RelayCyberAttempts, len(report.RelayCyberCases))
 	}
+	oauthPage, err := db.ListCodexAuditCyberCasesPage(ctx, CodexAuditCasesQuery{
+		Kind: CodexAuditCaseOAuthCyber, Start: report.WindowStart, End: report.WindowEnd, Page: 1, PageSize: 20,
+	})
+	if err != nil {
+		t.Fatalf("ListCodexAuditCyberCasesPage(oauth): %v", err)
+	}
+	relayPage, err := db.ListCodexAuditCyberCasesPage(ctx, CodexAuditCasesQuery{
+		Kind: CodexAuditCaseRelayCyber, Start: report.WindowStart, End: report.WindowEnd, Page: 1, PageSize: 20,
+	})
+	if err != nil {
+		t.Fatalf("ListCodexAuditCyberCasesPage(relay): %v", err)
+	}
+	if oauthPage.Total != 0 || len(oauthPage.Items) != 0 || relayPage.Total != 6 || len(relayPage.Items) != 6 {
+		t.Fatalf("canonical cyber pages = oauth:%d/%d relay:%d/%d, want 0/0 and 6/6",
+			oauthPage.Total, len(oauthPage.Items), relayPage.Total, len(relayPage.Items))
+	}
 	if report.LastOAuthCyberPolicyAt != nil || report.LastRelayCyberPolicyAt == nil {
 		t.Fatalf("last cyber timestamps = oauth:%v relay:%v, want nil/non-nil",
 			report.LastOAuthCyberPolicyAt, report.LastRelayCyberPolicyAt)

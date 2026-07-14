@@ -19,8 +19,9 @@ import RelayGuardianPanel from '../components/RelayGuardianPanel'
 import { useLatestDataLoader } from '../hooks/useLatestDataLoader'
 import { formatBeijingTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
-import type { AccountRow, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
+import type { AccountRow, CodexAuditCyberCase, CodexAuditReport, HealthResponse, PromptFilterLog, UsageLog } from '../types'
 import { formatCodexAuditHealthScore, getCodexAuditFindings, getCodexAuditPresentation, getRelayWindowHealthStandard } from '../lib/codexAuditPresentation'
+import { stripLegacyAuditAttribution } from '../lib/codexAuditCase'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -386,19 +387,27 @@ export default function CodexAudit() {
             />
 
             <div className="grid min-w-0 gap-4 xl:grid-cols-2">
-              <CyberPolicyPanel
+              <CyberCasesPanel
+                key={`oauth-${report.window_start}-${report.window_end}`}
+                kind="oauth_cyber"
                 title="OAuth 漏放案卷"
-                description="仅展示实际由受保护 OAuth 账号发起且返回 cyber_policy 的请求；Relay 账号事件不计入漏放。"
-                rows={report.oauth_cyber_cases || []}
-                total={report.summary.oauth_cyber_miss_attempts}
+                description="仅统计实际调用 OAuth 且返回 cyber_policy 的逻辑请求；Relay 事件不会混入。"
+                start={report.window_start}
+                end={report.window_end}
+                requestTotal={report.summary.oauth_cyber_miss_requests}
+                attemptTotal={report.summary.oauth_cyber_miss_attempts}
                 empty="当前窗口内没有 OAuth 漏放"
                 tone={report.summary.oauth_cyber_miss_attempts ? 'bad' : 'ok'}
               />
-              <CyberPolicyPanel
+              <CyberCasesPanel
+                key={`relay-${report.window_start}-${report.window_end}`}
+                kind="relay_cyber"
                 title="Relay CYB 案卷"
-                description="展示 Relay 账号返回的 cyber_policy，用于供应商质量分析，不计入 OAuth 漏放。"
-                rows={report.relay_cyber_cases || []}
-                total={report.summary.relay_cyber_attempts}
+                description="仅统计 Relay 路由账号返回的 cyber_policy，用于观察上游质量。"
+                start={report.window_start}
+                end={report.window_end}
+                requestTotal={report.summary.relay_cyber_requests}
+                attemptTotal={report.summary.relay_cyber_attempts}
                 empty="当前窗口内 Relay 未返回 cyber_policy"
                 tone={report.summary.relay_cyber_attempts ? 'warn' : 'ok'}
               />
@@ -492,9 +501,56 @@ export default function CodexAudit() {
   )
 }
 
-function CyberPolicyPanel({ title, description, rows, total, empty, tone }: { title: string; description: string; rows: PromptFilterLog[]; total: number; empty: string; tone: Tone }) {
-  const { pageRows, page, totalPages, setPage, pageSize } = usePaged(rows)
-  const clean = total === 0
+function CyberCasesPanel({
+  kind,
+  title,
+  description,
+  start,
+  end,
+  requestTotal,
+  attemptTotal,
+  empty,
+  tone,
+}: {
+  kind: 'oauth_cyber' | 'relay_cyber'
+  title: string
+  description: string
+  start: string
+  end: string
+  requestTotal: number
+  attemptTotal: number
+  empty: string
+  tone: Tone
+}) {
+  const [rows, setRows] = useState<CodexAuditCyberCase[]>([])
+  const [total, setTotal] = useState(requestTotal)
+  const [page, setPage] = useState(1)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const clean = requestTotal === 0
+  const totalPages = Math.max(1, Math.ceil(total / AUDIT_PAGE_SIZE))
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    void api.getCodexAuditCyberCases({ kind, start, end, page, pageSize: AUDIT_PAGE_SIZE })
+      .then((res) => {
+        if (cancelled) return
+        setRows(res.items ?? [])
+        setTotal(res.total ?? 0)
+      })
+      .catch((err) => {
+        if (!cancelled) setError(getErrorMessage(err))
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [end, kind, page, start])
+
   const cardClass = tone === 'bad'
     ? 'border-red-500/40 bg-red-500/[0.06]'
     : tone === 'warn'
@@ -514,24 +570,114 @@ function CyberPolicyPanel({ title, description, rows, total, empty, tone }: { ti
             </div>
           </div>
           <div className="shrink-0 text-right">
-            <div className={`text-2xl font-bold tabular-nums ${toneTextClass(tone)}`}>{formatNumber(total)}</div>
-            <div className="text-[11px] leading-tight text-muted-foreground">上游尝试</div>
+            <div className={`text-2xl font-bold tabular-nums ${toneTextClass(tone)}`}>{formatNumber(requestTotal)}</div>
+            <div className="text-[11px] leading-tight text-muted-foreground">逻辑请求 · 尝试 {formatNumber(attemptTotal)}</div>
           </div>
         </div>
-        {clean ? (
+        {error ? (
+          <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{error}</div>
+        ) : clean ? (
           <div className="rounded-lg border border-border/60 bg-background/60 p-6 text-center text-xs text-muted-foreground">{empty}</div>
-        ) : (
+        ) : rows.length ? (
           <>
             <div className="space-y-2">
-              {pageRows.map((log) => <AuditLogRow key={log.id} log={log} />)}
+              {rows.map((item) => <CyberCaseRow key={item.audit_request_id || `legacy-${item.id}`} item={item} />)}
             </div>
-            {rows.length > pageSize ? (
-              <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={rows.length} pageSize={pageSize} />
+            {total > AUDIT_PAGE_SIZE ? (
+              <Pagination page={page} totalPages={totalPages} onPageChange={setPage} totalItems={total} pageSize={AUDIT_PAGE_SIZE} />
             ) : null}
           </>
+        ) : (
+          <EmptyState>{loading ? '正在加载案卷…' : empty}</EmptyState>
         )}
       </CardContent>
     </Card>
+  )
+}
+
+function cyberContentLabel(value?: string) {
+  if (value === 'confirmed_route_gap') return '确定性高风险路由漏放'
+  if (value === 'local_rule_hit') return '本地规则已命中'
+  return '内容性质未确认'
+}
+
+function CyberCaseRow({ item }: { item: CodexAuditCyberCase }) {
+  const [open, setOpen] = useState(false)
+  const full = stripLegacyAuditAttribution(item.full_text)
+  const preview = stripLegacyAuditAttribution(item.text_preview)
+  const scopeLabel = item.scope === 'oauth' ? 'OAuth 保护漏放' : 'Relay 上游 CYB'
+  const inbound = item.inbound_endpoint || item.endpoint || '-'
+  const upstream = item.upstream_endpoint || '-'
+  return (
+    <div className="min-w-0 rounded-lg border border-border/60 bg-background/70">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full min-w-0 items-center gap-2 px-3 py-2.5 text-left sm:gap-3"
+      >
+        <Badge className={item.scope === 'oauth' ? 'shrink-0 border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300' : 'shrink-0 border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'}>{scopeLabel}</Badge>
+        <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-muted-foreground sm:inline">{formatBeijingTime(item.created_at)}</span>
+        <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-muted-foreground md:inline">{inbound}</span>
+        <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-muted-foreground md:inline">{item.model || '-'}</span>
+        <span className="min-w-0 flex-1 truncate text-xs text-foreground">{preview || (item.legacy ? '历史记录无精确关联正文' : '未保存请求预览')}</span>
+        <ChevronDown className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open ? (
+        <div className="border-t border-border/60 px-3 py-3">
+          <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground sm:hidden">
+            <span>{formatBeijingTime(item.created_at)}</span>
+            <span>{inbound}</span>
+            <span>{item.model || '-'}</span>
+          </div>
+          <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+            <span>CYB 账号 {item.cyber_account_name || (item.cyber_account_id ? `#${item.cyber_account_id}` : '-')}</span>
+            <span>{upstreamAccountTypeLabel(item.cyber_account_type)}</span>
+            <span>最终账号 {item.final_account_name || (item.final_account_id ? `#${item.final_account_id}` : '-')}</span>
+            <span>最终状态 {item.final_status_code || '-'}</span>
+            <span>端点 {inbound} → {upstream}</span>
+            <span>分流 {routeSourceLabel(item.route_source || item.route_class)}</span>
+            <span>归属 {pinKindLabel(item.pin_kind)}</span>
+            {item.route_group_id ? <span>分组 {item.route_group_id}</span> : null}
+            {item.route_signals ? <span>信号 {formatRouteSignals(item.route_signals)}</span> : null}
+          </div>
+          <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px]">
+            <Badge variant="outline" className="bg-background/70">{cyberContentLabel(item.content_classification)}</Badge>
+            <span className="text-muted-foreground">{formatNumber(item.cyber_attempts)} 次 cyber_policy · {formatNumber(item.attempt_count)} 次上游调用</span>
+            {item.legacy ? <span className="text-amber-700 dark:text-amber-300">历史记录无 logical_request_id，未猜测正文或用户归属</span> : null}
+          </div>
+          {item.attempts?.length ? (
+            <div className="mb-3 rounded-md border border-border/60 bg-muted/25 p-2.5">
+              <div className="mb-2 text-[11px] font-medium text-foreground">上游尝试链路</div>
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
+                {item.attempts.map((attempt, index) => {
+                  const ok = attempt.status_code >= 200 && attempt.status_code < 300
+                  const cyber = attempt.upstream_error_kind === 'cyber_policy'
+                  const style = cyber
+                    ? 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300'
+                    : ok
+                      ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                      : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                  return (
+                    <div key={`${attempt.account_id}-${attempt.created_at}-${index}`} className="contents">
+                      {index > 0 ? <span className="text-muted-foreground">→</span> : null}
+                      <span
+                        className={`inline-flex min-w-0 items-center gap-1 rounded border px-2 py-1 ${style}`}
+                        title={[formatBeijingTime(attempt.created_at), attempt.inbound_endpoint, attempt.upstream_endpoint, attempt.route_source, attempt.error_message].filter(Boolean).join(' · ')}
+                      >
+                        <span className="max-w-40 truncate">{attempt.account_name || `#${attempt.account_id || '-'}`}</span>
+                        <span className="font-mono">{attempt.status_code || '-'}</span>
+                        <span className="text-[10px] opacity-75">第 {attempt.attempt_index || index + 1} 次</span>
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          ) : null}
+          <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/40 p-3 text-[12px] leading-5 text-foreground">{full || '（无精确关联的请求正文）'}</pre>
+        </div>
+      ) : null}
+    </div>
   )
 }
 

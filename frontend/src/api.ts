@@ -14,6 +14,7 @@ import type {
   CreateAPIKeyRequest,
   CodexAuditCaseKind,
   CodexAuditCasesResponse,
+  CodexAuditCyberCasesResponse,
   CodexAuditReport,
   FetchOpenAIResponsesModelsRequest,
   FetchOpenAIResponsesModelsResponse,
@@ -351,6 +352,15 @@ export const api = {
     if (params.page) search.set('page', String(params.page))
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return request<CodexAuditCasesResponse>(`/audit/codex2api/cases?${search.toString()}`)
+  },
+  getCodexAuditCyberCases: (params: { kind: 'oauth_cyber' | 'relay_cyber'; start: string; end: string; page?: number; pageSize?: number }) => {
+    const search = new URLSearchParams()
+    search.set('kind', params.kind)
+    search.set('start', params.start)
+    search.set('end', params.end)
+    if (params.page) search.set('page', String(params.page))
+    if (params.pageSize) search.set('page_size', String(params.pageSize))
+    return request<CodexAuditCyberCasesResponse>(`/audit/codex2api/cases?${search.toString()}`)
   },
   getRelayGuardianStatus: () =>
     request<RelayGuardianStatusResponse>('/relay-guardian/status'),

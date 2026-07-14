@@ -30,8 +30,8 @@ type CodexAuditReport struct {
 	RelayRoutes            []CodexAuditRelayRouteRow   `json:"relay_routes"`
 	RouteSignals           []CodexAuditRouteSignalRow  `json:"route_signals"`
 	RouteSamples           []*PromptFilterLog          `json:"route_samples"`
-	OAuthCyberCases        []*PromptFilterLog          `json:"oauth_cyber_cases"`
-	RelayCyberCases        []*PromptFilterLog          `json:"relay_cyber_cases"`
+	OAuthCyberCases        []*CodexAuditCyberCase      `json:"oauth_cyber_cases"`
+	RelayCyberCases        []*CodexAuditCyberCase      `json:"relay_cyber_cases"`
 	SuspiciousSamples      []*PromptFilterLog          `json:"suspicious_samples"`
 	ProbeObserved          []CodexAuditProbeRow        `json:"probe_observed"`
 	ProbeShortCircuits     []CodexAuditProbeRow        `json:"probe_short_circuits"`
@@ -210,6 +210,8 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 		GeneratedAt:        now,
 		ProbeObserved:      []CodexAuditProbeRow{},
 		ProbeShortCircuits: []CodexAuditProbeRow{},
+		OAuthCyberCases:    []*CodexAuditCyberCase{},
+		RelayCyberCases:    []*CodexAuditCyberCase{},
 		ProbeHighFrequency: []CodexAuditProbeRow{},
 		Notes: []string{
 			"Sub2 bridge account state is not queried from inside codex2api; use the external s12 audit workflow when bridge schedulability must be confirmed.",
@@ -239,12 +241,16 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 		return nil, err
 	}
 	report.RouteSamples = routeCases.Items
-	if report.OAuthCyberCases, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "upstream_cyber_policy", CyberScope: "oauth", Start: start, End: end}); err != nil {
+	oauthCases, err := db.listCodexAuditCyberCasesPage(ctx, CodexAuditCasesQuery{Kind: CodexAuditCaseOAuthCyber, Page: 1, PageSize: query.Limit, Start: start, End: end}, false)
+	if err != nil {
 		return nil, err
 	}
-	if report.RelayCyberCases, _, err = db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: query.Limit, Source: "upstream_cyber_policy", CyberScope: "relay", Start: start, End: end}); err != nil {
+	report.OAuthCyberCases = oauthCases.Items
+	relayCyberCases, err := db.listCodexAuditCyberCasesPage(ctx, CodexAuditCasesQuery{Kind: CodexAuditCaseRelayCyber, Page: 1, PageSize: query.Limit, Start: start, End: end}, false)
+	if err != nil {
 		return nil, err
 	}
+	report.RelayCyberCases = relayCyberCases.Items
 	if report.SuspiciousSamples, err = db.codexAuditSuspiciousSamples(ctx, start, end, query.Limit); err != nil {
 		return nil, err
 	}
@@ -276,33 +282,34 @@ func (db *DB) BuildCodexAuditReport(ctx context.Context, query CodexAuditQuery) 
 func (db *DB) codexAuditLastCyberPolicyAt(ctx context.Context, end time.Time, scope string) (*time.Time, error) {
 	start := end.Add(-30 * 24 * time.Hour)
 	startArg, endArg := db.timeRangeArgs(start, end)
-	accountType := "oauth"
-	routeClause := ""
+	kind := CodexAuditCaseOAuthCyber
 	if scope == "relay" {
-		accountType = "openai_responses"
-		routeClause = " AND COALESCE(u.route_class, '') = 'cyb_relay' AND COALESCE(u.route_group_id, 0) > 0"
+		kind = CodexAuditCaseRelayCyber
+	}
+	_, scopePredicate, err := codexAuditCyberScopeSQL(kind)
+	if err != nil {
+		return nil, err
 	}
 	var raw any
 	if err := db.conn.QueryRowContext(ctx, `
 		SELECT MAX(u.created_at) FROM usage_logs u
-		WHERE LOWER(COALESCE(u.upstream_error_kind, '')) = 'cyber_policy'
-		  AND COALESCE(u.upstream_account_type, '') = $3
-		  AND u.created_at >= $1 AND u.created_at <= $2
+		WHERE u.created_at >= $1 AND u.created_at <= $2
+		  AND `+scopePredicate+`
 		  AND (
-			NOT COALESCE(u.guardian_attempt_only, FALSE)
-			OR (
-				COALESCE(u.guardian_attempt_only, FALSE)
-				AND COALESCE(u.attempt_index, 0) > 0
-				AND COALESCE(u.logical_request_id, '') <> ''
-				AND EXISTS (
-					SELECT 1 FROM usage_logs f
-					WHERE f.logical_request_id = u.logical_request_id
-					  AND f.created_at >= $1 AND f.created_at <= $2
-					  AND NOT COALESCE(f.guardian_attempt_only, FALSE)
-				)
-			)
-		  )`+routeClause,
-		startArg, endArg, accountType).Scan(&raw); err != nil {
+		    NOT COALESCE(u.guardian_attempt_only, FALSE)
+		    OR (
+		      COALESCE(u.guardian_attempt_only, FALSE)
+		      AND COALESCE(u.attempt_index, 0) > 0
+		      AND COALESCE(u.logical_request_id, '') <> ''
+		      AND EXISTS (
+		        SELECT 1 FROM usage_logs f
+		        WHERE f.logical_request_id = u.logical_request_id
+		          AND f.created_at >= $1 AND f.created_at <= $2
+		          AND NOT COALESCE(f.guardian_attempt_only, FALSE)
+		      )
+		    )
+		  )`,
+		startArg, endArg).Scan(&raw); err != nil {
 		return nil, err
 	}
 	if raw == nil {
@@ -1092,20 +1099,14 @@ summary_usage AS MATERIALIZED (
 	       COALESCE(u.route_group_id, 0) AS route_group_id,
 	       COALESCE(u.account_id, 0) AS account_id,
 	       COALESCE(u.status_code, 0) AS status_code,
-	       CASE WHEN LOWER(COALESCE(u.upstream_error_kind, '')) = 'cyber_policy'
-	                  AND COALESCE(u.upstream_account_type, '') = 'oauth'
+	       CASE WHEN ` + codexAuditOAuthCyberAttemptSQL + `
 	            THEN 1 ELSE 0 END AS oauth_cyber,
-	       CASE WHEN LOWER(COALESCE(u.upstream_error_kind, '')) = 'cyber_policy'
-	                  AND COALESCE(u.upstream_account_type, '') = 'openai_responses'
-	                  AND COALESCE(u.route_class, '') = 'cyb_relay'
-	                  AND COALESCE(u.route_group_id, 0) > 0
+	       CASE WHEN ` + codexAuditRelayCyberAttemptSQL + `
 	            THEN 1 ELSE 0 END AS relay_cyber,
-	       CASE WHEN LOWER(COALESCE(u.upstream_error_kind, '')) = 'cyber_policy'
+	       CASE WHEN ` + codexAuditCyberPolicyAttemptSQL + `
 	                  AND NOT (
-	                    COALESCE(u.upstream_account_type, '') = 'oauth' OR
-	                    (COALESCE(u.upstream_account_type, '') = 'openai_responses'
-	                     AND COALESCE(u.route_class, '') = 'cyb_relay'
-	                     AND COALESCE(u.route_group_id, 0) > 0)
+	                    COALESCE(` + codexAuditOAuthCyberAttemptSQL + `, FALSE) OR
+	                    COALESCE(` + codexAuditRelayCyberAttemptSQL + `, FALSE)
 	                  )
 	            THEN 1 ELSE 0 END AS legacy_cyber,
 	       CASE WHEN COALESCE(u.logical_request_id, '') <> '' AND ` + codexAuditRoutePoolViolationSQL + `
