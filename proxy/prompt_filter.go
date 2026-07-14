@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -46,12 +45,16 @@ type promptFilterAuditScanMeta struct {
 }
 
 type promptFilterPartitionScanDetails struct {
-	Version       int                               `json:"version"`
-	PayloadBytes  int                               `json:"payload_bytes"`
-	ScannedBytes  int                               `json:"scanned_bytes"`
-	ScanTruncated bool                              `json:"scan_truncated"`
-	OpaqueBytes   int                               `json:"opaque_bytes"`
-	Partitions    []promptFilterPartitionScanDetail `json:"partitions"`
+	Version        int                               `json:"version"`
+	Mode           string                            `json:"mode"`
+	PayloadBytes   int                               `json:"payload_bytes"`
+	ValidJSON      *bool                             `json:"valid_json,omitempty"`
+	Supported      bool                              `json:"supported_payload"`
+	FallbackReason string                            `json:"fallback_reason,omitempty"`
+	ScannedBytes   int                               `json:"scanned_bytes"`
+	ScanTruncated  bool                              `json:"scan_truncated"`
+	OpaqueBytes    int                               `json:"opaque_bytes"`
+	Partitions     []promptFilterPartitionScanDetail `json:"partitions"`
 }
 
 type promptFilterPartitionScanDetail struct {
@@ -245,7 +248,9 @@ func inspectPromptFilterText(text string, endpoint string, cfg promptfilter.Conf
 	cybSignal, signals := promptFilterCYBSignal(verdict, text, cfg, endpoint)
 	details := promptFilterPartitionScanDetails{
 		Version:      promptfilter.RoutingPartitionScanVersion,
+		Mode:         "direct_text",
 		PayloadBytes: len(text),
+		Supported:    true,
 		ScannedBytes: len(text),
 		Partitions: []promptFilterPartitionScanDetail{{
 			Name:         "text",
@@ -275,38 +280,25 @@ func inspectPromptFilterText(text string, endpoint string, cfg promptfilter.Conf
 // routing rules are never assembled across compartments.
 func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilter.Config, userTextRescanEnabled bool) promptFilterRouteScan {
 	if !userTextRescanEnabled || !cybRelayTextEndpoint(endpoint) {
-		fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
-		fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
-		legacyBudget := cfg.MaxTextLength
-		if legacyBudget <= 0 {
-			legacyBudget = promptfilter.DefaultMaxTextLength
-		}
-		fullScan.PayloadBytes = int64(len(rawBody))
-		fullScan.ScanTruncated = len(fullText) >= legacyBudget
-		fullScan.ScanDetails = marshalPromptFilterScanDetails(promptFilterPartitionScanDetails{
-			Version:       promptfilter.RoutingPartitionScanVersion,
-			PayloadBytes:  len(rawBody),
-			ScannedBytes:  len(fullText),
-			ScanTruncated: fullScan.ScanTruncated,
-			Partitions: []promptFilterPartitionScanDetail{{
-				Name:         "legacy_full",
-				BudgetBytes:  legacyBudget,
-				SourceBytes:  len(fullText),
-				ScannedBytes: len(fullText),
-				Truncated:    fullScan.ScanTruncated,
-				Score:        fullScan.Verdict.Score,
-				RawScore:     fullScan.Verdict.RawScore,
-				Matched:      fullScan.Verdict.Matched,
-				RouteSignals: fullScan.Signals,
-			}},
-		})
-		return fullScan
+		return inspectPromptFilterPayloadLegacy(rawBody, endpoint, cfg, "partition_scan_disabled")
 	}
 
 	partitioned := promptfilter.ExtractRoutingPartitions(rawBody, endpoint)
+	if !partitioned.ValidJSON {
+		return inspectPromptFilterPayloadLegacy(rawBody, endpoint, cfg, "invalid_json")
+	}
+	if !partitioned.Supported {
+		return inspectPromptFilterPayloadLegacy(rawBody, endpoint, cfg, "unsupported_payload_shape")
+	}
+	if !promptFilterPartitionsUsable(partitioned) {
+		return inspectPromptFilterPayloadLegacy(rawBody, endpoint, cfg, "partition_extraction_unusable")
+	}
 	details := promptFilterPartitionScanDetails{
 		Version:       partitioned.Version,
+		Mode:          "partitioned_json",
 		PayloadBytes:  partitioned.PayloadBytes,
+		ValidJSON:     boolPointer(partitioned.ValidJSON),
+		Supported:     partitioned.Supported,
 		ScannedBytes:  partitioned.ScannedBytes,
 		ScanTruncated: partitioned.ScanTruncated,
 		OpaqueBytes:   partitioned.OpaqueBytes,
@@ -320,7 +312,7 @@ func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilte
 	userPreview := ""
 	combinedParts := make([]string, 0, len(partitioned.Partitions))
 	partitionScans := make([]promptFilterRouteScan, len(partitioned.Partitions))
-	scanPartition := func(index int) {
+	for index := range partitioned.Partitions {
 		partition := partitioned.Partitions[index]
 		partitionCfg := cfg
 		partitionCfg.MaxTextLength = partition.BudgetBytes
@@ -332,25 +324,6 @@ func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilte
 			AuditText: partition.Text,
 			CYBSignal: partitionSignal,
 			Signals:   partitionSignals,
-		}
-	}
-	if partitioned.ScannedBytes >= 64*1024 {
-		var wait sync.WaitGroup
-		for index, partition := range partitioned.Partitions {
-			if strings.TrimSpace(partition.Text) == "" {
-				scanPartition(index)
-				continue
-			}
-			wait.Add(1)
-			go func(index int) {
-				defer wait.Done()
-				scanPartition(index)
-			}(index)
-		}
-		wait.Wait()
-	} else {
-		for index := range partitioned.Partitions {
-			scanPartition(index)
 		}
 	}
 	for index, partition := range partitioned.Partitions {
@@ -404,6 +377,85 @@ func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilte
 		}
 	}
 	return merged
+}
+
+func promptFilterPartitionsUsable(partitioned promptfilter.RoutingPayloadPartitions) bool {
+	if !partitioned.ValidJSON || !partitioned.Supported || len(partitioned.Partitions) != 4 {
+		return false
+	}
+	expectedBudgets := map[string]int{
+		promptfilter.RoutingPartitionUser:   promptfilter.RoutingUserScanBudget,
+		promptfilter.RoutingPartitionSystem: promptfilter.RoutingSystemScanBudget,
+		promptfilter.RoutingPartitionTools:  promptfilter.RoutingToolsScanBudget,
+		promptfilter.RoutingPartitionOther:  promptfilter.RoutingOtherScanBudget,
+	}
+	seen := make(map[string]bool, len(expectedBudgets))
+	total := 0
+	for _, partition := range partitioned.Partitions {
+		budget, ok := expectedBudgets[partition.Name]
+		if !ok || seen[partition.Name] || partition.BudgetBytes != budget ||
+			partition.SourceBytes < 0 || partition.ScannedBytes < 0 ||
+			partition.ScannedBytes > partition.BudgetBytes ||
+			len(partition.Text) != partition.ScannedBytes {
+			return false
+		}
+		seen[partition.Name] = true
+		total += partition.ScannedBytes
+	}
+	return len(seen) == len(expectedBudgets) && total == partitioned.ScannedBytes && total <= promptfilter.RoutingTotalScanBudget
+}
+
+func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promptfilter.Config, fallbackReason string) promptFilterRouteScan {
+	fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
+	legacyBudget := cfg.MaxTextLength
+	if legacyBudget <= 0 {
+		legacyBudget = promptfilter.DefaultMaxTextLength
+	}
+	fullScan.PayloadBytes = int64(len(rawBody))
+	fullScan.ScanTruncated = len(fullText) >= legacyBudget
+	validJSON := gjson.ValidBytes(rawBody)
+	fullScan.ScanDetails = marshalPromptFilterScanDetails(promptFilterPartitionScanDetails{
+		Version:        promptfilter.RoutingPartitionScanVersion,
+		Mode:           "legacy_full",
+		PayloadBytes:   len(rawBody),
+		ValidJSON:      boolPointer(validJSON),
+		Supported:      promptFilterPayloadShapeSupported(rawBody, validJSON),
+		FallbackReason: fallbackReason,
+		ScannedBytes:   len(fullText),
+		ScanTruncated:  fullScan.ScanTruncated,
+		Partitions: []promptFilterPartitionScanDetail{{
+			Name:         "legacy_full",
+			BudgetBytes:  legacyBudget,
+			SourceBytes:  len(fullText),
+			ScannedBytes: len(fullText),
+			Truncated:    fullScan.ScanTruncated,
+			Score:        fullScan.Verdict.Score,
+			RawScore:     fullScan.Verdict.RawScore,
+			Matched:      fullScan.Verdict.Matched,
+			RouteSignals: fullScan.Signals,
+		}},
+	})
+	return fullScan
+}
+
+func boolPointer(value bool) *bool {
+	return &value
+}
+
+func promptFilterPayloadShapeSupported(rawBody []byte, validJSON bool) bool {
+	if !validJSON {
+		return false
+	}
+	for _, path := range []string{
+		"instructions", "system", "tools", "functions", "skills",
+		"tool_choice", "messages", "input", "prompt",
+	} {
+		if gjson.GetBytes(rawBody, path).Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 func routingTextOutsideLegacyWindow(legacyFullText string, userText string) bool {

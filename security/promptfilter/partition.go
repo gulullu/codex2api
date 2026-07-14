@@ -41,6 +41,8 @@ type RoutingTextPartition struct {
 type RoutingPayloadPartitions struct {
 	Version       int                    `json:"version"`
 	PayloadBytes  int                    `json:"payload_bytes"`
+	ValidJSON     bool                   `json:"valid_json"`
+	Supported     bool                   `json:"supported_payload"`
 	ScannedBytes  int                    `json:"scanned_bytes"`
 	ScanTruncated bool                   `json:"scan_truncated"`
 	OpaqueBytes   int                    `json:"opaque_bytes"`
@@ -64,8 +66,10 @@ func ExtractRoutingPartitions(body []byte, endpoint string) RoutingPayloadPartit
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return result
 	}
+	result.ValidJSON = true
 
 	root := gjson.ParseBytes(body)
+	result.Supported = hasSupportedRoutingField(root)
 	result.OpaqueBytes = countOpaqueJSONBytes(root)
 
 	var userSegments []string
@@ -92,6 +96,18 @@ func ExtractRoutingPartitions(body []byte, endpoint string) RoutingPayloadPartit
 		result.ScanTruncated = result.ScanTruncated || partition.Truncated
 	}
 	return result
+}
+
+func hasSupportedRoutingField(root gjson.Result) bool {
+	for _, field := range []string{
+		"instructions", "system", "tools", "functions", "skills",
+		"tool_choice", "messages", "input", "prompt",
+	} {
+		if root.Get(field).Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 func collectConversationPartitions(result gjson.Result, directStringIsUser bool, user, system, other *[]string) {
@@ -184,7 +200,7 @@ func collectSafeGJSONText(result gjson.Result, parts *[]string) {
 	case result.IsObject():
 		result.ForEach(func(key, value gjson.Result) bool {
 			name := strings.ToLower(strings.TrimSpace(key.String()))
-			if name == "type" || name == "role" || isOpaqueField(name) {
+			if name == "type" || name == "role" || isAlwaysOpaqueField(name) {
 				return true
 			}
 			collectSafeGJSONText(value, parts)
@@ -214,7 +230,7 @@ func countOpaqueJSONBytes(result gjson.Result) int {
 	}
 	total := 0
 	result.ForEach(func(key, value gjson.Result) bool {
-		if isOpaqueField(strings.ToLower(strings.TrimSpace(key.String()))) {
+		if isAlwaysOpaqueField(strings.ToLower(strings.TrimSpace(key.String()))) {
 			total += rawResultBytes(value)
 			return true
 		}
@@ -236,9 +252,9 @@ func isOpaqueObject(result gjson.Result) bool {
 	}
 }
 
-func isOpaqueField(name string) bool {
+func isAlwaysOpaqueField(name string) bool {
 	switch name {
-	case "encrypted_content", "b64_json", "image_url", "url", "file_id", "file_data", "source", "audio", "bytes", "binary", "blob", "data":
+	case "encrypted_content", "b64_json", "file_data", "bytes", "binary", "blob":
 		return true
 	default:
 		return false
@@ -253,8 +269,9 @@ func rawResultBytes(result gjson.Result) int {
 }
 
 func buildLatestFirstPartition(name string, budget int, segments []string) RoutingTextPartition {
-	segments = uniqueTextSegments(segments)
-	sourceBytes := joinedSourceBytes(segments)
+	sourceSegments := normalizedTextSegments(segments)
+	sourceBytes := joinedSourceBytes(sourceSegments)
+	segments = uniqueTextSegments(sourceSegments)
 	remaining := budget
 	selected := make([]string, 0, len(segments))
 	for index := len(segments) - 1; index >= 0 && remaining > 0; index-- {
@@ -285,22 +302,25 @@ func buildLatestFirstPartition(name string, budget int, segments []string) Routi
 }
 
 func buildOrderedPartition(name string, budget int, segments []string) RoutingTextPartition {
-	segments = uniqueTextSegments(segments)
+	sourceSegments := normalizedTextSegments(segments)
+	sourceBytes := joinedSourceBytes(sourceSegments)
+	segments = uniqueTextSegments(sourceSegments)
 	source := strings.Join(segments, "\n")
 	text := boundedHeadTail(source, budget)
-	return RoutingTextPartition{Name: name, BudgetBytes: budget, SourceBytes: len(source), ScannedBytes: len(text), Truncated: len(text) < len(source), Text: text}
+	return RoutingTextPartition{Name: name, BudgetBytes: budget, SourceBytes: sourceBytes, ScannedBytes: len(text), Truncated: len(text) < sourceBytes, Text: text}
 }
 
 func buildFairPartition(name string, budget int, segments []string) RoutingTextPartition {
-	segments = uniqueTextSegments(segments)
-	sourceBytes := joinedSourceBytes(segments)
+	sourceSegments := normalizedTextSegments(segments)
+	sourceBytes := joinedSourceBytes(sourceSegments)
+	segments = uniqueTextSegments(sourceSegments)
 	if len(segments) == 0 || budget <= 0 {
 		return RoutingTextPartition{Name: name, BudgetBytes: budget, SourceBytes: sourceBytes, Truncated: sourceBytes > 0}
 	}
 
 	separatorBytes := len(segments) - 1
 	if separatorBytes >= budget {
-		segments = segments[:budget]
+		segments = sampleHeadTailSegments(segments, fairSegmentLimit(budget))
 		separatorBytes = len(segments) - 1
 	}
 	available := budget - separatorBytes
@@ -314,6 +334,51 @@ func buildFairPartition(name string, budget int, segments []string) RoutingTextP
 	}
 	text := strings.Join(selected, "\n")
 	return RoutingTextPartition{Name: name, BudgetBytes: budget, SourceBytes: sourceBytes, ScannedBytes: len(text), Truncated: len(text) < sourceBytes, Text: text}
+}
+
+const minimumFairSegmentBytes = 32
+
+func fairSegmentLimit(budget int) int {
+	if budget <= 0 {
+		return 0
+	}
+	limit := (budget + 1) / (minimumFairSegmentBytes + 1)
+	if limit < 1 {
+		return 1
+	}
+	return limit
+}
+
+// sampleHeadTailSegments deterministically alternates from the beginning and
+// end, then restores source order. This prevents very large tool arrays from
+// making every later tool permanently invisible.
+func sampleHeadTailSegments(segments []string, limit int) []string {
+	if limit <= 0 || len(segments) == 0 {
+		return nil
+	}
+	if len(segments) <= limit {
+		return segments
+	}
+	selected := make([]bool, len(segments))
+	left, right := 0, len(segments)-1
+	count := 0
+	for count < limit && left <= right {
+		selected[left] = true
+		left++
+		count++
+		if count < limit && left <= right {
+			selected[right] = true
+			right--
+			count++
+		}
+	}
+	result := make([]string, 0, count)
+	for index, segment := range segments {
+		if selected[index] {
+			result = append(result, segment)
+		}
+	}
+	return result
 }
 
 func fairByteAllocations(segments []string, budget int) []int {
@@ -367,6 +432,17 @@ func uniqueTextSegments(segments []string) []string {
 		}
 		seen[segment] = struct{}{}
 		result = append(result, segment)
+	}
+	return result
+}
+
+func normalizedTextSegments(segments []string) []string {
+	result := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		if segment != "" {
+			result = append(result, segment)
+		}
 	}
 	return result
 }

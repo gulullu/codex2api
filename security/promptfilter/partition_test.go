@@ -51,7 +51,7 @@ func TestExtractRoutingPartitionsEndpointCoverage(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			scan := ExtractRoutingPartitions([]byte(tc.body), tc.endpoint)
-			if scan.Version != RoutingPartitionScanVersion || scan.PayloadBytes != len(tc.body) {
+			if scan.Version != RoutingPartitionScanVersion || scan.PayloadBytes != len(tc.body) || !scan.ValidJSON || !scan.Supported {
 				t.Fatalf("metadata = %+v", scan)
 			}
 			for partition, marker := range map[string]string{
@@ -69,6 +69,17 @@ func TestExtractRoutingPartitionsEndpointCoverage(t *testing.T) {
 				t.Fatal("system text leaked into user partition")
 			}
 		})
+	}
+}
+
+func TestExtractRoutingPartitionsInvalidAndUnsupportedPayloadMetadata(t *testing.T) {
+	invalid := ExtractRoutingPartitions([]byte(`{"input":"unterminated"`), "/v1/responses")
+	if invalid.ValidJSON || invalid.Supported || invalid.ScannedBytes != 0 {
+		t.Fatalf("invalid JSON metadata = %+v", invalid)
+	}
+	unsupported := ExtractRoutingPartitions([]byte(`{"unknown":"readable but unsupported"}`), "/v1/responses")
+	if !unsupported.ValidJSON || unsupported.Supported || unsupported.ScannedBytes != 0 {
+		t.Fatalf("unsupported payload metadata = %+v", unsupported)
 	}
 }
 
@@ -158,6 +169,48 @@ func TestExtractRoutingPartitionsCountsButNeverScansOpaqueValuesOrMutatesBody(t 
 	}
 	if !strings.Contains(partitionText(t, scan, RoutingPartitionOther), "READABLE_SUMMARY") {
 		t.Fatal("readable reasoning summary was not retained in other partition")
+	}
+}
+
+func TestExtractRoutingPartitionsScansOrdinaryDataSourceAndURLToolFields(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"field_test","data":"DATA_FIELD_MARKER","source":"SOURCE_FIELD_MARKER","url":"URL_FIELD_MARKER","parameters":{"properties":{"payload":{"description":"SCHEMA_MARKER"}}}}]}`)
+	scan := ExtractRoutingPartitions(body, "/v1/responses")
+	toolText := partitionText(t, scan, RoutingPartitionTools)
+	for _, marker := range []string{"DATA_FIELD_MARKER", "SOURCE_FIELD_MARKER", "URL_FIELD_MARKER", "SCHEMA_MARKER"} {
+		if !strings.Contains(toolText, marker) {
+			t.Fatalf("ordinary tool field %s was treated as opaque: %q", marker, toolText)
+		}
+	}
+	if scan.OpaqueBytes != 0 {
+		t.Fatalf("ordinary tool fields counted as opaque: %d", scan.OpaqueBytes)
+	}
+}
+
+func TestBuildFairPartitionSamplesBothEndsWhenToolCountExceedsBudget(t *testing.T) {
+	segments := make([]string, RoutingToolsScanBudget+1000)
+	for index := range segments {
+		segments[index] = fmt.Sprintf("tool_%05d", index)
+	}
+	segments[0] = "HEAD_TOOL_MARKER"
+	segments[len(segments)-1] = "TAIL_TOOL_MARKER"
+	partition := buildFairPartition(RoutingPartitionTools, RoutingToolsScanBudget, segments)
+	for _, marker := range []string{"HEAD_TOOL_MARKER", "TAIL_TOOL_MARKER"} {
+		if !strings.Contains(partition.Text, marker) {
+			t.Fatalf("extreme tool sampling lost %s", marker)
+		}
+	}
+	if partition.ScannedBytes > RoutingToolsScanBudget || !partition.Truncated {
+		t.Fatalf("extreme tool partition metadata = %+v", partition)
+	}
+}
+
+func TestPartitionSourceBytesCountPreDedupReadableText(t *testing.T) {
+	partition := buildOrderedPartition(RoutingPartitionSystem, 1024, []string{"duplicate", "duplicate"})
+	if partition.SourceBytes != len("duplicate\nduplicate") {
+		t.Fatalf("source bytes = %d", partition.SourceBytes)
+	}
+	if partition.ScannedBytes != len("duplicate") || !partition.Truncated {
+		t.Fatalf("dedup scan metadata = %+v", partition)
 	}
 }
 

@@ -295,13 +295,62 @@ func TestPromptFilterPartitionScanMetadata(t *testing.T) {
 	if err := json.Unmarshal([]byte(scan.ScanDetails), &details); err != nil {
 		t.Fatalf("scan_details JSON: %v", err)
 	}
-	if details.Version != promptfilter.RoutingPartitionScanVersion || details.OpaqueBytes == 0 || len(details.Partitions) != 4 {
+	if details.Version != promptfilter.RoutingPartitionScanVersion || details.Mode != "partitioned_json" || details.ValidJSON == nil || !*details.ValidJSON || !details.Supported || details.FallbackReason != "" || details.OpaqueBytes == 0 || len(details.Partitions) != 4 {
 		t.Fatalf("scan details = %+v", details)
 	}
 	for _, partition := range details.Partitions {
 		if partition.ScannedBytes > partition.BudgetBytes {
 			t.Fatalf("partition exceeded budget: %+v", partition)
 		}
+	}
+}
+
+func TestPromptFilterPartitionScanFallsBackFailClosedOnInvalidOrUnsupportedPayload(t *testing.T) {
+	cfg := promptfilter.Config{Enabled: true, Mode: promptfilter.ModeMonitor, Threshold: 100, StrictThreshold: 150}
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantReason string
+		validJSON  bool
+	}{
+		{name: "invalid json", body: `{"input":"unterminated"`, wantReason: "invalid_json"},
+		{name: "unsupported shape", body: `{"unknown":"text"}`, wantReason: "unsupported_payload_shape", validJSON: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scan := inspectPromptFilterPayload([]byte(tc.body), "/v1/responses", cfg, true)
+			var details promptFilterPartitionScanDetails
+			if err := json.Unmarshal([]byte(scan.ScanDetails), &details); err != nil {
+				t.Fatalf("scan_details JSON: %v", err)
+			}
+			if details.Mode != "legacy_full" || details.ValidJSON == nil || *details.ValidJSON != tc.validJSON || details.FallbackReason != tc.wantReason || len(details.Partitions) != 1 || details.Partitions[0].Name != "legacy_full" {
+				t.Fatalf("fallback details = %+v", details)
+			}
+		})
+	}
+}
+
+func TestPromptFilterDirectTextAuditMetadataIsNotJSONFailure(t *testing.T) {
+	cfg := promptfilter.Config{Enabled: true, Mode: promptfilter.ModeMonitor, Threshold: 100, StrictThreshold: 150}
+	scan := inspectPromptFilterText("normal direct text", "/v1/responses", cfg)
+	var details promptFilterPartitionScanDetails
+	if err := json.Unmarshal([]byte(scan.ScanDetails), &details); err != nil {
+		t.Fatalf("scan_details JSON: %v", err)
+	}
+	if details.Mode != "direct_text" || details.ValidJSON != nil || !details.Supported || details.FallbackReason != "" || len(details.Partitions) != 1 {
+		t.Fatalf("direct text metadata = %+v", details)
+	}
+}
+
+func TestPromptFilterPartitionsUsableRejectsCorruptExtractionMetadata(t *testing.T) {
+	valid := promptfilter.ExtractRoutingPartitions([]byte(`{"input":"normal"}`), "/v1/responses")
+	if !promptFilterPartitionsUsable(valid) {
+		t.Fatalf("valid partition extraction was rejected: %+v", valid)
+	}
+	corrupt := valid
+	corrupt.Partitions = append([]promptfilter.RoutingTextPartition(nil), valid.Partitions...)
+	corrupt.Partitions[0].ScannedBytes++
+	if promptFilterPartitionsUsable(corrupt) {
+		t.Fatal("corrupt partition extraction metadata was accepted")
 	}
 }
 
