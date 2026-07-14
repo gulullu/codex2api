@@ -30,6 +30,7 @@ create table public.:"backup_table" (
 
 -- Unicode is encoded with PostgreSQL U& escapes so source-file encoding can
 -- never silently change the retired writer's exact marker strings.
+create temporary table rb15_candidate_analysis on commit drop as
 with raw as (
     select p.*,
            (U&'\3010\5F52\5C5E\3011' || E'\n')::text as full_header,
@@ -54,7 +55,7 @@ with raw as (
            left(full_text, char_length(full_header)) = full_header
              and left(text_preview, char_length(preview_header)) = preview_header
              as marker_pair,
-           source in ('local_filter', 'semantic_review_disagreement', 'upstream_cyber_policy')
+           source in ('local_filter', 'semantic_review_disagreement', 'session_bleed', 'upstream_cyber_policy')
              as source_supported,
            case when full_separator > char_length(full_header)
                 then regexp_split_to_array(
@@ -121,6 +122,33 @@ with raw as (
            end as type_source_safe
     from parsed
 )
+select *
+from safety
+where marker_pair;
+
+do $assert_candidates$
+declare
+    marker_count integer;
+    safe_count integer;
+begin
+    select count(*),
+           count(*) filter (
+             where source_supported is true
+               and full_parse_safe is true
+               and preview_parse_safe is true
+               and type_source_safe is true
+           )
+      into marker_count, safe_count
+      from pg_temp.rb15_candidate_analysis;
+    if marker_count = 0 then
+        raise exception 'rb15 snapshot has zero legacy marker pairs';
+    end if;
+    if marker_count <> safe_count then
+        raise exception 'rb15 unsafe candidate set: marker pairs %, safe %', marker_count, safe_count;
+    end if;
+end
+$assert_candidates$;
+
 insert into public.:"backup_table" (
     id, created_at, source, logical_request_id,
     original_full_text, original_text_preview,
@@ -132,7 +160,7 @@ select id, created_at, source, logical_request_id,
        full_text, text_preview, md5(full_text), md5(text_preview),
        marker_pair, source_supported, full_parse_safe, preview_parse_safe,
        type_source_safe, full_prefix_bytes, preview_prefix_bytes
-from safety
+from pg_temp.rb15_candidate_analysis
 where marker_pair
   and source_supported
   and full_parse_safe

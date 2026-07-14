@@ -43,6 +43,9 @@ func stripLegacyEnrichment(source, fullText, textPreview string) (stripResult, e
 	if !strings.HasPrefix(fullText, legacyFullHeader) {
 		return stripResult{}, errors.New("full_marker_not_at_start")
 	}
+	if !isSupportedLegacySource(source) {
+		return stripResult{}, errors.New("unsupported_source")
+	}
 
 	searchEnd := len(fullText)
 	if searchEnd > maxLegacyFullPrefix {
@@ -125,6 +128,15 @@ func stripLegacyEnrichment(source, fullText, textPreview string) (stripResult, e
 		cleanFullMD5:     md5String(cleanFull),
 		cleanPreviewMD5:  md5String(cleanPreview),
 	}, nil
+}
+
+func isSupportedLegacySource(source string) bool {
+	switch source {
+	case "local_filter", "semantic_review_disagreement", "session_bleed", "upstream_cyber_policy":
+		return true
+	default:
+		return false
+	}
 }
 
 func validLegacyLine(line, prefix string, allowEmpty bool) bool {

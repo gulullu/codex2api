@@ -122,33 +122,56 @@ stored hash, parser flag, or prefix bound.
 ## Cleanup dry-run
 
 ```bash
-docker run --rm --pull=never \
-  --network "$NETWORK" --env-file "$DB_ENV" \
-  --read-only --cap-drop=ALL --security-opt=no-new-privileges:true \
-  --pids-limit=64 --memory=64m --cpus=0.5 --user=65534:65534 \
-  --tmpfs /tmp:rw,noexec,nosuid,size=8m \
-  --mount type=bind,src=/root/codex2api-ops/rb15-enrich-cleanup,dst=/usr/local/bin/rb15-enrich-cleanup,readonly \
-  "$RUN_IMAGE" /usr/local/bin/rb15-enrich-cleanup \
-    --backup-table "public.$BACKUP_NAME" \
-    --manifest-table "public.$MANIFEST_NAME" \
-    --batch-size 200 --statement-timeout 5s --lock-timeout 2s \
-    --batch-deadline 100s
+rb15_run() {
+  docker run --rm --pull=never \
+    --network "$NETWORK" --env-file "$DB_ENV" \
+    --read-only --cap-drop=ALL --security-opt=no-new-privileges:true \
+    --pids-limit=64 --memory=64m --cpus=0.5 --user=65534:65534 \
+    --tmpfs /tmp:rw,noexec,nosuid,size=8m \
+    --mount type=bind,src=/root/codex2api-ops/rb15-enrich-cleanup,dst=/usr/local/bin/rb15-enrich-cleanup,readonly \
+    "$RUN_IMAGE" /usr/local/bin/rb15-enrich-cleanup \
+      --backup-table "public.$BACKUP_NAME" \
+      --manifest-table "public.$MANIFEST_NAME" \
+      --batch-size 100 --statement-timeout 5s --lock-timeout 2s \
+      --batch-deadline 100s "$@"
+}
+
+umask 077
+CLEANUP_EVIDENCE="/root/codex2api-ops/rb15-cleanup-dryrun-${BACKUP_NAME}.json"
+CLEANUP_EVIDENCE_SHA="${CLEANUP_EVIDENCE}.sha256"
+test ! -e "$CLEANUP_EVIDENCE"
+test ! -e "$CLEANUP_EVIDENCE_SHA"
+CLEANUP_TMP="$(mktemp /root/codex2api-ops/.rb15-cleanup-dryrun.XXXXXX)"
+rb15_run >"$CLEANUP_TMP"
+jq -e '.mode == "cleanup-dry-run" and .completed == true and .write_ready == true' \
+  "$CLEANUP_TMP" >/dev/null
+mv "$CLEANUP_TMP" "$CLEANUP_EVIDENCE"
+chmod 0600 "$CLEANUP_EVIDENCE"
+sha256sum "$CLEANUP_EVIDENCE" >"$CLEANUP_EVIDENCE_SHA"
+chmod 0600 "$CLEANUP_EVIDENCE_SHA"
+
+EXPECTED_ROWS="$(jq -er '.candidate_snapshot.count' "$CLEANUP_EVIDENCE")"
+EXPECTED_DIGEST="$(jq -er '.candidate_snapshot.digest_sha256' "$CLEANUP_EVIDENCE")"
+test "$EXPECTED_ROWS" -gt 0
+test "${#EXPECTED_DIGEST}" -eq 64
 ```
 
-Record the unedited `candidate_snapshot.count` and
-`candidate_snapshot.digest_sha256`. Require `write_ready: true`. Before the
-first cleanup, every row should be `pending_cleanup`; on resume,
-`already_clean` is also valid. Any other category is a hard stop.
+The root-only JSON plus its SHA-256 sidecar are the external evidence for this
+sealed candidate set. Do not edit or replace either file. Inspect counts with
+`jq`; before the first cleanup every row should be `pending_cleanup`, while a
+resume may also contain `already_clean`. Any other category is a hard stop.
 
 ## Execute cleanup
 
-Repeat the identical hardened `docker run` command and arguments above, adding
-only values copied from the immediately preceding successful dry-run:
-
-```text
---execute
---expected-rows '<candidate_snapshot.count>'
---expected-candidate-digest '<candidate_snapshot.digest_sha256>'
+```bash
+sha256sum -c "$CLEANUP_EVIDENCE_SHA"
+test "$(jq -er '.backup_table' "$CLEANUP_EVIDENCE")" = "public.$BACKUP_NAME"
+test "$(jq -er '.manifest_table' "$CLEANUP_EVIDENCE")" = "public.$MANIFEST_NAME"
+test "$(jq -er '.candidate_snapshot.digest_sha256' "$CLEANUP_EVIDENCE")" = "$EXPECTED_DIGEST"
+rb15_run \
+  --execute \
+  --expected-rows "$EXPECTED_ROWS" \
+  --expected-candidate-digest "$EXPECTED_DIGEST"
 ```
 
 Success means `completed: true`, postflight entirely `already_clean`, unchanged
@@ -158,10 +181,36 @@ and a fresh dry-run succeeds against the same sealed pair.
 
 ## Rollback
 
-Use the identical hardened invocation with `--rollback` first (dry-run). Proceed
-only when every row is `pending_rollback` or `already_restored`. Then repeat with
-`--rollback --execute` plus the exact row count and digest from that rollback
-dry-run. Success means postflight entirely `already_restored`.
+The rollback dry-run must independently reproduce the exact same sealed
+candidate count and digest before any restore:
+
+```bash
+sha256sum -c "$CLEANUP_EVIDENCE_SHA"
+ROLLBACK_EVIDENCE="/root/codex2api-ops/rb15-rollback-dryrun-${BACKUP_NAME}.json"
+ROLLBACK_EVIDENCE_SHA="${ROLLBACK_EVIDENCE}.sha256"
+test ! -e "$ROLLBACK_EVIDENCE"
+test ! -e "$ROLLBACK_EVIDENCE_SHA"
+ROLLBACK_TMP="$(mktemp /root/codex2api-ops/.rb15-rollback-dryrun.XXXXXX)"
+rb15_run --rollback >"$ROLLBACK_TMP"
+jq -e '.mode == "rollback-dry-run" and .completed == true and .write_ready == true' \
+  "$ROLLBACK_TMP" >/dev/null
+test "$(jq -er '.candidate_snapshot.count' "$ROLLBACK_TMP")" = "$EXPECTED_ROWS"
+test "$(jq -er '.candidate_snapshot.digest_sha256' "$ROLLBACK_TMP")" = "$EXPECTED_DIGEST"
+mv "$ROLLBACK_TMP" "$ROLLBACK_EVIDENCE"
+chmod 0600 "$ROLLBACK_EVIDENCE"
+sha256sum "$ROLLBACK_EVIDENCE" >"$ROLLBACK_EVIDENCE_SHA"
+chmod 0600 "$ROLLBACK_EVIDENCE_SHA"
+sha256sum -c "$ROLLBACK_EVIDENCE_SHA"
+
+rb15_run \
+  --rollback --execute \
+  --expected-rows "$EXPECTED_ROWS" \
+  --expected-candidate-digest "$EXPECTED_DIGEST"
+```
+
+Proceed only when the rollback evidence contains exclusively
+`pending_rollback` or `already_restored`. Success means postflight entirely
+`already_restored`.
 
 Rollback restores only exact backed-up text by ID. It must never enable or start
 `codex2api-miss-enrich.timer`.

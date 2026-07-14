@@ -169,6 +169,12 @@ insert into public.prompt_filter_logs(id, created_at, source, logical_request_id
 values(1, now(), 'upstream_cyber_policy', 'tracked-sql-1', $1, $2)`, full, preview); err != nil {
 		t.Fatal(err)
 	}
+	sessionFull, sessionPreview := legacyBlock("session_bleed", "session-bleed-payload", false)
+	if _, err := db.Exec(`
+insert into public.prompt_filter_logs(id, created_at, source, logical_request_id, full_text, text_preview)
+values(2, now(), 'session_bleed', 'tracked-sql-2', $1, $2)`, sessionFull, sessionPreview); err != nil {
+		t.Fatal(err)
+	}
 	_, thisFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("cannot locate tracked SQL from test source path")
@@ -178,12 +184,16 @@ values(1, now(), 'upstream_cyber_policy', 'tracked-sql-1', $1, $2)`, full, previ
 	if err != nil {
 		t.Fatalf("read tracked snapshot SQL: %v", err)
 	}
-	rendered := string(raw)
-	rendered = strings.Replace(rendered, "\\set ON_ERROR_STOP on", "", 1)
-	rendered = strings.ReplaceAll(rendered, `public.:"backup_table"`, "public.rb15_sql_backup")
-	rendered = strings.ReplaceAll(rendered, `public.:"manifest_table"`, "public.rb15_sql_manifest")
-	rendered = strings.ReplaceAll(rendered, `:'backup_table'`, `'rb15_sql_backup'`)
-	rendered = strings.ReplaceAll(rendered, `:'manifest_table'`, `'rb15_sql_manifest'`)
+	render := func(backup, manifest string) string {
+		rendered := string(raw)
+		rendered = strings.Replace(rendered, "\\set ON_ERROR_STOP on", "", 1)
+		rendered = strings.ReplaceAll(rendered, `public.:"backup_table"`, "public."+backup)
+		rendered = strings.ReplaceAll(rendered, `public.:"manifest_table"`, "public."+manifest)
+		rendered = strings.ReplaceAll(rendered, `:'backup_table'`, `'`+backup+`'`)
+		rendered = strings.ReplaceAll(rendered, `:'manifest_table'`, `'`+manifest+`'`)
+		return rendered
+	}
+	rendered := render("rb15_sql_backup", "rb15_sql_manifest")
 	if strings.Contains(rendered, `public.:"`) ||
 		strings.Contains(rendered, `:'backup_table'`) ||
 		strings.Contains(rendered, `:'manifest_table'`) {
@@ -199,7 +209,7 @@ select count(*), bool_and(marker_pair and source_supported and full_parse_safe a
 from public.rb15_sql_backup`).Scan(&count, &allSafe); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 || !allSafe {
+	if count != 2 || !allSafe {
 		t.Fatalf("tracked SQL candidate count=%d all_safe=%v", count, allSafe)
 	}
 	var manifestCount int
@@ -208,6 +218,24 @@ from public.rb15_sql_backup`).Scan(&count, &allSafe); err != nil {
 	}
 	if manifestCount != count {
 		t.Fatalf("tracked SQL manifest count=%d, backup count=%d", manifestCount, count)
+	}
+
+	if _, err := db.Exec(`update public.prompt_filter_logs set source='unsupported_source' where id=2`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(render("rb15_unsafe_backup", "rb15_unsafe_manifest"))
+	if err == nil || !strings.Contains(err.Error(), "unsafe candidate set") {
+		t.Fatalf("tracked SQL silently omitted unsafe marker pair: %v", err)
+	}
+	if _, rollbackErr := db.Exec(`rollback`); rollbackErr != nil {
+		t.Fatalf("rollback failed tracked SQL transaction: %v", rollbackErr)
+	}
+	var unsafeBackupExists bool
+	if err := db.QueryRow(`select to_regclass('public.rb15_unsafe_backup') is not null`).Scan(&unsafeBackupExists); err != nil {
+		t.Fatal(err)
+	}
+	if unsafeBackupExists {
+		t.Fatal("unsafe snapshot transaction did not roll back")
 	}
 }
 
@@ -331,6 +359,8 @@ func dropE2ETables(t *testing.T, db *sql.DB) {
 	if _, err := db.Exec(`
 drop table if exists public.rb15_sql_manifest;
 drop table if exists public.rb15_sql_backup;
+drop table if exists public.rb15_unsafe_manifest;
+drop table if exists public.rb15_unsafe_backup;
 drop table if exists public.rb15_e2e_manifest;
 drop table if exists public.rb15_e2e_backup;
 drop table if exists public.prompt_filter_logs;

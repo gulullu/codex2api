@@ -41,6 +41,7 @@ func TestStripLegacyEnrichment(t *testing.T) {
 		withNewAPI bool
 	}{
 		{name: "local", source: "local_filter"},
+		{name: "session bleed uses local type", source: "session_bleed"},
 		{name: "upstream miss", source: "upstream_cyber_policy"},
 		{name: "new api line", source: "semantic_review_disagreement", withNewAPI: true},
 	} {
@@ -71,6 +72,7 @@ func TestStripLegacyEnrichmentRejectsNonExactMarkers(t *testing.T) {
 		{name: "marker in middle", full: "prefix" + validFull, preview: validPreview, source: "local_filter"},
 		{name: "preview in middle", full: validFull, preview: "prefix" + validPreview, source: "local_filter"},
 		{name: "source type mismatch", full: validFull, preview: validPreview, source: "upstream_cyber_policy"},
+		{name: "unsupported source", full: validFull, preview: validPreview, source: "unknown_source"},
 		{name: "unknown line", full: strings.Replace(validFull, legacyPoolPrefix, "account: ", 1), preview: validPreview, source: "local_filter"},
 		{name: "missing separator", full: strings.Replace(validFull, "\n\npayload", "\npayload", 1), preview: validPreview, source: "local_filter"},
 		{name: "oversized block", full: legacyFullHeader + legacySub2Prefix + strings.Repeat("x", maxLegacyFullPrefix) + "\n" + legacyPoolPrefix + "x\n" + legacyTypePrefix + legacyLocalType + "\n\npayload", preview: validPreview, source: "local_filter"},
@@ -201,6 +203,9 @@ func TestParseOptionsDefaultsToDryRun(t *testing.T) {
 	}
 	if opts.batchDeadline != 100*time.Second {
 		t.Fatalf("batch deadline = %v", opts.batchDeadline)
+	}
+	if opts.batchSize != 100 {
+		t.Fatalf("batch size = %d", opts.batchSize)
 	}
 }
 

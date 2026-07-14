@@ -29,7 +29,7 @@ const (
 	parserVersion        = "rb15-marker-v1"
 	predicateVersion     = "rb15-strict-v1"
 	advisoryLockKey      = int64(5927309398729187913)
-	defaultBatchSize     = 200
+	defaultBatchSize     = 100
 	maxBatchSize         = 500
 	defaultStmtTimeout   = 5 * time.Second
 	defaultLockTimeout   = 2 * time.Second
