@@ -108,6 +108,11 @@ type RelayCircuitSnapshot struct {
 	InFlight      int    `json:"in_flight"`
 	LastResort    bool   `json:"last_resort"`
 	EvidenceEpoch uint64 `json:"evidence_epoch"`
+	// confirmedStrongCycleToken is process-local evidence that a strong gateway
+	// failure cohort reached the breaker's confirmation boundary. It is kept out
+	// of JSON/runtime persistence deliberately: a restart must collect fresh
+	// evidence and Guardian cold-start protection owns that boundary.
+	confirmedStrongCycleToken uint64
 }
 
 type relayCircuitRuntimeRecord struct {
@@ -160,6 +165,11 @@ type relayCircuitAccountState struct {
 	limitedInFlight     int
 	lastResort          bool
 	identityFingerprint string
+	// confirmedStrongCycleToken advances only through confirmFailureLocked for
+	// a strong gateway status. The general generation also changes for scheduler
+	// state transitions such as pool-invariant last-resort promotion, so it must
+	// not be used as proof of an independent confirmed failure cycle.
+	confirmedStrongCycleToken uint64
 
 	strongEvidence      []relayCircuitStrongEvidence
 	weakObservations    []relayCircuitWeakObservation
@@ -264,9 +274,15 @@ func (b *relayCircuitBreaker) forgetAccountRuntime(accountID int64, identityFing
 	b.mu.Lock()
 	oldRevision := uint64(0)
 	nextGeneration := uint64(1)
+	confirmedStrongCycleToken := uint64(0)
 	if old := b.states[accountID]; old != nil {
 		oldRevision = old.revision
 		nextGeneration = old.generation + 1
+		// Guardian intentionally retains history across some breaker-only
+		// boundaries (for example delete/re-add of the same DB id). Preserve the
+		// process-local token so a later confirmed cycle cannot reuse an already
+		// observed value and disappear from that retained history.
+		confirmedStrongCycleToken = old.confirmedStrongCycleToken
 		if nextGeneration == 0 {
 			nextGeneration = 1
 		}
@@ -277,12 +293,13 @@ func (b *relayCircuitBreaker) forgetAccountRuntime(accountID int64, identityFing
 		}
 	}
 	state := &relayCircuitAccountState{
-		state:               RelayCircuitClosed,
-		generation:          nextGeneration,
-		revision:            oldRevision + 1,
-		updatedAt:           now,
-		identityFingerprint: identityFingerprint,
-		weakSeen:            make(map[string]time.Time),
+		state:                     RelayCircuitClosed,
+		generation:                nextGeneration,
+		revision:                  oldRevision + 1,
+		updatedAt:                 now,
+		identityFingerprint:       identityFingerprint,
+		confirmedStrongCycleToken: confirmedStrongCycleToken,
+		weakSeen:                  make(map[string]time.Time),
 	}
 	if state.revision == 0 {
 		state.revision = 1
@@ -611,13 +628,15 @@ func (b *relayCircuitBreaker) ensureLoadedWithIdentity(accountID int64, identity
 		delete(b.retryLoad, accountID)
 		state := b.stateLocked(accountID)
 		oldRevision := state.revision
+		confirmedStrongCycleToken := state.confirmedStrongCycleToken
 		*state = relayCircuitAccountState{
-			state:               RelayCircuitClosed,
-			generation:          record.Generation + 1,
-			revision:            oldRevision + 1,
-			updatedAt:           now,
-			identityFingerprint: identityFingerprint,
-			weakSeen:            make(map[string]time.Time),
+			state:                     RelayCircuitClosed,
+			generation:                record.Generation + 1,
+			revision:                  oldRevision + 1,
+			updatedAt:                 now,
+			identityFingerprint:       identityFingerprint,
+			confirmedStrongCycleToken: confirmedStrongCycleToken,
+			weakSeen:                  make(map[string]time.Time),
 		}
 		if state.generation == 0 {
 			state.generation = 1
@@ -983,6 +1002,15 @@ func (b *relayCircuitBreaker) activateLastResortLocked(accountID int64, state *r
 }
 
 func (b *relayCircuitBreaker) confirmFailureLocked(accountID int64, state *relayCircuitAccountState, poolAccountIDs []int64, now time.Time, statusCode int, recoveryFailure bool) bool {
+	// A single probation/half-open failure is enough to restore the transport
+	// fence, but it is not a second independently confirmed strong cohort. Only
+	// the ordinary strong-quorum path advances Guardian's cycle identity.
+	if IsRelayStrongGatewayFailureStatus(statusCode) && !recoveryFailure {
+		state.confirmedStrongCycleToken++
+		if state.confirmedStrongCycleToken == 0 {
+			state.confirmedStrongCycleToken = 1
+		}
+	}
 	if poolAccountIDs != nil && !b.hasOtherHealthyFrontLocked(accountID, poolAccountIDs, now) {
 		b.activateLastResortLocked(accountID, state, now, statusCode)
 		return false
@@ -1378,6 +1406,7 @@ func relayCircuitSnapshotFromState(accountID int64, state *relayCircuitAccountSt
 	snapshot.InFlight = state.limitedInFlight
 	snapshot.LastResort = state.lastResort
 	snapshot.EvidenceEpoch = state.evidenceEpoch
+	snapshot.confirmedStrongCycleToken = state.confirmedStrongCycleToken
 	return snapshot
 }
 

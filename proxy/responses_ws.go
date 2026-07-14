@@ -15,7 +15,6 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
-	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
@@ -1053,10 +1052,9 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 		return false
 	}
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
-	c.Set(contextPromptFilterText, text)
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model)
+	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
+	c.Set(contextPromptFilterText, scan.AuditText)
+	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
 }
 
 func isResponsesWebSocketUpgradeRequest(r *http.Request) bool {

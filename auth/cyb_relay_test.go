@@ -1,6 +1,10 @@
 package auth
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/codex2api/database"
+)
 
 func TestNormalizeCybRelayConfigBoundsTTL(t *testing.T) {
 	tests := []struct {
@@ -26,8 +30,23 @@ func TestNormalizeCybRelayConfigBoundsTTL(t *testing.T) {
 func TestNewStoreDefaultsCybSessionPinOn(t *testing.T) {
 	store := NewStore(nil, nil, nil)
 	cfg := store.GetCybRelayConfig()
-	if cfg.Enabled || cfg.GroupID != 0 || !cfg.SessionPinEnabled || cfg.SessionPinTTLSeconds != DefaultCybRelaySessionPinTTLSeconds {
+	if cfg.Enabled || cfg.GroupID != 0 || !cfg.SessionPinEnabled || cfg.SessionPinTTLSeconds != DefaultCybRelaySessionPinTTLSeconds || !cfg.UserTextRescanEnabled() {
 		t.Fatalf("default CYB relay config = %+v", cfg)
+	}
+}
+
+func TestNewStoreDefaultsUserTextRescanOnForLegacySettingsLiteral(t *testing.T) {
+	legacy := NewStore(nil, nil, &database.SystemSettings{})
+	if !legacy.GetCybRelayConfig().UserTextRescanEnabled() {
+		t.Fatal("legacy SystemSettings zero value disabled user-text safety rescan")
+	}
+
+	explicit := NewStore(nil, nil, &database.SystemSettings{
+		PromptFilterUserTextRescanConfigured: true,
+		PromptFilterUserTextRescanEnabled:    false,
+	})
+	if explicit.GetCybRelayConfig().UserTextRescanEnabled() {
+		t.Fatal("explicit persisted false did not disable user-text rescan")
 	}
 }
 

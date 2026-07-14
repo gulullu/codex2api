@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/codex2api/auth"
@@ -91,6 +93,7 @@ func newPromptFilterRoutingStore(reviewURL string) *auth.Store {
 		PromptFilterCybRelayGroupID:              7,
 		PromptFilterCybRelaySessionPinEnabled:    false,
 		PromptFilterCybRelaySessionPinTTLSeconds: 600,
+		PromptFilterUserTextRescanEnabled:        true,
 	})
 }
 
@@ -227,6 +230,279 @@ func TestPromptFilterMultiVectorSignalUsesTheFullResponsesPayload(t *testing.T) 
 	scannerSignal, scannerSignals := PromptFilterRouteSignal(scannerVerdict, promptfilter.ExtractText(scannerBody, "/v1/responses", cfg.MaxTextLength), cfg, "/v1/responses")
 	if scannerSignal || len(scannerSignals) != 0 {
 		t.Fatalf("redacted scanner replay routed = %v, signals = %v, verdict = %+v; want default route", scannerSignal, scannerSignals, scannerVerdict)
+	}
+}
+
+func TestPromptFilterPayloadRescanRecoversInputOutsideFullScanWindow(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		MaxTextLength:   promptfilter.DefaultMaxTextLength,
+		CustomPatterns: []promptfilter.PatternConfig{{
+			Name:     "test_cyb_route",
+			Pattern:  `trigger cyb route`,
+			Weight:   60,
+			Category: "cyb-test",
+		}},
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":        "gpt-5.4",
+		"instructions": strings.Repeat("benign system envelope ", 5000),
+		"input":        "trigger cyb route",
+		"tools": []map[string]any{{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "large_benign_tool",
+				"description": strings.Repeat("benign tool documentation ", 3000),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal long payload: %v", err)
+	}
+
+	fullText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	fullVerdict := promptfilter.InspectText(fullText, cfg)
+	if signal, signals := PromptFilterRouteSignal(fullVerdict, fullText, cfg, "/v1/responses"); signal {
+		t.Fatalf("bounded full scan unexpectedly found middle input: signals=%v verdict=%+v", signals, fullVerdict)
+	}
+
+	scan := inspectPromptFilterPayload(body, "/v1/responses", routingPromptFilterConfig(cfg), true)
+	if !scan.CYBSignal {
+		t.Fatalf("input rescan did not recover route signal: %+v", scan)
+	}
+	if fmt.Sprint(scan.Signals) != "[local_threshold user_text_rescue]" {
+		t.Fatalf("signals = %v, want local_threshold + user_text_rescue", scan.Signals)
+	}
+	if !strings.HasPrefix(scan.AuditText, "trigger cyb route") {
+		t.Fatalf("audit text does not preserve rescued input first: %.80q", scan.AuditText)
+	}
+
+	disabled := inspectPromptFilterPayload(body, "/v1/responses", routingPromptFilterConfig(cfg), false)
+	if disabled.CYBSignal || len(disabled.Signals) != 0 {
+		t.Fatalf("disabled user-text rescan still routed: %+v", disabled)
+	}
+}
+
+func TestPromptFilterPayloadRescanRecoversUserBetweenOpaqueResponsesItems(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		MaxTextLength:   32 * 1024,
+		CustomPatterns: []promptfilter.PatternConfig{{
+			Name:     "test_opaque_history_route",
+			Pattern:  `current opaque history cyb signal`,
+			Weight:   60,
+			Category: "cyb-test",
+		}},
+	}
+	const currentUser = "current opaque history cyb signal"
+	body, err := json.Marshal(map[string]any{
+		"instructions": "benign system envelope",
+		"input": []any{
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("A", 40*1024)},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": currentUser}}},
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("B", 40*1024)},
+			map[string]any{"type": "function_call_output", "output": strings.Repeat("opaque-tool-output", 4096)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal opaque Responses payload: %v", err)
+	}
+
+	fullText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	if strings.Contains(fullText, currentUser) {
+		t.Fatal("fixture did not place current user outside the bounded full scan")
+	}
+	legacyUserText := promptfilter.ExtractUserText(body, "/v1/responses", cfg.MaxTextLength)
+	if strings.Contains(legacyUserText, currentUser) {
+		t.Fatal("fixture did not reproduce opaque-history loss in the legacy user extractor")
+	}
+	routingUserText := promptfilter.ExtractRoutingUserText(body, "/v1/responses", cfg.MaxTextLength)
+	if routingUserText != currentUser {
+		t.Fatalf("routing user text = %q, want current visible input only", routingUserText)
+	}
+
+	scan := inspectPromptFilterPayload(body, "/v1/responses", routingPromptFilterConfig(cfg), true)
+	if !scan.CYBSignal || fmt.Sprint(scan.Signals) != "[local_threshold user_text_rescue]" {
+		t.Fatalf("field-aware rescan did not rescue route: %+v", scan)
+	}
+	if !strings.HasPrefix(scan.AuditText, currentUser) {
+		t.Fatalf("rescued audit text did not prioritize current user: %.100q", scan.AuditText)
+	}
+}
+
+func TestPromptFilterPayloadRescanKeepsSystemOnlySignals(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		CustomPatterns: []promptfilter.PatternConfig{{
+			Name:    "test_cyb_route",
+			Pattern: `trigger cyb route`,
+			Weight:  60,
+		}},
+	}
+	body := []byte(`{"instructions":"trigger cyb route","input":"summarize this configuration"}`)
+	scan := inspectPromptFilterPayload(body, "/v1/responses", cfg, true)
+	if !scan.CYBSignal {
+		t.Fatalf("system-only signal was lost: %+v", scan)
+	}
+	if fmt.Sprint(scan.Signals) != "[local_threshold]" {
+		t.Fatalf("signals = %v, want full-payload local_threshold without rescue marker", scan.Signals)
+	}
+}
+
+func TestPromptFilterPayloadRescanDoesNotPromoteBenignDefensiveContext(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       100,
+		StrictThreshold: 150,
+	}
+	body := []byte(`{"instructions":"You are a defensive security reviewer.","input":"Review a scanner configuration that detects prompt injection, command injection, and path traversal. Do not execute attacks."}`)
+	scan := inspectPromptFilterPayload(body, "/v1/responses", cfg, true)
+	if scan.CYBSignal || len(scan.Signals) != 0 {
+		t.Fatalf("benign defensive context routed after input rescan: %+v", scan)
+	}
+}
+
+func TestPromptFilterPayloadRescanRecoversMessagesOutsideFullScanWindow(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		MaxTextLength:   promptfilter.DefaultMaxTextLength,
+		CustomPatterns: []promptfilter.PatternConfig{{
+			Name:     "test_messages_route",
+			Pattern:  `trigger messages route`,
+			Weight:   60,
+			Category: "cyb-test",
+		}},
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":        "gpt-5.4",
+		"instructions": strings.Repeat("benign system envelope ", 5000),
+		"messages": []map[string]any{{
+			"role":    "user",
+			"content": "trigger messages route",
+		}},
+		"tools": []map[string]any{{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "large_benign_tool",
+				"description": strings.Repeat("benign tool documentation ", 3000),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal long messages payload: %v", err)
+	}
+
+	fullText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	fullVerdict := promptfilter.InspectText(fullText, cfg)
+	if signal, signals := PromptFilterRouteSignal(fullVerdict, fullText, cfg, "/v1/responses"); signal {
+		t.Fatalf("bounded full scan unexpectedly found middle messages: signals=%v verdict=%+v", signals, fullVerdict)
+	}
+
+	scan := inspectPromptFilterPayload(body, "/v1/responses", routingPromptFilterConfig(cfg), true)
+	if !scan.CYBSignal || !strings.Contains(strings.Join(scan.Signals, ","), promptFilterUserTextRescueSignal) {
+		t.Fatalf("messages rescan did not rescue route: %+v", scan)
+	}
+	if !strings.HasPrefix(scan.AuditText, "trigger messages route") {
+		t.Fatalf("audit text does not preserve rescued messages first: %.80q", scan.AuditText)
+	}
+}
+
+func TestPromptFilterPayloadRescanFallsBackToFullTextWhenInputAndMessagesEmpty(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		CustomPatterns: []promptfilter.PatternConfig{{
+			Name:    "test_fallback_route",
+			Pattern: `trigger fallback route`,
+			Weight:  60,
+		}},
+	}
+	body := []byte(`{"instructions":"trigger fallback route","input":[],"messages":[]}`)
+	userText := promptfilter.ExtractUserText(body, "/v1/responses", cfg.MaxTextLength)
+	if !strings.Contains(userText, "trigger fallback route") {
+		t.Fatalf("empty user compartments did not fall back to full text: %q", userText)
+	}
+
+	scan := inspectPromptFilterPayload(body, "/v1/responses", cfg, true)
+	if !scan.CYBSignal || fmt.Sprint(scan.Signals) != "[local_threshold]" {
+		t.Fatalf("fallback scan = %+v, want original full-payload route only", scan)
+	}
+}
+
+func TestPromptFilterPayloadRescanMergesDistinctMatchesWithoutAddingScores(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		MaxTextLength:   promptfilter.DefaultMaxTextLength,
+		CustomPatterns: []promptfilter.PatternConfig{
+			{Name: "system_signal", Pattern: `system-only-signal`, Weight: 80},
+			{Name: "user_signal", Pattern: `user-only-signal`, Weight: 60},
+		},
+	}
+	body, err := json.Marshal(map[string]any{
+		"instructions": "system-only-signal " + strings.Repeat("benign system envelope ", 5000),
+		"input":        "user-only-signal",
+		"tools": []map[string]any{{
+			"description": strings.Repeat("benign tool documentation ", 3000),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal split-signal payload: %v", err)
+	}
+
+	scan := inspectPromptFilterPayload(body, "/v1/responses", cfg, true)
+	if scan.Verdict.Score != 80 || scan.Verdict.RawScore != 80 {
+		t.Fatalf("merged distinct matches added scores: score=%d raw=%d matches=%+v", scan.Verdict.Score, scan.Verdict.RawScore, scan.Verdict.Matched)
+	}
+	gotNames := make(map[string]bool, len(scan.Verdict.Matched))
+	for _, match := range scan.Verdict.Matched {
+		gotNames[match.Name] = true
+	}
+	if len(gotNames) != 2 || !gotNames["system_signal"] || !gotNames["user_signal"] {
+		t.Fatalf("distinct match union = %+v, want system_signal + user_signal", scan.Verdict.Matched)
+	}
+}
+
+func TestPromptFilterPayloadRescanDoesNotDoubleCountDuplicateMatches(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       50,
+		StrictThreshold: 90,
+		CustomPatterns: []promptfilter.PatternConfig{{
+			Name:     "test_cyb_route",
+			Pattern:  `trigger cyb route`,
+			Weight:   60,
+			Category: "cyb-test",
+		}},
+	}
+	body := []byte(`{"instructions":"trigger cyb route","input":"trigger cyb route"}`)
+	scan := inspectPromptFilterPayload(body, "/v1/responses", cfg, true)
+	if scan.Verdict.Score != 60 || scan.Verdict.RawScore != 60 {
+		t.Fatalf("duplicate match inflated score: score=%d raw=%d matches=%+v", scan.Verdict.Score, scan.Verdict.RawScore, scan.Verdict.Matched)
+	}
+	if len(scan.Verdict.Matched) != 1 || scan.Verdict.Matched[0].Name != "test_cyb_route" {
+		t.Fatalf("duplicate match was not de-duplicated: %+v", scan.Verdict.Matched)
+	}
+	if strings.Contains(strings.Join(scan.Signals, ","), promptFilterUserTextRescueSignal) {
+		t.Fatalf("rescue marker added even though full scan already routed: %v", scan.Signals)
 	}
 }
 

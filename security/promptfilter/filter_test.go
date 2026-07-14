@@ -1,6 +1,7 @@
 package promptfilter
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -233,6 +234,165 @@ func TestExtractTextSkipsMultimodalNonTextFields(t *testing.T) {
 	for _, leaked := range []string{"private.example", "secret.png", "BASE64SECRET"} {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("ExtractText leaked non-text field %q in %q", leaked, got)
+		}
+	}
+}
+
+func TestExtractRoutingUserTextSkipsOpaqueResponsesHistoryAt32KCap(t *testing.T) {
+	const currentUser = "CURRENT_USER_CYB_ROUTE_SIGNAL"
+	body, err := json.Marshal(map[string]any{
+		"instructions": "SYSTEM_SIGNAL_REMAINS_IN_FULL_SCAN",
+		"input": []any{
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("A", 40*1024)},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": currentUser}}},
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("B", 40*1024)},
+			map[string]any{"type": "function_call_output", "output": strings.Repeat("OPAQUE_TOOL_OUTPUT", 4096)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	legacy := ExtractUserText(body, "/v1/responses", 32*1024)
+	if strings.Contains(legacy, currentUser) {
+		t.Fatalf("test fixture did not reproduce bounded legacy extraction loss")
+	}
+	got := ExtractRoutingUserText(body, "/v1/responses", 32*1024)
+	if got != currentUser {
+		t.Fatalf("routing text = %q, want only current visible user text", got)
+	}
+	for _, opaque := range []string{strings.Repeat("A", 64), strings.Repeat("B", 64), "OPAQUE_TOOL_OUTPUT"} {
+		if strings.Contains(got, opaque) {
+			t.Fatalf("routing text leaked opaque field %q", opaque)
+		}
+	}
+}
+
+func TestExtractRoutingUserTextPrioritizesLatestVisibleResponsesTurn(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "compatibility history"},
+		},
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "older visible turn"}}},
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("CIPHERTEXT", 2000)},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "assistant text must not displace user"}}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_image", "image_url": "https://private.invalid/image"},
+				map[string]any{"type": "input_text", "text": "latest visible turn"},
+			}},
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("TAILCIPHER", 2000)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	got := ExtractRoutingUserText(body, "/v1/responses", 128)
+	if !strings.HasPrefix(got, "latest visible turn") {
+		t.Fatalf("latest input was not prioritized: %q", got)
+	}
+	for _, want := range []string{"older visible turn", "compatibility history"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("routing text %q omitted visible user segment %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{"CIPHERTEXT", "TAILCIPHER", "assistant text", "private.invalid"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("routing text leaked non-user/opaque value %q: %q", unwanted, got)
+		}
+	}
+}
+
+func TestExtractRoutingUserTextDeduplicatesMessagesAndInput(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":"same current user"}],"input":[{"role":"user","content":[{"type":"input_text","text":"same current user"}]}]}`)
+	got := ExtractRoutingUserText(body, "/v1/responses", DefaultMaxTextLength)
+	if got != "same current user" {
+		t.Fatalf("duplicated compatibility fields produced %q", got)
+	}
+}
+
+func TestExtractRoutingUserTextLongLatestTurnPreservesUTF8HeadAndTail(t *testing.T) {
+	latest := "HEAD_CURRENT_USER_" + strings.Repeat("界🙂", 5000) + "_TAIL_CURRENT_USER"
+	body, err := json.Marshal(map[string]any{
+		"input": []any{map[string]any{
+			"role":    "user",
+			"content": []any{map[string]any{"type": "input_text", "text": latest}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal long UTF-8 payload: %v", err)
+	}
+	got := ExtractRoutingUserText(body, "/v1/responses", 4096)
+	if !utf8.ValidString(got) {
+		t.Fatalf("routing extractor split UTF-8: %q", got)
+	}
+	for _, want := range []string{"HEAD_CURRENT_USER_", "_TAIL_CURRENT_USER"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("routing extractor lost latest-turn %s marker", want)
+		}
+	}
+}
+
+func TestExtractRoutingUserTextSupportsChatAnthropicAndDirectResponsesInput(t *testing.T) {
+	tests := []struct {
+		name       string
+		endpoint   string
+		body       string
+		wantPrefix string
+		wantOlder  string
+		unwanted   []string
+	}{
+		{
+			name:       "chat",
+			endpoint:   "/v1/chat/completions",
+			body:       `{"messages":[{"role":"system","content":"system shell"},{"role":"user","content":"older chat user"},{"role":"assistant","content":"assistant history"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://private.invalid/chat"}},{"type":"text","text":"latest chat user"}]}]}`,
+			wantPrefix: "latest chat user",
+			wantOlder:  "older chat user",
+			unwanted:   []string{"system shell", "assistant history", "private.invalid"},
+		},
+		{
+			name:       "anthropic",
+			endpoint:   "/v1/messages",
+			body:       `{"system":"anthropic system","messages":[{"role":"user","content":"older anthropic user"},{"role":"assistant","content":"assistant history"},{"role":"user","content":[{"type":"image","source":{"type":"base64","data":"BASE64SECRET"}},{"type":"text","text":"latest anthropic user"}]}]}`,
+			wantPrefix: "latest anthropic user",
+			wantOlder:  "older anthropic user",
+			unwanted:   []string{"anthropic system", "assistant history", "BASE64SECRET"},
+		},
+		{
+			name:       "responses_direct_input",
+			endpoint:   "/v1/responses",
+			body:       `{"instructions":"system shell","input":"direct current user"}`,
+			wantPrefix: "direct current user",
+			unwanted:   []string{"system shell"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ExtractRoutingUserText([]byte(tc.body), tc.endpoint, DefaultMaxTextLength)
+			if !strings.HasPrefix(got, tc.wantPrefix) {
+				t.Fatalf("routing text = %q, want prefix %q", got, tc.wantPrefix)
+			}
+			if tc.wantOlder != "" && !strings.Contains(got, tc.wantOlder) {
+				t.Fatalf("routing text = %q, want older user text %q", got, tc.wantOlder)
+			}
+			for _, unwanted := range tc.unwanted {
+				if strings.Contains(got, unwanted) {
+					t.Fatalf("routing text leaked %q: %q", unwanted, got)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractRoutingUserTextDoesNotFallbackToFullPayload(t *testing.T) {
+	body := []byte(`{"instructions":"SYSTEM_ONLY_ROUTE_SIGNAL","input":[{"type":"reasoning","encrypted_content":"OPAQUE"},{"type":"function_call_output","output":"TOOL_RESULT"}],"tools":[{"description":"TOOL_ONLY_ROUTE_SIGNAL"}]}`)
+	if got := ExtractRoutingUserText(body, "/v1/responses", DefaultMaxTextLength); got != "" {
+		t.Fatalf("routing user extractor fell back to non-user payload: %q", got)
+	}
+	full := ExtractText(body, "/v1/responses", DefaultMaxTextLength)
+	for _, want := range []string{"SYSTEM_ONLY_ROUTE_SIGNAL", "TOOL_ONLY_ROUTE_SIGNAL"} {
+		if !strings.Contains(full, want) {
+			t.Fatalf("full payload scan lost %q: %q", want, full)
 		}
 	}
 }

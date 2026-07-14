@@ -304,9 +304,26 @@ sub2 failover form the availability protection for this release. Guardian
 a later controlled change after shadow events are replayed. Combining both
 changes would obscure attribution and make rollback less safe.
 
-Before Guardian `enforce` or online Relay-group switching is allowed, the
-configuration transition must be changed to fence and publish every in-memory
-scope first, then delete Redis state asynchronously or in one bounded batch.
-The current per-account Redis cleanup can extend a transition by its I/O timeout;
-it is harmless while Guardian is `monitor` and groups are not switched online,
-but it is not an accepted enforce-mode availability boundary.
+The configuration-transition availability blocker is now closed in source:
+the new in-memory scope and epoch are published first, then all old Redis keys
+share one bounded cleanup deadline. A timeout cannot scale with account count;
+leftover records are rejected by the new epoch. Race tests cover a blocked
+delete while requests observe the newly published scope.
+
+Guardian restart semantics remain deliberately availability-first. A process
+restart does **not** restore Guardian quarantine/probation state; the independent
+fast breaker still restores its transport fence. The API exposes a cold-start
+guard lasting one full Guardian recovery window (initial quarantine plus both
+probation stages). During that guard, Guardian may use bounded last-resort
+capacity but may not create a new long isolation.
+
+Raw or retry-absorbed `3 in 5m` gateway observations are diagnostic suspect
+evidence only. A long strong isolation requires two distinct
+fast-breaker-confirmed strong cycles inside ten minutes. Replacement peer
+capacity also requires a recent canonical, non-probe success; configured or
+nominally healthy capacity alone is not sufficient.
+
+These changes do not authorize switching production to `enforce`. Keep
+Guardian in `monitor` until the new shadow outcomes have completed a controlled
+soak and confirmed-breaker precision, cold-start behavior, and canonical peer
+freshness have been reviewed from production evidence.

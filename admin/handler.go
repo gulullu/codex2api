@@ -6219,6 +6219,7 @@ type settingsResponse struct {
 	PromptFilterCybRelayGroupID                int64                          `json:"prompt_filter_cyb_relay_group_id"`
 	PromptFilterCybRelaySessionPinEnabled      bool                           `json:"prompt_filter_cyb_relay_session_pin_enabled"`
 	PromptFilterCybRelaySessionPinTTLSeconds   int                            `json:"prompt_filter_cyb_relay_session_pin_ttl_seconds"`
+	PromptFilterUserTextRescanEnabled          bool                           `json:"prompt_filter_user_text_rescan_enabled"`
 	PromptFilterSemanticReviewEnabled          bool                           `json:"prompt_filter_semantic_review_enabled"`
 	PromptFilterSemanticReviewAPIKeyConfigured bool                           `json:"prompt_filter_semantic_review_api_key_configured"`
 	PromptFilterSemanticReviewAPIKeyCount      int                            `json:"prompt_filter_semantic_review_api_key_count"`
@@ -6336,6 +6337,7 @@ type updateSettingsReq struct {
 	PromptFilterCybRelayGroupID                *int64                          `json:"prompt_filter_cyb_relay_group_id"`
 	PromptFilterCybRelaySessionPinEnabled      *bool                           `json:"prompt_filter_cyb_relay_session_pin_enabled"`
 	PromptFilterCybRelaySessionPinTTLSeconds   *int                            `json:"prompt_filter_cyb_relay_session_pin_ttl_seconds"`
+	PromptFilterUserTextRescanEnabled          *bool                           `json:"prompt_filter_user_text_rescan_enabled"`
 	PromptFilterSemanticReviewEnabled          *bool                           `json:"prompt_filter_semantic_review_enabled"`
 	PromptFilterSemanticReviewAPIKey           *string                         `json:"prompt_filter_semantic_review_api_key"`
 	PromptFilterSemanticReviewBaseURL          *string                         `json:"prompt_filter_semantic_review_base_url"`
@@ -7227,6 +7229,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterCybRelayGroupID:                cybRelayCfg.GroupID,
 		PromptFilterCybRelaySessionPinEnabled:      cybRelayCfg.SessionPinEnabled,
 		PromptFilterCybRelaySessionPinTTLSeconds:   cybRelayCfg.SessionPinTTLSeconds,
+		PromptFilterUserTextRescanEnabled:          cybRelayCfg.UserTextRescanEnabled(),
 		PromptFilterSemanticReviewEnabled:          semanticReviewCfg.Enabled,
 		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewProviderKeyCount(semanticReviewCfg.Providers) > 0,
 		PromptFilterSemanticReviewAPIKeyCount:      semanticReviewProviderKeyCount(semanticReviewCfg.Providers),
@@ -7366,7 +7369,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	cybRelayChanged := req.PromptFilterCybRelayEnabled != nil ||
 		req.PromptFilterCybRelayGroupID != nil ||
 		req.PromptFilterCybRelaySessionPinEnabled != nil ||
-		req.PromptFilterCybRelaySessionPinTTLSeconds != nil
+		req.PromptFilterCybRelaySessionPinTTLSeconds != nil ||
+		req.PromptFilterUserTextRescanEnabled != nil
 	if req.PromptFilterCybRelayEnabled != nil {
 		cybRelayCfg.Enabled = *req.PromptFilterCybRelayEnabled
 	}
@@ -7378,6 +7382,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	if req.PromptFilterCybRelaySessionPinTTLSeconds != nil {
 		cybRelayCfg.SessionPinTTLSeconds = *req.PromptFilterCybRelaySessionPinTTLSeconds
+	}
+	if req.PromptFilterUserTextRescanEnabled != nil {
+		cybRelayCfg.UserTextRescanDisabled = !*req.PromptFilterUserTextRescanEnabled
 	}
 	cybRelayCfg = auth.NormalizeCybRelayConfig(cybRelayCfg)
 	if cybRelayChanged && cybRelayCfg.Enabled {
@@ -8236,7 +8243,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	if cybRelayChanged {
 		h.store.SetCybRelayConfig(cybRelayCfg)
-		log.Printf("设置已更新: prompt_filter_cyb_relay enabled=%t group_id=%d session_pin=%t ttl_seconds=%d", cybRelayCfg.Enabled, cybRelayCfg.GroupID, cybRelayCfg.SessionPinEnabled, cybRelayCfg.SessionPinTTLSeconds)
+		log.Printf("设置已更新: prompt_filter_cyb_relay enabled=%t group_id=%d session_pin=%t ttl_seconds=%d user_text_rescan=%t", cybRelayCfg.Enabled, cybRelayCfg.GroupID, cybRelayCfg.SessionPinEnabled, cybRelayCfg.SessionPinTTLSeconds, cybRelayCfg.UserTextRescanEnabled())
 	}
 
 	// 持久化保存到数据库
@@ -8308,6 +8315,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterCybRelayGroupID:                cybRelayCfg.GroupID,
 		PromptFilterCybRelaySessionPinEnabled:      cybRelayCfg.SessionPinEnabled,
 		PromptFilterCybRelaySessionPinTTLSeconds:   cybRelayCfg.SessionPinTTLSeconds,
+		PromptFilterUserTextRescanEnabled:          cybRelayCfg.UserTextRescanEnabled(),
+		PromptFilterUserTextRescanConfigured:       true,
 		PromptFilterSemanticReviewEnabled:          semanticReviewEnabled,
 		PromptFilterSemanticReviewAPIKey:           semanticReviewAPIKey,
 		PromptFilterSemanticReviewBaseURL:          semanticReviewBaseURL,
@@ -8479,6 +8488,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterCybRelayGroupID:                cybRelayCfg.GroupID,
 		PromptFilterCybRelaySessionPinEnabled:      cybRelayCfg.SessionPinEnabled,
 		PromptFilterCybRelaySessionPinTTLSeconds:   cybRelayCfg.SessionPinTTLSeconds,
+		PromptFilterUserTextRescanEnabled:          cybRelayCfg.UserTextRescanEnabled(),
 		PromptFilterSemanticReviewEnabled:          semanticReviewResponse.Enabled,
 		PromptFilterSemanticReviewAPIKeyConfigured: semanticReviewProviderKeyCount(semanticReviewResponse.Providers) > 0,
 		PromptFilterSemanticReviewAPIKeyCount:      semanticReviewProviderKeyCount(semanticReviewResponse.Providers),

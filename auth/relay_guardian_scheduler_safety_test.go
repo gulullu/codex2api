@@ -497,6 +497,7 @@ func TestRelayGuardianStrongGatewayPoolCorrelationOverridesVisibleTrigger(t *tes
 		t.Run(string(mode), func(t *testing.T) {
 			clock := newRelayCircuitTestClock()
 			_, guardian := newGuardianTestStore(t, mode, clock, 50, 53, 54)
+			confirmGuardianStrongBreakerCyclesForTest(t, guardian, 53)
 			guardian.observe(guardianObservation(50, "50-attempt-1", 524, true, clock.Now()))
 			clock.Advance(2 * time.Minute)
 			guardian.observe(guardianObservation(50, "50-attempt-2", 524, true, clock.Now()))

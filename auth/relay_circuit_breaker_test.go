@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -269,6 +270,74 @@ func relayCircuitConfirmStrongOpen(t *testing.T, breaker *relayCircuitBreaker, a
 		if opened != (i == relayCircuitStrongFailureLimit) {
 			t.Fatalf("strong failure %d opened=%v", i, opened)
 		}
+	}
+}
+
+func relayCircuitRecoverStrongOpen(t *testing.T, breaker *relayCircuitBreaker, clock *relayCircuitTestClock, accountID int64) {
+	t.Helper()
+	open := breaker.snapshot(accountID)
+	if !open.OpenUntil.After(clock.Now()) {
+		t.Fatalf("open deadline missing before recovery: %+v", open)
+	}
+	clock.Advance(open.OpenUntil.Sub(clock.Now()))
+	for success := 1; success <= relayCircuitRecoverySuccesses; success++ {
+		probe, ok := breaker.beginWithEvidence(accountID, "cycle-recovery-"+strconv.Itoa(success), 100)
+		if !ok || !probe.Probe {
+			t.Fatalf("recovery probe %d denied: permit=%+v ok=%v", success, probe, ok)
+		}
+		closed := breaker.reportSuccess(probe)
+		if closed != (success == relayCircuitRecoverySuccesses) {
+			t.Fatalf("recovery probe %d closed=%v", success, closed)
+		}
+	}
+}
+
+func TestRelayCircuitConfirmedStrongCycleTokenTracksOnlyConfirmedStrongCycles(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	breaker := newRelayCircuitTestBreaker(clock)
+
+	if token := breaker.snapshot(51).confirmedStrongCycleToken; token != 0 {
+		t.Fatalf("new breaker cycle token=%d, want 0", token)
+	}
+	relayCircuitConfirmStrongOpen(t, breaker, 51)
+	if token := breaker.snapshot(51).confirmedStrongCycleToken; token != 1 {
+		t.Fatalf("first confirmed strong cycle token=%d, want 1", token)
+	}
+
+	// A single strong recovery probe can reopen the transport fence, but it is
+	// not a second independently confirmed strong quorum.
+	clock.Advance(breaker.snapshot(51).OpenUntil.Sub(clock.Now()))
+	probe, ok := breaker.beginWithEvidence(51, "single-strong-recovery-failure", 100)
+	if !ok || !probe.Probe {
+		t.Fatalf("strong recovery probe denied: permit=%+v ok=%v", probe, ok)
+	}
+	if !breaker.reportFailure(probe, http.StatusBadGateway) {
+		t.Fatal("single strong recovery failure did not reopen circuit")
+	}
+	if token := breaker.snapshot(51).confirmedStrongCycleToken; token != 1 {
+		t.Fatalf("single strong recovery failure advanced confirmed cycle token to %d", token)
+	}
+
+	relayCircuitRecoverStrongOpen(t, breaker, clock, 51)
+	relayCircuitConfirmStrongOpen(t, breaker, 51)
+	if token := breaker.snapshot(51).confirmedStrongCycleToken; token != 2 {
+		t.Fatalf("second confirmed strong cycle token=%d, want 2", token)
+	}
+}
+
+func TestRelayCircuitConfirmedStrongCycleTokenSurvivesBreakerOnlyIdentityReset(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	breaker := newRelayCircuitTestBreaker(clock)
+	relayCircuitConfirmStrongOpen(t, breaker, 51)
+
+	breaker.forgetAccountRuntime(51, "replacement-identity")
+	afterReset := breaker.snapshot(51)
+	if afterReset.State != RelayCircuitClosed || afterReset.confirmedStrongCycleToken != 1 {
+		t.Fatalf("breaker-only identity reset reused cycle namespace: %+v token=%d", afterReset, afterReset.confirmedStrongCycleToken)
+	}
+	relayCircuitConfirmStrongOpen(t, breaker, 51)
+	if token := breaker.snapshot(51).confirmedStrongCycleToken; token != 2 {
+		t.Fatalf("post-reset confirmed cycle token=%d, want 2", token)
 	}
 }
 
@@ -1339,11 +1408,14 @@ func TestRelayCircuitRemoveAndReaddSameAccountIDStartsFreshEpoch(t *testing.T) {
 			} else {
 				relayCircuitConfirmStoreStrongOpen(t, store, primary)
 			}
+			if token := store.RelayCircuitSnapshot(primary.ID()).confirmedStrongCycleToken; token != 1 {
+				t.Fatalf("pre-removal confirmed cycle token=%d, want 1", token)
+			}
 
 			store.RemoveAccount(primary.ID())
 			replacement := relayCircuitSchedulerAccount(primary.ID(), primary.schedulerPriority())
 			store.AddAccount(replacement)
-			if snapshot := store.RelayCircuitSnapshot(replacement.ID()); snapshot.State != RelayCircuitClosed || snapshot.LastResort {
+			if snapshot := store.RelayCircuitSnapshot(replacement.ID()); snapshot.State != RelayCircuitClosed || snapshot.LastResort || snapshot.confirmedStrongCycleToken != 1 {
 				t.Fatalf("replacement account inherited removed membership state: %+v", snapshot)
 			}
 			if !store.RelayCircuitSelectable(replacement) {
@@ -1354,6 +1426,14 @@ func TestRelayCircuitRemoveAndReaddSameAccountIDStartsFreshEpoch(t *testing.T) {
 			}
 			if snapshot := store.RelayCircuitSnapshot(replacement.ID()); snapshot.State != RelayCircuitClosed || snapshot.StrongFailures != 0 {
 				t.Fatalf("removed object's completion mutated replacement account: %+v", snapshot)
+			}
+			if tt.lastResort {
+				relayCircuitConfirmStoreLastResort(t, store, replacement, "replacement-last-resort")
+			} else {
+				relayCircuitConfirmStoreStrongOpen(t, store, replacement)
+			}
+			if token := store.RelayCircuitSnapshot(replacement.ID()).confirmedStrongCycleToken; token != 2 {
+				t.Fatalf("replacement confirmed cycle token=%d, want monotonic token 2", token)
 			}
 		})
 	}
@@ -1658,6 +1738,10 @@ func TestRelayCircuitRequestPoolInvariantPromotesOpenAfterHealthyPeerPaused(t *t
 	clock := newRelayCircuitTestClock()
 	store, primary, fallback := newRelayCircuitSchedulerStore(false, clock)
 	relayCircuitConfirmStoreStrongOpen(t, store, primary)
+	confirmedToken := store.RelayCircuitSnapshot(primary.ID()).confirmedStrongCycleToken
+	if confirmedToken != 1 {
+		t.Fatalf("confirmed open token=%d, want 1", confirmedToken)
+	}
 	if !store.ApplyAccountEnabled(fallback.ID(), false) {
 		t.Fatal("pause healthy peer failed")
 	}
@@ -1669,11 +1753,43 @@ func TestRelayCircuitRequestPoolInvariantPromotesOpenAfterHealthyPeerPaused(t *t
 	if snapshot.State != RelayCircuitSuspect || !snapshot.LastResort || snapshot.AdmissionLimit != relayCircuitLastResortAdmissionLimit {
 		t.Fatalf("open account was not promoted to capped last-resort: %+v", snapshot)
 	}
+	if snapshot.confirmedStrongCycleToken != confirmedToken {
+		t.Fatalf("pool-invariant promotion advanced confirmed cycle token: before=%d after=%d", confirmedToken, snapshot.confirmedStrongCycleToken)
+	}
 	if atomic.LoadInt32(&fallback.DispatchPaused) == 0 {
 		t.Fatal("pool invariant re-enabled the manually paused peer")
 	}
 	if fallbackSnapshot := store.RelayCircuitSnapshot(fallback.ID()); fallbackSnapshot.LastResort {
 		t.Fatalf("paused peer was promoted instead of remaining untouched: %+v", fallbackSnapshot)
+	}
+}
+
+func TestRelayCircuitLastResortNewStrongQuorumAdvancesConfirmedCycleToken(t *testing.T) {
+	clock := newRelayCircuitTestClock()
+	store, primary, fallback := newRelayCircuitSchedulerStore(false, clock)
+	relayCircuitConfirmStoreStrongOpen(t, store, primary)
+	if !store.ApplyAccountEnabled(fallback.ID(), false) {
+		t.Fatal("pause healthy peer failed")
+	}
+	if !store.EnsureRelayCircuitRequestPoolInvariant(nil, nil) {
+		t.Fatal("request pool invariant did not promote open front")
+	}
+	if token := store.RelayCircuitSnapshot(primary.ID()).confirmedStrongCycleToken; token != 1 {
+		t.Fatalf("promoted last-resort token=%d, want 1", token)
+	}
+
+	for index := 1; index <= relayCircuitStrongFailureLimit; index++ {
+		permit, ok := store.BeginRelayCircuitRequestForLogicalRequest(primary, "last-resort-new-quorum-"+strconv.Itoa(index))
+		if !ok {
+			t.Fatalf("last-resort permit %d denied", index)
+		}
+		if store.ReportRelayCircuitFailure(permit, http.StatusBadGateway) {
+			t.Fatalf("last-resort failure %d unexpectedly removed the sole front", index)
+		}
+	}
+	snapshot := store.RelayCircuitSnapshot(primary.ID())
+	if !snapshot.LastResort || snapshot.confirmedStrongCycleToken != 2 {
+		t.Fatalf("new confirmed last-resort quorum did not advance cycle token: %+v token=%d", snapshot, snapshot.confirmedStrongCycleToken)
 	}
 }
 
@@ -2294,6 +2410,9 @@ func TestRelayCircuitProbationUsesRollbackCompatibleWireState(t *testing.T) {
 	restarted := newRelayCircuitBreaker(tokenCache)
 	restarted.now = clock.Now
 	restarted.ensureLoaded(51)
+	if token := restarted.snapshot(51).confirmedStrongCycleToken; token != 0 {
+		t.Fatalf("process restart restored process-local confirmed cycle token=%d", token)
+	}
 	if snapshot := restarted.snapshot(51); snapshot.State != RelayCircuitProbation || snapshot.LastResort ||
 		snapshot.ProbeSuccesses != 1 || snapshot.AdmissionLimit != relayCircuitProbationMaxInFlight {
 		t.Fatalf("rb12 did not restore probation semantics from half_open wire state: %+v", snapshot)

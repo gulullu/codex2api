@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.5.4+rb14 - 2026-07-14
+
+### RelayBases integration
+
+- Added a field-aware supplemental CYB routing scan for visible user input. The existing complete-payload scan remains authoritative for system prompts, skills, tools and all other request text; the supplemental scan skips opaque encrypted/tool blobs, keeps the newest user turn inside its bounded window, and emits `user_text_rescue` only when it recovers a route the complete scan missed. This remains routing-only and never blocks a request.
+- Hardened Relay Health Guardian shadow decisions. Raw or retry-absorbed gateway observations are suspect evidence only; long isolation now requires two distinct fast-breaker-confirmed strong cycles, recent canonical non-probe success from replacement capacity, and a 50-minute cold-start guard after process or configuration changes. Guardian remains in `monitor` for a fresh production soak before any enforce decision.
+- Reworked the sub2 `codex-pro` maintenance controller around durable run ownership and exact HTTP-access receipts. Maintenance snapshots use a 90-second budget, pause/seal/restore intents are replay-safe, transient read failures remain retryable, definite tuple or foreign-write conflicts fail closed, and standby eligibility is revalidated throughout. The primary bridge account is an explicit runtime configuration value rather than a code default, so account replacement does not require a source change.
+
 ## v2.5.4+rb13 - 2026-07-14
 
 ### RelayBases integration

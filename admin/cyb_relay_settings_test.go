@@ -36,7 +36,7 @@ func TestUpdateSettingsCybRelayPersistsNormalizedConfig(t *testing.T) {
 	store := auth.NewStore(db, tokenCache, initialSettings)
 	handler := NewHandler(store, db, tokenCache, proxy.NewRateLimiter(0), "admin-secret")
 
-	body := fmt.Sprintf(`{"prompt_filter_cyb_relay_enabled":true,"prompt_filter_cyb_relay_group_id":%d,"prompt_filter_cyb_relay_session_pin_enabled":true,"prompt_filter_cyb_relay_session_pin_ttl_seconds":5}`, groupID)
+	body := fmt.Sprintf(`{"prompt_filter_cyb_relay_enabled":true,"prompt_filter_cyb_relay_group_id":%d,"prompt_filter_cyb_relay_session_pin_enabled":true,"prompt_filter_cyb_relay_session_pin_ttl_seconds":5,"prompt_filter_user_text_rescan_enabled":false}`, groupID)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewBufferString(body))
@@ -56,12 +56,18 @@ func TestUpdateSettingsCybRelayPersistsNormalizedConfig(t *testing.T) {
 	if !runtimeCfg.Enabled || runtimeCfg.GroupID != groupID || !runtimeCfg.SessionPinEnabled || runtimeCfg.SessionPinTTLSeconds != auth.MinCybRelaySessionPinTTLSeconds {
 		t.Fatalf("runtime config = %+v", runtimeCfg)
 	}
+	if runtimeCfg.UserTextRescanEnabled() {
+		t.Fatal("runtime user-text rescan remained enabled after hot rollback toggle")
+	}
 	persisted, err := db.GetSystemSettings(context.Background())
 	if err != nil {
 		t.Fatalf("GetSystemSettings: %v", err)
 	}
 	if !persisted.PromptFilterCybRelayEnabled || persisted.PromptFilterCybRelayGroupID != groupID || !persisted.PromptFilterCybRelaySessionPinEnabled || persisted.PromptFilterCybRelaySessionPinTTLSeconds != auth.MinCybRelaySessionPinTTLSeconds {
 		t.Fatalf("persisted config = %+v", persisted)
+	}
+	if persisted.PromptFilterUserTextRescanEnabled {
+		t.Fatal("user-text rescan rollback toggle was not persisted")
 	}
 
 	getRecorder := httptest.NewRecorder()
@@ -76,6 +82,9 @@ func TestUpdateSettingsCybRelayPersistsNormalizedConfig(t *testing.T) {
 		t.Fatalf("decode GET response: %v", err)
 	}
 	assertCybRelaySettingsResponse(t, getResponse, groupID, auth.MinCybRelaySessionPinTTLSeconds)
+	if getResponse.PromptFilterUserTextRescanEnabled {
+		t.Fatal("GET settings did not expose disabled user-text rescan")
+	}
 }
 
 func TestUpdateSettingsCybRelayRejectsMissingGroupBeforeRuntimeMutation(t *testing.T) {
@@ -159,17 +168,18 @@ func TestDeleteAccountGroupRejectsEnabledCybRelayGroupEvenWithForce(t *testing.T
 
 func testCybRelaySystemSettings() *database.SystemSettings {
 	return &database.SystemSettings{
-		SiteName:                     "CodexProxy",
-		MaxConcurrency:               2,
-		TestModel:                    "gpt-5.4",
-		TestContent:                  "hi",
-		TestConcurrency:              1,
-		PromptFilterMode:             "monitor",
-		PromptFilterThreshold:        50,
-		PromptFilterStrictThreshold:  90,
-		PromptFilterMaxTextLength:    81920,
-		PromptFilterCustomPatterns:   "[]",
-		PromptFilterDisabledPatterns: "[]",
+		SiteName:                          "CodexProxy",
+		MaxConcurrency:                    2,
+		TestModel:                         "gpt-5.4",
+		TestContent:                       "hi",
+		TestConcurrency:                   1,
+		PromptFilterMode:                  "monitor",
+		PromptFilterThreshold:             50,
+		PromptFilterStrictThreshold:       90,
+		PromptFilterMaxTextLength:         81920,
+		PromptFilterCustomPatterns:        "[]",
+		PromptFilterDisabledPatterns:      "[]",
+		PromptFilterUserTextRescanEnabled: true,
 	}
 }
 

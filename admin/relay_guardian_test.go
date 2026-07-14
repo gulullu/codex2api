@@ -60,8 +60,15 @@ func TestGetHealthIncludesRelayGuardianAggregation(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(response.Guardian, wantGuardian) {
-		t.Fatalf("guardian=%+v, want %+v", response.Guardian, wantGuardian)
+	// The handler boundary strips time.Time's process-local monotonic component.
+	// Normalize the direct Store result through the same JSON representation.
+	wantGuardianJSON, _ := json.Marshal(wantGuardian)
+	var normalizedWantGuardian auth.RelayGuardianHealthSummary
+	if err := json.Unmarshal(wantGuardianJSON, &normalizedWantGuardian); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(response.Guardian, normalizedWantGuardian) {
+		t.Fatalf("guardian=%+v, want %+v", response.Guardian, normalizedWantGuardian)
 	}
 	if !reflect.DeepEqual(response.Relay, wantRelay) {
 		t.Fatalf("relay=%+v, want %+v", response.Relay, wantRelay)

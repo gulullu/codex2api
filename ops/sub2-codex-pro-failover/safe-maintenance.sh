@@ -22,6 +22,41 @@ else
   controller="$script_dir/sub2-codex-pro-failover.sh"
 fi
 
+readonly failover_config_file="${FAILOVER_CONFIG_FILE:-/etc/default/codex2api-sub2-codex-pro-failover}"
+
+load_bridge_account_id_once() {
+  local value="${BRIDGE_ACCOUNT_ID:-}"
+  if [[ -z "$value" ]]; then
+    [[ -r "$failover_config_file" ]] || {
+      printf 'BRIDGE_ACCOUNT_ID is required and config is unreadable: %s\n' "$failover_config_file" >&2
+      exit 64
+    }
+    local line matches=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      if [[ "$line" == BRIDGE_ACCOUNT_ID=* ]]; then
+        matches=$((matches + 1))
+        value="${line#BRIDGE_ACCOUNT_ID=}"
+      fi
+    done <"$failover_config_file"
+    (( matches == 1 )) || {
+      printf 'BRIDGE_ACCOUNT_ID config must contain exactly one assignment\n' >&2
+      exit 64
+    }
+  fi
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    printf 'BRIDGE_ACCOUNT_ID must be a positive integer\n' >&2
+    exit 64
+  }
+  local maximum=9223372036854775807
+  if (( ${#value} > ${#maximum} )) ||
+     { (( ${#value} == ${#maximum} )) && [[ "$value" > "$maximum" ]]; }; then
+    printf 'BRIDGE_ACCOUNT_ID is outside PostgreSQL bigint range\n' >&2
+    exit 64
+  fi
+  export BRIDGE_ACCOUNT_ID="$value"
+}
+
 if [[ -z "${CREDENTIALS_DIRECTORY:-}" && -z "${SUB2_ADMIN_KEY_FILE:-}" && -r /root/.sub2api_admin.key ]]; then
   export SUB2_ADMIN_KEY_FILE=/root/.sub2api_admin.key
 fi
@@ -34,6 +69,11 @@ if ! flock --nonblock 8; then
   printf 'another codex2api maintenance lifecycle is already running\n' >&2
   exit 75
 fi
+
+# Freeze one validated primary identity for prepare, the wrapped command, and
+# finish. A config-file edit during a long rebuild applies only to a later
+# lifecycle; it cannot split ownership across two account ids.
+load_bridge_account_id_once
 
 "$controller" prepare-maintenance
 

@@ -835,6 +835,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_group_id BIGINT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_cyb_relay_session_pin_ttl_seconds INT DEFAULT 600;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_user_text_rescan_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ALTER COLUMN prompt_filter_semantic_review_enabled SET DEFAULT FALSE;
 	ALTER TABLE system_settings ALTER COLUMN prompt_filter_cyb_relay_session_pin_ttl_seconds SET DEFAULT 600;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
@@ -1546,13 +1547,18 @@ type SystemSettings struct {
 	PromptFilterCybRelayGroupID                int64
 	PromptFilterCybRelaySessionPinEnabled      bool
 	PromptFilterCybRelaySessionPinTTLSeconds   int
-	RelayGuardianMode                          string
-	SmartPacingEnabled                         bool   // issue #312 智能配速总开关
-	SmartPacingMinConcurrency                  int    // 配速并发下限
-	SmartPacingWindows                         string // "5h,7d" / "5h" / "7d"
-	IgnoreUsageLimitStatus                     bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
-	RetryIntervalMS                            int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
-	TransportRetryPolicy                       string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
+	PromptFilterUserTextRescanEnabled          bool
+	// PromptFilterUserTextRescanConfigured distinguishes a persisted false
+	// value from pre-feature in-memory SystemSettings literals whose bool zero
+	// value should retain the safety default (enabled).
+	PromptFilterUserTextRescanConfigured bool
+	RelayGuardianMode                    string
+	SmartPacingEnabled                   bool   // issue #312 智能配速总开关
+	SmartPacingMinConcurrency            int    // 配速并发下限
+	SmartPacingWindows                   string // "5h,7d" / "5h" / "7d"
+	IgnoreUsageLimitStatus               bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
+	RetryIntervalMS                      int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
+	TransportRetryPolicy                 string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
 	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
 	// 用于抬升出站 UA / manifest 的模拟版本（绝不低于内置常量），空表示尚未同步。
 	CodexSyncedCLIVersion string
@@ -1770,6 +1776,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_cyb_relay_group_id, 0),
 		       COALESCE(prompt_filter_cyb_relay_session_pin_enabled, true),
 		       COALESCE(prompt_filter_cyb_relay_session_pin_ttl_seconds, 600),
+		       COALESCE(prompt_filter_user_text_rescan_enabled, true),
 		       COALESCE(NULLIF(TRIM(relay_guardian_mode), ''), 'off'),
 		       COALESCE(auto_reset_credits_enabled, false),
 		       COALESCE(auto_reset_credits_before_expiry_min, 60)
@@ -1836,12 +1843,16 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PromptFilterCybRelayGroupID,
 		&s.PromptFilterCybRelaySessionPinEnabled,
 		&s.PromptFilterCybRelaySessionPinTTLSeconds,
+		&s.PromptFilterUserTextRescanEnabled,
 		&s.RelayGuardianMode,
 		&s.AutoResetCreditsEnabled,
 		&s.AutoResetCreditsBeforeExpiryMin,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
+	}
+	if err == nil {
+		s.PromptFilterUserTextRescanConfigured = true
 	}
 	s.SiteName = NormalizeSiteName(s.SiteName)
 	s.SiteLogo = strings.TrimSpace(s.SiteLogo)
@@ -1888,6 +1899,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	testContent := strings.TrimSpace(s.TestContent)
 	if testContent == "" {
 		testContent = "hi"
+	}
+	userTextRescanEnabled := s.PromptFilterUserTextRescanEnabled
+	if !s.PromptFilterUserTextRescanConfigured {
+		userTextRescanEnabled = true
 	}
 	_, err := db.conn.ExecContext(ctx, `
 			INSERT INTO system_settings (
@@ -1951,9 +1966,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					prompt_filter_cyb_relay_session_pin_enabled,
 					prompt_filter_cyb_relay_session_pin_ttl_seconds,
 					auto_reset_credits_enabled,
-					auto_reset_credits_before_expiry_min
+					auto_reset_credits_before_expiry_min,
+					prompt_filter_user_text_rescan_enabled
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2054,7 +2070,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					prompt_filter_cyb_relay_session_pin_enabled = EXCLUDED.prompt_filter_cyb_relay_session_pin_enabled,
 					prompt_filter_cyb_relay_session_pin_ttl_seconds = EXCLUDED.prompt_filter_cyb_relay_session_pin_ttl_seconds,
 					auto_reset_credits_enabled = EXCLUDED.auto_reset_credits_enabled,
-					auto_reset_credits_before_expiry_min = EXCLUDED.auto_reset_credits_before_expiry_min
+					auto_reset_credits_before_expiry_min = EXCLUDED.auto_reset_credits_before_expiry_min,
+					prompt_filter_user_text_rescan_enabled = EXCLUDED.prompt_filter_user_text_rescan_enabled
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2085,7 +2102,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.PromptFilterCybRelayEnabled, s.PromptFilterCybRelayGroupID, s.PromptFilterCybRelaySessionPinEnabled,
 		normalizeCybRelaySessionPinTTLSeconds(s.PromptFilterCybRelaySessionPinTTLSeconds),
 		s.AutoResetCreditsEnabled,
-		NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin))
+		NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin),
+		userTextRescanEnabled)
 	return err
 }
 

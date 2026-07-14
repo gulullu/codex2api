@@ -18,6 +18,15 @@ const promptFilterFullTextMaxRunes = 32000
 const codexAmbientSuggestionClassifierPrefix = "Classify Codex ambient suggestion candidates for policy safety."
 const codex55UnrestrictedInstructionsPatternName = "codex55_unrestricted_instructions"
 const promptCyberPolicyMessage = "This request was blocked by the content policy. Please rephrase and try again."
+const promptFilterUserTextRescueSignal = "user_text_rescue"
+
+type promptFilterRouteScan struct {
+	Verdict   promptfilter.Verdict
+	FullText  string
+	AuditText string
+	CYBSignal bool
+	Signals   []string
+}
 
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
@@ -45,24 +54,23 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 		return false
 	}
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
-	c.Set(contextPromptFilterText, text)
+	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
+	c.Set(contextPromptFilterText, scan.AuditText)
 	if nested, ok := takeNestedPromptRiskDecision(c); ok {
 		setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
 		return false
 	}
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model)
+	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
 }
 
 func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, endpoint string, model string) bool {
-	c.Set(contextPromptFilterText, text)
 	if h == nil || h.store == nil {
 		return false
 	}
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	verdict := promptfilter.InspectText(text, cfg)
-	return h.inspectCybRelayPrompt(c, nil, verdict, text, endpoint, model)
+	scan := inspectPromptFilterText(text, endpoint, cfg)
+	c.Set(contextPromptFilterText, scan.AuditText)
+	return h.inspectCybRelayPrompt(c, nil, scan, endpoint, model)
 }
 
 func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
@@ -70,10 +78,9 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		return false
 	}
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
-	c.Set(contextPromptFilterText, text)
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	return h.inspectCybRelayPrompt(c, rawBody, verdict, text, endpoint, model)
+	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
+	c.Set(contextPromptFilterText, scan.AuditText)
+	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
 }
 
 var promptFilterExplicitHighRiskPatterns = map[string]struct{}{
@@ -158,9 +165,84 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	return len(signals) > 0, signals
 }
 
-// PromptFilterRouteSignal exposes the same monitor-only routing decision used
-// by the live proxy so the admin route tester cannot drift back to legacy
-// moderation or blocking semantics.
+func inspectPromptFilterText(text string, endpoint string, cfg promptfilter.Config) promptFilterRouteScan {
+	verdict := promptfilter.InspectText(text, cfg)
+	cybSignal, signals := promptFilterCYBSignal(verdict, text, cfg, endpoint)
+	return promptFilterRouteScan{
+		Verdict:   verdict,
+		FullText:  text,
+		AuditText: text,
+		CYBSignal: cybSignal,
+		Signals:   signals,
+	}
+}
+
+// inspectPromptFilterPayload scans two independent text compartments. The
+// normal full-payload scan remains authoritative for system, tools and skills;
+// the input/messages scan prevents a long instructions+tools envelope from
+// pushing the current conversation out of the bounded full-text scan window.
+// Scores are deliberately merged by max rather than addition so the same rule
+// appearing in both compartments cannot inflate the routing score.
+func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilter.Config, userTextRescanEnabled bool) promptFilterRouteScan {
+	fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
+	if !userTextRescanEnabled || !cybRelayTextEndpoint(endpoint) {
+		return fullScan
+	}
+
+	userText := promptfilter.ExtractRoutingUserText(rawBody, endpoint, cfg.MaxTextLength)
+	userScan := inspectPromptFilterText(userText, endpoint, cfg)
+	merged := fullScan
+	merged.Verdict = mergePromptFilterVerdicts(fullScan.Verdict, userScan.Verdict)
+	merged.CYBSignal = fullScan.CYBSignal || userScan.CYBSignal
+	for _, signal := range userScan.Signals {
+		merged.Signals = appendUniqueRouteSignal(merged.Signals, signal)
+	}
+	if !fullScan.CYBSignal && userScan.CYBSignal {
+		merged.Signals = appendUniqueRouteSignal(merged.Signals, promptFilterUserTextRescueSignal)
+		// Persist the rescued input first: prompt-filter audit text has a
+		// prefix cap, while the full scan may already occupy its entire window.
+		merged.AuditText = strings.TrimSpace(userText + "\n--- full payload scan ---\n" + fullText)
+		merged.Verdict.TextPreview = userScan.Verdict.TextPreview
+	}
+	return merged
+}
+
+func mergePromptFilterVerdicts(full promptfilter.Verdict, user promptfilter.Verdict) promptfilter.Verdict {
+	merged := full
+	if user.Score > merged.Score {
+		merged.Score = user.Score
+		merged.Reason = user.Reason
+	}
+	if user.RawScore > merged.RawScore {
+		merged.RawScore = user.RawScore
+	}
+	if user.ExtractedChars > merged.ExtractedChars {
+		merged.ExtractedChars = user.ExtractedChars
+	}
+	if user.StrictHit && !merged.StrictHit {
+		merged.StrictHit = true
+		merged.Reason = user.Reason
+	}
+	merged.Enabled = merged.Enabled || user.Enabled
+
+	seen := make(map[promptfilter.Match]struct{}, len(full.Matched)+len(user.Matched))
+	merged.Matched = make([]promptfilter.Match, 0, len(full.Matched)+len(user.Matched))
+	for _, verdict := range []promptfilter.Verdict{full, user} {
+		for _, match := range verdict.Matched {
+			if _, ok := seen[match]; ok {
+				continue
+			}
+			seen[match] = struct{}{}
+			merged.Matched = append(merged.Matched, match)
+		}
+	}
+	return merged
+}
+
+// PromptFilterRouteSignal exposes the per-text monitor-only routing decision.
+// The raw live path applies this decision independently to the full payload
+// and input/messages compartments, while single-text testers use it once.
 func PromptFilterRouteSignal(verdict promptfilter.Verdict, text string, cfg promptfilter.Config, endpoint string) (bool, []string) {
 	cfg = routingPromptFilterConfig(cfg)
 	return promptFilterCYBSignal(verdict, text, cfg, endpoint)
@@ -207,11 +289,13 @@ func (h *Handler) reviewPromptFilterVerdictDetailed(ctx context.Context, text st
 	return verdict, outcome, reviewErr
 }
 
-func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, localVerdict promptfilter.Verdict, text string, endpoint string, model string) bool {
-	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	cybSignal, signals := promptFilterCYBSignal(localVerdict, text, cfg, endpoint)
+func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, scan promptFilterRouteScan, endpoint string, model string) bool {
+	localVerdict := scan.Verdict
+	text := scan.AuditText
+	cybSignal := scan.CYBSignal
+	signals := append([]string(nil), scan.Signals...)
 	relayCfg := h.cybRelayConfig()
-	probeRoute := relayCfg.Enabled && relayCfg.GroupID > 0 && cybRelayTextEndpoint(endpoint) && detectProbeRoute(rawBody, endpoint, text)
+	probeRoute := relayCfg.Enabled && relayCfg.GroupID > 0 && cybRelayTextEndpoint(endpoint) && detectProbeRoute(rawBody, endpoint, scan.FullText)
 	decision := defaultPromptRiskDecision()
 	if probeRoute {
 		signals = appendUniqueRouteSignal(signals, probeRouteSignal)

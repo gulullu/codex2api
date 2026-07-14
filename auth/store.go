@@ -197,6 +197,11 @@ type Account struct {
 	// relayGuardianSchedulingHint 是 Guardian 的纯运行态调度提示。
 	// 它只影响选号顺序与并发上限，不写数据库，也不改变人工 enabled/Disabled 配置。
 	relayGuardianSchedulingHint atomic.Uint64
+	// relayGuardianCanonicalSuccessAt records the latest user-visible, non-probe
+	// Relay success observed in this process. Guardian replacement-capacity checks
+	// require this request-path proof instead of trusting an idle configured front.
+	// It is intentionally process-local so a restart must collect fresh evidence.
+	relayGuardianCanonicalSuccessAt atomic.Int64
 	// relayCircuitLastResort is independent from the Guardian mode. It keeps a
 	// failing sole front available at a tiny cap, but places it behind every
 	// normal Relay front as soon as another front recovers.
@@ -244,6 +249,13 @@ type CybRelayConfig struct {
 	GroupID              int64
 	SessionPinEnabled    bool
 	SessionPinTTLSeconds int
+	// UserTextRescanDisabled is intentionally negative so the zero value keeps
+	// the safety rescan enabled for existing constructors and tests.
+	UserTextRescanDisabled bool
+}
+
+func (cfg CybRelayConfig) UserTextRescanEnabled() bool {
+	return !cfg.UserTextRescanDisabled
 }
 
 func NormalizeCybRelayConfig(cfg CybRelayConfig) CybRelayConfig {
@@ -2834,8 +2846,14 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			SmartPacingMinConcurrency:                defaultSmartPacingMinConcurrency,
 			SmartPacingWindows:                       "5h,7d",
 			PromptFilterCybRelaySessionPinEnabled:    true,
+			PromptFilterUserTextRescanEnabled:        true,
+			PromptFilterUserTextRescanConfigured:     true,
 			PromptFilterCybRelaySessionPinTTLSeconds: DefaultCybRelaySessionPinTTLSeconds,
 		}
+	}
+	userTextRescanEnabled := true
+	if settings.PromptFilterUserTextRescanConfigured {
+		userTextRescanEnabled = settings.PromptFilterUserTextRescanEnabled
 	}
 	s := &Store{
 		globalProxy:             settings.ProxyURL,
@@ -2886,10 +2904,11 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	}
 	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	s.SetCybRelayConfig(CybRelayConfig{
-		Enabled:              settings.PromptFilterCybRelayEnabled,
-		GroupID:              settings.PromptFilterCybRelayGroupID,
-		SessionPinEnabled:    settings.PromptFilterCybRelaySessionPinEnabled,
-		SessionPinTTLSeconds: settings.PromptFilterCybRelaySessionPinTTLSeconds,
+		Enabled:                settings.PromptFilterCybRelayEnabled,
+		GroupID:                settings.PromptFilterCybRelayGroupID,
+		SessionPinEnabled:      settings.PromptFilterCybRelaySessionPinEnabled,
+		SessionPinTTLSeconds:   settings.PromptFilterCybRelaySessionPinTTLSeconds,
+		UserTextRescanDisabled: !userTextRescanEnabled,
 	})
 	s.SetRelayGuardianMode(settings.RelayGuardianMode)
 	// 环境变量优先，否则读数据库设置

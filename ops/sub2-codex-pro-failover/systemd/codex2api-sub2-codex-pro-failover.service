@@ -9,10 +9,10 @@ AssertPathExists=/var/run/docker.sock
 Type=oneshot
 User=root
 Group=root
+EnvironmentFile=/etc/default/codex2api-sub2-codex-pro-failover
 Environment=HEALTH_URL=http://127.0.0.1:8090/health
 Environment=SUB2_ADMIN_BASE_URL=http://127.0.0.1:18082
 Environment=GROUP_NAME=codex-pro
-Environment=BRIDGE_ACCOUNT_ID=7692
 Environment=BACKUP_OPEN_PARALLELISM=4
 Environment=SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS=5
 Environment=BACKUP_OPEN_BATCH_TIMEOUT_SECONDS=120

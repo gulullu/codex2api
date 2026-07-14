@@ -257,6 +257,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					prompt_filter_cyb_relay_group_id INTEGER DEFAULT 0,
 					prompt_filter_cyb_relay_session_pin_enabled INTEGER DEFAULT 1,
 					prompt_filter_cyb_relay_session_pin_ttl_seconds INTEGER DEFAULT 600,
+					prompt_filter_user_text_rescan_enabled INTEGER DEFAULT 1,
 					relay_guardian_mode TEXT DEFAULT 'off',
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60
@@ -532,6 +533,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_cyb_relay_group_id", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_cyb_relay_session_pin_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "prompt_filter_cyb_relay_session_pin_ttl_seconds", "INTEGER DEFAULT 600"},
+		{"system_settings", "prompt_filter_user_text_rescan_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "relay_guardian_mode", "TEXT DEFAULT 'off'"},
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "INTEGER DEFAULT 0"},

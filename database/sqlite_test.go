@@ -709,6 +709,7 @@ func TestSQLiteMigratesCybRelayRoutingColumns(t *testing.T) {
 		"system_settings": {
 			"prompt_filter_cyb_relay_enabled", "prompt_filter_cyb_relay_group_id",
 			"prompt_filter_cyb_relay_session_pin_enabled", "prompt_filter_cyb_relay_session_pin_ttl_seconds",
+			"prompt_filter_user_text_rescan_enabled",
 		},
 		"prompt_filter_logs": {
 			"account_id", "route_class", "route_reason", "route_group_id", "route_pinned", "upstream_account_type",
@@ -1328,6 +1329,7 @@ func TestSQLiteCybRelaySettingsRoundtripAndNormalizeTTL(t *testing.T) {
 		PromptFilterCybRelayGroupID:              42,
 		PromptFilterCybRelaySessionPinEnabled:    true,
 		PromptFilterCybRelaySessionPinTTLSeconds: 10,
+		PromptFilterUserTextRescanEnabled:        true,
 	}
 	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
 		t.Fatalf("UpdateSystemSettings returned error: %v", err)
@@ -1342,6 +1344,9 @@ func TestSQLiteCybRelaySettingsRoundtripAndNormalizeTTL(t *testing.T) {
 	}
 	if got.PromptFilterCybRelaySessionPinTTLSeconds != 60 {
 		t.Fatalf("TTL = %d, want minimum 60", got.PromptFilterCybRelaySessionPinTTLSeconds)
+	}
+	if !got.PromptFilterUserTextRescanEnabled {
+		t.Fatal("prompt-filter user-text rescan disabled after settings round trip")
 	}
 
 	got.PromptFilterCybRelaySessionPinTTLSeconds = 0
@@ -1366,6 +1371,49 @@ func TestSQLiteCybRelaySettingsRoundtripAndNormalizeTTL(t *testing.T) {
 	}
 	if got.PromptFilterCybRelaySessionPinTTLSeconds != 86400 {
 		t.Fatalf("maximum TTL = %d, want 86400", got.PromptFilterCybRelaySessionPinTTLSeconds)
+	}
+}
+
+func TestSQLiteUserTextRescanDefaultsOnAndSupportsExplicitDisable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	legacy := &SystemSettings{
+		SiteName:        "CodexProxy",
+		MaxConcurrency:  2,
+		TestModel:       "gpt-5.4",
+		TestConcurrency: 1,
+	}
+	if err := db.UpdateSystemSettings(ctx, legacy); err != nil {
+		t.Fatalf("UpdateSystemSettings(legacy zero value) returned error: %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(default) returned error: %v", err)
+	}
+	if !got.PromptFilterUserTextRescanEnabled {
+		t.Fatal("unconfigured user-text rescan defaulted to disabled")
+	}
+
+	got.PromptFilterUserTextRescanEnabled = false
+	got.PromptFilterUserTextRescanConfigured = true
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(explicit disable) returned error: %v", err)
+	}
+	got, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(explicit disable) returned error: %v", err)
+	}
+	if got.PromptFilterUserTextRescanEnabled {
+		t.Fatal("explicit user-text rescan disable was not persisted")
+	}
+	if !got.PromptFilterUserTextRescanConfigured {
+		t.Fatal("persisted user-text rescan setting was not marked configured")
 	}
 }
 

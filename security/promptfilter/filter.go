@@ -1023,3 +1023,198 @@ func ExtractUserText(body []byte, endpoint string, maxLen int) string {
 	}
 	return limitScanText(joined, maxLen)
 }
+
+// ExtractRoutingUserText extracts only user-visible text for the supplemental
+// CYB routing scan. Unlike ExtractUserText, this deliberately does not recurse
+// through arbitrary input fields: encrypted reasoning, file/image payloads,
+// tool outputs and other opaque blobs cannot consume the bounded scan window.
+//
+// The complete-payload scan remains responsible for system, tools, skills and
+// every other request field. This extractor only adds an independent view that
+// puts the newest visible user turn first, so a long history cannot push the
+// current request into the middle of the head/tail scan window. If no visible
+// user text exists it returns an empty string; it never falls back to the full
+// payload.
+func ExtractRoutingUserText(body []byte, endpoint string, maxLen int) string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return ""
+	}
+
+	var segments []string
+	ep := strings.ToLower(strings.TrimSpace(endpoint))
+	switch ep {
+	case "chat", "chat_completions", "/v1/chat/completions", "messages", "anthropic", "/v1/messages":
+		collectRoutingMessageSegments(gjson.GetBytes(body, "messages"), &segments)
+	default:
+		// Some Responses-compatible clients send both fields. Treat input as
+		// authoritative/current by collecting it last; latest-first assembly
+		// below therefore preserves it ahead of compatibility messages.
+		collectRoutingMessageSegments(gjson.GetBytes(body, "messages"), &segments)
+		collectRoutingInputSegments(gjson.GetBytes(body, "input"), &segments)
+	}
+	return latestFirstRoutingText(segments, maxLen)
+}
+
+func collectRoutingMessageSegments(result gjson.Result, segments *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if result.IsArray() {
+		for _, item := range result.Array() {
+			collectRoutingMessageSegments(item, segments)
+		}
+		return
+	}
+	if !result.IsObject() || !strings.EqualFold(strings.TrimSpace(result.Get("role").String()), "user") {
+		return
+	}
+	if text := routingVisibleMessageText(result); text != "" {
+		*segments = append(*segments, text)
+	}
+}
+
+func collectRoutingInputSegments(result gjson.Result, segments *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if result.Type == gjson.String {
+		if text := strings.TrimSpace(result.String()); text != "" {
+			*segments = append(*segments, text)
+		}
+		return
+	}
+	if result.IsArray() {
+		for _, item := range result.Array() {
+			collectRoutingInputSegments(item, segments)
+		}
+		return
+	}
+	if !result.IsObject() {
+		return
+	}
+	role := strings.ToLower(strings.TrimSpace(result.Get("role").String()))
+	if role == "user" {
+		if text := routingVisibleMessageText(result); text != "" {
+			*segments = append(*segments, text)
+		}
+		return
+	}
+	if role != "" {
+		return
+	}
+
+	// A bare Responses input_text content item is user-visible even when a
+	// compatibility client omits the surrounding role=user message object.
+	typeName := strings.ToLower(strings.TrimSpace(result.Get("type").String()))
+	if typeName != "input_text" && typeName != "text" {
+		return
+	}
+	var parts []string
+	collectRoutingVisibleContent(result, &parts)
+	if text := strings.TrimSpace(strings.Join(parts, "\n")); text != "" {
+		*segments = append(*segments, text)
+	}
+}
+
+func routingVisibleMessageText(message gjson.Result) string {
+	var parts []string
+	if content := message.Get("content"); content.Exists() {
+		collectRoutingVisibleContent(content, &parts)
+	}
+	// Support the compact {role:"user", text:"..."} and
+	// {role:"user", input_text:"..."} shapes without traversing any other
+	// object fields.
+	if text := message.Get("text"); text.Type == gjson.String {
+		if value := strings.TrimSpace(text.String()); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	if text := message.Get("input_text"); text.Type == gjson.String {
+		if value := strings.TrimSpace(text.String()); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func collectRoutingVisibleContent(result gjson.Result, parts *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if result.Type == gjson.String {
+		if text := strings.TrimSpace(result.String()); text != "" {
+			*parts = append(*parts, text)
+		}
+		return
+	}
+	if result.IsArray() {
+		for _, item := range result.Array() {
+			collectRoutingVisibleContent(item, parts)
+		}
+		return
+	}
+	if !result.IsObject() {
+		return
+	}
+
+	typeName := strings.ToLower(strings.TrimSpace(result.Get("type").String()))
+	switch typeName {
+	case "", "message", "text", "input_text":
+		// These are the only object shapes allowed to contribute text. In
+		// particular, do not recurse through encrypted_content, reasoning,
+		// tool_result, function_call_output, image/file/audio data or arbitrary
+		// extension fields.
+	default:
+		return
+	}
+	if text := result.Get("text"); text.Type == gjson.String {
+		if value := strings.TrimSpace(text.String()); value != "" {
+			*parts = append(*parts, value)
+		}
+	}
+	if text := result.Get("input_text"); text.Type == gjson.String {
+		if value := strings.TrimSpace(text.String()); value != "" {
+			*parts = append(*parts, value)
+		}
+	}
+	if content := result.Get("content"); content.Exists() {
+		collectRoutingVisibleContent(content, parts)
+	}
+}
+
+func latestFirstRoutingText(segments []string, maxLen int) string {
+	if maxLen <= 0 {
+		maxLen = DefaultMaxTextLength
+	}
+	var builder strings.Builder
+	builder.Grow(maxLen)
+	seen := make(map[string]struct{}, len(segments))
+	for index := len(segments) - 1; index >= 0; index-- {
+		segment := strings.TrimSpace(segments[index])
+		if segment == "" {
+			continue
+		}
+		if _, duplicate := seen[segment]; duplicate {
+			continue
+		}
+		seen[segment] = struct{}{}
+		if builder.Len() == 0 && len(segment) >= maxLen {
+			return limitScanText(segment, maxLen)
+		}
+		separator := ""
+		if builder.Len() > 0 {
+			separator = "\n"
+		}
+		remaining := maxLen - builder.Len() - len(separator)
+		if remaining <= 0 {
+			break
+		}
+		builder.WriteString(separator)
+		if len(segment) > remaining {
+			builder.WriteString(safeUTF8Prefix(segment, remaining))
+			break
+		}
+		builder.WriteString(segment)
+	}
+	return strings.TrimSpace(builder.String())
+}
