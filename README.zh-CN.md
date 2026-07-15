@@ -486,6 +486,8 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 
 **对外请求链路：** 客户端请求 → Gin RPM 限流 → `proxy.Handler` API Key 校验 → `auth.Store` 调度选号 → 上游请求 → 响应回传 + 用量写入
 
+`CODEX_UPSTREAM_CYB_FEEDBACK_ENABLED` 默认开启：只有默认 OAuth 路由上用户可见、最终确定为 `cyber_policy` 的逻辑请求，才会在进程内保存“公开端点 + 原始入站请求字节”的 HMAC。默认 6 小时、最多 1,024 条；相同字节再次出现且已配置 Relay 分组时，才提前改走 Relay。它不保存请求正文、不做模糊匹配、不在本地拦截，也不会生成会话或 WebSocket Pin。可通过 `CODEX_UPSTREAM_CYB_FEEDBACK_TTL`、`CODEX_UPSTREAM_CYB_FEEDBACK_MAX_ENTRIES` 调整边界，或将启用开关设为 `false` 立即关闭。
+
 **管理后台链路：** 浏览器 → `/admin/` 嵌入式前端 → `/api/admin/*` 管理接口 → 数据库 / 账号池 / 缓存层
 
 ### 调度系统

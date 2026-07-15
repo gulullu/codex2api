@@ -99,6 +99,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	h.captureUpstreamCybFeedbackRequest(c, "/v1/messages", rawBody, false)
 
 	if len(rawBody) == 0 {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")

@@ -46,14 +46,15 @@ func upstreamErrorConsoleBody(body []byte) string {
 
 // Handler API 路由处理器
 type Handler struct {
-	store        *auth.Store
-	configKeys   map[string]bool // 配置文件中的静态 key
-	db           *database.DB
-	cfg          *config.Config       // 全局配置
-	deviceCfg    *DeviceProfileConfig // 设备指纹配置
-	cache        cache.TokenCache     // Redis/Memory 运行态缓存
-	apiKeyGateMu sync.Mutex
-	apiKeyGate   *apiKeyConcurrencyLimiter
+	store               *auth.Store
+	configKeys          map[string]bool // 配置文件中的静态 key
+	db                  *database.DB
+	cfg                 *config.Config       // 全局配置
+	deviceCfg           *DeviceProfileConfig // 设备指纹配置
+	cache               cache.TokenCache     // Redis/Memory 运行态缓存
+	apiKeyGateMu        sync.Mutex
+	apiKeyGate          *apiKeyConcurrencyLimiter
+	upstreamCybFeedback *upstreamCybFeedbackCache
 }
 
 const (
@@ -430,12 +431,13 @@ func noAvailableAnthropicAccountMessage(model string) string {
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
 	return &Handler{
-		store:      store,
-		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
-		db:         db,
-		cfg:        cfg,
-		deviceCfg:  deviceCfg,
-		apiKeyGate: newAPIKeyConcurrencyLimiter(),
+		store:               store,
+		configKeys:          make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
+		db:                  db,
+		cfg:                 cfg,
+		deviceCfg:           deviceCfg,
+		apiKeyGate:          newAPIKeyConcurrencyLimiter(),
+		upstreamCybFeedback: newUpstreamCybFeedbackCache(upstreamCybFeedbackConfigFromEnv()),
 	}
 }
 
@@ -669,6 +671,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	markCyberPolicyUsageKind(input)
 	h.store.ObserveRelayGuardianUsage(input)
 	h.logUsage(input)
+	h.maybeLearnUpstreamCybFeedback(c, input)
 }
 
 // logContinueThinkingRounds 为思考截断续想中「被折叠隐藏」的上游轮次补记真实用量。
@@ -1843,6 +1846,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.captureUpstreamCybFeedbackRequest(c, "/v1/responses", rawBody, false)
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
 	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
@@ -3633,6 +3637,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.captureUpstreamCybFeedbackRequest(c, "/v1/responses/compact", rawBody, false)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -4528,6 +4533,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.captureUpstreamCybFeedbackRequest(c, "/v1/chat/completions", rawBody, false)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)

@@ -23,6 +23,7 @@ const codex55UnrestrictedInstructionsPatternName = "codex55_unrestricted_instruc
 const promptCyberPolicyMessage = "This request was blocked by the content policy. Please rephrase and try again."
 const promptFilterUserTextRescueSignal = "user_text_rescue"
 const promptFilterSQLCredentialExfiltrationSignal = "local_sql_credential_exfiltration"
+const promptFilterTargetedCovertSurveillanceSignal = "local_targeted_covert_surveillance"
 const contextPromptFilterScanMeta = "promptFilterScanMeta"
 
 type promptFilterRouteScan struct {
@@ -71,6 +72,23 @@ type promptFilterPartitionScanDetail struct {
 
 var promptFilterSQLCredentialExtractionPattern = regexp.MustCompile(`(?i)\b(?:extract(?:s|ed|ing)?|dump(?:s|ed|ing)?|steal(?:s|ing)?|stole|exfiltrat(?:e|es|ed|ing|ion)|harvest(?:s|ed|ing)?|retriev(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|read(?:s|ing)?|leak(?:s|ed|ing)?)\b[^.!?\n]{0,160}\b(?:credentials?|password(?:_hash)?s?|passwds?|tokens?|api[_ -]?keys?|secrets?|cookies?|session[_ -]?tokens?)\b|\b(?:credentials?|password(?:_hash)?s?|passwds?|tokens?|api[_ -]?keys?|secrets?|cookies?|session[_ -]?tokens?)\b[^.!?\n]{0,100}\b(?:extract(?:s|ed|ing)?|dump(?:s|ed|ing)?|steal(?:s|ing)?|stole|exfiltrat(?:e|es|ed|ing|ion)|harvest(?:s|ed|ing)?|retriev(?:e|es|ed|ing)|obtain(?:s|ed|ing)?|read(?:s|ing)?|leak(?:s|ed|ing)?)\b|(?:提取|导出|转储|窃取|获取|读取|泄露|外传)[^。！？\n]{0,100}(?:凭证|密码(?:哈希)?|口令|令牌|token|密钥|cookie)|(?:凭证|密码(?:哈希)?|口令|令牌|token|密钥|cookie)[^。！？\n]{0,80}(?:提取|导出|转储|窃取|获取|读取|泄露|外传)`)
 
+// These five witnesses intentionally form a strict conjunction. The rule is
+// evaluated once per routing partition, so evidence in system/tools/user is
+// never assembled into a targeted-surveillance decision.
+var promptFilterTargetedCovertSurveillancePatterns = []*regexp.Regexp{
+	// The request asks for an actionable procedure, rather than describing or
+	// analyzing surveillance in the abstract.
+	regexp.MustCompile(`(?i)\b(?:write|provide|create|give|draft|design|develop|outline|prepare)\b[^.!?\n]{0,140}\b(?:step[- ]by[- ]step|actionable|operational|practical|detailed|guide|instructions?|playbook|procedure|plan)\b|\b(?:how\s+to|step[- ]by[- ]step)\b[^.!?\n]{0,120}\b(?:intercept(?:s|ed|ing)?|wiretap(?:s|ped|ping)?|tap(?:s|ped|ping)?|eavesdrop(?:s|ped|ping)?|monitor(?:s|ed|ing)?|captur(?:e|es|ed|ing)|read(?:s|ing)?|record(?:s|ed|ing)?)\b|(?:写|给出|提供|制定|设计|编写|列出|生成|教我|如何|怎么)[^。！？\n]{0,100}(?:步骤|指南|方案|计划|教程|操作方法|实施方法)`),
+	// A concrete human target is present. Generic population analytics do not
+	// satisfy this witness.
+	regexp.MustCompile(`(?i)\b(?:specific|particular|named|target(?:ed)?)\s+(?:person|individual|employee|woman|man|victim|subject)\b|\b(?:the\s+)?(?:target|victim|subject)\b|(?:特定|指定|目标|某个)[^。！？\n]{0,8}(?:个人|人员|对象|某人)|(?:目标本人|当事人)`),
+	regexp.MustCompile(`(?i)\bwithout\s+(?:(?:their|his|her|the\s+target'?s|that\s+person'?s)\s+)?(?:consent|permission|knowledge)\b|\b(?:unbeknownst\s+to|without\s+(?:them|him|her|the\s+target)\s+knowing|secretly|covertly)\b|(?:未经|没有取得)[^。！？\n]{0,16}(?:同意|许可|授权)|(?:本人|对方|目标|当事人)[^。！？\n]{0,12}(?:不知情|不知道|未察觉)|(?:在|趁)[^。！？\n]{0,8}(?:不知情|不知道)|不让[^。！？\n]{0,12}(?:知道|察觉)|(?:秘密|暗中|隐蔽地)`),
+	regexp.MustCompile(`(?i)\b(?:intercept(?:s|ed|ing)?|wiretap(?:s|ped|ping)?|tap(?:s|ped|ping)?|eavesdrop(?:s|ped|ping)?(?:\s+on)?|monitor(?:s|ed|ing)?|captur(?:e|es|ed|ing)|read(?:s|ing)?|record(?:s|ed|ing)?)\b[^.!?\n]{0,80}\b(?:communications?|messages?|calls?|emails?|texts?|chats?|conversations?)\b|\b(?:communications?|messages?|calls?|emails?|texts?|chats?|conversations?)\b[^.!?\n]{0,80}\b(?:intercept(?:s|ed|ing)?|wiretap(?:s|ped|ping)?|tap(?:s|ped|ping)?|eavesdrop(?:s|ped|ping)?|monitor(?:s|ed|ing)?|captur(?:e|es|ed|ing)|read(?:s|ing)?|record(?:s|ed|ing)?)\b|(?:截获|窃听|监听|偷看|监控|读取|拦截|录下)[^。！？\n]{0,60}(?:通信|通讯|消息|电话|通话|短信|邮件|聊天|对话)|(?:通信|通讯|消息|电话|通话|短信|邮件|聊天|对话)[^。！？\n]{0,60}(?:截获|窃听|监听|偷看|监控|读取|拦截|录下)`),
+	regexp.MustCompile(`(?i)\b(?:avoid(?:s|ed|ing)?|evad(?:e|es|ed|ing)|bypass(?:es|ed|ing)?|escap(?:e|es|ed|ing))\b[^.!?\n]{0,60}\b(?:detection|discovery|notice|being\s+caught)\b[^.!?\n]{0,60}\b(?:by\s+)?(?:the\s+)?(?:target|victim|subject|person|them|him|her|police|law\s+enforcement|authorit(?:y|ies)|investigators?)\b|\b(?:remain|stay)\s+undetected\s+by\b[^.!?\n]{0,50}\b(?:the\s+)?(?:target|victim|subject|police|law\s+enforcement|authorit(?:y|ies))\b|\bwithout\s+alerting\b[^.!?\n]{0,50}\b(?:the\s+)?(?:target|victim|subject|police|law\s+enforcement|authorit(?:y|ies))\b|(?:规避|逃避|绕过|躲避|避免)[^。！？\n]{0,40}(?:本人|对方|目标|当事人|受害人|警方|警察|执法|监管|调查人员)[^。！？\n]{0,30}(?:发现|侦测|察觉|追查|查获|注意)|(?:不被|不让)[^。！？\n]{0,30}(?:本人|对方|目标|当事人|受害人|警方|警察|执法|监管|调查人员)[^。！？\n]{0,20}(?:发现|侦测|察觉|追查|查获|注意)`),
+}
+
+var promptFilterTargetedCovertSurveillanceDefensivePattern = regexp.MustCompile(`(?i)\b(?:detect|identify|stop|block|remove|report)\b[^.!?\n]{0,60}\b(?:stalking|tracking|surveillance|interception|wiretapping|eavesdropping|spyware)\b|\bprotect\b[^.!?\n]{0,50}\bfrom\b[^.!?\n]{0,50}\b(?:stalking|tracking|surveillance|interception|wiretapping|eavesdropping|spyware)\b|(?:检测|识别|举报|清除)[^。！？\n]{0,50}(?:跟踪|监控|监听|窃听|拦截|间谍软件)|(?:制止|阻止)(?:非法|秘密|隐蔽)?(?:跟踪|监控|监听|窃听|拦截)`)
+
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
 		api.ErrorCode("content_policy_violation"),
@@ -96,6 +114,7 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 	if h == nil || h.store == nil {
 		return false
 	}
+	h.captureUpstreamCybFeedbackRequest(c, endpoint, rawBody, false)
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
 	c.Set(contextPromptFilterText, scan.AuditText)
@@ -122,6 +141,7 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	if h == nil || h.store == nil {
 		return false
 	}
+	h.captureUpstreamCybFeedbackRequest(c, endpoint, rawBody, false)
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
 	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
 	c.Set(contextPromptFilterText, scan.AuditText)
@@ -202,6 +222,50 @@ func promptFilterSQLCredentialExfiltrationVerdict(verdict promptfilter.Verdict, 
 	return hasSQLInjection && hasOperationalExploit && promptFilterSQLCredentialExtractionPattern.MatchString(text)
 }
 
+func promptFilterTargetedCovertSurveillanceVerdict(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || promptFilterTargetedCovertSurveillanceDefensivePattern.MatchString(text) {
+		return false
+	}
+	for _, pattern := range promptFilterTargetedCovertSurveillancePatterns {
+		if !pattern.MatchString(text) {
+			return false
+		}
+	}
+	return true
+}
+
+// promptFilterTargetedCovertSurveillancePayloadVerdict preserves the strict
+// same-partition guarantee even when the broader user-text rescan feature is
+// disabled and the request otherwise uses legacy_full scanning. Invalid or
+// unsupported payloads fail open for this narrow composite rule rather than
+// assembling witnesses from an opaque concatenated string.
+func promptFilterTargetedCovertSurveillancePayloadVerdict(rawBody []byte, endpoint string) bool {
+	if !cybRelayTextEndpoint(endpoint) {
+		return false
+	}
+	partitioned := promptfilter.ExtractRoutingPartitions(rawBody, endpoint)
+	if !promptFilterPartitionsUsable(partitioned) {
+		return false
+	}
+	for _, partition := range partitioned.Partitions {
+		if promptFilterTargetedCovertSurveillanceVerdict(partition.Text) {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutPromptFilterRouteSignal(signals []string, excluded string) []string {
+	filtered := make([]string, 0, len(signals))
+	for _, signal := range signals {
+		if signal != excluded {
+			filtered = append(filtered, signal)
+		}
+	}
+	return filtered
+}
+
 func cybRelayTextEndpoint(endpoint string) bool {
 	switch strings.ToLower(strings.TrimSpace(endpoint)) {
 	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/messages":
@@ -234,6 +298,9 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	}
 	if promptFilterSQLCredentialExfiltrationVerdict(verdict, text) {
 		signals = append(signals, promptFilterSQLCredentialExfiltrationSignal)
+	}
+	if promptFilterTargetedCovertSurveillanceVerdict(text) {
+		signals = append(signals, promptFilterTargetedCovertSurveillanceSignal)
 	}
 	// Only fill the evidence-backed gap below the normal routing threshold.
 	// Existing stronger signals retain their original, more specific reason.
@@ -408,6 +475,14 @@ func promptFilterPartitionsUsable(partitioned promptfilter.RoutingPayloadPartiti
 func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promptfilter.Config, fallbackReason string) promptFilterRouteScan {
 	fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
 	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
+	// Never trust the concatenated legacy text for this five-witness rule.
+	// Re-add it only after an independent bounded partition extraction proves
+	// all witnesses coexist in one real payload compartment.
+	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
+	if cfg.Enabled && promptFilterTargetedCovertSurveillancePayloadVerdict(rawBody, endpoint) {
+		fullScan.Signals = appendUniqueRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
+	}
+	fullScan.CYBSignal = len(fullScan.Signals) > 0
 	legacyBudget := cfg.MaxTextLength
 	if legacyBudget <= 0 {
 		legacyBudget = promptfilter.DefaultMaxTextLength
@@ -610,6 +685,7 @@ func (h *Handler) inspectCybRelayPrompt(c *gin.Context, rawBody []byte, scan pro
 		h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", localVerdict)
 		return false
 	}
+	decision = h.applyUpstreamCybFeedbackRoute(c, rawBody, endpoint, decision)
 	decision = h.applyCybRoutePin(c, rawBody, decision)
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", localVerdict)
 	h.logCybRelayDecision(c, endpoint, model, text, localVerdict, decision)

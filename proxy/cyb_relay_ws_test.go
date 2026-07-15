@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,6 +216,62 @@ func TestCybRelayWebSocketUsesDedicatedHTTPResponsesUpstream(t *testing.T) {
 	}
 	if !sawDelta {
 		t.Fatal("downstream websocket did not receive relay SSE content delta")
+	}
+}
+
+func TestResponsesWebSocketRelayOnlyAccountAliasDoesNotSelectOAuth(t *testing.T) {
+	t.Setenv("CODEX_TRANSPORT_MODE", "standard")
+	requests := make(chan cybRelayWSUpstreamRequest, 1)
+	upstream := newCybRelayWSUpstream(requests)
+	defer upstream.Close()
+
+	previousWebsocketExecute := WebsocketExecuteFunc
+	var oauthCalls atomic.Int32
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		oauthCalls.Add(1)
+		return nil, errors.New("Relay-only account alias must not select OAuth")
+	}
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWebsocketExecute })
+
+	store := newCybRelayRoutingTestStore()
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "oauth", PlanType: "pro", Status: auth.StatusReady})
+	relayAccount := cybRelayTestAccount(2, upstream.URL, "sk-relay-only", cybRelayTestGroupID)
+	relayAccount.Models = []string{"gpt-4.1-direct"}
+	relayAccount.ModelMapping = `{"relay-ws-only-alias":"gpt-4.1-direct"}`
+	store.AddAccount(relayAccount)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	conn, closeWS := dialCybRelayTestWebSocket(t, handler)
+	defer closeWS()
+	requestBody := []byte(`{"type":"response.create","model":"relay-ws-only-alias","input":"Summarize this fruit basket in one sentence."}`)
+	if err := conn.WriteMessage(websocket.TextMessage, requestBody); err != nil {
+		t.Fatalf("write websocket request: %v", err)
+	}
+
+	select {
+	case got := <-requests:
+		if got.auth != "Bearer sk-relay-only" {
+			t.Fatalf("relay Authorization = %q, want Relay-only account", got.auth)
+		}
+		if model := gjson.GetBytes(got.body, "model").String(); model != "gpt-4.1-direct" {
+			t.Fatalf("relay mapped model = %q, want gpt-4.1-direct; body=%s", model, got.body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Relay-only alias request")
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read Relay-only alias event: %v", err)
+		}
+		if gjson.GetBytes(message, "type").String() == "response.completed" {
+			break
+		}
+	}
+	if got := oauthCalls.Load(); got != 0 {
+		t.Fatalf("Relay-only account alias selected OAuth %d time(s)", got)
 	}
 }
 

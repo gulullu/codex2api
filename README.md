@@ -439,6 +439,8 @@ Public request flow:
 Client -> Gin RPM limiter -> proxy.Handler API key check -> auth.Store scheduler -> upstream request -> response + usage logging
 ```
 
+When `CODEX_UPSTREAM_CYB_FEEDBACK_ENABLED` is enabled (the default), a canonical, user-visible `cyber_policy` failure from the default OAuth route stores only a process-local HMAC of the exact public endpoint and inbound request bytes. If the same bytes recur within the default 6-hour / 1,024-entry window and a Relay group is configured, that request is routed to Relay. It never stores prompt text, performs fuzzy matching, blocks locally, or creates a session/WebSocket pin. Use `CODEX_UPSTREAM_CYB_FEEDBACK_TTL` and `CODEX_UPSTREAM_CYB_FEEDBACK_MAX_ENTRIES` to tune the bounded cache, or set the enable flag to `false` for an immediate rollback.
+
 Admin flow:
 
 ```text

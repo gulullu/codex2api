@@ -111,6 +111,14 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: 'SQL 注入与凭据提取共现',
     description: '同一请求分区同时出现可执行 SQL 注入、操作性利用和凭据提取信号，因此改走 Relay。',
   },
+  local_targeted_covert_surveillance: {
+    label: '定向隐蔽监控意图',
+    description: '同一请求分区同时要求针对特定个人、未经同意截获通信并规避发现，因此改走 Relay；不代表本地拦截。',
+  },
+  upstream_cyb_feedback_hash: {
+    label: '上游 CYB 反馈指纹',
+    description: '请求内容命中近期上游 cyber_policy 反馈形成的内容指纹，因此提前改走 Relay；仅用于路由，不代表本地拦截。',
+  },
   encrypted_owner_hit: {
     label: '命中加密上下文原账号',
     description: '请求携带的加密上下文已找到原账号，并继续由该账号处理。',

@@ -282,6 +282,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return errResponsesWSClientGone
 	}
 	beginLogicalRequest(c)
+	h.captureUpstreamCybFeedbackRequest(c, "/v1/responses", rawPayload, true)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
 		_ = writeResponsesWSError(conn, apiErr)
@@ -380,7 +381,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	accountFilter := accountFilterForModel(effectiveModel)
 	relayCfg := h.cybRelayConfig()
 	if promptDecision.routesToCybRelay() || (relayCfg.Enabled && relayCfg.GroupID > 0) {
-		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, false)
+		allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 

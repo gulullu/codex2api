@@ -49,6 +49,11 @@ type promptRiskDecision struct {
 	RouteSource string
 	PinKind     string
 	RoutePinned bool
+	// SkipPinPersistence is an internal routing guard. It is never persisted
+	// to audit rows and is used when an exact feedback digest is the sole
+	// reason for the current route, so one learned request cannot expand into
+	// a whole conversation or WebSocket pin.
+	SkipPinPersistence bool
 }
 
 func defaultPromptRiskDecision() promptRiskDecision {
@@ -269,6 +274,13 @@ func (h *Handler) applyCybRoutePin(c *gin.Context, rawBody []byte, decision prom
 		setPromptRiskDecisionContext(c, decision, cfg.GroupID)
 		return decision
 	}
+	if decision.SkipPinPersistence {
+		if strings.TrimSpace(decision.RouteSource) == "" || decision.RouteSource == cybRelayRouteSourceDefault {
+			decision.RouteSource = cybRelayRouteSourceDirect
+		}
+		setPromptRiskDecisionContext(c, decision, cfg.GroupID)
+		return decision
+	}
 
 	if pinned, _ := c.Get(contextCybWSRoutePinned); pinned == true && !decision.routesToCybRelay() {
 		decision = promptRiskDecision{
@@ -329,7 +341,7 @@ func (h *Handler) pinCybRelayResponseID(c *gin.Context, event []byte) {
 	}
 	h.recordResponseRouteOwner(c, responseID)
 	decision, ok := promptRiskDecisionFromContext(c)
-	if !ok || !decision.routesToCybRelay() {
+	if !ok || !decision.routesToCybRelay() || decision.SkipPinPersistence {
 		return
 	}
 	cfg := h.cybRelayConfig()
