@@ -132,7 +132,7 @@ func TestContinuationSocketLimitsFromEnv(t *testing.T) {
 
 	t.Run("upper bound fallback and per-account clamp", func(t *testing.T) {
 		t.Setenv(continuationGlobalLimitEnv, "16")
-		t.Setenv(continuationPerAccountLimitEnv, "4097")
+		t.Setenv(continuationPerAccountLimitEnv, fmt.Sprint(maxContinuationSocketLimit+1))
 		globalLimit, perAccountLimit := continuationSocketLimitsFromEnv()
 		if globalLimit != 16 || perAccountLimit != 16 {
 			t.Fatalf("clamped limits = (%d, %d), want (16, 16)", globalLimit, perAccountLimit)
@@ -149,7 +149,7 @@ func TestContinuationSocketLimitsFromEnv(t *testing.T) {
 	})
 
 	t.Run("global upper bound fallback", func(t *testing.T) {
-		t.Setenv(continuationGlobalLimitEnv, "4097")
+		t.Setenv(continuationGlobalLimitEnv, fmt.Sprint(maxContinuationSocketLimit+1))
 		t.Setenv(continuationPerAccountLimitEnv, "64")
 		globalLimit, perAccountLimit := continuationSocketLimitsFromEnv()
 		if globalLimit != defaultContinuationGlobalLimit || perAccountLimit != 64 {
@@ -870,11 +870,7 @@ func TestExpiredResponseBindingReturnsConnectionToOrdinaryCapacity(t *testing.T)
 	account := &auth.Account{DBID: 42, DynamicConcurrencyLimit: 1}
 	wc, _ := newTestSlotConnection(manager, account, "wss://example.test/responses", "expired-bound")
 	manager.BindResponseConn("resp_expired", wc, "expired-bound", account.ID(), "key-A")
-	manager.respConnMu.Lock()
-	binding := manager.respConnBindings["resp_expired"]
-	binding.expiresAt = time.Now().Add(-time.Second)
-	manager.respConnBindings["resp_expired"] = binding
-	manager.respConnMu.Unlock()
+	setTestResponseBindingExpiry(t, manager, "resp_expired", time.Now().Add(-time.Second))
 
 	accountLock := manager.accountLock(account.ID())
 	accountLock.Lock()
@@ -898,11 +894,7 @@ func TestCleanupReclaimsExpiredBindingDespiteHeartbeatActivity(t *testing.T) {
 	wsURL := "wss://example.test/responses"
 	expiredBound, expiredSession := newTestSlotConnection(manager, account, wsURL, "expired-heartbeat")
 	manager.BindResponseConn("resp_heartbeat", expiredBound, "expired-heartbeat", account.ID(), "key-A")
-	manager.respConnMu.Lock()
-	binding := manager.respConnBindings["resp_heartbeat"]
-	binding.expiresAt = time.Now().Add(-time.Second)
-	manager.respConnBindings["resp_heartbeat"] = binding
-	manager.respConnMu.Unlock()
+	setTestResponseBindingExpiry(t, manager, "resp_heartbeat", time.Now().Add(-time.Second))
 	// Simulate recent business use after this older response binding. The
 	// binding expiry must be processed independently of the fresher socket use.
 	expiredBound.Touch()
@@ -930,11 +922,7 @@ func TestExpiredBindingDoesNotOverridePongKeepaliveWithinOrdinaryCapacity(t *tes
 	account := &auth.Account{DBID: 42, DynamicConcurrencyLimit: 1}
 	wc, session := newTestSlotConnection(manager, account, "wss://example.test/responses", "pong-idle")
 	manager.BindResponseConn("resp_pong_idle", wc, "pong-idle", account.ID(), "key-A")
-	manager.respConnMu.Lock()
-	binding := manager.respConnBindings["resp_pong_idle"]
-	binding.expiresAt = time.Now().Add(-time.Second)
-	manager.respConnBindings["resp_pong_idle"] = binding
-	manager.respConnMu.Unlock()
+	setTestResponseBindingExpiry(t, manager, "resp_pong_idle", time.Now().Add(-time.Second))
 
 	stale := time.Now().Add(-IdleTimeout - time.Second).UnixNano()
 	wc.lastUsed.Store(stale)
@@ -1088,7 +1076,85 @@ func setTestResponseBindingExpiry(t *testing.T, manager *Manager, responseID str
 	}
 	binding.expiresAt = expiresAt
 	manager.respConnBindings[responseID] = binding
+	if summary := manager.respConnSummaries[binding.conn]; summary != nil && summary.latestGeneration == binding.generation {
+		summary.latestExpiresAt = expiresAt
+	}
 	manager.respConnMu.Unlock()
+}
+
+func assertResponseBindingIndexesConsistent(t testing.TB, manager *Manager) {
+	t.Helper()
+	manager.respConnMu.Lock()
+	defer manager.respConnMu.Unlock()
+
+	type expectedSummary struct {
+		responses map[string]uint64
+		accountID int64
+		latest    responseConnBinding
+	}
+	expected := make(map[*WsConnection]*expectedSummary)
+	expectedAccounts := make(map[int64]int)
+	var oldestGeneration uint64
+	for responseID, binding := range manager.respConnBindings {
+		if binding.conn == nil || binding.generation == 0 {
+			t.Fatalf("invalid primary binding %q: conn=%p generation=%d", responseID, binding.conn, binding.generation)
+		}
+		if orderedID, ok := manager.responseBindingOrder[binding.generation]; !ok || orderedID != responseID {
+			t.Fatalf("primary binding %q generation %d missing from order: got %q present=%v", responseID, binding.generation, orderedID, ok)
+		}
+		if oldestGeneration == 0 || binding.generation < oldestGeneration {
+			oldestGeneration = binding.generation
+		}
+		summary := expected[binding.conn]
+		if summary == nil {
+			summary = &expectedSummary{responses: make(map[string]uint64), accountID: binding.accountID}
+			expected[binding.conn] = summary
+			expectedAccounts[binding.accountID]++
+		} else if summary.accountID != binding.accountID {
+			t.Fatalf("connection %p spans accounts %d and %d", binding.conn, summary.accountID, binding.accountID)
+		}
+		summary.responses[responseID] = binding.generation
+		if binding.generation > summary.latest.generation {
+			summary.latest = binding
+		}
+	}
+	if len(manager.responseBindingOrder) != len(manager.respConnBindings) {
+		t.Fatalf("order size %d != primary size %d", len(manager.responseBindingOrder), len(manager.respConnBindings))
+	}
+	for generation, responseID := range manager.responseBindingOrder {
+		binding, ok := manager.respConnBindings[responseID]
+		if !ok || binding.generation != generation {
+			t.Fatalf("order generation %d points to stale response %q", generation, responseID)
+		}
+	}
+	if manager.responseBindingOldestGeneration != oldestGeneration {
+		t.Fatalf("oldest generation=%d, want %d", manager.responseBindingOldestGeneration, oldestGeneration)
+	}
+	if len(manager.respConnSummaries) != len(expected) {
+		t.Fatalf("summary count %d, want %d", len(manager.respConnSummaries), len(expected))
+	}
+	for wc, want := range expected {
+		got := manager.respConnSummaries[wc]
+		if got == nil || got.accountID != want.accountID || len(got.responseGenerations) != len(want.responses) {
+			t.Fatalf("summary %p shape=%+v, want account=%d responses=%d", wc, got, want.accountID, len(want.responses))
+		}
+		for responseID, generation := range want.responses {
+			if got.responseGenerations[responseID] != generation {
+				t.Fatalf("summary %p response %q generation=%d, want %d", wc, responseID, got.responseGenerations[responseID], generation)
+			}
+		}
+		if got.latestGeneration != want.latest.generation || !got.latestExpiresAt.Equal(want.latest.expiresAt) {
+			t.Fatalf("summary %p latest=(%d,%v), want (%d,%v)", wc, got.latestGeneration, got.latestExpiresAt, want.latest.generation, want.latest.expiresAt)
+		}
+	}
+	if len(manager.respConnSummaryAccountCounts) != len(expectedAccounts) {
+		t.Fatalf("account count map=%v, want %v", manager.respConnSummaryAccountCounts, expectedAccounts)
+	}
+	for accountID, count := range expectedAccounts {
+		if manager.respConnSummaryAccountCounts[accountID] != count {
+			t.Fatalf("account %d summary count=%d, want %d", accountID, manager.respConnSummaryAccountCounts[accountID], count)
+		}
+	}
 }
 
 func TestContinuationPerAccountBudgetEvictsOldestBindingGenerationOnRelease(t *testing.T) {
@@ -2177,7 +2243,7 @@ func TestAcquireReusableConnectionSkipsBusySlot(t *testing.T) {
 
 // ==================== 续链亲和(response_id → 连接绑定) ====================
 
-func newBoundTestConn(t *testing.T, manager *Manager, accountID int64, sessionKey string) *WsConnection {
+func newBoundTestConn(t interface{ Helper() }, manager *Manager, accountID int64, sessionKey string) *WsConnection {
 	t.Helper()
 	key := manager.poolKey(accountID, "wss://example.test/responses", sessionKey, "")
 	session := NewSession(accountID, manager)
@@ -2243,6 +2309,9 @@ func TestAcquirePreferredConnection(t *testing.T) {
 
 	wc := newBoundTestConn(t, manager, 7, "base#3")
 	manager.BindResponseConn("resp_chain", wc, "base#3", 7, "key-A")
+	if got, pending, _, err := manager.AcquirePreferredConnection(context.Background(), "resp_chain", 7, "key-A", safeConnectionIdentity{ownerKey: "owner", handshakeFingerprint: "fingerprint"}); got != nil || pending != nil || !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("safe continuation acquired legacy binding: conn=%p pending=%v err=%v", got, pending, err)
+	}
 
 	got, pr, slotKey, err := manager.AcquirePreferredConnection(context.Background(), "resp_chain", 7, "key-A")
 	if err != nil || got != wc {
@@ -2487,6 +2556,174 @@ func TestBindResponseConnBounded(t *testing.T) {
 	}
 	if oldestStillPresent || !newestPresent {
 		t.Fatalf("full binding table did not replace oldest ID with newest: oldest=%v newest=%v", oldestStillPresent, newestPresent)
+	}
+
+	const continuousEvictions = 1000
+	for i := 1; i <= continuousEvictions; i++ {
+		responseID := fmt.Sprintf("resp_%d", responseConnBindingMaxEntries+i)
+		manager.BindResponseConn(responseID, wc, "base#0", 7, "key-A")
+	}
+	finalID := fmt.Sprintf("resp_%d", responseConnBindingMaxEntries+continuousEvictions)
+	manager.respConnMu.Lock()
+	size = len(manager.respConnBindings)
+	_, evictedPrefixPresent := manager.respConnBindings[fmt.Sprintf("resp_%d", continuousEvictions)]
+	_, finalPresent := manager.respConnBindings[finalID]
+	orderSize := len(manager.responseBindingOrder)
+	summarySize := len(manager.respConnSummaries[wc].responseGenerations)
+	manager.respConnMu.Unlock()
+	if size != responseConnBindingMaxEntries || orderSize != responseConnBindingMaxEntries || summarySize != responseConnBindingMaxEntries {
+		t.Fatalf("continuous full-table eviction sizes: bindings=%d order=%d summary=%d, want %d", size, orderSize, summarySize, responseConnBindingMaxEntries)
+	}
+	if evictedPrefixPresent || !finalPresent {
+		t.Fatalf("continuous full-table FIFO eviction: old=%v final=%v", evictedPrefixPresent, finalPresent)
+	}
+	assertResponseBindingIndexesConsistent(t, manager)
+}
+
+func TestBindResponseConnLatestGenerationHasLatestExpiry(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	wc := newBoundTestConn(t, manager, 7, "expiry-order")
+
+	const binders = 128
+	var wg sync.WaitGroup
+	for i := 0; i < binders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			manager.BindResponseConn(fmt.Sprintf("resp_expiry_order_%d", i), wc, wc.PoolKey, 7, "key-A")
+		}(i)
+	}
+	wg.Wait()
+
+	manager.respConnMu.Lock()
+	summary := manager.respConnSummaries[wc]
+	var latest responseConnBinding
+	for _, binding := range manager.respConnBindings {
+		if binding.conn == wc && binding.generation > latest.generation {
+			latest = binding
+		}
+	}
+	for responseID, binding := range manager.respConnBindings {
+		if binding.conn == wc && binding.expiresAt.After(latest.expiresAt) {
+			manager.respConnMu.Unlock()
+			t.Fatalf("older response %s generation %d expires after latest generation %d", responseID, binding.generation, latest.generation)
+		}
+	}
+	if summary == nil {
+		manager.respConnMu.Unlock()
+		t.Fatal("latest response summary is missing")
+	}
+	if summary.latestGeneration != latest.generation || !summary.latestExpiresAt.Equal(latest.expiresAt) {
+		manager.respConnMu.Unlock()
+		t.Fatalf("summary latest=(%d,%v), binding latest=(%d,%v)", summary.latestGeneration, summary.latestExpiresAt, latest.generation, latest.expiresAt)
+	}
+	manager.respConnMu.Unlock()
+}
+
+func TestResponseBindingSecondaryIndexesLifecycle(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	wcA := newBoundTestConn(t, manager, 7, "index-a")
+	wcB := newBoundTestConn(t, manager, 8, "index-b")
+
+	manager.BindResponseConn("resp_old", wcA, wcA.PoolKey, 7, "key-A")
+	manager.BindResponseConn("resp_live", wcA, wcA.PoolKey, 7, "key-A")
+	setTestResponseBindingExpiry(t, manager, "resp_old", time.Now().Add(-time.Second))
+	manager.pruneResponseConnBindings()
+	if got, _ := manager.lookupResponseConn("resp_old", 7, "key-A"); got != nil {
+		t.Fatal("expired partial binding remained resolvable")
+	}
+	if got, _ := manager.lookupResponseConn("resp_live", 7, "key-A"); got != wcA {
+		t.Fatal("partial expiry removed the still-live sibling binding")
+	}
+	assertResponseBindingIndexesConsistent(t, manager)
+
+	manager.BindResponseConn("resp_live", wcB, wcB.PoolKey, 8, "key-B")
+	if got, _ := manager.lookupResponseConn("resp_live", 7, "key-A"); got != nil {
+		t.Fatal("cross-connection rebind left the old owner resolvable")
+	}
+	if got, _ := manager.lookupResponseConn("resp_live", 8, "key-B"); got != wcB {
+		t.Fatal("cross-connection rebind did not publish the new owner")
+	}
+	assertResponseBindingIndexesConsistent(t, manager)
+
+	manager.BindResponseConn("resp_b", wcB, wcB.PoolKey, 8, "key-B")
+	manager.DiscardConnection(wcB)
+	assertResponseBindingIndexesConsistent(t, manager)
+}
+
+func TestResponseBindingSecondaryIndexesConcurrentOperations(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	connections := []*WsConnection{
+		newBoundTestConn(t, manager, 70, "index-concurrent-a"),
+		newBoundTestConn(t, manager, 70, "index-concurrent-b"),
+		newBoundTestConn(t, manager, 71, "index-concurrent-c"),
+		newBoundTestConn(t, manager, 71, "index-concurrent-d"),
+	}
+
+	const workers = 8
+	const perWorker = 250
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				wc := connections[(worker+i)%len(connections)]
+				responseID := fmt.Sprintf("resp_concurrent_%d_%d", worker, i)
+				accountID := wc.session.AccountID
+				manager.BindResponseConn(responseID, wc, wc.PoolKey, accountID, "key-concurrent")
+				if i%3 == 0 {
+					_, _ = manager.lookupResponseConn(responseID, accountID, "key-concurrent")
+				}
+				if i%31 == 0 {
+					manager.pruneResponseConnBindings()
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	assertResponseBindingIndexesConsistent(t, manager)
+	for _, wc := range connections {
+		manager.DiscardConnection(wc)
+	}
+	assertResponseBindingIndexesConsistent(t, manager)
+}
+
+func BenchmarkResponseBindingHotPathWith50KRetainedIDs(b *testing.B) {
+	manager := NewManager()
+	b.Cleanup(manager.Stop)
+	const connectionCount = 100
+	connections := make([]*WsConnection, 0, connectionCount)
+	for i := 0; i < connectionCount; i++ {
+		connections = append(connections, newBoundTestConn(b, manager, int64(7000+i%10), fmt.Sprintf("bench-%d", i)))
+	}
+	for i := 0; i < 50_000; i++ {
+		wc := connections[i%len(connections)]
+		manager.BindResponseConn(fmt.Sprintf("resp_bench_%d", i), wc, wc.PoolKey, wc.session.AccountID, "key-bench")
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if snapshot := manager.snapshotLiveResponseBindings(); len(snapshot) != connectionCount {
+			b.Fatalf("live connection summary size = %d, want %d", len(snapshot), connectionCount)
+		}
+	}
+}
+
+func BenchmarkResponseBindingContinuousBindAtHardCap(b *testing.B) {
+	manager := NewManager()
+	b.Cleanup(manager.Stop)
+	wc := newBoundTestConn(b, manager, 7, "bench-full")
+	for i := 0; i < responseConnBindingMaxEntries; i++ {
+		manager.BindResponseConn(fmt.Sprintf("resp_full_%d", i), wc, wc.PoolKey, 7, "key-bench")
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		manager.BindResponseConn(fmt.Sprintf("resp_overflow_%d", i), wc, wc.PoolKey, 7, "key-bench")
 	}
 }
 

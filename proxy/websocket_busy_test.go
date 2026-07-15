@@ -21,6 +21,171 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func TestWebsocketUncertainOutcomesNeverRetryPenalizeOrFallback(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		kind string
+	}{
+		{"write uncertain", fmt.Errorf("send: %w", ErrWebsocketWriteUncertain), upstreamErrorKindWebsocketWriteUncertain},
+		{"read uncertain", fmt.Errorf("read: %w", ErrWebsocketReadUncertain), upstreamErrorKindWebsocketReadUncertain},
+		{"isolation violation", fmt.Errorf("validate: %w", ErrWebsocketIsolationViolation), upstreamErrorKindWebsocketIsolation},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			kind := classifyTransportFailure(tt.err)
+			if kind != tt.kind {
+				t.Fatalf("classifyTransportFailure = %q, want %q", kind, tt.kind)
+			}
+			if shouldRetryTransportFailure(tt.err, kind) {
+				t.Fatal("uncertain committed request was declared retryable")
+			}
+			if shouldPenalizeTransportFailure(kind) {
+				t.Fatal("uncertain WS outcome would penalize the account")
+			}
+			if isWebsocketLocalContentionError(tt.err) {
+				t.Fatal("uncertain WS outcome was misclassified as pre-send local contention")
+			}
+			if shouldFallbackWebsocketLocalContentionToHTTP(tt.err, true, []byte(`{"input":"hello"}`), requestSessionIdentity{}) {
+				t.Fatal("uncertain WS outcome was allowed to replay over HTTP")
+			}
+			outcome := classifyStreamOutcome(nil, tt.err, nil, false)
+			if outcome.failureKind != tt.kind || outcome.penalize || outcome.verifyAccountAuth {
+				t.Fatalf("stream outcome = %+v, want kind=%q without penalty/auth probe", outcome, tt.kind)
+			}
+		})
+	}
+}
+
+func TestCommittedLocalReadLimitNeverFallsBackToHTTP(t *testing.T) {
+	readLimit := fmt.Errorf("%w: %w", &websocket.CloseError{
+		Code: websocket.CloseMessageTooBig,
+		Text: "message too big",
+	}, websocket.ErrReadLimit)
+	err := fmt.Errorf("%w: local response exceeded limit: %w", ErrWebsocketReadUncertain, readLimit)
+	kind := classifyTransportFailure(err)
+	if kind != upstreamErrorKindWebsocketReadUncertain {
+		t.Fatalf("failure kind=%q, want %q", kind, upstreamErrorKindWebsocketReadUncertain)
+	}
+	outcome := classifyStreamOutcome(nil, err, nil, false)
+	if outcome.failureKind != upstreamErrorKindWebsocketReadUncertain || outcome.penalize || outcome.verifyAccountAuth {
+		t.Fatalf("stream outcome=%+v, want read-uncertain without penalty/auth probe", outcome)
+	}
+	if shouldRetryTransportFailure(err, kind) {
+		t.Fatal("committed local read-limit error was declared retryable")
+	}
+	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, false, nil, nil) {
+		t.Fatal("committed local read-limit error was allowed to replay over HTTP")
+	}
+}
+
+func TestWebsocketUncertainOutcomesFailOnceAcrossPublicEndpoints(t *testing.T) {
+	endpoints := []struct {
+		name   string
+		path   string
+		body   string
+		invoke func(*Handler, *gin.Context)
+	}{
+		{
+			name: "responses",
+			path: "/v1/responses",
+			body: `{"model":"gpt-5.4","input":"hello","stream":true}`,
+			invoke: func(handler *Handler, ctx *gin.Context) {
+				handler.Responses(ctx)
+			},
+		},
+		{
+			name: "chat completions",
+			path: "/v1/chat/completions",
+			body: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":true}`,
+			invoke: func(handler *Handler, ctx *gin.Context) {
+				handler.ChatCompletions(ctx)
+			},
+		},
+		{
+			name: "messages",
+			path: "/v1/messages",
+			body: `{"model":"claude-opus-4-6","max_tokens":128,"messages":[{"role":"user","content":"hello"}],"stream":true}`,
+			invoke: func(handler *Handler, ctx *gin.Context) {
+				handler.Messages(ctx)
+			},
+		},
+	}
+	errorsToTest := []struct {
+		name string
+		err  error
+	}{
+		{"write uncertain", fmt.Errorf("send: %w", ErrWebsocketWriteUncertain)},
+		{"read uncertain", fmt.Errorf("read: %w", ErrWebsocketReadUncertain)},
+		{"isolation violation", fmt.Errorf("validate: %w", ErrWebsocketIsolationViolation)},
+	}
+
+	for _, endpoint := range endpoints {
+		for _, injected := range errorsToTest {
+			t.Run(endpoint.name+"/"+injected.name, func(t *testing.T) {
+				gin.SetMode(gin.TestMode)
+				previousExec := WebsocketExecuteFunc
+				previousSettings := CurrentRuntimeSettings()
+				previousResin := resinCfg.Load()
+				t.Cleanup(func() {
+					WebsocketExecuteFunc = previousExec
+					ApplyRuntimeSettings(previousSettings)
+					resinCfg.Store(previousResin)
+				})
+				nextSettings := previousSettings
+				nextSettings.CodexForceWebsocket = true
+				ApplyRuntimeSettings(nextSettings)
+
+				var wsCalls atomic.Int32
+				var selectedAccount atomic.Int64
+				WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+					wsCalls.Add(1)
+					selectedAccount.Store(account.ID())
+					return nil, injected.err
+				}
+
+				var httpCalls atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					httpCalls.Add(1)
+					http.Error(w, "must not replay", http.StatusInternalServerError)
+				}))
+				t.Cleanup(upstream.Close)
+				SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+				store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, MaxRetries: 3, TestConcurrency: 1, TestModel: "gpt-5.4"})
+				t.Cleanup(store.Stop)
+				first := &auth.Account{DBID: 501, AccessToken: "at-501", PlanType: "pro", AccountID: "acct-501"}
+				second := &auth.Account{DBID: 502, AccessToken: "at-502", PlanType: "free", AccountID: "acct-502"}
+				store.AddAccount(first)
+				store.AddAccount(second)
+				handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(endpoint.body))
+				ctx.Request.Header.Set("Content-Type", "application/json")
+				endpoint.invoke(handler, ctx)
+
+				if recorder.Code != http.StatusBadGateway {
+					t.Fatalf("status=%d body=%s, want one terminal 502", recorder.Code, recorder.Body.String())
+				}
+				if wsCalls.Load() != 1 || httpCalls.Load() != 0 {
+					t.Fatalf("upstream calls WS=%d HTTP=%d, want 1/0", wsCalls.Load(), httpCalls.Load())
+				}
+				if atomic.LoadInt64(&first.ActiveRequests) != 0 || atomic.LoadInt64(&second.ActiveRequests) != 0 {
+					t.Fatalf("active leases first=%d second=%d", atomic.LoadInt64(&first.ActiveRequests), atomic.LoadInt64(&second.ActiveRequests))
+				}
+				selected := selectedAccount.Load()
+				if selected == 0 {
+					t.Fatal("no account was selected")
+				}
+				if got := atomic.LoadInt64(&first.TotalRequests) + atomic.LoadInt64(&second.TotalRequests); got != 1 {
+					t.Fatalf("total dispatches=%d, want exactly 1; selected=%d", got, selected)
+				}
+			})
+		}
+	}
+}
+
 func TestShouldFallbackWebsocketLocalContentionToHTTPProtectsExplicitContext(t *testing.T) {
 	busyErr := fmt.Errorf("%w: timed out waiting for busy session", ErrWebsocketSessionBusy)
 	stateless := requestSessionIdentity{upstreamSeed: "derived"}
@@ -41,6 +206,16 @@ func TestShouldFallbackWebsocketLocalContentionToHTTPProtectsExplicitContext(t *
 	explicit := requestSessionIdentity{upstreamSeed: "session", explicitUpstreamID: "session"}
 	if shouldFallbackWebsocketLocalContentionToHTTP(busyErr, true, []byte(`{"input":"hello"}`), explicit) {
 		t.Fatal("explicit upstream session must not cross from busy WebSocket to HTTP")
+	}
+	fusedErr := fmt.Errorf("%w: account-local safe reuse fuse", ErrWebsocketSafePoolFallback)
+	if !shouldFallbackWebsocketLocalContentionToHTTP(fusedErr, true, []byte(`{"prompt_cache_key":"session","input":"hello"}`), explicit) {
+		t.Fatal("pre-write safe-pool fuse should retain the account and fall back to HTTP even with an explicit cache key")
+	}
+	if shouldFallbackWebsocketLocalContentionToHTTP(fusedErr, true, []byte(`{"previous_response_id":"resp_1","input":"next"}`), explicit) {
+		t.Fatal("safe-pool fuse must not move a connection-local continuation to HTTP")
+	}
+	if kind := classifyTransportFailure(fusedErr); kind != upstreamErrorKindWebsocketSafePoolFallback || shouldRetryTransportFailure(fusedErr, kind) || shouldPenalizeTransportFailure(kind) {
+		t.Fatalf("safe-pool fallback classification kind=%q retry=%v penalize=%v", kind, shouldRetryTransportFailure(fusedErr, kind), shouldPenalizeTransportFailure(kind))
 	}
 	if shouldFallbackWebsocketLocalContentionToHTTP(errors.New("connection reset"), true, []byte(`{"input":"hello"}`), stateless) {
 		t.Fatal("ordinary transport errors must keep the configured retry policy")
@@ -373,6 +548,15 @@ func TestCompatibilityEndpointsFallbackLocalWebsocketContentionToSameAccountHTTP
 			err:  fmt.Errorf("%w: acquire timed out waiting for account connection capacity", ErrWebsocketLocalCapacity),
 			invoke: func(handler *Handler, ctx *gin.Context) {
 				handler.Messages(ctx)
+			},
+		},
+		{
+			name: "responses fused safe pool retains explicit cache owner",
+			path: "/v1/responses",
+			body: `{"model":"gpt-5.4","prompt_cache_key":"official-cache","client_metadata":{"session_id":"session-A","thread_id":"thread-A"},"input":"hello","stream":true}`,
+			err:  fmt.Errorf("%w: account-local reuse fuse", ErrWebsocketSafePoolFallback),
+			invoke: func(handler *Handler, ctx *gin.Context) {
+				handler.Responses(ctx)
 			},
 		},
 	}

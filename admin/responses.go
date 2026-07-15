@@ -205,9 +205,40 @@ type runtimeStatusResponse struct {
 	UsageLog     runtimeUsageLogResponse      `json:"usage_log"`
 	Probes       runtimeProbesResponse        `json:"probes"`
 	Accounts     runtimeAccountsResponse      `json:"accounts"`
+	Websocket    runtimeWebsocketResponse     `json:"websocket"`
 	ImageStorage runtimeImageStorageResponse  `json:"image_storage"`
 	AdminAuth    runtimeAdminAuthResponse     `json:"admin_auth"`
 	Checks       []runtimeCheckResponse       `json:"checks"`
+}
+
+type runtimeWebsocketResponse struct {
+	GlobalOneShot              bool   `json:"global_oneshot"`
+	SafePoolScope              string `json:"safe_pool_scope"`
+	ConfiguredMaxSlots         int    `json:"configured_max_slots"`
+	WaitMillis                 int64  `json:"wait_millis"`
+	ReuseFenceMillis           int64  `json:"reuse_fence_millis"`
+	Connections                int    `json:"connections"`
+	ActiveConnections          int    `json:"active_connections"`
+	IdleConnections            int    `json:"idle_connections"`
+	BoundIdleConnections       int    `json:"bound_idle_connections"`
+	RetiringConnections        int    `json:"retiring_connections"`
+	PendingDials               int    `json:"pending_dials"`
+	ResponseBindings           int    `json:"response_bindings"`
+	FusedAccounts              int    `json:"fused_accounts"`
+	CompatibilityFusedAccounts int    `json:"compatibility_fused_accounts"`
+	TrackedAccounts            int    `json:"tracked_accounts"`
+	DialAttempts               uint64 `json:"dial_attempts"`
+	DialSuccess                uint64 `json:"dial_success"`
+	DialFailures               uint64 `json:"dial_failures"`
+	ReuseHits                  uint64 `json:"reuse_hits"`
+	Saturations                uint64 `json:"saturations"`
+	FuseTrips                  uint64 `json:"fuse_trips"`
+	CompatibilityDrops         uint64 `json:"compatibility_drops"`
+	CompatibilityFallbacks     uint64 `json:"compatibility_fallbacks"`
+	OwnerEligible              uint64 `json:"owner_eligible"`
+	OwnerMissing               uint64 `json:"owner_missing"`
+	OwnerRejected              uint64 `json:"owner_rejected"`
+	RequestIneligible          uint64 `json:"request_ineligible"`
 }
 
 type runtimeCheckResponse struct {

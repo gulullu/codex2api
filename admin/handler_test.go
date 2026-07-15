@@ -913,6 +913,11 @@ func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 
 func TestRuntimeStatusRouteReturnsDependencySnapshot(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
+	t.Setenv("CODEX_WS_SAFE_POOL_SCOPE", "tagged")
+	t.Setenv("CODEX_WS_SAFE_POOL_MAX_SLOTS", "73")
+	t.Setenv("CODEX_WS_SAFE_POOL_WAIT_MS", "321")
+	t.Setenv("CODEX_WS_SAFE_POOL_REUSE_FENCE_MS", "123")
 
 	db := newTestAdminDB(t)
 	tc := cache.NewMemory(4)
@@ -957,6 +962,12 @@ func TestRuntimeStatusRouteReturnsDependencySnapshot(t *testing.T) {
 	}
 	if payload.UsageLog.Mode != database.UsageLogModeFull || !payload.UsageLog.Enabled {
 		t.Fatalf("usage log = mode:%q enabled:%v, want full enabled", payload.UsageLog.Mode, payload.UsageLog.Enabled)
+	}
+	if !payload.Websocket.GlobalOneShot || payload.Websocket.SafePoolScope != "tagged" {
+		t.Fatalf("websocket rollout = oneshot:%v scope:%q, want true tagged", payload.Websocket.GlobalOneShot, payload.Websocket.SafePoolScope)
+	}
+	if payload.Websocket.ConfiguredMaxSlots != 73 || payload.Websocket.WaitMillis != 321 || payload.Websocket.ReuseFenceMillis != 123 {
+		t.Fatalf("websocket tuning = slots:%d wait:%d fence:%d, want 73/321/123", payload.Websocket.ConfiguredMaxSlots, payload.Websocket.WaitMillis, payload.Websocket.ReuseFenceMillis)
 	}
 }
 

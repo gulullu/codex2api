@@ -80,8 +80,37 @@ type WsConnection struct {
 	// 构造后不再修改；为 0 表示未知（测试用字面量构造），视为未到龄。
 	createdAt int64
 
+	// safeReusable marks connections admitted through the opt-in safe pool.
+	// reuseNotBefore is a terminal-frame fence: while it is in the future the
+	// healthy idle socket remains in place but cannot receive a new lease.
+	safeReusable   atomic.Bool
+	reuseNotBefore atomic.Int64
+	// retireAfterLease is set when the global/account rollout policy is removed
+	// while a request is still active. The active response may finish, but this
+	// physical socket can never receive another lease.
+	retireAfterLease atomic.Bool
+	// safeOwnerKey and handshakeFingerprint are immutable and populated before
+	// the permanent reader starts. They prevent continuation and ordinary reuse
+	// from crossing a Codex session/thread or a connection-scoped identity.
+	safeOwnerKey         string
+	handshakeFingerprint string
+	// recent response IDs detect a delayed duplicate response.created from a
+	// prior lease before any such frame can reach the downstream callback.
+	safeHistoryMu     sync.Mutex
+	recentResponseIDs map[string]struct{}
+	// safeTerminalRelease is a one-shot barrier for the narrow interval after
+	// a terminal frame has been delivered and its response binding published,
+	// but before WsResponse.Close removes the previous Session pending marker.
+	// A continuation may wait for this barrier; an actually in-flight turn has
+	// no barrier and must still fail immediately as busy.
+	safeTerminalMu      sync.Mutex
+	safeTerminalRelease *safeTerminalRelease
+
 	// 写操作锁
 	writeMu sync.Mutex
+	// writeMessageFunc is a test-only fault seam. Production leaves it nil and
+	// always writes through Gorilla.
+	writeMessageFunc func(messageType int, data []byte) error
 
 	// 永久 reader、业务帧 lease 与探活状态。读取状态按需初始化，兼容测试中
 	// 通过字面量构造且没有底层 socket 的 WsConnection。
@@ -182,6 +211,109 @@ func (wc *WsConnection) IsConnected() bool {
 	return wc.state.Load() == int32(StateConnected)
 }
 
+func (wc *WsConnection) setReuseFence(duration time.Duration) {
+	if wc == nil || duration <= 0 {
+		return
+	}
+	wc.reuseNotBefore.Store(time.Now().Add(duration).UnixNano())
+}
+
+func (wc *WsConnection) reuseFenceActive() bool {
+	if wc == nil {
+		return false
+	}
+	notBefore := wc.reuseNotBefore.Load()
+	return notBefore > 0 && time.Now().UnixNano() < notBefore
+}
+
+func (wc *WsConnection) reuseFenceRemaining() time.Duration {
+	if wc == nil {
+		return 0
+	}
+	remaining := time.Until(time.Unix(0, wc.reuseNotBefore.Load()))
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (wc *WsConnection) hasRecentResponseID(responseID string) bool {
+	if wc == nil || responseID == "" {
+		return false
+	}
+	wc.safeHistoryMu.Lock()
+	defer wc.safeHistoryMu.Unlock()
+	_, exists := wc.recentResponseIDs[responseID]
+	return exists
+}
+
+func (wc *WsConnection) recordRecentResponseID(responseID string) {
+	if wc == nil || responseID == "" {
+		return
+	}
+	wc.safeHistoryMu.Lock()
+	defer wc.safeHistoryMu.Unlock()
+	if wc.recentResponseIDs == nil {
+		wc.recentResponseIDs = make(map[string]struct{})
+	}
+	if _, exists := wc.recentResponseIDs[responseID]; !exists && len(wc.recentResponseIDs) >= safePoolMaxRecentResponseIDs {
+		// Never evict old IDs and reopen a delayed-frame hole. The active
+		// response graph protects the current lease; retire at this terminal
+		// boundary instead of admitting another lease.
+		wc.retireAfterLease.Store(true)
+		return
+	}
+	wc.recentResponseIDs[responseID] = struct{}{}
+}
+
+const safePoolMaxRecentResponseIDs = 4096
+
+type safeTerminalRelease struct {
+	leaseID string
+	done    chan struct{}
+}
+
+func (wc *WsConnection) beginSafeTerminalRelease(leaseID string) error {
+	if wc == nil || strings.TrimSpace(leaseID) == "" {
+		return fmt.Errorf("safe websocket terminal release requires a lease id")
+	}
+	wc.safeTerminalMu.Lock()
+	defer wc.safeTerminalMu.Unlock()
+	if wc.safeTerminalRelease != nil {
+		return fmt.Errorf("safe websocket terminal release is already pending for lease %q", wc.safeTerminalRelease.leaseID)
+	}
+	wc.safeTerminalRelease = &safeTerminalRelease{
+		leaseID: leaseID,
+		done:    make(chan struct{}),
+	}
+	return nil
+}
+
+func (wc *WsConnection) finishSafeTerminalRelease(leaseID string) {
+	if wc == nil {
+		return
+	}
+	wc.safeTerminalMu.Lock()
+	barrier := wc.safeTerminalRelease
+	if barrier != nil && (leaseID == "" || barrier.leaseID == leaseID) {
+		wc.safeTerminalRelease = nil
+		close(barrier.done)
+	}
+	wc.safeTerminalMu.Unlock()
+}
+
+func (wc *WsConnection) safeTerminalReleaseDone() <-chan struct{} {
+	if wc == nil {
+		return nil
+	}
+	wc.safeTerminalMu.Lock()
+	defer wc.safeTerminalMu.Unlock()
+	if wc.safeTerminalRelease == nil {
+		return nil
+	}
+	return wc.safeTerminalRelease.done
+}
+
 // Close 安全关闭连接
 func (wc *WsConnection) Close() error {
 	if wc == nil {
@@ -189,6 +321,9 @@ func (wc *WsConnection) Close() error {
 	}
 	wc.closeOnce.Do(func() {
 		wc.state.Store(int32(StateClosing))
+		// Wake a continuation waiting for the response-level Close path. It will
+		// revalidate the pool pointer and observe that this socket is gone.
+		wc.finishSafeTerminalRelease("")
 		if wc.conn != nil {
 			wc.closeErr = wc.conn.Close()
 		}
@@ -210,20 +345,30 @@ func (wc *WsConnection) WriteMessage(messageType int, data []byte) error {
 	wc.writeMu.Lock()
 	defer wc.writeMu.Unlock()
 
-	if !wc.IsConnected() || wc.conn == nil {
-		return fmt.Errorf("websocket connection is not connected")
+	if !wc.IsConnected() || (wc.conn == nil && wc.writeMessageFunc == nil) {
+		return fmt.Errorf("%w: websocket connection is not connected", errWebsocketWriteNotStarted)
 	}
 	leaseID, tracksLease, err := wc.beginReadLeaseWrite(messageType)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errWebsocketWriteNotStarted, err)
 	}
 
-	wc.conn.SetWriteDeadline(time.Now().Add(WriteTimeout))
-	defer wc.conn.SetWriteDeadline(time.Time{})
-
-	writeErr := wc.conn.WriteMessage(messageType, data)
+	var writeErr error
+	if wc.writeMessageFunc != nil {
+		writeErr = wc.writeMessageFunc(messageType, data)
+	} else {
+		wc.conn.SetWriteDeadline(time.Now().Add(WriteTimeout))
+		defer wc.conn.SetWriteDeadline(time.Time{})
+		writeErr = wc.conn.WriteMessage(messageType, data)
+	}
 	if tracksLease {
-		return wc.completeReadLeaseWrite(leaseID, writeErr)
+		if completedErr := wc.completeReadLeaseWrite(leaseID, writeErr); completedErr != nil {
+			// Gorilla cannot prove how many bytes reached the peer when a data write
+			// fails. Treat every post-attempt failure as an uncertain committed turn;
+			// replaying it can duplicate work and billing.
+			return fmt.Errorf("%w: %w", proxy.ErrWebsocketWriteUncertain, completedErr)
+		}
+		return nil
 	}
 	return writeErr
 }
@@ -283,6 +428,29 @@ type Manager struct {
 	accountLocks   [managerLockStripeCount]sync.Mutex
 	capacityMu     sync.Mutex
 	pendingCreates map[int64]int
+	// safePoolPendingCreates is the safe-owner subset of pendingCreates. It is
+	// tracked separately so the rollout slot limit remains strict across
+	// parallel cold dials without charging unrelated one-shot handshakes.
+	safePoolPendingCreates map[int64]int
+
+	// account ID -> safePoolFuseState. Process-local by design: it is a
+	// transport escape hatch, never a database/account-status mutation.
+	safePoolFuses sync.Map
+	// safePoolAccounts is a cheap process-local hint used to avoid scanning all
+	// sockets on every ordinary request after the rollout is disabled.
+	safePoolAccounts               sync.Map
+	safePoolDialAttempts           atomic.Uint64
+	safePoolDialSuccess            atomic.Uint64
+	safePoolDialFailures           atomic.Uint64
+	safePoolReuseHits              atomic.Uint64
+	safePoolSaturations            atomic.Uint64
+	safePoolFuseTrips              atomic.Uint64
+	safePoolCompatibilityDrops     atomic.Uint64
+	safePoolCompatibilityFallbacks atomic.Uint64
+	safePoolOwnerEligible          atomic.Uint64
+	safePoolOwnerMissing           atomic.Uint64
+	safePoolOwnerRejected          atomic.Uint64
+	safePoolRequestIneligible      atomic.Uint64
 
 	// response_id -> 连接 绑定（续链亲和）。上游 chatgpt backend 无服务端存储时，
 	// previous_response_id 的上下文只存活在产生该响应的那条 WS 连接里；带续链 ID
@@ -290,6 +458,17 @@ type Manager struct {
 	// 参考 sub2api openai_ws_state_store 的 BindResponseConn/GetResponseConn。
 	respConnMu       sync.Mutex
 	respConnBindings map[string]responseConnBinding
+	// respConnSummaries indexes the same bindings by physical connection. It
+	// keeps hot-path capacity and continuation-budget checks proportional to
+	// live sockets (hundreds), not response IDs retained for TTL (tens of
+	// thousands at 10k RPM).
+	respConnSummaries            map[*WsConnection]*responseConnSummary
+	respConnSummaryAccountCounts map[int64]int
+	// responseBindingOrder is an intrusive generation FIFO for the bounded
+	// response-ID table. The generation is already unique and monotonic, so this
+	// avoids a 65k-entry scan for every Bind once the table reaches its ceiling.
+	responseBindingOrder            map[uint64]string
+	responseBindingOldestGeneration uint64
 	// responseBindingGeneration is incremented under respConnMu for every
 	// published Bind. Unlike wall-clock expiry it cannot collide within one
 	// process, so continuation eviction can detect a concurrent rebind exactly.
@@ -326,20 +505,31 @@ const managerLockStripeCount = 1024
 // 防止跨 Key 用他人 response_id 定向挤上他人连接（与 response cache 的
 // owner 隔离同一原则）。
 type responseConnBinding struct {
-	conn       *WsConnection
-	sessionKey string
-	accountID  int64
-	apiKey     string
-	expiresAt  time.Time
-	generation uint64
+	conn                 *WsConnection
+	sessionKey           string
+	accountID            int64
+	apiKey               string
+	safeOwnerKey         string
+	handshakeFingerprint string
+	expiresAt            time.Time
+	generation           uint64
+}
+
+type responseConnSummary struct {
+	responseGenerations map[string]uint64
+	accountID           int64
+	latestGeneration    uint64
+	latestExpiresAt     time.Time
 }
 
 const (
 	// responseConnBindingTTL is independent of physical Pong keepalive. Once it
 	// expires the socket loses continuation exemption and rejoins ordinary cap.
 	responseConnBindingTTL = IdleTimeout
-	// responseConnBindingMaxEntries 绑定表上限，防止内存膨胀。
-	responseConnBindingMaxEntries = 4096
+	// At the 10k-RPM target, a five-minute continuation TTL can retain about
+	// 50k logical response IDs. Keep bounded headroom above that live set so a
+	// normal pause does not evict valid previous_response_id state in seconds.
+	responseConnBindingMaxEntries = 65536
 
 	defaultContinuationGlobalLimit     = 512
 	defaultContinuationPerAccountLimit = 128
@@ -648,27 +838,331 @@ func (s continuationBudgetSnapshot) globalCount() int {
 	return len(s.candidates)
 }
 
-// latestLiveResponseBindingsLocked prunes unusable bindings and returns the
-// newest live Bind generation per physical connection. Callers hold
-// respConnMu. Expiry is used only for TTL; the monotonic generation is the
-// continuation LRU key and cannot collide like a wall-clock timestamp.
-func (m *Manager) latestLiveResponseBindingsLocked(now time.Time) map[*WsConnection]uint64 {
-	latest := make(map[*WsConnection]uint64)
+func (m *Manager) newResponseConnSummaryLocked(wc *WsConnection, accountID int64) *responseConnSummary {
+	if m.respConnSummaries == nil {
+		m.respConnSummaries = make(map[*WsConnection]*responseConnSummary)
+	}
+	if m.respConnSummaryAccountCounts == nil {
+		m.respConnSummaryAccountCounts = make(map[int64]int)
+	}
+	summary := &responseConnSummary{
+		responseGenerations: make(map[string]uint64),
+		accountID:           accountID,
+	}
+	m.respConnSummaries[wc] = summary
+	m.respConnSummaryAccountCounts[accountID]++
+	return summary
+}
+
+func (m *Manager) deleteResponseConnSummaryLocked(wc *WsConnection) {
+	summary := m.respConnSummaries[wc]
+	if summary == nil {
+		return
+	}
+	delete(m.respConnSummaries, wc)
+	if count := m.respConnSummaryAccountCounts[summary.accountID]; count <= 1 {
+		delete(m.respConnSummaryAccountCounts, summary.accountID)
+	} else {
+		m.respConnSummaryAccountCounts[summary.accountID] = count - 1
+	}
+}
+
+func (m *Manager) rebuildResponseBindingOrderLocked() {
+	m.responseBindingOrder = make(map[uint64]string, len(m.respConnBindings))
+	m.responseBindingOldestGeneration = 0
+	for responseID, binding := range m.respConnBindings {
+		if binding.generation == 0 {
+			continue
+		}
+		m.responseBindingOrder[binding.generation] = responseID
+		if m.responseBindingOldestGeneration == 0 || binding.generation < m.responseBindingOldestGeneration {
+			m.responseBindingOldestGeneration = binding.generation
+		}
+		if binding.generation > m.responseBindingGeneration {
+			m.responseBindingGeneration = binding.generation
+		}
+	}
+}
+
+func (m *Manager) advanceResponseBindingOldestLocked() {
+	oldest := m.responseBindingOldestGeneration
+	if oldest == 0 {
+		return
+	}
+	for oldest <= m.responseBindingGeneration {
+		if _, exists := m.responseBindingOrder[oldest]; exists {
+			m.responseBindingOldestGeneration = oldest
+			return
+		}
+		oldest++
+	}
+	m.responseBindingOldestGeneration = 0
+}
+
+func (m *Manager) deleteResponseBindingOrderLocked(binding responseConnBinding) {
+	if binding.generation == 0 || m.responseBindingOrder == nil {
+		return
+	}
+	delete(m.responseBindingOrder, binding.generation)
+}
+
+func (m *Manager) recordResponseBindingOrderLocked(responseID string, binding responseConnBinding) {
+	if m.responseBindingOrder == nil {
+		m.responseBindingOrder = make(map[uint64]string, 64)
+	}
+	m.responseBindingOrder[binding.generation] = responseID
+	if m.responseBindingOldestGeneration == 0 || binding.generation < m.responseBindingOldestGeneration {
+		m.responseBindingOldestGeneration = binding.generation
+	}
+}
+
+func (m *Manager) evictOldestResponseConnBindingLocked() bool {
+	m.advanceResponseBindingOldestLocked()
+	for m.responseBindingOldestGeneration != 0 {
+		generation := m.responseBindingOldestGeneration
+		responseID, exists := m.responseBindingOrder[generation]
+		if !exists {
+			m.advanceResponseBindingOldestLocked()
+			continue
+		}
+		binding, current := m.respConnBindings[responseID]
+		if !current || binding.generation != generation {
+			delete(m.responseBindingOrder, generation)
+			m.advanceResponseBindingOldestLocked()
+			continue
+		}
+		m.removeResponseConnBindingLocked(responseID)
+		return true
+	}
+	return false
+}
+
+func (m *Manager) rebuildResponseConnSummariesLocked() {
+	m.respConnSummaries = make(map[*WsConnection]*responseConnSummary)
+	m.respConnSummaryAccountCounts = make(map[int64]int)
+	for responseID, binding := range m.respConnBindings {
+		if binding.conn == nil {
+			continue
+		}
+		summary := m.respConnSummaries[binding.conn]
+		if summary == nil {
+			summary = m.newResponseConnSummaryLocked(binding.conn, binding.accountID)
+		}
+		summary.responseGenerations[responseID] = binding.generation
+		if binding.generation >= summary.latestGeneration {
+			summary.latestGeneration = binding.generation
+			summary.latestExpiresAt = binding.expiresAt
+		}
+	}
+	m.rebuildResponseBindingOrderLocked()
+}
+
+func (m *Manager) recomputeResponseConnSummaryLocked(wc *WsConnection) {
+	summary := m.respConnSummaries[wc]
+	if summary == nil {
+		return
+	}
+	summary.latestGeneration = 0
+	summary.latestExpiresAt = time.Time{}
+	for responseID, indexedGeneration := range summary.responseGenerations {
+		binding, exists := m.respConnBindings[responseID]
+		if !exists || binding.conn != wc {
+			delete(summary.responseGenerations, responseID)
+			continue
+		}
+		if indexedGeneration != binding.generation {
+			summary.responseGenerations[responseID] = binding.generation
+		}
+		if binding.generation >= summary.latestGeneration {
+			summary.latestGeneration = binding.generation
+			summary.latestExpiresAt = binding.expiresAt
+		}
+	}
+	if len(summary.responseGenerations) == 0 {
+		m.deleteResponseConnSummaryLocked(wc)
+	}
+}
+
+// removeResponseConnBindingBatchLocked removes any number of IDs owned by one
+// physical connection and repairs its summary once. Bulk expiry/dead-connection
+// cleanup must not call the single-ID latest-generation repair N times: that
+// turns a large response history on one socket into O(N^2) work.
+func (m *Manager) removeResponseConnBindingBatchLocked(wc *WsConnection, responseIDs []string) {
+	if wc == nil || len(responseIDs) == 0 {
+		return
+	}
+	summary := m.respConnSummaries[wc]
+	for _, responseID := range responseIDs {
+		binding, exists := m.respConnBindings[responseID]
+		if !exists || binding.conn != wc {
+			continue
+		}
+		delete(m.respConnBindings, responseID)
+		m.deleteResponseBindingOrderLocked(binding)
+		if summary != nil {
+			delete(summary.responseGenerations, responseID)
+		}
+	}
+	if summary == nil {
+		m.advanceResponseBindingOldestLocked()
+		return
+	}
+	if len(summary.responseGenerations) == 0 {
+		m.deleteResponseConnSummaryLocked(wc)
+		m.advanceResponseBindingOldestLocked()
+		return
+	}
+	m.recomputeResponseConnSummaryLocked(wc)
+	m.advanceResponseBindingOldestLocked()
+}
+
+func (m *Manager) removeResponseConnBindingLocked(responseID string) {
+	binding, ok := m.respConnBindings[responseID]
+	if !ok {
+		return
+	}
+	delete(m.respConnBindings, responseID)
+	m.deleteResponseBindingOrderLocked(binding)
+	summary := m.respConnSummaries[binding.conn]
+	if summary == nil {
+		m.advanceResponseBindingOldestLocked()
+		return
+	}
+	delete(summary.responseGenerations, responseID)
+	if len(summary.responseGenerations) == 0 {
+		m.deleteResponseConnSummaryLocked(binding.conn)
+		m.advanceResponseBindingOldestLocked()
+		return
+	}
+	if binding.generation != summary.latestGeneration {
+		m.advanceResponseBindingOldestLocked()
+		return
+	}
+	m.recomputeResponseConnSummaryLocked(binding.conn)
+	m.advanceResponseBindingOldestLocked()
+}
+
+func (m *Manager) publishResponseConnBindingLocked(responseID string, binding responseConnBinding) {
+	if _, exists := m.respConnBindings[responseID]; exists {
+		m.removeResponseConnBindingLocked(responseID)
+	}
+	m.respConnBindings[responseID] = binding
+	m.recordResponseBindingOrderLocked(responseID, binding)
+	summary := m.respConnSummaries[binding.conn]
+	if summary == nil {
+		summary = m.newResponseConnSummaryLocked(binding.conn, binding.accountID)
+	}
+	summary.responseGenerations[responseID] = binding.generation
+	if binding.generation >= summary.latestGeneration {
+		summary.latestGeneration = binding.generation
+		summary.latestExpiresAt = binding.expiresAt
+	}
+}
+
+func (m *Manager) removeResponseConnBindingsForConnectionLocked(wc *WsConnection) {
+	if wc == nil {
+		return
+	}
+	if summary := m.respConnSummaries[wc]; summary != nil {
+		for responseID := range summary.responseGenerations {
+			if binding, exists := m.respConnBindings[responseID]; exists && binding.conn == wc {
+				delete(m.respConnBindings, responseID)
+				m.deleteResponseBindingOrderLocked(binding)
+			}
+		}
+		m.deleteResponseConnSummaryLocked(wc)
+		m.advanceResponseBindingOldestLocked()
+		return
+	}
+	// Defensive fallback for tests or data created before the secondary index.
+	for responseID, binding := range m.respConnBindings {
+		if binding.conn == wc {
+			delete(m.respConnBindings, responseID)
+			m.deleteResponseBindingOrderLocked(binding)
+		}
+	}
+	m.advanceResponseBindingOldestLocked()
+}
+
+func (m *Manager) pruneResponseConnBindingsLocked(now time.Time) {
+	if len(m.respConnSummaries) == 0 && len(m.respConnBindings) > 0 {
+		m.rebuildResponseConnSummariesLocked()
+	}
+	removeAll := make(map[*WsConnection]struct{})
+	removeIDs := make(map[*WsConnection][]string)
+	orphanIDs := make([]string, 0)
 	for responseID, binding := range m.respConnBindings {
 		wc := binding.conn
-		if wc == nil || now.After(binding.expiresAt) || !wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
-			delete(m.respConnBindings, responseID)
+		if wc == nil {
+			orphanIDs = append(orphanIDs, responseID)
+			continue
+		}
+		if _, alreadyRemoving := removeAll[wc]; alreadyRemoving {
+			continue
+		}
+		if !wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
+			removeAll[wc] = struct{}{}
+			delete(removeIDs, wc)
 			continue
 		}
 		if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc {
-			delete(m.respConnBindings, responseID)
+			removeAll[wc] = struct{}{}
+			delete(removeIDs, wc)
 			continue
 		}
-		if currentGeneration, ok := latest[wc]; !ok || binding.generation > currentGeneration {
-			latest[wc] = binding.generation
+		if now.After(binding.expiresAt) {
+			removeIDs[wc] = append(removeIDs[wc], responseID)
 		}
 	}
+	for _, responseID := range orphanIDs {
+		if binding, exists := m.respConnBindings[responseID]; exists {
+			delete(m.respConnBindings, responseID)
+			m.deleteResponseBindingOrderLocked(binding)
+		}
+	}
+	for wc := range removeAll {
+		m.removeResponseConnBindingsForConnectionLocked(wc)
+	}
+	for wc, responseIDs := range removeIDs {
+		if _, removingAll := removeAll[wc]; !removingAll {
+			m.removeResponseConnBindingBatchLocked(wc, responseIDs)
+		}
+	}
+	m.advanceResponseBindingOldestLocked()
+}
+
+// responseConnSummarySnapshotLocked returns the newest live Bind generation
+// per physical connection without scanning the full response-ID table.
+func (m *Manager) responseConnSummarySnapshotLocked(now time.Time) map[*WsConnection]uint64 {
+	if len(m.respConnSummaries) == 0 && len(m.respConnBindings) > 0 {
+		m.rebuildResponseConnSummariesLocked()
+	}
+	latest := make(map[*WsConnection]uint64, len(m.respConnSummaries))
+	stale := make([]*WsConnection, 0)
+	for wc, summary := range m.respConnSummaries {
+		if wc == nil || summary == nil || summary.latestGeneration == 0 || now.After(summary.latestExpiresAt) ||
+			!wc.IsConnected() || isEvictableIdleExpired(wc) || isRotatableOverAge(wc) {
+			stale = append(stale, wc)
+			continue
+		}
+		if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc {
+			stale = append(stale, wc)
+			continue
+		}
+		latest[wc] = summary.latestGeneration
+	}
+	for _, wc := range stale {
+		m.removeResponseConnBindingsForConnectionLocked(wc)
+	}
 	return latest
+}
+
+// latestLiveResponseBindingsLocked keeps the historical prune+snapshot
+// semantics for periodic cleanup and cap repair. Hot acquire/release paths use
+// the secondary connection index directly.
+func (m *Manager) latestLiveResponseBindingsLocked(now time.Time) map[*WsConnection]uint64 {
+	m.pruneResponseConnBindingsLocked(now)
+	return m.responseConnSummarySnapshotLocked(now)
 }
 
 func (m *Manager) pruneResponseConnBindings() {
@@ -685,7 +1179,7 @@ func (m *Manager) snapshotLiveResponseBindings() map[*WsConnection]uint64 {
 		return map[*WsConnection]uint64{}
 	}
 	m.respConnMu.Lock()
-	latest := m.latestLiveResponseBindingsLocked(time.Now())
+	latest := m.responseConnSummarySnapshotLocked(time.Now())
 	m.respConnMu.Unlock()
 	return latest
 }
@@ -695,7 +1189,7 @@ func (m *Manager) snapshotLiveResponseBindings() map[*WsConnection]uint64 {
 // ordinary capacity and are never continuation-budget victims. Caller holds
 // respConnMu; the returned latest map shares no mutable binding objects.
 func (m *Manager) continuationBudgetSnapshotLocked(now time.Time) continuationBudgetSnapshot {
-	latest := m.latestLiveResponseBindingsLocked(now)
+	latest := m.responseConnSummarySnapshotLocked(now)
 	snapshot := continuationBudgetSnapshot{
 		latest:     latest,
 		candidates: make([]continuationBudgetCandidate, 0, len(latest)),
@@ -773,6 +1267,21 @@ func (m *Manager) continuationSocketLimits() (globalLimit int, perAccountLimit i
 	return globalLimit, perAccountLimit
 }
 
+func (m *Manager) continuationBudgetMayBeExceeded(accountID int64) bool {
+	if m == nil {
+		return false
+	}
+	globalLimit, perAccountLimit := m.continuationSocketLimits()
+	m.respConnMu.Lock()
+	globalCount := len(m.respConnSummaries)
+	accountCount := m.respConnSummaryAccountCounts[accountID]
+	m.respConnMu.Unlock()
+	// Summaries include active sockets, while the budget only counts idle ones.
+	// They are therefore a conservative O(1) pressure test: false positives run
+	// the exact convergence scan, false negatives are impossible.
+	return globalCount > globalLimit || accountCount > perAccountLimit
+}
+
 // discardContinuationBudgetCandidate re-locks one cross-account snapshot
 // candidate using the normal pool-key -> account -> binding order. It never
 // waits for those locks while holding respConnMu, revalidates both liveness and
@@ -806,11 +1315,7 @@ func (m *Manager) discardContinuationBudgetCandidate(
 		removed = m.connections.CompareAndDelete(wc.PoolKey, wc)
 		if removed {
 			m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
-			for responseID, binding := range m.respConnBindings {
-				if binding.conn == wc {
-					delete(m.respConnBindings, responseID)
-				}
-			}
+			m.removeResponseConnBindingsForConnectionLocked(wc)
 		}
 	}
 	m.respConnMu.Unlock()
@@ -864,10 +1369,8 @@ func (m *Manager) removeResponseConnBindingsForConnections(connections map[*WsCo
 		return
 	}
 	m.respConnMu.Lock()
-	for responseID, binding := range m.respConnBindings {
-		if _, ok := connections[binding.conn]; ok {
-			delete(m.respConnBindings, responseID)
-		}
+	for wc := range connections {
+		m.removeResponseConnBindingsForConnectionLocked(wc)
 	}
 	m.respConnMu.Unlock()
 }
@@ -894,7 +1397,7 @@ func (m *Manager) discardOrdinaryIdleConnection(
 		return false, false
 	}
 	m.respConnMu.Lock()
-	latestBinding := m.latestLiveResponseBindingsLocked(time.Now())
+	latestBinding := m.responseConnSummarySnapshotLocked(time.Now())
 	if _, isBound := latestBinding[wc]; isBound {
 		m.respConnMu.Unlock()
 		return false, true
@@ -1121,6 +1624,17 @@ func (m *Manager) storeConnectionAndBeginReadLease(
 	wc *WsConnection,
 	sessionKey string,
 ) (*PendingRequest, error) {
+	return m.storeConnectionAndBeginReadLeaseChecked(ctx, account, accountLock, wc, sessionKey, nil)
+}
+
+func (m *Manager) storeConnectionAndBeginReadLeaseChecked(
+	ctx context.Context,
+	account *auth.Account,
+	accountLock *sync.Mutex,
+	wc *WsConnection,
+	sessionKey string,
+	promotionCheck func() bool,
+) (*PendingRequest, error) {
 	accountID := account.ID()
 	accountLock.Lock()
 	defer accountLock.Unlock()
@@ -1131,6 +1645,11 @@ func (m *Manager) storeConnectionAndBeginReadLease(
 		m.discardConnectionState(wc)
 		return nil, ctx.Err()
 	default:
+	}
+	if promotionCheck != nil && !promotionCheck() {
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, fmt.Errorf("promote websocket connection: rollout capacity or policy changed during dial")
 	}
 
 	// A dial reservation can outlive the health-tier limit that admitted it.
@@ -1535,6 +2054,9 @@ func canReuseConnection(wc *WsConnection) bool {
 	if !wc.IsConnected() || wc.IsExpired() || wc.IsOverAge() {
 		return false
 	}
+	if wc.safeReusable.Load() && wc.retireAfterLease.Load() {
+		return false
+	}
 	if wc.session == nil {
 		return false
 	}
@@ -1579,11 +2101,28 @@ func (m *Manager) probe(wc *WsConnection) bool {
 	return m.probeWithContext(context.Background(), wc)
 }
 
+// contextInterruptionError also recognizes a reached deadline during the tiny
+// window before context.Err publishes DeadlineExceeded. Timer and Done can
+// become ready together; callers must not misclassify that scheduling race as
+// proof that a shared physical socket is dead.
+func contextInterruptionError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 func (m *Manager) probeWithContext(ctx context.Context, wc *WsConnection) bool {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if ctx.Err() != nil {
+	if contextInterruptionError(ctx) != nil {
 		return false
 	}
 	m.mu.RLock()
@@ -1597,7 +2136,7 @@ func (m *Manager) probeWithContext(ctx context.Context, wc *WsConnection) bool {
 		go func() { result <- fn(wc) }()
 		select {
 		case alive := <-result:
-			if ctx.Err() != nil {
+			if contextInterruptionError(ctx) != nil {
 				return false
 			}
 			return alive
@@ -1606,16 +2145,18 @@ func (m *Manager) probeWithContext(ctx context.Context, wc *WsConnection) bool {
 		}
 	}
 	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
-		return ctx.Err() == nil
+		return contextInterruptionError(ctx) == nil
 	}
-	return probeConnectionWithContext(ctx, wc, defaultProbeTimeout)
+	alive := probeConnectionWithContext(ctx, wc, defaultProbeTimeout)
+	return alive && contextInterruptionError(ctx) == nil
 }
 
 func preferredContinuationContextError(ctx context.Context, stage string) error {
-	if ctx == nil || ctx.Err() == nil {
+	cause := contextInterruptionError(ctx)
+	if cause == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: response-bound websocket continuation canceled %s: %w", proxy.ErrWebsocketContinuationUnavailable, stage, ctx.Err())
+	return fmt.Errorf("%w: response-bound websocket continuation canceled %s: %w", proxy.ErrWebsocketContinuationUnavailable, stage, cause)
 }
 
 // createConnection 创建新 WebSocket 连接
@@ -1625,6 +2166,18 @@ func (m *Manager) createConnection(
 	wsURL string,
 	sessionKey string,
 	headers http.Header,
+	proxyOverride string,
+) (*WsConnection, error) {
+	return m.createConnectionWithIdentity(ctx, account, wsURL, sessionKey, headers, safeConnectionIdentity{}, proxyOverride)
+}
+
+func (m *Manager) createConnectionWithIdentity(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	sessionKey string,
+	headers http.Header,
+	identity safeConnectionIdentity,
 	proxyOverride string,
 ) (*WsConnection, error) {
 	// 浅拷贝共享 dialer，继承全部调优字段（NetDialContext/KeepAlive、读写缓冲、压缩等），
@@ -1711,6 +2264,15 @@ func (m *Manager) createConnection(
 	wc.httpResp = resp
 	wc.onDisconnected = m.getOnDisconnected()
 	wc.onReadFailure = m.discardConnectionOnReadFailure
+	if identity.valid() {
+		// Publish safe-pool identity before starting the sole reader. An
+		// immediate post-upgrade business frame must therefore trip the account
+		// fuse instead of passing through the ordinary idle-frame path.
+		wc.safeOwnerKey = identity.ownerKey
+		wc.handshakeFingerprint = identity.handshakeFingerprint
+		wc.safeReusable.Store(true)
+		m.safePoolAccounts.Store(account.ID(), struct{}{})
+	}
 	session.SetConnected(true)
 
 	// 控制帧处理器必须在唯一永久 reader 启动前安装。
@@ -1729,6 +2291,10 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 	if wc.account == nil || wc.session == nil {
 		return
 	}
+	if wc.safeReusable.Load() && (wc.retireAfterLease.Load() || m.IsSafePoolFused(wc.session.AccountID)) {
+		m.DiscardConnection(wc)
+		return
+	}
 	accountLock := m.accountLock(wc.session.AccountID)
 	accountLock.Lock()
 	if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc || !wc.IsConnected() {
@@ -1742,7 +2308,9 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 	accountLock.Unlock()
 	// The global continuation trim obtains account locks for arbitrary dynamic
 	// account IDs, so it must run only after releasing this account's lock.
-	m.enforceContinuationSocketBudgets()
+	if m.continuationBudgetMayBeExceeded(wc.session.AccountID) {
+		m.enforceContinuationSocketBudgets()
+	}
 }
 
 // RemoveConnection 移除连接
@@ -1792,6 +2360,11 @@ func (m *Manager) discardConnectionOnReadFailure(wc *WsConnection) {
 	if wc == nil {
 		return
 	}
+	if wc.safeReusable.Load() {
+		if isolationErr := wc.safePoolReadIsolationFailure(); isolationErr != nil && wc.session != nil {
+			m.TripSafePoolFuse(wc.session.AccountID, isolationErr)
+		}
+	}
 	wc.promotionMu.Lock()
 	m.DiscardConnection(wc)
 	wc.promotionMu.Unlock()
@@ -1819,7 +2392,6 @@ func (m *Manager) BindResponseConn(responseID string, wc *WsConnection, sessionK
 	if m == nil || responseID == "" || wc == nil {
 		return
 	}
-	now := time.Now()
 	m.respConnMu.Lock()
 	// Validate while holding the same mutex that protects publication. Discard
 	// removes the pool entry and closes the connection before taking this lock,
@@ -1836,67 +2408,83 @@ func (m *Manager) BindResponseConn(responseID string, wc *WsConnection, sessionK
 		m.respConnBindings = make(map[string]responseConnBinding, 64)
 	}
 	_, replacingExisting := m.respConnBindings[responseID]
-	if len(m.respConnBindings) >= responseConnBindingMaxEntries && !replacingExisting {
-		// High churn can fill the ID table with dead/non-current pointers before
-		// the periodic cleanup tick. Apply the full liveness predicate here.
-		m.latestLiveResponseBindingsLocked(now)
+	if len(m.respConnBindings) >= responseConnBindingMaxEntries && !replacingExisting && len(m.responseBindingOrder) == 0 {
+		// This is a defensive repair path for an index reconstructed from legacy
+		// or test state. Normal runtime publication always maintains the FIFO and
+		// never pays a full-table scan at the ceiling.
+		m.latestLiveResponseBindingsLocked(time.Now())
+		if len(m.respConnBindings) >= responseConnBindingMaxEntries {
+			m.rebuildResponseBindingOrderLocked()
+		}
 	}
 	if len(m.respConnBindings) >= responseConnBindingMaxEntries && !replacingExisting {
-		// Expired/dead IDs were pruned above. Keep the hard 4096-ID ceiling while
-		// preferring the newest continuations: replace the oldest monotonic Bind
-		// generation instead of relying on wall-clock expiry or map iteration.
-		oldestID := ""
-		var oldestGeneration uint64
-		for existingID, binding := range m.respConnBindings {
-			if oldestID == "" || binding.generation < oldestGeneration ||
-				(binding.generation == oldestGeneration && existingID < oldestID) {
-				oldestID = existingID
-				oldestGeneration = binding.generation
+		// Keep the bounded ID ceiling in amortized O(1) time by evicting the
+		// oldest monotonic Bind generation. Rebuild only if defensive state made
+		// the secondary order inconsistent; the final scan is unreachable for
+		// normal published bindings and preserves fail-safe boundedness.
+		evicted := m.evictOldestResponseConnBindingLocked()
+		if !evicted {
+			m.rebuildResponseBindingOrderLocked()
+			evicted = m.evictOldestResponseConnBindingLocked()
+		}
+		if !evicted {
+			oldestID := ""
+			var oldestGeneration uint64
+			for existingID, binding := range m.respConnBindings {
+				if oldestID == "" || binding.generation < oldestGeneration ||
+					(binding.generation == oldestGeneration && existingID < oldestID) {
+					oldestID = existingID
+					oldestGeneration = binding.generation
+				}
+			}
+			if oldestID != "" {
+				m.removeResponseConnBindingLocked(oldestID)
 			}
 		}
-		if oldestID != "" {
-			delete(m.respConnBindings, oldestID)
-		}
 	}
+	// Capture publication time under respConnMu, after any bounded-table repair.
+	// This keeps expiresAt monotonic with generation even when concurrent binders
+	// were scheduled in the opposite order before acquiring the lock.
+	now := time.Now()
 	m.responseBindingGeneration++
-	m.respConnBindings[responseID] = responseConnBinding{
-		conn:       wc,
-		sessionKey: sessionKey,
-		accountID:  accountID,
-		apiKey:     apiKey,
-		expiresAt:  now.Add(responseConnBindingTTL),
-		generation: m.responseBindingGeneration,
+	binding := responseConnBinding{
+		conn:                 wc,
+		sessionKey:           sessionKey,
+		accountID:            accountID,
+		apiKey:               apiKey,
+		safeOwnerKey:         wc.safeOwnerKey,
+		handshakeFingerprint: wc.handshakeFingerprint,
+		expiresAt:            now.Add(responseConnBindingTTL),
+		generation:           m.responseBindingGeneration,
 	}
+	m.publishResponseConnBindingLocked(responseID, binding)
 	m.respConnMu.Unlock()
 }
 
-// lookupResponseConn 返回 response_id 绑定的连接及其池内 sessionKey。
-// 绑定过期、账号/API Key 不匹配、连接已断开/被重建（池内同 key 已非同一指针）
-// 时返回 nil。
-func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey string) (*WsConnection, string) {
+func (m *Manager) lookupResponseBinding(responseID string, accountID int64, apiKey string) (responseConnBinding, bool) {
 	responseID = strings.TrimSpace(responseID)
 	if m == nil || responseID == "" {
-		return nil, ""
+		return responseConnBinding{}, false
 	}
-	now := time.Now()
 	m.respConnMu.Lock()
+	now := time.Now()
 	binding, ok := m.respConnBindings[responseID]
 	if ok && (now.After(binding.expiresAt) || binding.accountID != accountID || binding.apiKey != apiKey) {
 		if now.After(binding.expiresAt) {
-			delete(m.respConnBindings, responseID)
+			m.removeResponseConnBindingLocked(responseID)
 		}
 		ok = false
 	}
 	m.respConnMu.Unlock()
 	if !ok || binding.conn == nil {
-		return nil, ""
+		return responseConnBinding{}, false
 	}
 	// 指针级校验：连接必须仍在池中且是同一条（防止复用已重建槽位的陈旧绑定）。
 	if v, exists := m.connections.Load(binding.conn.PoolKey); !exists || v != binding.conn {
-		return nil, ""
+		return responseConnBinding{}, false
 	}
 	if !binding.conn.IsConnected() {
-		return nil, ""
+		return responseConnBinding{}, false
 	}
 	// Idle/age expiry prevents admitting a new turn, but an already in-flight
 	// bound connection is still authoritative for detecting continuation
@@ -1904,6 +2492,17 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 	// of misclassifying it as a cache miss and crossing to another WS slot.
 	if (binding.conn.IsExpired() || binding.conn.IsOverAge()) &&
 		(binding.conn.session == nil || binding.conn.session.PendingCount() == 0) {
+		return responseConnBinding{}, false
+	}
+	return binding, true
+}
+
+// lookupResponseConn returns the connection and its pool session key for
+// compatibility with existing callers. Safe continuation admission uses the
+// full immutable binding snapshot so owner/fingerprint fields are enforced.
+func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey string) (*WsConnection, string) {
+	binding, ok := m.lookupResponseBinding(responseID, accountID, apiKey)
+	if !ok {
 		return nil, ""
 	}
 	return binding.conn, binding.sessionKey
@@ -1918,27 +2517,93 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 // 换到普通槽位，因为 previous_response_id 的上游上下文只存在于原 WS 连接。
 // 同理，绑定连接因本地账号容量无法激活时返回 ErrWebsocketLocalCapacity，交由上层
 // 作为本地争用处理，而不是伪装成 cache miss 后跨连接继续。
-func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string, error) {
+func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID string, accountID int64, apiKey string, identities ...safeConnectionIdentity) (*WsConnection, *PendingRequest, string, error) {
 	opCtx, finishOperation, err := m.beginOperation(ctx)
 	if err != nil {
 		return nil, nil, "", err
 	}
 	defer finishOperation()
 
-	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
-	if wc == nil {
-		return nil, nil, "", fmt.Errorf("%w: response binding is missing, expired, mismatched, or disconnected", proxy.ErrWebsocketContinuationUnavailable)
+	expectedIdentity := safeConnectionIdentity{}
+	requireSafeIdentity := len(identities) != 0
+	if len(identities) != 0 {
+		expectedIdentity = identities[0]
 	}
-	accountLock := m.accountLock(accountID)
-	lock := m.keyLock(wc.PoolKey)
-	m.lockPoolKey(wc.PoolKey, lock)
+	var wc *WsConnection
+	var sessionKey string
+	var binding responseConnBinding
+	var lock *sync.Mutex
+	for {
+		var bindingOK bool
+		binding, bindingOK = m.lookupResponseBinding(responseID, accountID, apiKey)
+		if !bindingOK {
+			return nil, nil, "", fmt.Errorf("%w: response binding is missing, expired, mismatched, or disconnected", proxy.ErrWebsocketContinuationUnavailable)
+		}
+		wc, sessionKey = binding.conn, binding.sessionKey
+		if requireSafeIdentity && !wc.safeReusable.Load() {
+			return nil, nil, "", fmt.Errorf("%w: response binding belongs to a legacy or isolated websocket", proxy.ErrWebsocketContinuationUnavailable)
+		}
+		if requireSafeIdentity && (binding.safeOwnerKey != expectedIdentity.ownerKey || binding.handshakeFingerprint != expectedIdentity.handshakeFingerprint) {
+			return nil, nil, "", fmt.Errorf("%w: response binding owner or handshake identity mismatch", proxy.ErrWebsocketContinuationUnavailable)
+		}
+		if wc.safeReusable.Load() {
+			if resolveStatelessPoolPolicy(wc.account, m).mode != statelessPoolSafe {
+				m.RetireSafePoolAccount(accountID)
+				return nil, nil, "", fmt.Errorf("%w: safe websocket reuse is disabled by current rollout policy", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			if !expectedIdentity.matches(wc) {
+				return nil, nil, "", fmt.Errorf("%w: safe websocket continuation owner or handshake identity mismatch", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			if m.IsSafePoolFused(accountID) {
+				return nil, nil, "", fmt.Errorf("%w: safe websocket pool is fused for account", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			// Binding publication happens immediately after the terminal frame is
+			// delivered, while the response defer may need another scheduler tick
+			// to remove its Session pending marker. Wait only for that explicitly
+			// marked transition; a genuinely active request has no marker and still
+			// falls through to the normal immediate busy result.
+			if waited, waitErr := waitForSafePoolTerminalRelease(opCtx, wc); waited {
+				if waitErr != nil {
+					return nil, nil, "", waitErr
+				}
+				continue
+			}
+			if wc.reuseFenceActive() {
+				if err := waitForSafePoolReuseFence(opCtx, wc); err != nil {
+					return nil, nil, "", err
+				}
+				continue
+			}
+		}
+
+		lock = m.keyLock(wc.PoolKey)
+		m.lockPoolKey(wc.PoolKey, lock)
+		if wc.safeReusable.Load() && wc.reuseFenceActive() {
+			lock.Unlock()
+			if err := waitForSafePoolReuseFence(opCtx, wc); err != nil {
+				return nil, nil, "", err
+			}
+			continue
+		}
+		break
+	}
 	defer lock.Unlock()
+
+	accountLock := m.accountLock(accountID)
 	if err := preferredContinuationContextError(opCtx, "while waiting for the connection lock"); err != nil {
 		return nil, nil, "", err
 	}
 	// pool-key 加锁后复验：期间可能被其他请求占用或销毁。
 	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc {
 		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection was replaced", proxy.ErrWebsocketContinuationUnavailable)
+	}
+	currentBinding, bindingOK := m.lookupResponseBinding(responseID, accountID, apiKey)
+	if !bindingOK || currentBinding.conn != wc || currentBinding.generation != binding.generation {
+		return nil, nil, "", fmt.Errorf("%w: response binding changed while reserving its websocket", proxy.ErrWebsocketContinuationUnavailable)
+	}
+	if wc.safeReusable.Load() && (resolveStatelessPoolPolicy(wc.account, m).mode != statelessPoolSafe || !expectedIdentity.matches(wc) || m.IsSafePoolFused(accountID)) {
+		m.RetireSafePoolAccount(accountID)
+		return nil, nil, "", fmt.Errorf("%w: safe websocket continuation identity changed or reuse was fused", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	if !canReuseConnection(wc) {
 		if wc.IsConnected() && wc.session != nil && wc.session.IsConnected() && wc.session.PendingCount() > 0 {
@@ -1950,8 +2615,8 @@ func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID str
 		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection is no longer reusable", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	if !m.probeWithContext(opCtx, wc) {
-		if opCtx.Err() != nil {
-			return nil, nil, "", fmt.Errorf("%w: response-bound websocket liveness probe was canceled: %w", proxy.ErrWebsocketContinuationUnavailable, opCtx.Err())
+		if err := preferredContinuationContextError(opCtx, "during the liveness probe"); err != nil {
+			return nil, nil, "", err
 		}
 		m.DiscardConnection(wc)
 		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection failed liveness probe", proxy.ErrWebsocketContinuationUnavailable)
@@ -1974,6 +2639,13 @@ func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID str
 			return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection became busy during probe", proxy.ErrWebsocketSessionBusy)
 		}
 		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection became unusable during probe", proxy.ErrWebsocketContinuationUnavailable)
+	}
+	if wc.safeReusable.Load() && (resolveStatelessPoolPolicy(wc.account, m).mode != statelessPoolSafe || !expectedIdentity.matches(wc) || wc.reuseFenceActive() || m.IsSafePoolFused(accountID)) {
+		// accountLock is held here, so do not call the account-wide retire
+		// helper recursively. Mark this exact socket non-reusable; the earlier
+		// policy gate handles normal hot-disable cleanup for all idle sockets.
+		wc.retireAfterLease.Store(true)
+		return nil, nil, "", fmt.Errorf("%w: safe websocket continuation failed final owner, fence, or fuse validation", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	if !m.ensureConnectionActivationCapacity(accountID, accountConnectionLimit(wc.account), wc) {
 		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection cannot be activated at current account capacity", proxy.ErrWebsocketLocalCapacity)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -76,6 +77,8 @@ func (h *Handler) buildRuntimeStatus(ctx context.Context, r *http.Request) runti
 		addCheck("accounts", runtimeStatusOK, "account_pool_ready", "账号池存在可调度账号")
 	}
 
+	websocket := runtimeWebsocketStatus()
+
 	imageStorage := h.runtimeImageStorageStatus()
 	addCheck("image_storage", imageStorage.Status, statusCode(imageStorage.Status, "image_storage"), statusMessage(imageStorage.Status, "图片存储配置正常", imageStorage.Error))
 
@@ -95,9 +98,44 @@ func (h *Handler) buildRuntimeStatus(ctx context.Context, r *http.Request) runti
 		UsageLog:     usageLog,
 		Probes:       probes,
 		Accounts:     accounts,
+		Websocket:    websocket,
 		ImageStorage: imageStorage,
 		AdminAuth:    adminAuth,
 		Checks:       checks,
+	}
+}
+
+func runtimeWebsocketStatus() runtimeWebsocketResponse {
+	snapshot := wsrelay.GetManager().SafePoolRuntimeSnapshot()
+	metrics := snapshot.Metrics
+	return runtimeWebsocketResponse{
+		GlobalOneShot:              snapshot.GlobalOneShot,
+		SafePoolScope:              snapshot.Scope,
+		ConfiguredMaxSlots:         snapshot.ConfiguredMaxSlots,
+		WaitMillis:                 snapshot.WaitMillis,
+		ReuseFenceMillis:           snapshot.ReuseFenceMillis,
+		Connections:                snapshot.Connections,
+		ActiveConnections:          snapshot.ActiveConnections,
+		IdleConnections:            snapshot.IdleConnections,
+		BoundIdleConnections:       snapshot.BoundIdleConnections,
+		RetiringConnections:        snapshot.RetiringConnections,
+		PendingDials:               snapshot.PendingDials,
+		ResponseBindings:           snapshot.ResponseBindings,
+		FusedAccounts:              snapshot.FusedAccounts,
+		CompatibilityFusedAccounts: snapshot.CompatibilityFusedAccounts,
+		TrackedAccounts:            snapshot.TrackedAccounts,
+		DialAttempts:               metrics.DialAttempts,
+		DialSuccess:                metrics.DialSuccess,
+		DialFailures:               metrics.DialFailures,
+		ReuseHits:                  metrics.ReuseHits,
+		Saturations:                metrics.Saturations,
+		FuseTrips:                  metrics.FuseTrips,
+		CompatibilityDrops:         metrics.CompatibilityDrops,
+		CompatibilityFallbacks:     metrics.CompatibilityFallbacks,
+		OwnerEligible:              metrics.OwnerEligible,
+		OwnerMissing:               metrics.OwnerMissing,
+		OwnerRejected:              metrics.OwnerRejected,
+		RequestIneligible:          metrics.RequestIneligible,
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 )
 
@@ -796,7 +797,7 @@ func TestReadPumpPropagatesPrematureNormalClose(t *testing.T) {
 	if err == nil {
 		t.Fatal("premature close 1000 was treated as a successful stream completion")
 	}
-	if !strings.Contains(err.Error(), "websocket read error") ||
+	if !errors.Is(err, proxy.ErrWebsocketReadUncertain) ||
 		!strings.Contains(err.Error(), "1000") ||
 		!strings.Contains(err.Error(), "premature normal close") {
 		t.Fatalf("normal close error = %v, want wrapped code and reason", err)
@@ -999,7 +1000,7 @@ func TestReadPumpPropagatesActiveClose(t *testing.T) {
 		if err == nil {
 			t.Fatal("active close 1011 did not reach the response consumer")
 		}
-		if !strings.Contains(err.Error(), "websocket read error") || !strings.Contains(err.Error(), "1011") {
+		if !errors.Is(err, proxy.ErrWebsocketReadUncertain) || !strings.Contains(err.Error(), "1011") {
 			t.Fatalf("active close error = %v, want existing wrapped websocket close semantics", err)
 		}
 	case <-time.After(readPumpTestTimeout):
@@ -1052,7 +1053,7 @@ func TestReadPumpEnforcesQueuedPayloadLimit(t *testing.T) {
 	}
 }
 
-func TestReadPumpMapsReadLimitToClose1009(t *testing.T) {
+func TestReadStreamMapsLocalReadLimitToNoReplayClose1009(t *testing.T) {
 	wc := &WsConnection{}
 	wc.state.Store(int32(StateConnected))
 	if err := wc.BeginReadLease("oversized-response"); err != nil {
@@ -1064,9 +1065,13 @@ func TestReadPumpMapsReadLimitToClose1009(t *testing.T) {
 	state.mu.Unlock()
 
 	wc.finishReadPump(websocket.ErrReadLimit, true)
-	_, _, err := wc.ReadMessage()
+	response := &WsResponse{conn: wc}
+	err := response.ReadStream(func([]byte) bool { return true })
 	if !errors.Is(err, websocket.ErrReadLimit) {
 		t.Fatalf("read error = %v, want preserved ErrReadLimit", err)
+	}
+	if !errors.Is(err, proxy.ErrWebsocketReadUncertain) {
+		t.Fatalf("read error = %v, want no-replay ErrWebsocketReadUncertain", err)
 	}
 	var closeErr *websocket.CloseError
 	if !errors.As(err, &closeErr) {
@@ -1076,7 +1081,7 @@ func TestReadPumpMapsReadLimitToClose1009(t *testing.T) {
 		t.Fatalf("close code = %d, want %d", closeErr.Code, websocket.CloseMessageTooBig)
 	}
 	if shouldRetryWebsocketSendError(err) {
-		t.Fatal("mapped read-limit error must reach HTTP fallback without WebSocket reconnects")
+		t.Fatal("committed local read-limit error must not rebuild WebSocket")
 	}
 }
 

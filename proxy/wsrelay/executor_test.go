@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,6 +67,84 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 	if got := headers.Get("Session_id"); got != "session-123" {
 		t.Fatalf("Session_id = %q", got)
+	}
+}
+
+func TestPrepareSafePoolFrameMetadataMovesTurnScopedValuesIntoFrame(t *testing.T) {
+	original := []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"session-A","thread_id":"thread-A","keep":"yes"}}`)
+	headers := http.Header{
+		"X-Codex-Turn-State":    {"turn-state-A"},
+		"X-Codex-Turn-Metadata": {`{"session_id":"session-A","thread_id":"thread-A","turn_id":"turn-A"}`},
+		"Traceparent":           {"00-trace-parent-01"},
+		"Tracestate":            {"vendor=value"},
+	}
+	prepared, ok := prepareSafePoolFrameMetadata(original, headers)
+	if !ok {
+		t.Fatal("consistent official metadata was rejected")
+	}
+	for path, want := range map[string]string{
+		"client_metadata.session_id":                    "session-A",
+		"client_metadata.thread_id":                     "thread-A",
+		"client_metadata.keep":                          "yes",
+		"client_metadata.x-codex-turn-state":            "turn-state-A",
+		"client_metadata.x-codex-turn-metadata":         `{"session_id":"session-A","thread_id":"thread-A","turn_id":"turn-A"}`,
+		"client_metadata.ws_request_header_traceparent": "00-trace-parent-01",
+		"client_metadata.ws_request_header_tracestate":  "vendor=value",
+	} {
+		if got := gjson.GetBytes(prepared, path).String(); got != want {
+			t.Fatalf("%s = %q, want %q; body=%s", path, got, want, prepared)
+		}
+	}
+	if gjson.GetBytes(original, "client_metadata.x-codex-turn-state").Exists() {
+		t.Fatal("prepareSafePoolFrameMetadata mutated the caller's request body")
+	}
+}
+
+func TestPrepareSafePoolFrameMetadataRejectsCanonicalIdentityConflicts(t *testing.T) {
+	base := []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"session-A","thread_id":"thread-A"}}`)
+	for _, tt := range []struct {
+		name    string
+		body    []byte
+		headers http.Header
+	}{
+		{
+			name: "nested thread conflicts with flat owner",
+			body: []byte(`{"client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"session_id\":\"session-A\",\"thread_id\":\"thread-B\"}"}}`),
+		},
+		{
+			name:    "compatibility header conflicts with canonical body",
+			body:    []byte(`{"client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"session_id\":\"session-A\",\"thread_id\":\"thread-A\",\"turn_id\":\"turn-A\"}"}}`),
+			headers: http.Header{"X-Codex-Turn-Metadata": {`{"session_id":"session-A","thread_id":"thread-A","turn_id":"turn-B"}`}},
+		},
+		{
+			name:    "header thread conflicts with flat owner",
+			body:    base,
+			headers: http.Header{"X-Codex-Turn-Metadata": {`{"session_id":"session-A","thread_id":"thread-B"}`}},
+		},
+		{
+			name:    "turn state header conflicts with canonical frame value",
+			body:    []byte(`{"client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-state":"state-A"}}`),
+			headers: http.Header{"X-Codex-Turn-State": {"state-B"}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, ok := prepareSafePoolFrameMetadata(tt.body, tt.headers); ok {
+				t.Fatal("conflicting metadata was admitted to safe pool")
+			}
+		})
+	}
+}
+
+func TestPrepareSafePoolFrameMetadataAcceptsSemanticProjectionAndMemoryShape(t *testing.T) {
+	body := []byte(`{"client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"thread_id\":\"thread-A\",\"session_id\":\"session-A\",\"turn_id\":\"turn-A\"}"}}`)
+	headers := http.Header{"X-Codex-Turn-Metadata": {`{ "turn_id":"turn-A", "session_id":"session-A", "thread_id":"thread-A" }`}}
+	if _, ok := prepareSafePoolFrameMetadata(body, headers); !ok {
+		t.Fatal("semantically equal compatibility projection was rejected")
+	}
+
+	memoryBody := []byte(`{"client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"request_kind\":\"memory\"}"}}`)
+	if _, ok := prepareSafePoolFrameMetadata(memoryBody, nil); !ok {
+		t.Fatal("memory metadata that legally omits session/thread was rejected")
 	}
 }
 
@@ -210,6 +289,258 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	}
 	if !gjson.GetBytes(got, "stream").Bool() {
 		t.Fatalf("stream should be true; body=%s", got)
+	}
+}
+
+func TestOfficialPromptCacheRequestEntersSafeOwnerPool(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
+	t.Setenv(safePoolFenceMillisEnv, "10")
+	var handshakes atomic.Int32
+	var turns atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("Session-Id") != "official-session" || req.Header.Get("Thread-Id") != "official-thread" {
+			t.Errorf("canonical owner headers missing: %v", req.Header)
+		}
+		if req.Header.Get("Session_id") != "" || req.Header.Get("Conversation_id") != "" {
+			t.Errorf("legacy prompt-cache session headers leaked into safe handshake: %v", req.Header)
+		}
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			return
+		}
+		handshakes.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			turn := turns.Add(1)
+			responseID := fmt.Sprintf("resp_official_%d", turn)
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q}}`, responseID)))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed"}}`, responseID)))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4601, AccountID: "acct-official", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	body := []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","client_metadata":{"session_id":"official-session","thread_id":"official-thread","turn_id":"turn-1"},"input":"hello"}`)
+	for turn := 0; turn < 2; turn++ {
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "official-cache", "", "key-A", nil, http.Header{}, "")
+		if err != nil {
+			t.Fatalf("turn %d execute: %v", turn+1, err)
+		}
+		if !response.safePool || response.oneShot || !response.conn.safeReusable.Load() {
+			t.Fatalf("official request routing: safe=%v oneshot=%v reusable=%v", response.safePool, response.oneShot, response.conn.safeReusable.Load())
+		}
+		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
+			t.Fatalf("turn %d read: %v", turn+1, err)
+		}
+		if err := response.Close(); err != nil {
+			t.Fatalf("turn %d close: %v", turn+1, err)
+		}
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("official safe turns used %d physical handshakes, want 1", got)
+	}
+	if got := manager.SafePoolMetricsSnapshot().ReuseHits; got != 1 {
+		t.Fatalf("safe reuse hits = %d, want 1", got)
+	}
+}
+
+func TestOfficialPromptCacheRequestHonorsHardOneShotKillSwitch(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
+	t.Setenv(safePoolScopeEnv, "all")
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			return
+		}
+		turn := handshakes.Add(1)
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		responseID := fmt.Sprintf("resp_oneshot_%d", turn)
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q}}`, responseID)))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed"}}`, responseID)))
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4602, AccountID: "acct-oneshot", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	body := []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","client_metadata":{"session_id":"official-session","thread_id":"official-thread"},"input":"hello"}`)
+	for turn := 0; turn < 2; turn++ {
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "official-cache", "", "key-A", nil, http.Header{}, "")
+		if err != nil {
+			t.Fatalf("turn %d execute: %v", turn+1, err)
+		}
+		if response.safePool || !response.oneShot {
+			t.Fatalf("hard-kill routing: safe=%v oneshot=%v", response.safePool, response.oneShot)
+		}
+		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
+			t.Fatalf("turn %d read: %v", turn+1, err)
+		}
+		if err := response.Close(); err != nil {
+			t.Fatalf("turn %d close: %v", turn+1, err)
+		}
+		if manager.ConnectionCount() != 0 {
+			t.Fatalf("turn %d left a one-shot socket pooled", turn+1)
+		}
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("hard kill used %d physical handshakes, want 2", got)
+	}
+}
+
+func TestOfficialPromptCacheUnenrolledAccountsKeepBaselineSessionReuse(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		scope string
+	}{
+		{name: "tagged but account not enrolled", scope: "tagged"},
+		{name: "safe pool disabled", scope: "disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+			t.Setenv(safePoolScopeEnv, tc.scope)
+			var handshakes atomic.Int32
+			var turns atomic.Int32
+			upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				conn, err := upgrader.Upgrade(w, req, nil)
+				if err != nil {
+					return
+				}
+				handshakes.Add(1)
+				defer conn.Close()
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					turn := turns.Add(1)
+					responseID := fmt.Sprintf("resp_baseline_%d", turn)
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.created","response":{"id":%q}}`, responseID)))
+					_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed"}}`, responseID)))
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			manager := NewManager()
+			t.Cleanup(manager.Stop)
+			exec := NewExecutorWithManager(manager)
+			exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+			account := &auth.Account{DBID: 4610, AccountID: "acct-baseline", AccessToken: "token", DynamicConcurrencyLimit: 8}
+			body := []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","client_metadata":{"session_id":"official-session","thread_id":"official-thread"},"input":"hello"}`)
+			for turn := 0; turn < 2; turn++ {
+				response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "official-cache", "", "key-A", nil, http.Header{}, "")
+				if err != nil {
+					t.Fatalf("turn %d execute: %v", turn+1, err)
+				}
+				if response.safePool || response.oneShot || response.conn.safeReusable.Load() {
+					t.Fatalf("unenrolled routing safe=%v oneshot=%v reusable=%v, want unchanged explicit-session path", response.safePool, response.oneShot, response.conn.safeReusable.Load())
+				}
+				if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
+					t.Fatalf("turn %d read: %v", turn+1, err)
+				}
+				if err := response.Close(); err != nil {
+					t.Fatalf("turn %d close: %v", turn+1, err)
+				}
+			}
+			if got := handshakes.Load(); got != 1 {
+				t.Fatalf("unenrolled baseline used %d handshakes, want 1", got)
+			}
+		})
+	}
+}
+
+func TestOfficialPromptCacheFuseFallsBackBeforeDialInsteadOfHandshakeStorm(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		handshakes.Add(1)
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4603, AccountID: "acct-fused", AccessToken: "token", DynamicConcurrencyLimit: 100}
+	manager.TripSafePoolCompatibilityFuse(account.ID(), errors.New("unknown legal control frame"))
+	body := []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","client_metadata":{"session_id":"official-session","thread_id":"official-thread"},"input":"hello"}`)
+	for request := 0; request < 5; request++ {
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "official-cache", "", "key-A", nil, http.Header{}, "")
+		if response != nil || !errors.Is(err, proxy.ErrWebsocketSafePoolFallback) {
+			t.Fatalf("request %d response=%v err=%v, want pre-write same-account HTTP fallback", request+1, response, err)
+		}
+	}
+	if got := handshakes.Load(); got != 0 {
+		t.Fatalf("process-fused account opened %d websocket handshakes, want 0", got)
+	}
+
+	continuation := []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","previous_response_id":"resp_fused","client_metadata":{"session_id":"official-session","thread_id":"official-thread"},"input":"continue"}`)
+	response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, continuation, "official-cache", "", "key-A", nil, http.Header{}, "")
+	if response != nil || !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("fused continuation response=%v err=%v, want fail-closed continuation", response, err)
+	}
+	if got := handshakes.Load(); got != 0 {
+		t.Fatalf("fused continuation opened %d websocket handshakes, want 0", got)
+	}
+}
+
+func TestSafeScopeUnprovableOwnerFallsBackToHTTPBeforeDial(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
+	var handshakes atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		handshakes.Add(1)
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4604, AccountID: "acct-owner-missing", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "missing owner", body: []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","input":"hello"}`)},
+		{name: "conflicting owner", body: []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"session_id\":\"session-A\",\"thread_id\":\"thread-B\"}"},"input":"hello"}`)},
+		{name: "audio ineligible", body: []byte(`{"model":"gpt-5.6","modalities":["text","audio"],"client_metadata":{"session_id":"session-A","thread_id":"thread-A"},"input":"hello"}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, tc.body, "official-cache", "", "key-A", nil, http.Header{}, "")
+			if response != nil || !errors.Is(err, proxy.ErrWebsocketSafePoolFallback) {
+				t.Fatalf("response=%v err=%v, want pre-write same-account HTTP fallback", response, err)
+			}
+		})
+	}
+	if got := handshakes.Load(); got != 0 {
+		t.Fatalf("owner-missing request opened %d websocket handshakes, want 0", got)
 	}
 }
 
@@ -543,8 +874,8 @@ func TestExecuteRequestViaWebsocketPreviousResponseSendFailureDoesNotResend(t *t
 	if response != nil {
 		t.Fatal("failed response-bound send unexpectedly returned a response")
 	}
-	if !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
-		t.Fatalf("response-bound send error = %v, want ErrWebsocketContinuationUnavailable", err)
+	if !errors.Is(err, proxy.ErrWebsocketWriteUncertain) {
+		t.Fatalf("response-bound send error = %v, want ErrWebsocketWriteUncertain", err)
 	}
 	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
 		t.Fatalf("response-bound send failure took %v, suggesting a retry or ordinary dial was attempted", elapsed)
@@ -673,17 +1004,50 @@ func TestShouldRetryWebsocketSendError(t *testing.T) {
 		t.Fatal("close 1009 must return to the handler for HTTP fallback without rebuilding WebSocket connections")
 	}
 
-	if !shouldRetryWebsocketSendError(errors.New("temporary write failure")) {
-		t.Fatal("ordinary transport write failures should retain the bounded reconnect retry")
+	if shouldRetryWebsocketSendError(errors.New("temporary write failure")) {
+		t.Fatal("unclassified write failures must not replay a possibly committed turn")
 	}
-	if !shouldRetryWebsocketSendError(fmt.Errorf("send interrupted: %w", &websocket.CloseError{
+	if shouldRetryWebsocketSendError(fmt.Errorf("send interrupted: %w", &websocket.CloseError{
 		Code: websocket.CloseInternalServerErr,
 		Text: "temporary upstream failure",
 	})) {
-		t.Fatal("retryable peer closes other than 1009 should retain the bounded reconnect retry")
+		t.Fatal("peer close after a write attempt must not replay the turn")
+	}
+	if !shouldRetryWebsocketSendError(fmt.Errorf("reserve: %w", errWebsocketWriteNotStarted)) {
+		t.Fatal("a proven pre-write failure should retain bounded reconnect retry")
 	}
 	if shouldRetryWebsocketSendError(nil) {
 		t.Fatal("nil is not a retryable send error")
+	}
+}
+
+func TestWriteMessagePostAttemptFailureIsUncertainAndNeverRetried(t *testing.T) {
+	session := NewSession(42, nil)
+	session.SetConnected(true)
+	wc := &WsConnection{session: session}
+	wc.SetState(StateConnected)
+	if err := wc.BeginReadLease("request-1"); err != nil {
+		t.Fatalf("begin lease: %v", err)
+	}
+	writes := 0
+	wc.writeMessageFunc = func(messageType int, data []byte) error {
+		writes++
+		if messageType != websocket.TextMessage || string(data) != `{"type":"response.create"}` {
+			t.Fatalf("unexpected attempted frame type=%d data=%s", messageType, data)
+		}
+		// Simulate Gorilla returning an error after the peer/kernel may already
+		// have accepted the complete business frame.
+		return errors.New("post-write socket failure")
+	}
+	err := wc.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create"}`))
+	if !errors.Is(err, proxy.ErrWebsocketWriteUncertain) {
+		t.Fatalf("write error = %v, want ErrWebsocketWriteUncertain", err)
+	}
+	if shouldRetryWebsocketSendError(err) {
+		t.Fatal("uncertain committed write was classified as replayable")
+	}
+	if writes != 1 {
+		t.Fatalf("business write attempts = %d, want exactly 1", writes)
 	}
 }
 

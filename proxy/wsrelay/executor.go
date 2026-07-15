@@ -16,10 +16,13 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var errWebsocketWriteNotStarted = errors.New("websocket request write did not start")
 
 // ==================== WebSocket 执行器常量 ====================
 
@@ -78,12 +81,105 @@ func resolveHandshakeSessionID(sessionID, poolRouteKey string, wsBody []byte) st
 	return sessionID
 }
 
+// prepareSafePoolFrameMetadata mirrors the official Codex WebSocket client:
+// values that may change between turns travel in each response.create frame,
+// not in the immutable HTTP-upgrade headers of a reused socket.
+func prepareSafePoolFrameMetadata(body []byte, ginHeaders http.Header) ([]byte, bool) {
+	prepared := bytes.Clone(body)
+	flatSessionID := strings.TrimSpace(gjson.GetBytes(prepared, "client_metadata.session_id").String())
+	flatThreadID := strings.TrimSpace(gjson.GetBytes(prepared, "client_metadata.thread_id").String())
+
+	// The nested turn metadata is canonical in the official client. Direct
+	// headers are only compatibility projections and must never overwrite a
+	// conflicting body identity. Semantic comparison permits harmless JSON key
+	// ordering/whitespace differences while rejecting a different snapshot.
+	bodyTurnMetadata := gjson.GetBytes(prepared, "client_metadata.x-codex-turn-metadata")
+	headerTurnMetadata := strings.TrimSpace(ginHeaders.Get("X-Codex-Turn-Metadata"))
+	var bodyCanonical []byte
+	if bodyTurnMetadata.Exists() {
+		if bodyTurnMetadata.Type != gjson.String {
+			return body, false
+		}
+		var ok bool
+		bodyCanonical, ok = canonicalSafePoolTurnMetadata(bodyTurnMetadata.String(), flatSessionID, flatThreadID)
+		if !ok {
+			return body, false
+		}
+	}
+	if headerTurnMetadata != "" {
+		headerCanonical, ok := canonicalSafePoolTurnMetadata(headerTurnMetadata, flatSessionID, flatThreadID)
+		if !ok {
+			return body, false
+		}
+		if bodyTurnMetadata.Exists() {
+			if !bytes.Equal(bodyCanonical, headerCanonical) {
+				return body, false
+			}
+		} else {
+			var err error
+			prepared, err = sjson.SetBytes(prepared, "client_metadata.x-codex-turn-metadata", headerTurnMetadata)
+			if err != nil {
+				return body, false
+			}
+		}
+	}
+
+	for _, mapping := range []struct {
+		header string
+		key    string
+	}{
+		{header: "X-Codex-Turn-State", key: "x-codex-turn-state"},
+		{header: "Traceparent", key: "ws_request_header_traceparent"},
+		{header: "Tracestate", key: "ws_request_header_tracestate"},
+	} {
+		if value := strings.TrimSpace(ginHeaders.Get(mapping.header)); value != "" {
+			path := "client_metadata." + mapping.key
+			if existing := gjson.GetBytes(prepared, path); existing.Exists() && strings.TrimSpace(existing.String()) != value {
+				return body, false
+			}
+			var err error
+			prepared, err = sjson.SetBytes(prepared, path, value)
+			if err != nil {
+				return body, false
+			}
+		}
+	}
+	return prepared, true
+}
+
+func canonicalSafePoolTurnMetadata(raw, flatSessionID, flatThreadID string) ([]byte, bool) {
+	var decoded any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &decoded); err != nil {
+		return nil, false
+	}
+	object, ok := decoded.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	for key, expected := range map[string]string{
+		"session_id": flatSessionID,
+		"thread_id":  flatThreadID,
+	} {
+		value, exists := object[key]
+		if !exists {
+			continue
+		}
+		identity, ok := value.(string)
+		if !ok || strings.TrimSpace(identity) == "" || identity != expected {
+			return nil, false
+		}
+	}
+	canonical, err := json.Marshal(decoded)
+	return canonical, err == nil
+}
+
 // ==================== WebSocket 执行器 ====================
 
 // Executor WebSocket 执行器
 type Executor struct {
-	manager *Manager
-	mu      sync.RWMutex
+	manager           *Manager
+	mu                sync.RWMutex
+	wsURLOverrideTest string
 }
 
 // NewExecutor 创建 WebSocket 执行器
@@ -131,10 +227,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	headerSessionID := resolveHandshakeSessionID(sessionID, poolRouteKey, wsBody)
 
 	// 构建 WebSocket URL
-	httpURL := proxy.CodexBaseURL + CodexWsEndpoint
-	wsURL, err := buildWebsocketURL(httpURL)
-	if err != nil {
-		return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
+	wsURL := strings.TrimSpace(e.wsURLOverrideTest)
+	if wsURL == "" {
+		httpURL := proxy.CodexBaseURL + CodexWsEndpoint
+		var err error
+		wsURL, err = buildWebsocketURL(httpURL)
+		if err != nil {
+			return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
+		}
 	}
 
 	// Resin 反向代理：改写 WS URL 为 Resin 反代地址
@@ -148,6 +248,38 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// Resin 反代：注入账号身份头
 	if proxy.IsResinEnabled() {
 		headers.Set("X-Resin-Account", proxy.ResinAccountID(account))
+	}
+
+	// Safe reuse is scoped to the official Codex session+thread owner. Prepare
+	// both the per-frame metadata and stable handshake identity before looking up
+	// a previous_response_id binding so continuation cannot bypass owner checks.
+	safeBody, frameMetadataKnown := prepareSafePoolFrameMetadata(wsBody, ginHeaders)
+	safeHeaders, handshakeKnown := safePoolOwnerHandshakeHeaders(headers, safeBody)
+	ownerKey, ownerKeyKnown := safePoolOwnerKey(safeBody, apiKey)
+	requestEligible := safePoolRequestEligible(safeBody)
+	ownerKnown := ownerKeyKnown && handshakeKnown && frameMetadataKnown && requestEligible
+	poolPolicy := resolveStatelessPoolPolicy(account, e.manager)
+	if poolPolicy.mode == statelessPoolSafe {
+		switch {
+		case ownerKnown:
+			e.manager.safePoolOwnerEligible.Add(1)
+		case !ownerKeyKnown:
+			e.manager.safePoolOwnerMissing.Add(1)
+		case !requestEligible:
+			e.manager.safePoolRequestIneligible.Add(1)
+		default:
+			e.manager.safePoolOwnerRejected.Add(1)
+		}
+	}
+	if poolPolicy.mode != statelessPoolSafe {
+		e.manager.RetireSafePoolAccount(account.ID())
+	}
+	safeIdentity := safeConnectionIdentity{}
+	if ownerKnown && poolPolicy.mode == statelessPoolSafe {
+		safeIdentity = safeConnectionIdentity{
+			ownerKey:             ownerKey,
+			handshakeFingerprint: safePoolHeaderFingerprint(safeHeaders),
+		}
 	}
 
 	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
@@ -172,24 +304,80 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
+	safePoolRequest := false
 	prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String())
 	continuationRequest := prevRespID != ""
 	if continuationRequest {
-		pwc, ppr, slotKey, preferredErr := e.manager.AcquirePreferredConnection(ctx, prevRespID, account.ID(), apiKey)
+		if poolPolicy.mode == statelessPoolHTTPFallback {
+			return nil, fmt.Errorf("%w: safe websocket reuse is process-fused and connection-local state cannot move to HTTP", proxy.ErrWebsocketContinuationUnavailable)
+		}
+		if poolPolicy.mode == statelessPoolOneShot && handshakeKnown {
+			return nil, fmt.Errorf("%w: one-shot websocket policy cannot resume connection-local previous_response_id state", proxy.ErrWebsocketContinuationUnavailable)
+		}
+		var pwc *WsConnection
+		var ppr *PendingRequest
+		var slotKey string
+		var preferredErr error
+		if poolPolicy.mode == statelessPoolSafe {
+			pwc, ppr, slotKey, preferredErr = e.manager.AcquirePreferredConnection(ctx, prevRespID, account.ID(), apiKey, safeIdentity)
+		} else {
+			pwc, ppr, slotKey, preferredErr = e.manager.AcquirePreferredConnection(ctx, prevRespID, account.ID(), apiKey)
+		}
 		if preferredErr != nil {
 			return nil, preferredErr
 		}
 		if pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
+			safePoolRequest = pwc.safeReusable.Load()
+			if safePoolRequest {
+				wsBody = safeBody
+				headers = safeHeaders
+			}
 		}
 	}
 	baseKey := strings.TrimSpace(poolRouteKey)
 	if baseKey == "" && headerSessionID != sessionID {
 		baseKey = headerSessionID
 	}
+	oneShotRequest := false
 	if wc == nil {
-		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
-			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+		if poolPolicy.mode == statelessPoolHTTPFallback {
+			return nil, fmt.Errorf("%w: safe websocket reuse is process-fused before request write", proxy.ErrWebsocketSafePoolFallback)
+		} else if poolPolicy.mode == statelessPoolSafe && ownerKnown {
+			wsBody = safeBody
+			headers = safeHeaders
+			safeBaseKey := safePoolOwnedRouteKey(baseKey, ownerKey, safeHeaders)
+			wc, pr, poolSessionID, err2 = e.manager.AcquireSafeReusableConnection(ctx, account, wsURL, safeBaseKey, poolPolicy.slots, poolPolicy.wait, safeHeaders, safeIdentity, proxyOverride)
+			safePoolRequest = err2 == nil && wc != nil
+		} else if poolPolicy.mode == statelessPoolSafe {
+			// A tagged/all safe rollout must never turn an unprovable owner into a
+			// per-request handshake storm. Before any WS write, retain the selected
+			// account and let the caller downgrade this request to HTTP. Connection-
+			// local continuation state cannot be moved and therefore fails closed.
+			if continuationRequest {
+				return nil, fmt.Errorf("%w: safe websocket owner is unavailable for previous_response_id", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			return nil, fmt.Errorf("%w: safe websocket owner is missing, conflicting, or ineligible before request write", proxy.ErrWebsocketSafePoolFallback)
+		} else if poolPolicy.mode == statelessPoolOneShot {
+			// The operator's explicit hard kill switch is the only policy that
+			// deliberately receives a unique physical socket per request.
+			poolSessionID = "stateless-" + uuid.NewString()
+			if frameMetadataKnown {
+				wsBody = safeBody
+			}
+			if handshakeKnown {
+				headers = safeHeaders
+			}
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+			oneShotRequest = err2 == nil && wc != nil
+		} else if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" {
+			switch poolPolicy.mode {
+			case statelessPoolLegacy:
+				wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+			default:
+				wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+				oneShotRequest = err2 == nil && wc != nil
+			}
 		} else {
 			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 		}
@@ -197,12 +385,25 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if err2 != nil {
 		return nil, err2
 	}
+	if safePoolRequest {
+		if _, policyActive := currentSafePoolSlots(account, e.manager); !policyActive {
+			if wc != nil && wc.session != nil && pr != nil {
+				wc.session.RemovePendingRequest(pr.RequestID)
+			}
+			if wc != nil {
+				wc.retireAfterLease.Store(true)
+				e.manager.DiscardConnection(wc)
+			}
+			e.manager.RetireSafePoolAccount(account.ID())
+			return nil, newLocalCapacityAcquireError(0, fmt.Errorf("safe websocket reuse was disabled before request write"))
+		}
+	}
 
 	// 发送请求，失败时最多重试 2 次（重建连接）。
 	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
 	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
-	for retries := 0; !continuationRequest && shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
+	for retries := 0; !safePoolRequest && !continuationRequest && shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
 
@@ -222,6 +423,12 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if sendErr != nil {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
+		if errors.Is(sendErr, proxy.ErrWebsocketWriteUncertain) {
+			return nil, sendErr
+		}
+		if safePoolRequest {
+			return nil, fmt.Errorf("safe websocket request failed before socket write: %w", sendErr)
+		}
 		if continuationRequest {
 			return nil, fmt.Errorf("%w: failed to write response-bound websocket request: %v", proxy.ErrWebsocketContinuationUnavailable, sendErr)
 		}
@@ -238,15 +445,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		manager:     e.manager,
 		apiKey:      apiKey,
 		readErrChan: make(chan error, 1),
+		safePool:    safePoolRequest,
+		oneShot:     oneShotRequest,
+		reuseFence:  poolPolicy.reuseFence,
 	}, nil
 }
 
 func shouldRetryWebsocketSendError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var closeErr *websocket.CloseError
-	return !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig
+	return errors.Is(err, errWebsocketWriteNotStarted)
 }
 
 // prepareWebsocketBody 准备 WebSocket 请求体
@@ -350,10 +556,10 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 // sendRequest 发送 WebSocket 请求
 func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) error {
 	if !wc.IsConnected() {
-		return fmt.Errorf("websocket connection is not connected")
+		return fmt.Errorf("%w: websocket connection is not connected", errWebsocketWriteNotStarted)
 	}
 	if err := wc.ensureReadLeaseForSend(requestID); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errWebsocketWriteNotStarted, err)
 	}
 	return wc.WriteMessage(websocket.TextMessage, body)
 }
@@ -379,8 +585,43 @@ type WsResponse struct {
 	// 握手失败后未读流等)上游可能仍在该连接上推送残留帧，归还复用会把上一个
 	// 请求的响应串给下一个用户(issue #308)，必须销毁。受 mu 保护。
 	streamCompleted bool
-	mu              sync.Mutex
+	// safePool enables strict response identity/sequence validation and a
+	// terminal reuse fence. It is set only for the explicit opt-in safe pool;
+	// owner-rejected requests fall back to same-account HTTP before dialing,
+	// while only the explicit hard-kill policy uses oneShot.
+	safePool          bool
+	oneShot           bool
+	reuseFence        time.Duration
+	responseID        string
+	lastSeq           int64
+	seenSeq           bool
+	seenCreated       bool
+	outputItems       map[int64]safePoolOutputItem
+	itemOutputIndex   map[string]int64
+	callItemID        map[string]string
+	contentParts      map[string]map[int64]string
+	preludeFrames     [][]byte
+	preludeBytes      int
+	preludeResponseID string
+	mu                sync.Mutex
 }
+
+type safePoolOutputItem struct {
+	id       string
+	itemType string
+}
+
+type safePoolEventAction uint8
+
+const (
+	safePoolEventForward safePoolEventAction = iota
+	safePoolEventBuffered
+	safePoolEventFlushPrelude
+	safePoolEventRetire
+
+	safePoolMaxPreludeFrames = 8
+	safePoolMaxPreludeBytes  = 64 << 10
+)
 
 // ReadStream 读取 SSE 流
 func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
@@ -400,13 +641,43 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 			// response terminal frame. Any socket close here, including 1000/1001,
 			// is premature and must preserve the real close error for the consumer.
 			r.markConnBroken()
+			if r.safePool {
+				if isolationErr := r.conn.safePoolReadIsolationFailure(); isolationErr != nil {
+					return fmt.Errorf("%w: %v", proxy.ErrWebsocketIsolationViolation, isolationErr)
+				}
+			}
+			// ExecuteRequestViaWebsocket returns WsResponse only after the
+			// response.create write was committed. A premature read failure is
+			// therefore uncertain in every WS mode, including one-shot fallback
+			// sockets. Replaying it could duplicate execution or billing. Explicit
+			// payload/policy closes remain deterministic request rejections.
+			// A local read-limit failure is normalized to close 1009 for diagnostics,
+			// but it means the upstream response already exceeded this process's
+			// buffer after request commit. It must never be mistaken for a proven
+			// pre-execution peer rejection and replayed over HTTP.
+			if errors.Is(err, websocket.ErrReadLimit) {
+				return fmt.Errorf("%w: local websocket response exceeded read limit after request commit: %w", proxy.ErrWebsocketReadUncertain, err)
+			}
+			var closeErr *websocket.CloseError
+			if !errors.As(err, &closeErr) || (closeErr.Code != websocket.CloseMessageTooBig && closeErr.Code != websocket.ClosePolicyViolation) {
+				return fmt.Errorf("%w: %w", proxy.ErrWebsocketReadUncertain, err)
+			}
 			return fmt.Errorf("websocket read error: %w", err)
 		}
 
 		// 只处理文本消息
 		if msgType != websocket.TextMessage {
 			if msgType == websocket.BinaryMessage {
-				return fmt.Errorf("unexpected binary message from websocket")
+				if r.safePool {
+					err := fmt.Errorf("%w: unexpected binary message", proxy.ErrWebsocketIsolationViolation)
+					r.markConnBroken()
+					if r.manager != nil && r.conn.session != nil {
+						r.manager.TripSafePoolFuse(r.conn.session.AccountID, err)
+					}
+					return err
+				}
+				r.markConnBroken()
+				return fmt.Errorf("%w: unexpected binary message from websocket", proxy.ErrWebsocketReadUncertain)
 			}
 			continue
 		}
@@ -432,9 +703,64 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 
 // handleMessage 处理单条 WebSocket 消息
 func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bool) error {
+	action := safePoolEventForward
+	if r.safePool {
+		var err error
+		action, err = r.validateSafePoolEvent(payload)
+		if err != nil {
+			r.markConnBroken()
+			if r.manager != nil && r.conn != nil && r.conn.session != nil {
+				if errors.Is(err, errSafePoolProtocolCompatibility) {
+					r.manager.TripSafePoolCompatibilityFuse(r.conn.session.AccountID, err)
+				} else {
+					r.manager.TripSafePoolFuse(r.conn.session.AccountID, err)
+				}
+			}
+			if errors.Is(err, errSafePoolProtocolCompatibility) {
+				return fmt.Errorf("%w: %v", proxy.ErrWebsocketReadUncertain, err)
+			}
+			return err
+		}
+		if action == safePoolEventBuffered {
+			return nil
+		}
+		if action == safePoolEventRetire {
+			if r.conn != nil {
+				r.conn.retireAfterLease.Store(true)
+			}
+			if r.manager != nil {
+				r.manager.safePoolCompatibilityDrops.Add(1)
+				if r.conn != nil && r.conn.session != nil {
+					eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+					if eventType == "" {
+						eventType = "unknown"
+					}
+					r.manager.TripSafePoolCompatibilityFuse(r.conn.session.AccountID, fmt.Errorf("%w: unowned extension event %s", errSafePoolProtocolCompatibility, eventType))
+				}
+			}
+			return nil
+		}
+		if action == safePoolEventFlushPrelude {
+			for _, frame := range r.preludeFrames {
+				if !callback(frame) {
+					r.preludeFrames = nil
+					r.preludeBytes = 0
+					r.markConnBroken()
+					return io.EOF
+				}
+			}
+			r.preludeFrames = nil
+			r.preludeBytes = 0
+		}
+	}
 	// 上游错误帧：透传给下游(转成 SSE 错误事件)，而不是转成 Go error 后静默关闭 pipe。
 	// 否则下游只会读到一个底层 read error → 表现为空响应，无从得知具体错误。
 	if errEvent, isErr := r.buildErrorEvent(payload); isErr {
+		if r.safePool {
+			// Even a request-scoped bare error has no response identity that can
+			// prove the physical socket returned to a clean boundary.
+			r.markConnBroken()
+		}
 		// 连接级寿命限制错误：针对连接而非单个请求，这条连接上的后续
 		// response.create 一律失败，而 Ping 探活仍会成功；归还池会持续毒害
 		// 后续请求（含续链亲和定向回来的），必须标记销毁 (issue #346)。
@@ -449,6 +775,39 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 
 	// 标准化完成事件类型
 	payload = normalizeCompletionEvent(payload)
+	eventType := gjson.GetBytes(payload, "type").String()
+	safeTerminalBound := false
+	if r.safePool && (eventType == "response.completed" || eventType == "response.incomplete") && r.manager != nil && r.conn != nil {
+		respID := gjson.GetBytes(payload, "response.id").String()
+		if respID != "" {
+			if r.pendingReq == nil {
+				err := fmt.Errorf("%w: terminal response %q has no active lease", proxy.ErrWebsocketIsolationViolation, respID)
+				r.markConnBroken()
+				if r.conn.session != nil {
+					r.manager.TripSafePoolFuse(r.conn.session.AccountID, err)
+				}
+				return err
+			}
+			if err := r.conn.beginSafeTerminalRelease(r.pendingReq.RequestID); err != nil {
+				isolationErr := fmt.Errorf("%w: %v", proxy.ErrWebsocketIsolationViolation, err)
+				r.markConnBroken()
+				if r.conn.session != nil {
+					r.manager.TripSafePoolFuse(r.conn.session.AccountID, isolationErr)
+				}
+				return isolationErr
+			}
+			accountID := int64(0)
+			if r.conn.session != nil {
+				accountID = r.conn.session.AccountID
+			}
+			// Publish before the downstream callback: the callback can make the
+			// terminal visible to a client that immediately starts its next turn.
+			// The release barrier above prevents that continuation from entering
+			// this socket until Close has removed the previous pending lease.
+			r.manager.BindResponseConn(respID, r.conn, r.sessionID, accountID, r.apiKey)
+			safeTerminalBound = true
+		}
+	}
 
 	// 调用回调
 	if !callback(payload) {
@@ -460,11 +819,10 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	}
 
 	// 检查是否是终止事件
-	eventType := gjson.GetBytes(payload, "type").String()
 	if eventType == "response.completed" || eventType == "response.failed" || eventType == "response.incomplete" {
 		// 续链亲和：记录本响应由哪条连接产出，后续带 previous_response_id 的
 		// 请求可回到原连接（上游无服务端存储时上下文只存活在连接内）。
-		if (eventType == "response.completed" || eventType == "response.incomplete") && r.manager != nil && r.conn != nil {
+		if !safeTerminalBound && (eventType == "response.completed" || eventType == "response.incomplete") && r.manager != nil && r.conn != nil {
 			if respID := gjson.GetBytes(payload, "response.id").String(); respID != "" {
 				accountID := int64(0)
 				if r.conn.session != nil {
@@ -477,6 +835,467 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	}
 
 	return nil
+}
+
+func (r *WsResponse) validateSafePoolEvent(payload []byte) (safePoolEventAction, error) {
+	eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+	if eventType == "" {
+		return safePoolEventForward, fmt.Errorf("%w: event type is empty", proxy.ErrWebsocketIsolationViolation)
+	}
+	// An error may legitimately be the first/only frame. It is delivered to the
+	// current request, but handleMessage marks the socket non-reusable.
+	if eventType == "error" {
+		return safePoolEventForward, nil
+	}
+
+	if !r.seenCreated {
+		// The official Codex client accepts metadata/timing controls before
+		// response.created. Buffer them until created is validated so an
+		// abandoned or delayed prelude can never escape on its own. Standard
+		// response.metadata may carry a candidate response id; if it does, the
+		// subsequent created frame must prove the same id.
+		if safePoolPreludeEvent(eventType) {
+			if strings.TrimSpace(gjson.GetBytes(payload, "item_id").String()) != "" ||
+				strings.TrimSpace(gjson.GetBytes(payload, "item.id").String()) != "" {
+				return safePoolEventForward, fmt.Errorf("%w: prelude %s carries item ownership", proxy.ErrWebsocketIsolationViolation, eventType)
+			}
+			candidateID := eventResponseID(payload)
+			sequence := gjson.GetBytes(payload, "sequence_number")
+			if sequence.Exists() && sequence.Int() < 0 {
+				return safePoolEventForward, fmt.Errorf("%w: %s has negative sequence_number %d", proxy.ErrWebsocketIsolationViolation, eventType, sequence.Int())
+			}
+			if candidateID != "" {
+				if r.preludeResponseID != "" && r.preludeResponseID != candidateID {
+					return safePoolEventForward, fmt.Errorf("%w: metadata prelude response id changed from %s to %s", proxy.ErrWebsocketIsolationViolation, r.preludeResponseID, candidateID)
+				}
+				r.preludeResponseID = candidateID
+			}
+			if len(r.preludeFrames) >= safePoolMaxPreludeFrames || r.preludeBytes+len(payload) > safePoolMaxPreludeBytes {
+				return safePoolEventForward, fmt.Errorf("%w: response metadata prelude exceeds %d frames or %d bytes", proxy.ErrWebsocketIsolationViolation, safePoolMaxPreludeFrames, safePoolMaxPreludeBytes)
+			}
+			r.preludeFrames = append(r.preludeFrames, bytes.Clone(payload))
+			r.preludeBytes += len(payload)
+			return safePoolEventBuffered, nil
+		}
+		if eventType != "response.created" {
+			if safePoolEventUnowned(payload) && !safePoolKnownPayloadEvent(eventType) {
+				return safePoolEventRetire, nil
+			}
+			return safePoolEventForward, fmt.Errorf("%w: first response event is %s, want response.created", proxy.ErrWebsocketIsolationViolation, eventType)
+		}
+	}
+
+	sequence := gjson.GetBytes(payload, "sequence_number")
+	seq := int64(0)
+	if sequence.Exists() {
+		seq = sequence.Int()
+		if seq < 0 {
+			return safePoolEventForward, fmt.Errorf("%w: %s has negative sequence_number %d", proxy.ErrWebsocketIsolationViolation, eventType, seq)
+		}
+	}
+	if !r.seenCreated {
+		responseID := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+		if responseID == "" {
+			return safePoolEventForward, fmt.Errorf("%w: response.created has no response.id", errSafePoolProtocolCompatibility)
+		}
+		if r.conn != nil && r.conn.hasRecentResponseID(responseID) {
+			return safePoolEventForward, fmt.Errorf("%w: delayed response.created repeated terminal response %s", proxy.ErrWebsocketIsolationViolation, responseID)
+		}
+		if r.preludeResponseID != "" && r.preludeResponseID != responseID {
+			return safePoolEventForward, fmt.Errorf("%w: response.created id %s does not match metadata prelude %s", proxy.ErrWebsocketIsolationViolation, responseID, r.preludeResponseID)
+		}
+		r.responseID = responseID
+		if sequence.Exists() {
+			r.lastSeq = seq
+			r.seenSeq = true
+		}
+		r.seenCreated = true
+		r.outputItems = make(map[int64]safePoolOutputItem)
+		r.itemOutputIndex = make(map[string]int64)
+		r.callItemID = make(map[string]string)
+		r.contentParts = make(map[string]map[int64]string)
+		if len(r.preludeFrames) > 0 {
+			return safePoolEventFlushPrelude, nil
+		}
+		return safePoolEventForward, nil
+	}
+	if eventType == "response.created" {
+		return safePoolEventForward, fmt.Errorf("%w: duplicate response.created for active lease", proxy.ErrWebsocketIsolationViolation)
+	}
+	// These request-local Codex control events may omit both identity and
+	// sequence. Unowned controls are safe once response.created established the
+	// single in-flight boundary. Owned controls must still pass the generic
+	// response check below, and controls must never claim an item graph.
+	if safePoolActiveUnscopedControlEvent(eventType) {
+		if strings.TrimSpace(gjson.GetBytes(payload, "item_id").String()) != "" ||
+			strings.TrimSpace(gjson.GetBytes(payload, "item.id").String()) != "" {
+			return safePoolEventForward, fmt.Errorf("%w: active control %s carries item ownership", proxy.ErrWebsocketIsolationViolation, eventType)
+		}
+		if safePoolEventUnowned(payload) {
+			return safePoolEventForward, nil
+		}
+	}
+	if safePoolEventUnowned(payload) && !safePoolKnownPayloadEvent(eventType) {
+		return safePoolEventRetire, nil
+	}
+	// Sequence numbers are a useful integrity signal when the upstream emits
+	// them, but private Codex control events and current official client fixtures
+	// do not guarantee universal presence or gap-free numbering. Enforce strict
+	// monotonicity when present; response and item identities remain mandatory.
+	if sequence.Exists() && r.seenSeq && seq <= r.lastSeq {
+		return safePoolEventForward, fmt.Errorf("%w: sequence_number %d did not advance beyond %d", proxy.ErrWebsocketIsolationViolation, seq, r.lastSeq)
+	}
+	if responseID := eventResponseID(payload); responseID != "" && responseID != r.responseID {
+		return safePoolEventForward, fmt.Errorf("%w: response id changed from %s to %s", proxy.ErrWebsocketIsolationViolation, r.responseID, responseID)
+	}
+	if err := r.validateSafePoolItemGraph(eventType, payload); err != nil {
+		return safePoolEventForward, err
+	}
+
+	if safePoolTerminalEvent(eventType) {
+		terminalID := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String())
+		if terminalID == "" {
+			return safePoolEventForward, fmt.Errorf("%w: terminal %s has no response.id", errSafePoolProtocolCompatibility, eventType)
+		}
+		if terminalID != r.responseID {
+			return safePoolEventForward, fmt.Errorf("%w: terminal %s has response.id %q, want %q", proxy.ErrWebsocketIsolationViolation, eventType, terminalID, r.responseID)
+		}
+		if status := strings.TrimSpace(gjson.GetBytes(payload, "response.status").String()); status != "" {
+			expected := strings.TrimPrefix(eventType, "response.")
+			if eventType == "response.done" {
+				expected = "completed"
+			}
+			if status != expected {
+				return safePoolEventForward, fmt.Errorf("%w: terminal %s carries response.status %q, want %q", proxy.ErrWebsocketIsolationViolation, eventType, status, expected)
+			}
+		}
+		if r.conn != nil {
+			r.conn.recordRecentResponseID(terminalID)
+		}
+	}
+	if sequence.Exists() {
+		r.lastSeq = seq
+		r.seenSeq = true
+	}
+	return safePoolEventForward, nil
+}
+
+func safePoolPreludeEvent(eventType string) bool {
+	switch eventType {
+	case "response.metadata", "codex.response.metadata", "responsesapi.websocket_timing", "codex.rate_limits":
+		return true
+	default:
+		return false
+	}
+}
+
+func safePoolActiveUnscopedControlEvent(eventType string) bool {
+	switch eventType {
+	case "response.metadata", "codex.response.metadata", "responsesapi.websocket_timing", "codex.rate_limits":
+		return true
+	default:
+		return false
+	}
+}
+
+func safePoolEventUnowned(payload []byte) bool {
+	return eventResponseID(payload) == "" &&
+		strings.TrimSpace(gjson.GetBytes(payload, "item_id").String()) == "" &&
+		strings.TrimSpace(gjson.GetBytes(payload, "item.id").String()) == ""
+}
+
+func safePoolKnownPayloadEvent(eventType string) bool {
+	if eventType == "response.created" || safePoolTerminalEvent(eventType) {
+		return true
+	}
+	for _, prefix := range []string{
+		"response.output_",
+		"response.content_",
+		"response.output_text.",
+		"response.refusal.",
+		"response.reasoning_",
+		"response.function_",
+		"response.file_",
+		"response.web_",
+		"response.image_",
+		"response.code_",
+		"response.computer_",
+		"response.custom_",
+		"response.mcp_",
+		"response.tool_",
+		"response.shell_",
+		"response.apply_patch_",
+	} {
+		if strings.HasPrefix(eventType, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func requiredSafePoolIndex(payload []byte, path, eventType string) (int64, error) {
+	value := gjson.GetBytes(payload, path)
+	if !value.Exists() {
+		return 0, fmt.Errorf("%w: %s has no %s", errSafePoolProtocolCompatibility, eventType, path)
+	}
+	index := value.Int()
+	if index < 0 {
+		return 0, fmt.Errorf("%w: %s has negative %s %d", proxy.ErrWebsocketIsolationViolation, eventType, path, index)
+	}
+	return index, nil
+}
+
+func (r *WsResponse) validateSafePoolItemReference(eventType string, payload []byte, itemID string) (int64, error) {
+	registeredIndex, known := r.itemOutputIndex[itemID]
+	if !known {
+		return 0, fmt.Errorf("%w: %s references unknown item %s", proxy.ErrWebsocketIsolationViolation, eventType, itemID)
+	}
+	outputIndex, err := requiredSafePoolIndex(payload, "output_index", eventType)
+	if err != nil {
+		return 0, err
+	}
+	if outputIndex != registeredIndex {
+		return 0, fmt.Errorf("%w: %s item %s moved from output_index %d to %d", proxy.ErrWebsocketIsolationViolation, eventType, itemID, registeredIndex, outputIndex)
+	}
+	return outputIndex, nil
+}
+
+func (r *WsResponse) bindSafePoolCallID(callID, itemID string) error {
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return nil
+	}
+	if previous, exists := r.callItemID[callID]; exists && previous != itemID {
+		return fmt.Errorf("%w: call_id %s moved from item %s to %s", proxy.ErrWebsocketIsolationViolation, callID, previous, itemID)
+	}
+	if r.callItemID == nil {
+		r.callItemID = make(map[string]string)
+	}
+	r.callItemID[callID] = itemID
+	return nil
+}
+
+func safePoolSyntheticCallItemID(callID string) string {
+	return "\x00call:" + strings.TrimSpace(callID)
+}
+
+func (r *WsResponse) validateSafePoolItemGraph(eventType string, payload []byte) error {
+	switch eventType {
+	case "response.output_item.added":
+		outputIndex, err := requiredSafePoolIndex(payload, "output_index", eventType)
+		if err != nil {
+			return err
+		}
+		itemID := strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
+		callID := strings.TrimSpace(gjson.GetBytes(payload, "item.call_id").String())
+		if itemID == "" && callID != "" {
+			itemID = safePoolSyntheticCallItemID(callID)
+		}
+		if itemID == "" {
+			return fmt.Errorf("%w: response.output_item.added has no item.id", errSafePoolProtocolCompatibility)
+		}
+		itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
+		if itemType == "" {
+			return fmt.Errorf("%w: response.output_item.added item %s has no type", errSafePoolProtocolCompatibility, itemID)
+		}
+		if previous, duplicate := r.outputItems[outputIndex]; duplicate {
+			return fmt.Errorf("%w: output_index %d already belongs to item %s", proxy.ErrWebsocketIsolationViolation, outputIndex, previous.id)
+		}
+		if previousIndex, duplicate := r.itemOutputIndex[itemID]; duplicate {
+			return fmt.Errorf("%w: item %s already belongs to output_index %d", proxy.ErrWebsocketIsolationViolation, itemID, previousIndex)
+		}
+		r.outputItems[outputIndex] = safePoolOutputItem{id: itemID, itemType: itemType}
+		r.itemOutputIndex[itemID] = outputIndex
+		if err := r.bindSafePoolCallID(callID, itemID); err != nil {
+			return err
+		}
+		return nil
+
+	case "response.output_item.done":
+		itemID := strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
+		callID := strings.TrimSpace(gjson.GetBytes(payload, "item.call_id").String())
+		if itemID == "" {
+			itemID = strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+		}
+		if itemID == "" && callID != "" {
+			itemID = safePoolSyntheticCallItemID(callID)
+		}
+		if itemID == "" {
+			return fmt.Errorf("%w: response.output_item.done has no item identity", errSafePoolProtocolCompatibility)
+		}
+		outputIndex, err := requiredSafePoolIndex(payload, "output_index", eventType)
+		if err != nil {
+			return err
+		}
+		itemType := strings.TrimSpace(gjson.GetBytes(payload, "item.type").String())
+		if itemType == "" {
+			return fmt.Errorf("%w: response.output_item.done item %s has no type", errSafePoolProtocolCompatibility, itemID)
+		}
+		if registeredIndex, known := r.itemOutputIndex[itemID]; known {
+			if registeredIndex != outputIndex {
+				return fmt.Errorf("%w: %s item %s moved from output_index %d to %d", proxy.ErrWebsocketIsolationViolation, eventType, itemID, registeredIndex, outputIndex)
+			}
+			if itemType != r.outputItems[outputIndex].itemType {
+				return fmt.Errorf("%w: item %s changed type from %s to %s", proxy.ErrWebsocketIsolationViolation, itemID, r.outputItems[outputIndex].itemType, itemType)
+			}
+			return r.bindSafePoolCallID(callID, itemID)
+		}
+		if previous, occupied := r.outputItems[outputIndex]; occupied {
+			return fmt.Errorf("%w: output_index %d already belongs to item %s", proxy.ErrWebsocketIsolationViolation, outputIndex, previous.id)
+		}
+		// Public Responses events carry complete identity on done. Accept a
+		// done-only lifecycle even if an added frame was omitted by a compatible
+		// upstream, while still rooting the item in this response/index.
+		r.outputItems[outputIndex] = safePoolOutputItem{id: itemID, itemType: itemType}
+		r.itemOutputIndex[itemID] = outputIndex
+		return r.bindSafePoolCallID(callID, itemID)
+
+	case "response.content_part.added":
+		itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+		if itemID == "" {
+			return fmt.Errorf("%w: response.content_part.added has no item_id", errSafePoolProtocolCompatibility)
+		}
+		if _, err := r.validateSafePoolItemReference(eventType, payload, itemID); err != nil {
+			return err
+		}
+		contentIndex, err := requiredSafePoolIndex(payload, "content_index", eventType)
+		if err != nil {
+			return err
+		}
+		partType := strings.TrimSpace(gjson.GetBytes(payload, "part.type").String())
+		if partType == "" {
+			return fmt.Errorf("%w: response.content_part.added item %s has no part.type", errSafePoolProtocolCompatibility, itemID)
+		}
+		if r.contentParts[itemID] == nil {
+			r.contentParts[itemID] = make(map[int64]string)
+		}
+		if previousType, duplicate := r.contentParts[itemID][contentIndex]; duplicate {
+			return fmt.Errorf("%w: item %s content_index %d already has type %s", proxy.ErrWebsocketIsolationViolation, itemID, contentIndex, previousType)
+		}
+		r.contentParts[itemID][contentIndex] = partType
+		return nil
+
+	case "response.content_part.done":
+		itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+		if itemID == "" {
+			return fmt.Errorf("%w: response.content_part.done has no item_id", errSafePoolProtocolCompatibility)
+		}
+		if _, err := r.validateSafePoolItemReference(eventType, payload, itemID); err != nil {
+			return err
+		}
+		contentIndex, err := requiredSafePoolIndex(payload, "content_index", eventType)
+		if err != nil {
+			return err
+		}
+		partType, known := r.contentParts[itemID][contentIndex]
+		doneType := strings.TrimSpace(gjson.GetBytes(payload, "part.type").String())
+		if !known {
+			if doneType == "" {
+				return fmt.Errorf("%w: response.content_part.done has neither prior part nor part.type", errSafePoolProtocolCompatibility)
+			}
+			if r.contentParts[itemID] == nil {
+				r.contentParts[itemID] = make(map[int64]string)
+			}
+			r.contentParts[itemID][contentIndex] = doneType
+			return nil
+		}
+		if doneType != "" && doneType != partType {
+			return fmt.Errorf("%w: item %s content_index %d changed type from %s to %s", proxy.ErrWebsocketIsolationViolation, itemID, contentIndex, partType, doneType)
+		}
+		return nil
+	}
+
+	itemID := strings.TrimSpace(gjson.GetBytes(payload, "item_id").String())
+	if itemID == "" {
+		itemID = strings.TrimSpace(gjson.GetBytes(payload, "item.id").String())
+	}
+	resolvedByCallID := false
+	if itemID == "" {
+		callID := strings.TrimSpace(gjson.GetBytes(payload, "call_id").String())
+		if callID == "" {
+			callID = strings.TrimSpace(gjson.GetBytes(payload, "item.call_id").String())
+		}
+		if callID != "" {
+			var known bool
+			itemID, known = r.callItemID[callID]
+			if !known {
+				return fmt.Errorf("%w: %s references unknown call_id %s", errSafePoolProtocolCompatibility, eventType, callID)
+			}
+			resolvedByCallID = true
+		}
+	}
+	if itemID == "" {
+		if eventResponseID(payload) == "" && !safePoolUnscopedEventAllowed(eventType) {
+			return fmt.Errorf("%w: %s has neither response nor registered item ownership", errSafePoolProtocolCompatibility, eventType)
+		}
+		return nil
+	}
+	if resolvedByCallID && !gjson.GetBytes(payload, "output_index").Exists() {
+		if _, known := r.itemOutputIndex[itemID]; !known {
+			return fmt.Errorf("%w: %s call identity has no registered output item", errSafePoolProtocolCompatibility, eventType)
+		}
+	} else {
+		if _, err := r.validateSafePoolItemReference(eventType, payload, itemID); err != nil {
+			return err
+		}
+	}
+	if content := gjson.GetBytes(payload, "content_index"); content.Exists() {
+		contentIndex, err := requiredSafePoolIndex(payload, "content_index", eventType)
+		if err != nil {
+			return err
+		}
+		if expectedPartType := safePoolExpectedContentPartType(eventType); expectedPartType != "" {
+			partType, known := r.contentParts[itemID][contentIndex]
+			if !known {
+				return fmt.Errorf("%w: %s references unknown item %s content_index %d", proxy.ErrWebsocketIsolationViolation, eventType, itemID, contentIndex)
+			}
+			if partType != expectedPartType {
+				return fmt.Errorf("%w: %s references %s content instead of %s", proxy.ErrWebsocketIsolationViolation, eventType, partType, expectedPartType)
+			}
+		}
+	}
+	return nil
+}
+
+// Only event families whose protocol lifecycle is explicitly rooted in
+// response.content_part.added require a registered content part. Reasoning
+// delta families also carry content_index in some server versions but may be
+// rooted directly in the reasoning output item, so they retain item/output
+// ownership checks without an unsupported content-part assumption.
+func safePoolExpectedContentPartType(eventType string) string {
+	switch eventType {
+	case "response.output_text.delta", "response.output_text.done":
+		return "output_text"
+	case "response.refusal.delta", "response.refusal.done":
+		return "refusal"
+	default:
+		return ""
+	}
+}
+
+func safePoolTerminalEvent(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.failed", "response.incomplete", "response.done":
+		return true
+	default:
+		return false
+	}
+}
+
+func safePoolUnscopedEventAllowed(eventType string) bool {
+	switch eventType {
+	case "response.metadata", "responsesapi.websocket_timing", "codex.rate_limits":
+		return true
+	default:
+		return false
+	}
+}
+
+func eventResponseID(payload []byte) string {
+	if responseID := strings.TrimSpace(gjson.GetBytes(payload, "response.id").String()); responseID != "" {
+		return responseID
+	}
+	return strings.TrimSpace(gjson.GetBytes(payload, "response_id").String())
 }
 
 // buildErrorEvent 判断 payload 是否为上游错误帧；若是，返回一个下游可识别的
@@ -580,9 +1399,11 @@ func (r *WsResponse) Close() error {
 
 	r.closed = true
 
-	// 移除等待请求
-	if r.conn != nil && r.conn.session != nil && r.pendingReq != nil {
-		r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
+	// Establish the reuse fence before removing the Session pending marker.
+	// That ordering closes the only window in which another acquirer could see
+	// an idle connection before the terminal quarantine became visible.
+	if r.conn != nil && r.safePool && !r.connBroken && r.streamCompleted {
+		r.conn.setReuseFence(r.reuseFence)
 	}
 
 	// 根据读流的结束方式决定连接去向：
@@ -592,9 +1413,24 @@ func (r *WsResponse) Close() error {
 	//     * 下游写入失败 / ctx 取消 / 上游正常关闭 / 握手失败后未读流 → 流没消费到边界，
 	//       上游可能仍在推送残留帧，复用会串会话(issue #308)。
 	if r.conn != nil {
-		if !r.connBroken && r.streamCompleted {
+		reusable := !r.oneShot && !r.connBroken && r.streamCompleted
+		leaseID := ""
+		if r.pendingReq != nil {
+			leaseID = r.pendingReq.RequestID
+		}
+		if r.conn.session != nil && r.pendingReq != nil {
+			r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
+		}
+		if reusable {
 			r.manager.ReleaseConnection(r.conn)
+			// Wake a continuation only after the terminal fence is visible, the
+			// previous pending marker is gone and Release has completed.
+			if r.safePool {
+				r.conn.finishSafeTerminalRelease(leaseID)
+			}
 		} else {
+			// Do not wake before Discard removes the pool pointer and response
+			// bindings. WsConnection.Close releases the barrier on that path.
 			r.manager.DiscardConnection(r.conn)
 		}
 	}

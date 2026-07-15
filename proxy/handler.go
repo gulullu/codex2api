@@ -973,12 +973,18 @@ func classifyTransportFailure(err error) string {
 	if err == nil {
 		return ""
 	}
+	if kind := websocketNoReplayKind(err); kind != "" {
+		return kind
+	}
 
 	if isWebsocketSessionBusyError(err) {
 		return upstreamErrorKindWebsocketBusy
 	}
 	if isWebsocketLocalCapacityError(err) {
 		return upstreamErrorKindWebsocketCapacity
+	}
+	if errors.Is(err, ErrWebsocketSafePoolFallback) {
+		return upstreamErrorKindWebsocketSafePoolFallback
 	}
 	if isWebsocketMessageTooBigError(err) {
 		return upstreamErrorKindMessageTooBig
@@ -998,14 +1004,23 @@ func requestErrorCausedByClientContext(clientContextErr, requestErr error) bool 
 }
 
 func shouldRetryTransportFailure(err error, kind string) bool {
-	if kind == upstreamErrorKindWebsocketPolicy {
+	if kind == upstreamErrorKindWebsocketPolicy || kind == upstreamErrorKindWebsocketSafePoolFallback || isWebsocketNoReplayError(err) {
 		return false
 	}
 	return IsRetryableError(err) || kind != ""
 }
 
 func shouldPenalizeTransportFailure(kind string) bool {
-	return kind != "" && kind != upstreamErrorKindWebsocketPolicy
+	switch kind {
+	case "", upstreamErrorKindWebsocketPolicy,
+		upstreamErrorKindWebsocketSafePoolFallback,
+		upstreamErrorKindWebsocketWriteUncertain,
+		upstreamErrorKindWebsocketReadUncertain,
+		upstreamErrorKindWebsocketIsolation:
+		return false
+	default:
+		return true
+	}
 }
 
 func classifyHTTPFailure(statusCode int) string {
@@ -1077,12 +1092,13 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 			kind = "transport"
 		}
 		messageTooBig := kind == upstreamErrorKindMessageTooBig
+		noReplay := isWebsocketNoReplayError(readErr)
 		return streamOutcome{
 			logStatusCode:     logStatusUpstreamStreamBreak,
 			failureKind:       kind,
 			failureMessage:    fmt.Sprintf("上游流读取失败: %v", readErr),
-			penalize:          kind != upstreamErrorKindWebsocketPolicy && !messageTooBig,
-			verifyAccountAuth: !messageTooBig && isWebsocketUpstreamClose(readErr),
+			penalize:          !noReplay && kind != upstreamErrorKindWebsocketPolicy && !messageTooBig,
+			verifyAccountAuth: !noReplay && !messageTooBig && isWebsocketUpstreamClose(readErr),
 		}
 	}
 

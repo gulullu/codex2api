@@ -24,6 +24,8 @@ var (
 	errReadPumpQueueOverflow = errors.New("websocket read pump queue exceeds its payload or item limit")
 	errReadPumpIdleFrame     = errors.New("websocket read pump received a business frame without an active lease")
 	errReadPumpUncommitted   = errors.New("websocket read pump received a business frame before request write committed")
+	errReadPumpPostTerminal  = errors.New("websocket read pump received a business frame after a terminal frame")
+	errReadPumpLeaseBoundary = errors.New("websocket read pump business frame crossed a request lease boundary")
 	errReadPumpStopped       = errors.New("websocket read pump stopped")
 	probeSequence            atomic.Uint64
 )
@@ -212,7 +214,7 @@ func (wc *WsConnection) captureReadLease() (capturedReadLease, error) {
 		return capturedReadLease{}, errReadPumpIdleFrame
 	}
 	if state.leaseTerminalQueued {
-		err := fmt.Errorf("websocket read pump received a business frame after the terminal frame for request %q", leaseID)
+		err := fmt.Errorf("%w for request %q", errReadPumpPostTerminal, leaseID)
 		wc.recordReadPumpFailureLocked(state, err, leaseID)
 		state.mu.Unlock()
 		wc.finalizeReadPumpFailure(state)
@@ -267,7 +269,7 @@ func (wc *WsConnection) enqueueBusinessFrameForCapturedLease(messageType int, pa
 	leaseID := captured.leaseID
 	if leaseID == "" || state.activeLease != leaseID || state.leasePhase != readLeaseCommitted {
 		if captured.write == nil || state.activeLease != leaseID {
-			return fmt.Errorf("websocket read pump lease changed while reading message for request %q", leaseID)
+			return fmt.Errorf("%w: lease changed while reading message for request %q", errReadPumpLeaseBoundary, leaseID)
 		}
 		if captured.write.resolved {
 			if !captured.write.committed {
@@ -277,10 +279,10 @@ func (wc *WsConnection) enqueueBusinessFrameForCapturedLease(messageType int, pa
 				return fmt.Errorf("%w: request %q write did not commit", errReadPumpUncommitted, leaseID)
 			}
 			if state.leasePhase != readLeaseCommitted {
-				return fmt.Errorf("websocket read pump lease changed after request %q committed", leaseID)
+				return fmt.Errorf("%w: lease changed after request %q committed", errReadPumpLeaseBoundary, leaseID)
 			}
 		} else if state.leasePhase != readLeaseWriting || state.leaseWrite != captured.write {
-			return fmt.Errorf("websocket read pump write changed while reading message for request %q", leaseID)
+			return fmt.Errorf("%w: write changed while reading message for request %q", errReadPumpLeaseBoundary, leaseID)
 		}
 	}
 	if len(state.queue) >= readPumpMaxQueuedItems || len(payload) > readPumpMaxQueuedPayload-state.queuedPayload {
@@ -649,6 +651,23 @@ func (wc *WsConnection) readPumpReusable() bool {
 	return !state.readerStopped && state.activeLease == "" && state.leasePhase == readLeaseIdle && state.leaseWrite == nil && !state.leaseTerminalQueued && len(state.queue) == 0
 }
 
+func (wc *WsConnection) safePoolReadIsolationFailure() error {
+	if wc == nil {
+		return nil
+	}
+	state := wc.ensureReadState()
+	state.mu.Lock()
+	readErr := state.readerErr
+	state.mu.Unlock()
+	if errors.Is(readErr, errReadPumpIdleFrame) ||
+		errors.Is(readErr, errReadPumpPostTerminal) ||
+		errors.Is(readErr, errReadPumpLeaseBoundary) ||
+		errors.Is(readErr, errReadPumpUncommitted) {
+		return readErr
+	}
+	return nil
+}
+
 func (wc *WsConnection) waitForEarlyReadFailure(ctx context.Context, grace time.Duration) error {
 	state := wc.ensureReadState()
 	state.mu.Lock()
@@ -776,7 +795,7 @@ func probeConnectionWithContext(ctx context.Context, wc *WsConnection, timeout t
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if ctx.Err() != nil {
+	if contextInterruptionError(ctx) != nil {
 		return false
 	}
 	deadline := time.Now().Add(timeout)
@@ -813,7 +832,7 @@ func probeConnectionWithContext(ctx context.Context, wc *WsConnection, timeout t
 	if err != nil {
 		return false
 	}
-	if ctx.Err() != nil {
+	if contextInterruptionError(ctx) != nil {
 		return false
 	}
 
