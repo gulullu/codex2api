@@ -22,7 +22,7 @@ const (
 	upstreamCybFeedbackSignal         = "upstream_cyb_feedback_hash"
 	contextUpstreamCybFeedbackDigest  = "upstreamCybFeedbackDigest"
 	upstreamCybFeedbackHashDomain     = "codex2api-upstream-cyb-feedback-v1"
-	upstreamCybFeedbackDefaultTTL     = 6 * time.Hour
+	upstreamCybFeedbackDefaultTTL     = 24 * time.Hour
 	upstreamCybFeedbackMaximumTTL     = 24 * time.Hour
 	upstreamCybFeedbackDefaultEntries = 1024
 	upstreamCybFeedbackMaximumEntries = 16384

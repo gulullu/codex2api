@@ -538,6 +538,14 @@ func TestUpstreamCybFeedbackCacheConcurrentAccess(t *testing.T) {
 }
 
 func TestUpstreamCybFeedbackConfigFromEnv(t *testing.T) {
+	t.Setenv("CODEX_UPSTREAM_CYB_FEEDBACK_ENABLED", "")
+	t.Setenv("CODEX_UPSTREAM_CYB_FEEDBACK_TTL", "")
+	t.Setenv("CODEX_UPSTREAM_CYB_FEEDBACK_MAX_ENTRIES", "")
+	defaults := upstreamCybFeedbackConfigFromEnv()
+	if !defaults.Enabled || defaults.TTL != 24*time.Hour || defaults.MaxEntries != 1024 {
+		t.Fatalf("default config = %+v", defaults)
+	}
+
 	t.Setenv("CODEX_UPSTREAM_CYB_FEEDBACK_ENABLED", "false")
 	t.Setenv("CODEX_UPSTREAM_CYB_FEEDBACK_TTL", "30m")
 	t.Setenv("CODEX_UPSTREAM_CYB_FEEDBACK_MAX_ENTRIES", "77")
