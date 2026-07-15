@@ -1092,12 +1092,37 @@ func relayGuardianAttributable(obs RelayGuardianObservation) bool {
 	}
 	kind := strings.ToLower(strings.TrimSpace(obs.UpstreamErrorKind))
 	message := strings.ToLower(obs.ErrorMessage)
-	for _, excluded := range []string{"cyber_policy", "content_policy", "client", "cancel", "rate_limit", "bad_request"} {
+	for _, excluded := range []string{"cyber_policy", "content_policy", "client", "cancel", "rate_limit", "usage_limit", "usage limit", "concurrency_limit", "concurrency limit", "bad_request"} {
 		if strings.Contains(kind, excluded) || strings.Contains(message, excluded) {
 			return false
 		}
 	}
 	return true
+}
+
+func relayGuardianLocalWebsocketContention(obs RelayGuardianObservation) bool {
+	switch strings.ToLower(strings.TrimSpace(obs.UpstreamErrorKind)) {
+	case "websocket_busy_session", "websocket_local_capacity", "websocket_continuation_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func relayGuardianSharedCapacityLimited(obs RelayGuardianObservation) bool {
+	kind := strings.ToLower(strings.TrimSpace(obs.UpstreamErrorKind))
+	for _, marker := range []string{"rate_limit", "usage_limit", "concurrency_limit"} {
+		if strings.Contains(kind, marker) {
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(obs.ErrorMessage))
+	for _, phrase := range []string{"rate limit exceeded", "usage limit exceeded", "concurrency limit exceeded"} {
+		if strings.Contains(message, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func (g *relayHealthGuardian) observe(obs RelayGuardianObservation) {
@@ -1110,6 +1135,19 @@ func (g *relayHealthGuardian) observe(obs RelayGuardianObservation) {
 	}
 	logicalID := strings.TrimSpace(obs.LogicalRequestID)
 	if logicalID == "" {
+		return
+	}
+	// A busy session or exhausted local WS slot is gateway-local contention,
+	// not evidence that the selected Relay front door is unhealthy. Exclude it
+	// before strong 502/504 classification, which intentionally ignores generic
+	// message-based suppressions for real gateway failures.
+	if relayGuardianLocalWebsocketContention(obs) {
+		return
+	}
+	// A downstream shared-user quota or concurrency ceiling can be wrapped by
+	// an intermediate gateway as 502. It is capacity evidence for the normal
+	// account cooldown/scheduler, not proof that the Relay front door is broken.
+	if relayGuardianSharedCapacityLimited(obs) {
 		return
 	}
 	account := g.store.FindByID(obs.AccountID)

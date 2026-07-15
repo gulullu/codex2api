@@ -644,53 +644,54 @@ func TestFailedWriteNeverBecomesReusable(t *testing.T) {
 }
 
 func TestProvisionalTerminalFrameReleasesLeaseOnlyAfterWriteCommit(t *testing.T) {
-	wc := &WsConnection{}
-	wc.state.Store(int32(StateConnected))
-	if err := wc.BeginReadLease("early-terminal"); err != nil {
-		t.Fatalf("BeginReadLease: %v", err)
-	}
-	leaseID, _, err := wc.beginReadLeaseWrite(websocket.TextMessage)
-	if err != nil {
-		t.Fatalf("beginReadLeaseWrite: %v", err)
-	}
-	captured, err := wc.captureReadLease()
-	if err != nil {
-		t.Fatalf("captureReadLease: %v", err)
-	}
-	if err := wc.enqueueBusinessFrameForCapturedLease(
-		websocket.TextMessage,
-		[]byte(`{"type":"response.completed","response":{"id":"early"}}`),
-		captured,
-	); err != nil {
-		t.Fatalf("enqueue provisional terminal: %v", err)
-	}
+	for _, terminalType := range []string{"response.completed", "response.incomplete"} {
+		t.Run(terminalType, func(t *testing.T) {
+			wc := &WsConnection{}
+			wc.state.Store(int32(StateConnected))
+			if err := wc.BeginReadLease("early-terminal"); err != nil {
+				t.Fatalf("BeginReadLease: %v", err)
+			}
+			leaseID, _, err := wc.beginReadLeaseWrite(websocket.TextMessage)
+			if err != nil {
+				t.Fatalf("beginReadLeaseWrite: %v", err)
+			}
+			captured, err := wc.captureReadLease()
+			if err != nil {
+				t.Fatalf("captureReadLease: %v", err)
+			}
+			payload := []byte(fmt.Sprintf(`{"type":%q,"response":{"id":"early"}}`, terminalType))
+			if err := wc.enqueueBusinessFrameForCapturedLease(websocket.TextMessage, payload, captured); err != nil {
+				t.Fatalf("enqueue provisional terminal: %v", err)
+			}
 
-	state := wc.ensureReadState()
-	state.mu.Lock()
-	activeBeforeCommit := state.activeLease
-	phaseBeforeCommit := state.leasePhase
-	terminalQueued := state.leaseTerminalQueued
-	state.mu.Unlock()
-	if activeBeforeCommit != leaseID || phaseBeforeCommit != readLeaseWriting || !terminalQueued {
-		t.Fatalf("before commit = (lease %q, phase %d, terminal %v), want writing lease retained", activeBeforeCommit, phaseBeforeCommit, terminalQueued)
-	}
+			state := wc.ensureReadState()
+			state.mu.Lock()
+			activeBeforeCommit := state.activeLease
+			phaseBeforeCommit := state.leasePhase
+			terminalQueued := state.leaseTerminalQueued
+			state.mu.Unlock()
+			if activeBeforeCommit != leaseID || phaseBeforeCommit != readLeaseWriting || !terminalQueued {
+				t.Fatalf("before commit = (lease %q, phase %d, terminal %v), want writing lease retained", activeBeforeCommit, phaseBeforeCommit, terminalQueued)
+			}
 
-	if err := wc.completeReadLeaseWrite(leaseID, nil); err != nil {
-		t.Fatalf("completeReadLeaseWrite: %v", err)
-	}
-	if err := wc.awaitCapturedReadLease(captured); err != nil {
-		t.Fatalf("awaitCapturedReadLease: %v", err)
-	}
-	state.mu.Lock()
-	activeAfterCommit := state.activeLease
-	phaseAfterCommit := state.leasePhase
-	terminalQueued = state.leaseTerminalQueued
-	state.mu.Unlock()
-	if activeAfterCommit != "" || phaseAfterCommit != readLeaseIdle || terminalQueued {
-		t.Fatalf("after commit = (lease %q, phase %d, terminal %v), want idle lease with queued response", activeAfterCommit, phaseAfterCommit, terminalQueued)
-	}
-	if wc.readPumpReusable() {
-		t.Fatal("connection became reusable before the queued terminal frame was consumed")
+			if err := wc.completeReadLeaseWrite(leaseID, nil); err != nil {
+				t.Fatalf("completeReadLeaseWrite: %v", err)
+			}
+			if err := wc.awaitCapturedReadLease(captured); err != nil {
+				t.Fatalf("awaitCapturedReadLease: %v", err)
+			}
+			state.mu.Lock()
+			activeAfterCommit := state.activeLease
+			phaseAfterCommit := state.leasePhase
+			terminalQueued = state.leaseTerminalQueued
+			state.mu.Unlock()
+			if activeAfterCommit != "" || phaseAfterCommit != readLeaseIdle || terminalQueued {
+				t.Fatalf("after commit = (lease %q, phase %d, terminal %v), want idle lease with queued response", activeAfterCommit, phaseAfterCommit, terminalQueued)
+			}
+			if wc.readPumpReusable() {
+				t.Fatal("connection became reusable before the queued terminal frame was consumed")
+			}
+		})
 	}
 }
 
@@ -913,9 +914,13 @@ func TestReadPumpReusesConnectionAcrossLeases(t *testing.T) {
 				t.Errorf("read request %d: %v", i, err)
 				return
 			}
+			terminalType := "response.completed"
+			if i == 1 {
+				terminalType = "response.incomplete"
+			}
 			frames := [][]byte{
 				[]byte(`{"type":"response.output_text.delta","delta":"lease-` + string(rune('0'+i)) + `-1"}`),
-				[]byte(`{"type":"response.completed","response":{"id":"resp_` + string(rune('0'+i)) + `"}}`),
+				[]byte(`{"type":"` + terminalType + `","response":{"id":"resp_` + string(rune('0'+i)) + `"}}`),
 			}
 			for _, frame := range frames {
 				if err := conn.WriteMessage(websocket.TextMessage, frame); err != nil {
@@ -936,9 +941,13 @@ func TestReadPumpReusesConnectionAcrossLeases(t *testing.T) {
 			t.Fatalf("write request %d: %v", i, err)
 		}
 
+		terminalType := "response.completed"
+		if i == 1 {
+			terminalType = "response.incomplete"
+		}
 		wantFrames := []string{
 			`{"type":"response.output_text.delta","delta":"lease-` + string(rune('0'+i)) + `-1"}`,
-			`{"type":"response.completed","response":{"id":"resp_` + string(rune('0'+i)) + `"}}`,
+			`{"type":"` + terminalType + `","response":{"id":"resp_` + string(rune('0'+i)) + `"}}`,
 		}
 		for frameIndex, want := range wantFrames {
 			messageType, payload, err := readPumpMessage(t, wc)

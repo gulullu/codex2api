@@ -213,6 +213,96 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	}
 }
 
+func TestExecuteRequestViaWebsocketPreviousResponseBusyDoesNotCrossConnection(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{
+		DBID:                    42,
+		AccessToken:             "token-123",
+		AccountID:               "acct-42",
+		DynamicConcurrencyLimit: 2,
+	}
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+	bound, session := newTestSlotConnection(manager, account, wsURL, "previous-bound#0")
+	const (
+		responseID = "resp_previous_busy"
+		apiKey     = "key-A"
+	)
+	manager.BindResponseConn(responseID, bound, "previous-bound#0", account.ID(), apiKey)
+	blocking := session.AddPendingRequest("previous-bound#0")
+	t.Cleanup(func() { session.RemovePendingRequest(blocking.RequestID) })
+	connectionCount := manager.ConnectionCount()
+
+	exec := NewExecutorWithManager(manager)
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(),
+		account,
+		[]byte(`{"model":"gpt-5.4","previous_response_id":"resp_previous_busy","input":"continue"}`),
+		"stateless-next-turn",
+		"",
+		apiKey,
+		nil,
+		http.Header{},
+		"route-key",
+	)
+	if response != nil {
+		t.Fatal("busy previous-response request unexpectedly acquired another connection")
+	}
+	if !errors.Is(err, proxy.ErrWebsocketSessionBusy) {
+		t.Fatalf("previous-response busy error = %v, want ErrWebsocketSessionBusy", err)
+	}
+	if got := manager.ConnectionCount(); got != connectionCount {
+		t.Fatalf("connection count = %d, want unchanged %d (no cross-slot fallback)", got, connectionCount)
+	}
+	if got := session.PendingCount(); got != 1 {
+		t.Fatalf("bound connection pending count = %d, want original request only", got)
+	}
+	if got, _ := manager.lookupResponseConn(responseID, account.ID(), apiKey); got != bound {
+		t.Fatal("busy previous-response binding was lost or replaced")
+	}
+}
+
+func TestExecuteRequestViaWebsocketPreviousResponseMissingDoesNotAcquireOrdinaryConnection(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{
+		DBID:                    42,
+		AccessToken:             "token-123",
+		AccountID:               "acct-42",
+		DynamicConcurrencyLimit: 2,
+	}
+	exec := NewExecutorWithManager(manager)
+	started := time.Now()
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(),
+		account,
+		[]byte(`{"model":"gpt-5.4","previous_response_id":"resp_missing","input":"continue"}`),
+		"stateless-next-turn",
+		"",
+		"key-A",
+		nil,
+		http.Header{},
+		"route-key",
+	)
+	if response != nil {
+		t.Fatal("missing previous-response binding unexpectedly acquired an ordinary connection")
+	}
+	if !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("missing previous-response error = %v, want ErrWebsocketContinuationUnavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("missing previous-response lookup took %v, suggesting an ordinary dial was attempted", elapsed)
+	}
+	if got := manager.ConnectionCount(); got != 0 {
+		t.Fatalf("connection count = %d, want 0 (no ordinary-slot fallback)", got)
+	}
+}
+
 func TestPrepareWebsocketBodyKeepsCacheKeyForStatelessSession(t *testing.T) {
 	exec := NewExecutor()
 
@@ -401,6 +491,72 @@ func TestExecuteRequestViaWebsocketSendFailureRemovesEffectiveProxyConnection(t 
 	}
 }
 
+func TestExecuteRequestViaWebsocketPreviousResponseSendFailureDoesNotResend(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{
+		DBID:                    42,
+		AccessToken:             "token-123",
+		AccountID:               "acct-42",
+		DynamicConcurrencyLimit: 2,
+	}
+	const (
+		responseID = "resp_bound_send_failure"
+		apiKey     = "key-A"
+	)
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+	key := manager.poolKey(account.ID(), wsURL, "previous-bound#0", "")
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{
+		account:  account,
+		conn:     newClosedTestWebsocketConn(t),
+		session:  session,
+		URL:      wsURL,
+		PoolKey:  key,
+		httpResp: &http.Response{StatusCode: http.StatusSwitchingProtocols},
+	}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+	manager.BindResponseConn(responseID, conn, "previous-bound#0", account.ID(), apiKey)
+	manager.probeFunc = func(*WsConnection) bool { return true }
+
+	exec := NewExecutorWithManager(manager)
+	started := time.Now()
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(),
+		account,
+		[]byte(`{"model":"gpt-5.4","previous_response_id":"resp_bound_send_failure","input":"continue"}`),
+		"stateless-next-turn",
+		"",
+		apiKey,
+		nil,
+		http.Header{},
+		"route-key",
+	)
+	if response != nil {
+		t.Fatal("failed response-bound send unexpectedly returned a response")
+	}
+	if !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("response-bound send error = %v, want ErrWebsocketContinuationUnavailable", err)
+	}
+	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+		t.Fatalf("response-bound send failure took %v, suggesting a retry or ordinary dial was attempted", elapsed)
+	}
+	if got := manager.ConnectionCount(); got != 0 {
+		t.Fatalf("connection count = %d, want 0 after discarding failed bound connection", got)
+	}
+	if got, _ := manager.lookupResponseConn(responseID, account.ID(), apiKey); got != nil {
+		t.Fatal("failed response-bound connection remained available for continuation")
+	}
+}
+
 func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {
 	received := make(chan []byte, 1)
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
@@ -528,5 +684,39 @@ func TestShouldRetryWebsocketSendError(t *testing.T) {
 	}
 	if shouldRetryWebsocketSendError(nil) {
 		t.Fatal("nil is not a retryable send error")
+	}
+}
+
+func TestWsResponseIncompleteTerminatesAndBindsContinuation(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	account := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{account: account, session: session, PoolKey: "incomplete-connection"}
+	conn.SetState(StateConnected)
+	manager.connections.Store(conn.PoolKey, conn)
+
+	response := &WsResponse{conn: conn, sessionID: "session-incomplete", manager: manager, apiKey: "key-A"}
+	payload := []byte(`{"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`)
+	callbackCount := 0
+	err := response.handleMessage(payload, func(got []byte) bool {
+		callbackCount++
+		if string(got) != string(payload) {
+			t.Fatalf("callback payload = %s, want %s", got, payload)
+		}
+		return true
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("handleMessage error = %v, want io.EOF terminal", err)
+	}
+	if callbackCount != 1 {
+		t.Fatalf("callback count = %d, want 1", callbackCount)
+	}
+	manager.respConnMu.Lock()
+	binding, ok := manager.respConnBindings["resp_incomplete"]
+	manager.respConnMu.Unlock()
+	if !ok || binding.conn != conn || binding.sessionKey != "session-incomplete" || binding.accountID != account.ID() || binding.apiKey != "key-A" {
+		t.Fatalf("incomplete response binding = %+v, present=%v", binding, ok)
 	}
 }

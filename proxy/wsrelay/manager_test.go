@@ -14,8 +14,37 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 )
+
+func TestSessionBusyAcquireErrorPreservesSentinel(t *testing.T) {
+	err := newSessionBusyAcquireError(30 * time.Second)
+	if !errors.Is(err, proxy.ErrWebsocketSessionBusy) {
+		t.Fatalf("errors.Is(%v, ErrWebsocketSessionBusy) = false", err)
+	}
+	if !strings.Contains(err.Error(), "waiting for busy session") {
+		t.Fatalf("error message = %q, want busy-session detail", err)
+	}
+	interrupted := newSessionBusyAcquireError(5*time.Second, context.DeadlineExceeded)
+	if !errors.Is(interrupted, proxy.ErrWebsocketSessionBusy) || !errors.Is(interrupted, context.DeadlineExceeded) {
+		t.Fatalf("interrupted error = %v, want busy and deadline sentinels", interrupted)
+	}
+}
+
+func TestLocalCapacityAcquireErrorPreservesSentinel(t *testing.T) {
+	err := newLocalCapacityAcquireError(30 * time.Second)
+	if !errors.Is(err, proxy.ErrWebsocketLocalCapacity) {
+		t.Fatalf("errors.Is(%v, ErrWebsocketLocalCapacity) = false", err)
+	}
+	if !strings.Contains(err.Error(), "account connection capacity") {
+		t.Fatalf("error message = %q, want capacity detail", err)
+	}
+	interrupted := newLocalCapacityAcquireError(5*time.Second, context.DeadlineExceeded)
+	if !errors.Is(interrupted, proxy.ErrWebsocketLocalCapacity) || !errors.Is(interrupted, context.DeadlineExceeded) {
+		t.Fatalf("interrupted error = %v, want capacity and deadline sentinels", interrupted)
+	}
+}
 
 func TestManagerStopIdempotent(t *testing.T) {
 	manager := NewManager()
@@ -375,8 +404,8 @@ func TestAcquireConnectionWaitsWhileSessionHasPendingRequest(t *testing.T) {
 	defer cancel()
 
 	_, _, err := manager.AcquireConnection(ctx, account, wsURL, "session-1", http.Header{}, "")
-	if err == nil {
-		t.Fatal("expected acquire to stop when session stays busy until context timeout")
+	if !errors.Is(err, proxy.ErrWebsocketSessionBusy) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("acquire error = %v, want busy-session and deadline sentinels", err)
 	}
 }
 
@@ -792,8 +821,8 @@ func TestActiveBoundConnectionStillConsumesDynamicCapacity(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, _, err := manager.AcquireConnection(ctx, account, wsURL, "new", http.Header{}, ""); err == nil {
-		t.Fatal("new connection bypassed the cap while a bound connection was active")
+	if _, _, err := manager.AcquireConnection(ctx, account, wsURL, "new", http.Header{}, ""); !errors.Is(err, proxy.ErrWebsocketLocalCapacity) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capacity-blocked acquire error = %v, want local-capacity and deadline sentinels", err)
 	}
 	if got := dialCount.Load(); got != 0 {
 		t.Fatalf("physical dial count = %d, want 0 while active bound capacity is full", got)
@@ -1157,9 +1186,12 @@ func TestPreferredBoundIdleActivationRespectsOrdinaryCapacity(t *testing.T) {
 	manager.BindResponseConn("resp_preferred_capacity", bound, "preferred-bound", account.ID(), "key-A")
 	activePending := activeSession.AddPendingRequest("ordinary-active")
 
-	got, pending, _ := manager.AcquirePreferredConnection("resp_preferred_capacity", account.ID(), "key-A")
+	got, pending, _, err := manager.AcquirePreferredConnection(context.Background(), "resp_preferred_capacity", account.ID(), "key-A")
 	if got != nil || pending != nil {
 		t.Fatal("preferred bound-idle activation exceeded strict ordinary account capacity")
+	}
+	if !errors.Is(err, proxy.ErrWebsocketLocalCapacity) {
+		t.Fatalf("preferred capacity error = %v, want ErrWebsocketLocalCapacity", err)
 	}
 	if boundSession.PendingCount() != 0 {
 		t.Fatal("rejected preferred activation left a pending request behind")
@@ -1182,9 +1214,9 @@ func TestPreferredBoundIdleActivationEvictsOrdinaryIdleForCapacity(t *testing.T)
 	bound, _ := newTestSlotConnection(manager, account, "wss://example.test/responses", "preferred-bound")
 	manager.BindResponseConn("resp_preferred_reclaim", bound, "preferred-bound", account.ID(), "key-A")
 
-	got, pending, _ := manager.AcquirePreferredConnection("resp_preferred_reclaim", account.ID(), "key-A")
-	if got != bound || pending == nil {
-		t.Fatal("preferred activation did not reclaim safe ordinary idle capacity")
+	got, pending, _, err := manager.AcquirePreferredConnection(context.Background(), "resp_preferred_reclaim", account.ID(), "key-A")
+	if err != nil || got != bound || pending == nil {
+		t.Fatalf("preferred activation = (%p, %v, %v), want reclaimed bound connection", got, pending, err)
 	}
 	if ordinaryIdle.IsConnected() {
 		t.Fatal("ordinary idle socket was not evicted before bound-idle activation")
@@ -1352,9 +1384,9 @@ func TestContinuationBudgetRevalidatesConcurrentPreferredAcquire(t *testing.T) {
 		t.Fatal("continuation trim did not reach the preferred-acquire barrier")
 	}
 
-	acquired, pending, _ := manager.AcquirePreferredConnection("resp_acquire_candidate", account.ID(), "key-A")
-	if acquired != oldCandidate || pending == nil {
-		t.Fatal("preferred continuation was not acquired while budget trim was awaiting revalidation")
+	acquired, pending, _, err := manager.AcquirePreferredConnection(context.Background(), "resp_acquire_candidate", account.ID(), "key-A")
+	if err != nil || acquired != oldCandidate || pending == nil {
+		t.Fatalf("preferred continuation = (%p, %v, %v), want acquired while trim awaited revalidation", acquired, pending, err)
 	}
 	close(releaseRevalidation)
 	select {
@@ -2212,9 +2244,9 @@ func TestAcquirePreferredConnection(t *testing.T) {
 	wc := newBoundTestConn(t, manager, 7, "base#3")
 	manager.BindResponseConn("resp_chain", wc, "base#3", 7, "key-A")
 
-	got, pr, slotKey := manager.AcquirePreferredConnection("resp_chain", 7, "key-A")
-	if got != wc {
-		t.Fatal("AcquirePreferredConnection should return the bound connection")
+	got, pr, slotKey, err := manager.AcquirePreferredConnection(context.Background(), "resp_chain", 7, "key-A")
+	if err != nil || got != wc {
+		t.Fatalf("AcquirePreferredConnection = (%p, %v), want bound connection", got, err)
 	}
 	if pr == nil {
 		t.Fatal("pending request must be registered")
@@ -2226,10 +2258,18 @@ func TestAcquirePreferredConnection(t *testing.T) {
 		t.Fatalf("PendingCount = %d, want 1", wc.session.PendingCount())
 	}
 
-	// 连接忙(已有在途请求)时不等待,直接回退常规路径
-	got2, pr2, _ := manager.AcquirePreferredConnection("resp_chain", 7, "key-A")
+	// 连接忙(已有在途请求)时不等待，也绝不能回退到另一条连接。
+	got2, pr2, _, busyErr := manager.AcquirePreferredConnection(context.Background(), "resp_chain", 7, "key-A")
 	if got2 != nil || pr2 != nil {
 		t.Fatal("busy preferred connection must not be acquired")
+	}
+	if !errors.Is(busyErr, proxy.ErrWebsocketSessionBusy) {
+		t.Fatalf("busy preferred error = %v, want ErrWebsocketSessionBusy", busyErr)
+	}
+
+	missing, missingPending, missingKey, missingErr := manager.AcquirePreferredConnection(context.Background(), "resp_missing", 7, "key-A")
+	if missing != nil || missingPending != nil || missingKey != "" || !errors.Is(missingErr, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("missing binding = (%p, %v, %q, %v), want continuation-unavailable", missing, missingPending, missingKey, missingErr)
 	}
 }
 
@@ -2259,11 +2299,12 @@ func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.
 		wc      *WsConnection
 		pending *PendingRequest
 		key     string
+		err     error
 	}
 	slowResult := make(chan result, 1)
 	go func() {
-		wc, pending, key := manager.AcquirePreferredConnection("resp_slow", 7, "key-A")
-		slowResult <- result{wc: wc, pending: pending, key: key}
+		wc, pending, key, err := manager.AcquirePreferredConnection(context.Background(), "resp_slow", 7, "key-A")
+		slowResult <- result{wc: wc, pending: pending, key: key, err: err}
 	}()
 	select {
 	case <-slowProbeStarted:
@@ -2273,13 +2314,13 @@ func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.
 
 	fastResult := make(chan result, 1)
 	go func() {
-		wc, pending, key := manager.AcquirePreferredConnection("resp_fast", 7, "key-A")
-		fastResult <- result{wc: wc, pending: pending, key: key}
+		wc, pending, key, err := manager.AcquirePreferredConnection(context.Background(), "resp_fast", 7, "key-A")
+		fastResult <- result{wc: wc, pending: pending, key: key, err: err}
 	}()
 	select {
 	case got := <-fastResult:
-		if got.wc != fastConn || got.pending == nil || got.key != "fast#0" {
-			t.Fatalf("fast preferred acquire = (%p, %v, %q), want healthy fast#0", got.wc, got.pending, got.key)
+		if got.err != nil || got.wc != fastConn || got.pending == nil || got.key != "fast#0" {
+			t.Fatalf("fast preferred acquire = (%p, %v, %q, %v), want healthy fast#0", got.wc, got.pending, got.key, got.err)
 		}
 		got.wc.session.RemovePendingRequest(got.pending.RequestID)
 	case <-time.After(250 * time.Millisecond):
@@ -2287,8 +2328,8 @@ func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.
 	}
 	releaseSlow()
 	slow := <-slowResult
-	if slow.wc != slowConn || slow.pending == nil || slow.key != "slow#0" {
-		t.Fatalf("slow preferred acquire after probe release = (%p, %v, %q)", slow.wc, slow.pending, slow.key)
+	if slow.err != nil || slow.wc != slowConn || slow.pending == nil || slow.key != "slow#0" {
+		t.Fatalf("slow preferred acquire after probe release = (%p, %v, %q, %v)", slow.wc, slow.pending, slow.key, slow.err)
 	}
 	slow.wc.session.RemovePendingRequest(slow.pending.RequestID)
 }
@@ -2301,12 +2342,117 @@ func TestAcquirePreferredConnectionProbeFailureEvicts(t *testing.T) {
 	wc := newBoundTestConn(t, manager, 7, "base#0")
 	manager.BindResponseConn("resp_dead", wc, "base#0", 7, "key-A")
 
-	got, pr, _ := manager.AcquirePreferredConnection("resp_dead", 7, "key-A")
+	got, pr, _, err := manager.AcquirePreferredConnection(context.Background(), "resp_dead", 7, "key-A")
 	if got != nil || pr != nil {
 		t.Fatal("dead preferred connection must not be acquired")
 	}
+	if !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("dead preferred connection error = %v, want continuation-unavailable", err)
+	}
 	if _, ok := manager.connections.Load(wc.PoolKey); ok {
 		t.Fatal("dead connection must be evicted from pool")
+	}
+}
+
+func TestAcquirePreferredConnectionProbeHonorsRequestCancellation(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	wc := newBoundTestConn(t, manager, 7, "base#0")
+	manager.BindResponseConn("resp_cancelled_probe", wc, "base#0", 7, "key-A")
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var startOnce sync.Once
+	manager.probeFunc = func(*WsConnection) bool {
+		startOnce.Do(func() { close(probeStarted) })
+		<-releaseProbe
+		return true
+	}
+	t.Cleanup(func() { close(releaseProbe) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	got, pending, _, err := manager.AcquirePreferredConnection(ctx, "resp_cancelled_probe", 7, "key-A")
+	if got != nil || pending != nil {
+		t.Fatal("cancelled preferred probe unexpectedly acquired the bound connection")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cancelled preferred probe error = %v, want context deadline exceeded", err)
+	}
+	if !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("cancelled preferred probe error = %v, want continuation-unavailable classification", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("cancelled preferred probe took %v, want prompt request cancellation", elapsed)
+	}
+	select {
+	case <-probeStarted:
+	default:
+		t.Fatal("preferred probe hook never started")
+	}
+	if !wc.IsConnected() {
+		t.Fatal("request cancellation discarded a potentially healthy continuation connection")
+	}
+	if gotBound, _ := manager.lookupResponseConn("resp_cancelled_probe", 7, "key-A"); gotBound != wc {
+		t.Fatal("request cancellation destroyed the continuation binding")
+	}
+	if wc.session.PendingCount() != 0 {
+		t.Fatal("cancelled preferred probe leaked a pending request")
+	}
+}
+
+func TestProbeWithContextRejectsCanceledRecentInboundFastPath(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	wc := newBoundTestConn(t, manager, 7, "recent#0")
+	wc.touchInbound()
+	if !wc.recentInboundWithin(probeRecencyWindow) || !wc.readPumpReusable() {
+		t.Fatal("test connection did not qualify for the recent-inbound fast path")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if manager.probeWithContext(ctx, wc) {
+		t.Fatal("canceled context was accepted by the recent-inbound probe fast path")
+	}
+}
+
+func TestAcquirePreferredConnectionCancellationWhileWaitingForKeyLockDoesNotReserve(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	wc := newBoundTestConn(t, manager, 7, "locked#0")
+	manager.BindResponseConn("resp_locked_cancel", wc, "locked#0", 7, "key-A")
+
+	lock := manager.keyLock(wc.PoolKey)
+	manager.lockPoolKey(wc.PoolKey, lock)
+	ctx, cancel := context.WithCancel(context.Background())
+	type result struct {
+		wc      *WsConnection
+		pending *PendingRequest
+		err     error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		got, pending, _, err := manager.AcquirePreferredConnection(ctx, "resp_locked_cancel", 7, "key-A")
+		resultCh <- result{wc: got, pending: pending, err: err}
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	lock.Unlock()
+
+	select {
+	case got := <-resultCh:
+		if got.wc != nil || got.pending != nil {
+			t.Fatal("canceled lock waiter reserved the continuation connection")
+		}
+		if !errors.Is(got.err, context.Canceled) || !errors.Is(got.err, proxy.ErrWebsocketContinuationUnavailable) {
+			t.Fatalf("lock-wait cancellation error = %v, want context and continuation sentinels", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled preferred acquisition did not return after the key lock was released")
+	}
+	if wc.session.PendingCount() != 0 {
+		t.Fatalf("canceled lock waiter leaked %d pending requests", wc.session.PendingCount())
 	}
 }
 

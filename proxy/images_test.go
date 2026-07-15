@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,125 @@ import (
 )
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+
+type auditFailingGinWriter struct {
+	gin.ResponseWriter
+	writeErr error
+	flushErr error
+}
+
+type auditFlushErrorHTTPWriter struct {
+	header     http.Header
+	flushErr   error
+	flushCalls int
+}
+
+func (w *auditFlushErrorHTTPWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+
+func (w *auditFlushErrorHTTPWriter) Write(data []byte) (int, error) { return len(data), nil }
+func (w *auditFlushErrorHTTPWriter) WriteHeader(int)                {}
+func (w *auditFlushErrorHTTPWriter) FlushError() error {
+	w.flushCalls++
+	return w.flushErr
+}
+
+type auditUnwrapAndFlushGinWriter struct {
+	gin.ResponseWriter
+	target     http.ResponseWriter
+	flushCalls int
+}
+
+type auditSelfUnwrapGinWriter struct {
+	gin.ResponseWriter
+	flushCalls int
+}
+
+type auditImageCloseTracker struct {
+	closeCalls int
+}
+
+func (c *auditImageCloseTracker) Close() error {
+	c.closeCalls++
+	return nil
+}
+
+func (w *auditSelfUnwrapGinWriter) Flush() {
+	w.flushCalls++
+}
+
+func (w *auditSelfUnwrapGinWriter) Unwrap() http.ResponseWriter {
+	return w
+}
+
+func (w *auditUnwrapAndFlushGinWriter) Flush() {
+	w.flushCalls++
+}
+
+func (w *auditUnwrapAndFlushGinWriter) Unwrap() http.ResponseWriter {
+	return w.target
+}
+
+func (w *auditFailingGinWriter) Write(data []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *auditFailingGinWriter) WriteString(data string) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.ResponseWriter.WriteString(data)
+}
+
+func (w *auditFailingGinWriter) FlushError() error {
+	if w.flushErr != nil {
+		return w.flushErr
+	}
+	w.ResponseWriter.Flush()
+	return nil
+}
+
+func TestFlushTerminalHTTPResponseUnwrapsLegacyFlusherToFlushError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	flushErr := errors.New("underlying flush failed")
+	underlying := &auditFlushErrorHTTPWriter{flushErr: flushErr}
+	outer := &auditUnwrapAndFlushGinWriter{ResponseWriter: c.Writer, target: underlying}
+
+	err := flushTerminalHTTPResponse(outer)
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("flush error = %v, want %v", err, flushErr)
+	}
+	if outer.flushCalls != 0 {
+		t.Fatalf("outer legacy Flush called %d times, want 0", outer.flushCalls)
+	}
+	if underlying.flushCalls != 1 {
+		t.Fatalf("underlying FlushError called %d times, want 1", underlying.flushCalls)
+	}
+}
+
+func TestFlushTerminalHTTPResponseRejectsSelfUnwrapLoop(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	writer := &auditSelfUnwrapGinWriter{ResponseWriter: c.Writer}
+
+	err := flushTerminalHTTPResponse(writer)
+	if !errors.Is(err, http.ErrNotSupported) {
+		t.Fatalf("flush error = %v, want %v", err, http.ErrNotSupported)
+	}
+	if writer.flushCalls != 0 {
+		t.Fatalf("self-loop legacy Flush called %d times, want 0", writer.flushCalls)
+	}
+}
 
 func TestBuildImagesAPIResponseCloudURL(t *testing.T) {
 	// 用本地 httptest 充当 S3 端点：PUT 返回 200 让上传成功；
@@ -616,7 +736,7 @@ func TestBuildImageErrorUsageLogRecordsFailure(t *testing.T) {
 	usage := &UsageInfo{InputTokens: 12, OutputTokens: 3, TotalTokens: 15, PromptTokens: 12, CompletionTokens: 3}
 	imageLogInfo := imageUsageLogInfo{Count: 1, Width: 1024, Height: 1024, Bytes: 2048, Format: "png", Size: "1024x1024"}
 
-	logInput := buildImageErrorUsageLog(account, "/v1/images/generations", "gpt-image-2", "gpt-image-2", false, 1500, 1, true, readErr, usage, imageLogInfo)
+	logInput := buildImageErrorUsageLog(account, "/v1/images/generations", "gpt-image-2", "gpt-image-2", false, 1500, 1, readErr, usage, imageLogInfo)
 
 	if logInput.AccountID != 42 {
 		t.Fatalf("AccountID = %d, want 42", logInput.AccountID)
@@ -638,6 +758,135 @@ func TestBuildImageErrorUsageLogRecordsFailure(t *testing.T) {
 	}
 	if logInput.ImageCount != 1 || logInput.ImageWidth != 1024 || logInput.ImageFormat != "png" {
 		t.Fatalf("image fields = %#v, want count=1 width=1024 format=png", logInput)
+	}
+	if logInput.GuardianAttemptOnly {
+		t.Fatal("base image failure input must not decide visibility before publication")
+	}
+}
+
+func TestImageUsageVisibilityCopiesDoNotLeakMappedStatusIntoHiddenAttempt(t *testing.T) {
+	base := &database.UsageLogInput{AccountID: 51, StatusCode: http.StatusUnauthorized, ErrorMessage: "upstream 401"}
+	hidden := imageUsageLogWithVisibility(base, true)
+	canonical := imageUsageLogWithVisibility(base, false)
+	canonical.StatusCode = http.StatusServiceUnavailable
+
+	if !hidden.GuardianAttemptOnly || hidden.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("hidden = %+v, want raw upstream 401 and attempt-only", hidden)
+	}
+	if canonical.GuardianAttemptOnly || canonical.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("canonical = %+v, want client-visible 503", canonical)
+	}
+	if base.StatusCode != http.StatusUnauthorized || base.GuardianAttemptOnly {
+		t.Fatalf("base input mutated: %+v", base)
+	}
+}
+
+func TestImageClientCancellationReleasesWithoutHealthOrAuditSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, test := range []struct {
+		name     string
+		withBody bool
+	}{
+		{name: "transport", withBody: false},
+		{name: "nonstream_read", withBody: true},
+		{name: "stream_read", withBody: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := database.New("sqlite", filepath.Join(t.TempDir(), "image-cancel.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.SetUsageLogConfig(database.UsageLogModeFull, 1, 1)
+			t.Cleanup(func() { _ = db.Close() })
+
+			store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, MaxRetries: 2})
+			t.Cleanup(store.Stop)
+			account := &auth.Account{DBID: 91, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+			store.AddAccount(account)
+			handler := NewHandler(store, db, nil, nil)
+			leased, _ := handler.nextImageAccount(0, nil, "gpt-image-2")
+			if leased != account || account.ActiveRequests != 1 {
+				t.Fatalf("leased account=%p active=%d, want account=%p active=1", leased, account.ActiveRequests, account)
+			}
+
+			account.Mu().RLock()
+			beforeTier := account.HealthTier
+			beforeFailures := account.FailureStreak
+			beforeLastFailure := account.LastFailureAt
+			account.Mu().RUnlock()
+
+			requestContext, cancel := context.WithCancel(context.Background())
+			cancel()
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil).WithContext(requestContext)
+			var body *auditImageCloseTracker
+			if test.withBody {
+				body = &auditImageCloseTracker{}
+			}
+			requestErr := fmt.Errorf("image operation stopped: %w", requestContext.Err())
+			handled := false
+			if body == nil {
+				handled = handler.releaseImageAttemptIfClientCanceled(ctx, account, nil, requestErr)
+			} else {
+				handled = handler.releaseImageAttemptIfClientCanceled(ctx, account, body, requestErr)
+			}
+			if !handled {
+				t.Fatal("client-caused cancellation was not handled")
+			}
+
+			if account.ActiveRequests != 0 {
+				t.Fatalf("active requests=%d, want released lease", account.ActiveRequests)
+			}
+			if body != nil && body.closeCalls != 1 {
+				t.Fatalf("body close calls=%d, want 1", body.closeCalls)
+			}
+			account.Mu().RLock()
+			afterTier := account.HealthTier
+			afterFailures := account.FailureStreak
+			afterLastFailure := account.LastFailureAt
+			account.Mu().RUnlock()
+			if afterTier != beforeTier || afterFailures != beforeFailures || !afterLastFailure.Equal(beforeLastFailure) {
+				t.Fatalf("client cancellation changed health: tier %q->%q failures %d->%d last %v->%v", beforeTier, afterTier, beforeFailures, afterFailures, beforeLastFailure, afterLastFailure)
+			}
+
+			rows, err := db.ListUsageLogsByTimeRange(context.Background(), time.Now().Add(-time.Minute), time.Now().Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 0 {
+				t.Fatalf("client cancellation usage rows=%d, want 0", len(rows))
+			}
+		})
+	}
+}
+
+func TestImageCancellationGuardIgnoresUnrelatedUpstreamError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	account := &auth.Account{DBID: 92, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	leased, _ := handler.nextImageAccount(0, nil, "gpt-image-2")
+	if leased != account {
+		t.Fatal("failed to lease image account")
+	}
+	t.Cleanup(func() {
+		if account.ActiveRequests > 0 {
+			store.Release(account)
+		}
+	})
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	body := &auditImageCloseTracker{}
+	if handler.releaseImageAttemptIfClientCanceled(ctx, account, body, context.DeadlineExceeded) {
+		t.Fatal("uncanceled downstream context was misclassified as client cancellation")
+	}
+	if account.ActiveRequests != 1 || body.closeCalls != 0 {
+		t.Fatalf("unrelated error changed resources: active=%d close=%d", account.ActiveRequests, body.closeCalls)
 	}
 }
 
@@ -682,10 +931,13 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/v1/images/generations", nil)
 	handler := &Handler{}
 
-	usage, imageCount, _, imageLogInfo, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now())
+	usage, imageCount, _, imageLogInfo, terminalDelivered, deliveryFailed, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now())
 
 	if err != nil {
 		t.Fatalf("streamImagesResponse returned error: %v", err)
+	}
+	if !terminalDelivered || deliveryFailed {
+		t.Fatalf("delivery flags = (terminal=%v failed=%v), want (true false)", terminalDelivered, deliveryFailed)
 	}
 	if imageCount != 1 {
 		t.Fatalf("imageCount = %d, want 1", imageCount)
@@ -705,5 +957,40 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: image_generation.completed\n") {
 		t.Fatalf("stream body missing completed event: %q", body)
+	}
+}
+
+func TestStreamImagesResponseFlushFailureIsNotTerminalDelivery(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("POST", "/v1/images/generations", nil)
+	c.Writer = &auditFailingGinWriter{ResponseWriter: c.Writer, flushErr: errors.New("flush failed")}
+
+	_, _, _, _, terminalDelivered, deliveryFailed, err := (&Handler{}).streamImagesResponse(c, strings.NewReader(""), "b64_json", "image_generation", "gpt-image-2", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "flush failed") {
+		t.Fatalf("error = %v, want flush failure", err)
+	}
+	if terminalDelivered || !deliveryFailed {
+		t.Fatalf("delivery flags = (terminal=%v failed=%v), want (false true)", terminalDelivered, deliveryFailed)
+	}
+}
+
+func TestStreamImagesResponseDeliveredErrorEventIsTerminalFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"image backend overloaded"}}}` + "\n\n"
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest("POST", "/v1/images/generations", nil)
+
+	_, _, _, _, terminalDelivered, deliveryFailed, err := (&Handler{}).streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "image backend overloaded") {
+		t.Fatalf("error = %v, want upstream image failure", err)
+	}
+	if !terminalDelivered || deliveryFailed {
+		t.Fatalf("delivery flags = (terminal=%v failed=%v), want (true false)", terminalDelivered, deliveryFailed)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, "event: error") || !strings.Contains(body, "image backend overloaded") {
+		t.Fatalf("stream body = %q, want delivered error event", body)
 	}
 }

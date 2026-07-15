@@ -309,7 +309,7 @@ func (wc *WsConnection) enqueueBusinessFrameForCapturedLease(messageType int, pa
 
 func isReadLeaseTerminal(payload []byte) bool {
 	switch gjson.GetBytes(payload, "type").String() {
-	case "response.completed", "response.failed", "response.done", "error":
+	case "response.completed", "response.failed", "response.incomplete", "response.done", "error":
 		return true
 	default:
 		return false
@@ -736,10 +736,13 @@ func (wc *WsConnection) notifyProbePong(payload string) {
 	wc.probeStateMu.Unlock()
 }
 
-func (wc *WsConnection) acquireProbeGate(state *wsReadState, deadline time.Time) bool {
+func (wc *WsConnection) acquireProbeGate(ctx context.Context, state *wsReadState, deadline time.Time) bool {
 	wc.probeGateOnce.Do(func() {
 		wc.probeGate = make(chan struct{}, 1)
 	})
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		return false
@@ -751,20 +754,39 @@ func (wc *WsConnection) acquireProbeGate(state *wsReadState, deadline time.Time)
 		return true
 	case <-state.readerDone:
 		return false
+	case <-ctx.Done():
+		return false
 	case <-timer.C:
 		return false
 	}
 }
 
 func probeConnectionWithTimeout(wc *WsConnection, timeout time.Duration) bool {
+	return probeConnectionWithContext(context.Background(), wc, timeout)
+}
+
+// probeConnectionWithContext applies one absolute timeout across gate
+// acquisition, Ping write and Pong wait, while also allowing a request-level
+// TTFT cancellation to stop the liveness check. A continuation probe must not
+// keep the request blocked after its upstream context has expired.
+func probeConnectionWithContext(ctx context.Context, wc *WsConnection, timeout time.Duration) bool {
 	if wc == nil || timeout <= 0 || !wc.IsConnected() || wc.conn == nil {
 		return false
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
 	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
 	wc.StartReadPump()
 	state := wc.ensureReadState()
 
-	if !wc.acquireProbeGate(state, deadline) {
+	if !wc.acquireProbeGate(ctx, state, deadline) {
 		return false
 	}
 	defer func() { <-wc.probeGate }()
@@ -791,6 +813,9 @@ func probeConnectionWithTimeout(wc *WsConnection, timeout time.Duration) bool {
 	if err != nil {
 		return false
 	}
+	if ctx.Err() != nil {
+		return false
+	}
 
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
@@ -802,6 +827,8 @@ func probeConnectionWithTimeout(wc *WsConnection, timeout time.Duration) bool {
 	case <-result:
 		return wc.IsConnected()
 	case <-state.readerDone:
+		return false
+	case <-ctx.Done():
 		return false
 	case <-timer.C:
 		return false

@@ -172,8 +172,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
-	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
+	prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String())
+	continuationRequest := prevRespID != ""
+	if continuationRequest {
+		pwc, ppr, slotKey, preferredErr := e.manager.AcquirePreferredConnection(ctx, prevRespID, account.ID(), apiKey)
+		if preferredErr != nil {
+			return nil, preferredErr
+		}
+		if pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
 	}
@@ -196,7 +202,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
 	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
-	for retries := 0; shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
+	for retries := 0; !continuationRequest && shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
 
@@ -216,6 +222,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if sendErr != nil {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
+		if continuationRequest {
+			return nil, fmt.Errorf("%w: failed to write response-bound websocket request: %v", proxy.ErrWebsocketContinuationUnavailable, sendErr)
+		}
 		return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", sendErr)
 	}
 
@@ -365,7 +374,7 @@ type WsResponse struct {
 	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
 	// streamCompleted 标记读流已消费到明确的终止边界(response.completed /
-	// response.failed / 上游 error 帧)。Close() 只在此标记为 true 且未标记
+	// response.incomplete / response.failed / 上游 error 帧)。Close() 只在此标记为 true 且未标记
 	// connBroken 时才归还连接复用；其余情况(下游断开、ctx 取消、上游关闭、
 	// 握手失败后未读流等)上游可能仍在该连接上推送残留帧，归还复用会把上一个
 	// 请求的响应串给下一个用户(issue #308)，必须销毁。受 mu 保护。
@@ -452,10 +461,10 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 
 	// 检查是否是终止事件
 	eventType := gjson.GetBytes(payload, "type").String()
-	if eventType == "response.completed" || eventType == "response.failed" {
+	if eventType == "response.completed" || eventType == "response.failed" || eventType == "response.incomplete" {
 		// 续链亲和：记录本响应由哪条连接产出，后续带 previous_response_id 的
 		// 请求可回到原连接（上游无服务端存储时上下文只存活在连接内）。
-		if eventType == "response.completed" && r.manager != nil && r.conn != nil {
+		if (eventType == "response.completed" || eventType == "response.incomplete") && r.manager != nil && r.conn != nil {
 			if respID := gjson.GetBytes(payload, "response.id").String(); respID != "" {
 				accountID := int64(0)
 				if r.conn.session != nil {

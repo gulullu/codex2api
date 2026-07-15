@@ -21,6 +21,20 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func newSessionBusyAcquireError(wait time.Duration, causes ...error) error {
+	if len(causes) > 0 && causes[0] != nil {
+		return fmt.Errorf("%w: acquire websocket connection interrupted after %s waiting for busy session: %w", proxy.ErrWebsocketSessionBusy, wait, causes[0])
+	}
+	return fmt.Errorf("%w: acquire websocket connection timed out after %s waiting for busy session", proxy.ErrWebsocketSessionBusy, wait)
+}
+
+func newLocalCapacityAcquireError(wait time.Duration, causes ...error) error {
+	if len(causes) > 0 && causes[0] != nil {
+		return fmt.Errorf("%w: acquire websocket connection interrupted after %s waiting for account connection capacity: %w", proxy.ErrWebsocketLocalCapacity, wait, causes[0])
+	}
+	return fmt.Errorf("%w: acquire websocket connection timed out after %s waiting for account connection capacity", proxy.ErrWebsocketLocalCapacity, wait)
+}
+
 // ==================== 连接池管理器 ====================
 
 // ConnectionState 连接状态
@@ -1234,11 +1248,11 @@ func (m *Manager) acquireConnection(
 						accountLock.Unlock()
 						lock.Unlock()
 						if waited >= AcquireMaxWait {
-							return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", AcquireMaxWait)
+							return nil, nil, newLocalCapacityAcquireError(AcquireMaxWait)
 						}
 						select {
 						case <-ctx.Done():
-							return nil, nil, ctx.Err()
+							return nil, nil, newLocalCapacityAcquireError(waited, ctx.Err())
 						case <-time.After(wait):
 						}
 						waited += wait
@@ -1275,11 +1289,11 @@ func (m *Manager) acquireConnection(
 				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
 				// 到龄连接也会走到这里等在途请求结束，结束后下一轮循环轮转重建。
 				if waited >= AcquireMaxWait {
-					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", AcquireMaxWait)
+					return nil, nil, newSessionBusyAcquireError(AcquireMaxWait)
 				}
 				select {
 				case <-ctx.Done():
-					return nil, nil, ctx.Err()
+					return nil, nil, newSessionBusyAcquireError(waited, ctx.Err())
 				case <-time.After(wait):
 				}
 				waited += wait
@@ -1298,11 +1312,11 @@ func (m *Manager) acquireConnection(
 			accountLock.Unlock()
 			lock.Unlock()
 			if waited >= AcquireMaxWait {
-				return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for account connection capacity", AcquireMaxWait)
+				return nil, nil, newLocalCapacityAcquireError(AcquireMaxWait)
 			}
 			select {
 			case <-ctx.Done():
-				return nil, nil, ctx.Err()
+				return nil, nil, newLocalCapacityAcquireError(waited, ctx.Err())
 			case <-time.After(wait):
 			}
 			waited += wait
@@ -1562,16 +1576,46 @@ const probeRecencyWindow = HeartbeatPingInterval
 
 // probe 调用探活函数（支持测试替换）
 func (m *Manager) probe(wc *WsConnection) bool {
+	return m.probeWithContext(context.Background(), wc)
+}
+
+func (m *Manager) probeWithContext(ctx context.Context, wc *WsConnection) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
 	m.mu.RLock()
 	fn := m.probeFunc
 	m.mu.RUnlock()
 	if fn != nil {
-		return fn(wc)
+		// Test hooks can deliberately block. Keep the same cancellation contract
+		// as the real probe so preferred-continuation acquisition never outlives
+		// the request's TTFT context.
+		result := make(chan bool, 1)
+		go func() { result <- fn(wc) }()
+		select {
+		case alive := <-result:
+			if ctx.Err() != nil {
+				return false
+			}
+			return alive
+		case <-ctx.Done():
+			return false
+		}
 	}
 	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
-		return true
+		return ctx.Err() == nil
 	}
-	return probeConnection(wc)
+	return probeConnectionWithContext(ctx, wc, defaultProbeTimeout)
+}
+
+func preferredContinuationContextError(ctx context.Context, stage string) error {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: response-bound websocket continuation canceled %s: %w", proxy.ErrWebsocketContinuationUnavailable, stage, ctx.Err())
 }
 
 // createConnection 创建新 WebSocket 连接
@@ -1851,65 +1895,102 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 	if v, exists := m.connections.Load(binding.conn.PoolKey); !exists || v != binding.conn {
 		return nil, ""
 	}
-	if !binding.conn.IsConnected() || binding.conn.IsExpired() || binding.conn.IsOverAge() {
+	if !binding.conn.IsConnected() {
+		return nil, ""
+	}
+	// Idle/age expiry prevents admitting a new turn, but an already in-flight
+	// bound connection is still authoritative for detecting continuation
+	// contention. Let AcquirePreferredConnection surface a busy sentinel instead
+	// of misclassifying it as a cache miss and crossing to another WS slot.
+	if (binding.conn.IsExpired() || binding.conn.IsOverAge()) &&
+		(binding.conn.session == nil || binding.conn.session.PendingCount() == 0) {
 		return nil, ""
 	}
 	return binding.conn, binding.sessionKey
 }
 
 // AcquirePreferredConnection 尝试独占 response_id 绑定的原连接（续链亲和）。
-// 成功返回 (连接, pendingRequest, 池内 sessionKey)；绑定失效或连接忙时返回 nil，
-// 调用方回退到常规 acquire 路径。忙时不等待：续链上下文虽在原连接，但排队会
-// 阻塞在前一个长响应后面，且该场景（同会话并发续链）极少，退化为缓存 miss 更稳。
-func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string) {
-	_, finishOperation, err := m.beginOperation(context.Background())
+// 成功返回 (连接, pendingRequest, 池内 sessionKey, nil)。没有绑定、绑定失效或原
+// 连接已断开时返回 ErrWebsocketContinuationUnavailable；previous_response_id 的
+// 上游状态不能安全地转移到普通连接。
+//
+// 一旦确认仍然有效的绑定连接正忙，必须返回 ErrWebsocketSessionBusy；不能静默
+// 换到普通槽位，因为 previous_response_id 的上游上下文只存在于原 WS 连接。
+// 同理，绑定连接因本地账号容量无法激活时返回 ErrWebsocketLocalCapacity，交由上层
+// 作为本地争用处理，而不是伪装成 cache miss 后跨连接继续。
+func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string, error) {
+	opCtx, finishOperation, err := m.beginOperation(ctx)
 	if err != nil {
-		return nil, nil, ""
+		return nil, nil, "", err
 	}
 	defer finishOperation()
 
 	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
 	if wc == nil {
-		return nil, nil, ""
+		return nil, nil, "", fmt.Errorf("%w: response binding is missing, expired, mismatched, or disconnected", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	accountLock := m.accountLock(accountID)
 	lock := m.keyLock(wc.PoolKey)
 	m.lockPoolKey(wc.PoolKey, lock)
 	defer lock.Unlock()
+	if err := preferredContinuationContextError(opCtx, "while waiting for the connection lock"); err != nil {
+		return nil, nil, "", err
+	}
 	// pool-key 加锁后复验：期间可能被其他请求占用或销毁。
 	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc {
-		return nil, nil, ""
+		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection was replaced", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	if !canReuseConnection(wc) {
+		if wc.IsConnected() && wc.session != nil && wc.session.IsConnected() && wc.session.PendingCount() > 0 {
+			return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection is busy", proxy.ErrWebsocketSessionBusy)
+		}
 		if wc.session == nil || wc.session.PendingCount() == 0 {
 			m.DiscardConnection(wc)
 		}
-		return nil, nil, ""
+		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection is no longer reusable", proxy.ErrWebsocketContinuationUnavailable)
 	}
-	if !m.probe(wc) {
+	if !m.probeWithContext(opCtx, wc) {
+		if opCtx.Err() != nil {
+			return nil, nil, "", fmt.Errorf("%w: response-bound websocket liveness probe was canceled: %w", proxy.ErrWebsocketContinuationUnavailable, opCtx.Err())
+		}
 		m.DiscardConnection(wc)
-		return nil, nil, ""
+		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection failed liveness probe", proxy.ErrWebsocketContinuationUnavailable)
+	}
+	if err := preferredContinuationContextError(opCtx, "after the liveness probe"); err != nil {
+		return nil, nil, "", err
 	}
 	// probe 可能等待网络，不能占用账号锁。拿到账号锁后再次复验，防止
 	// probe 期间连接被其它 pool key 的容量裁剪安全回收。
 	accountLock.Lock()
 	defer accountLock.Unlock()
-	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc || !canReuseConnection(wc) {
-		return nil, nil, ""
+	if err := preferredContinuationContextError(opCtx, "while waiting for account capacity"); err != nil {
+		return nil, nil, "", err
+	}
+	if v, exists := m.connections.Load(wc.PoolKey); !exists || v != wc {
+		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection disappeared during probe", proxy.ErrWebsocketContinuationUnavailable)
+	}
+	if !canReuseConnection(wc) {
+		if wc.IsConnected() && wc.session != nil && wc.session.IsConnected() && wc.session.PendingCount() > 0 {
+			return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection became busy during probe", proxy.ErrWebsocketSessionBusy)
+		}
+		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection became unusable during probe", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	if !m.ensureConnectionActivationCapacity(accountID, accountConnectionLimit(wc.account), wc) {
-		return nil, nil, ""
+		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection cannot be activated at current account capacity", proxy.ErrWebsocketLocalCapacity)
+	}
+	if err := preferredContinuationContextError(opCtx, "before reserving the continuation lease"); err != nil {
+		return nil, nil, "", err
 	}
 	pr, err := m.addPendingAndBeginReadLease(wc, sessionKey)
 	if err != nil {
 		m.DiscardConnection(wc)
-		return nil, nil, ""
+		return nil, nil, "", fmt.Errorf("%w: reserve response-bound websocket connection: %w", proxy.ErrWebsocketSessionBusy, err)
 	}
 	wc.Touch()
 	if wc.account != nil {
 		m.trimIdleAccountConnections(accountID, accountConnectionLimit(wc.account), wc)
 	}
-	return wc, pr, sessionKey
+	return wc, pr, sessionKey, nil
 }
 
 // poolKey 生成连接池键

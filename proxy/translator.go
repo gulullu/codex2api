@@ -3190,10 +3190,12 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
 		return nil, false
 
-	case "response.completed":
+	case "response.completed", "response.incomplete":
 		usage := extractUsageFromResult(parsed.Get("response.usage"))
 		finishReason := "stop"
-		if st.HasToolCalls {
+		if eventType == "response.incomplete" && parsed.Get("response.incomplete_details.reason").String() == "max_output_tokens" {
+			finishReason = "length"
+		} else if st.HasToolCalls {
 			finishReason = "tool_calls"
 		}
 		return newFinalChunk(st.ChunkID, st.Model, st.Created, finishReason, usage), true

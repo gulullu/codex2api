@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -10,9 +11,192 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
+
+type finalCancelAfterWriteGinWriter struct {
+	gin.ResponseWriter
+	cancel context.CancelFunc
+}
+
+func (w *finalCancelAfterWriteGinWriter) Write(data []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(data)
+	if err == nil && n == len(data) && w.cancel != nil {
+		w.cancel()
+	}
+	return n, err
+}
+
+func (w *finalCancelAfterWriteGinWriter) WriteString(data string) (int, error) {
+	n, err := w.ResponseWriter.WriteString(data)
+	if err == nil && n == len(data) && w.cancel != nil {
+		w.cancel()
+	}
+	return n, err
+}
+
+type finalShortWriteGinWriter struct{ gin.ResponseWriter }
+
+func (w *finalShortWriteGinWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	return len(data) - 1, nil
+}
+
+func (w *finalShortWriteGinWriter) WriteString(data string) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	return len(data) - 1, nil
+}
+
+func TestPublishHTTPFinalWithAuditUsesSynchronousWriteBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("complete write is canonical", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		canonical, hidden := 0, 0
+		delivered := publishHTTPFinalWithAudit(c,
+			func() { c.Data(http.StatusBadGateway, "application/json", []byte(`{"error":"upstream"}`)) },
+			func() { canonical++ },
+			func() { hidden++ },
+		)
+		if !delivered || canonical != 1 || hidden != 0 {
+			t.Fatalf("delivered=%t canonical=%d hidden=%d", delivered, canonical, hidden)
+		}
+	})
+
+	t.Run("pre-write cancellation is hidden", func(t *testing.T) {
+		requestCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil).WithContext(requestCtx)
+		canonical, hidden, sends := 0, 0, 0
+		delivered := publishHTTPFinalWithAudit(c,
+			func() { sends++; c.Data(http.StatusBadGateway, "application/json", []byte(`{"error":"upstream"}`)) },
+			func() { canonical++ },
+			func() { hidden++ },
+		)
+		if delivered || sends != 0 || canonical != 0 || hidden != 1 {
+			t.Fatalf("delivered=%t sends=%d canonical=%d hidden=%d", delivered, sends, canonical, hidden)
+		}
+	})
+
+	t.Run("cancellation after full write remains canonical", func(t *testing.T) {
+		requestCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Writer = &finalCancelAfterWriteGinWriter{ResponseWriter: c.Writer, cancel: cancel}
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil).WithContext(requestCtx)
+		canonical, hidden := 0, 0
+		delivered := publishHTTPFinalWithAudit(c,
+			func() { c.Data(http.StatusBadGateway, "application/json", []byte(`{"error":"upstream"}`)) },
+			func() { canonical++ },
+			func() { hidden++ },
+		)
+		if !delivered || requestCtx.Err() == nil || canonical != 1 || hidden != 0 {
+			t.Fatalf("delivered=%t ctxErr=%v canonical=%d hidden=%d", delivered, requestCtx.Err(), canonical, hidden)
+		}
+	})
+
+	t.Run("short write is hidden", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Writer = &finalShortWriteGinWriter{ResponseWriter: c.Writer}
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		canonical, hidden := 0, 0
+		delivered := publishHTTPFinalWithAudit(c,
+			func() { c.Data(http.StatusBadGateway, "application/json", []byte(`{"error":"upstream"}`)) },
+			func() { canonical++ },
+			func() { hidden++ },
+		)
+		if delivered || canonical != 0 || hidden != 1 {
+			t.Fatalf("delivered=%t canonical=%d hidden=%d", delivered, canonical, hidden)
+		}
+	})
+
+	t.Run("send error is hidden even after write", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+		canonical, hidden := 0, 0
+		delivered := publishHTTPFinalWithAuditErr(c,
+			func() error {
+				c.Data(http.StatusBadGateway, "application/json", []byte(`{"error":"upstream"}`))
+				return errors.New("renderer failed")
+			},
+			func() { canonical++ },
+			func() { hidden++ },
+		)
+		if delivered || canonical != 0 || hidden != 1 {
+			t.Fatalf("delivered=%t canonical=%d hidden=%d", delivered, canonical, hidden)
+		}
+	})
+}
+
+func TestHTTPFinalUsageCopySeparatesMappedCanonicalFromRawHidden(t *testing.T) {
+	base := &database.UsageLogInput{StatusCode: http.StatusUnauthorized}
+	canonical := httpFinalUsageCopy(base, http.StatusServiceUnavailable, false)
+	hidden := httpFinalUsageCopy(base, http.StatusUnauthorized, true)
+
+	if canonical == nil || canonical.StatusCode != http.StatusServiceUnavailable || canonical.GuardianAttemptOnly {
+		t.Fatalf("canonical copy=%+v", canonical)
+	}
+	if hidden == nil || hidden.StatusCode != http.StatusUnauthorized || !hidden.GuardianAttemptOnly {
+		t.Fatalf("hidden copy=%+v", hidden)
+	}
+	if base.StatusCode != http.StatusUnauthorized || base.GuardianAttemptOnly {
+		t.Fatalf("base mutated=%+v", base)
+	}
+}
+
+func TestFirstNoAccountPublishesOneAccountNeutralCanonicalFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-5.4","input":"hello","stream":false}`},
+		{name: "compact", path: "/v1/responses/compact", body: `{"model":"gpt-5.4","input":"hello"}`},
+		{name: "chat", path: "/v1/chat/completions", body: `{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db, err := database.New("sqlite", filepath.Join(t.TempDir(), "first-no-account.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.SetUsageLogConfig(database.UsageLogModeFull, 1, 1)
+			t.Cleanup(func() { _ = db.Close() })
+			store := auth.NewStore(nil, nil, &database.SystemSettings{
+				MaxConcurrency:      4,
+				MaxRetries:          0,
+				MaxRateLimitRetries: 0,
+			})
+			t.Cleanup(store.Stop)
+			handler := NewHandler(store, db, &config.Config{AllowAnonymousV1: true}, nil)
+
+			recorder := runRelayTextHandler(t, handler, test.path, []byte(test.body))
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d want=503 body=%s", recorder.Code, recorder.Body.String())
+			}
+			logs := waitForRetryUsageLogs(t, db, 1)
+			if len(logs) != 1 || logs[0].AccountID != 0 || logs[0].StatusCode != http.StatusServiceUnavailable || logs[0].UpstreamErrorKind != ErrorCodeNoAvailableAccount || logs[0].LogicalRequestID == "" {
+				t.Fatalf("canonical no-account rows=%+v", logs)
+			}
+		})
+	}
+}
 
 func TestBuildRetryAttemptUsageLogKeepsLogicalRequestAcrossEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)

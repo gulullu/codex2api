@@ -200,17 +200,26 @@ func (db *DB) ListRelayGuardianReliability(ctx context.Context, groupID int64, s
 		SELECT id, created_at, account_id, status_code,
 			CASE WHEN status_code BETWEEN 500 AND 599
 				AND status_code NOT IN (502, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530)
+				AND LOWER(upstream_error_kind) NOT IN ('websocket_busy_session', 'websocket_local_capacity', 'websocket_continuation_unavailable')
 				AND LOWER(upstream_error_kind) NOT LIKE '%cyber_policy%'
 				AND LOWER(upstream_error_kind) NOT LIKE '%content_policy%'
 				AND LOWER(upstream_error_kind) NOT LIKE '%client%'
 				AND LOWER(upstream_error_kind) NOT LIKE '%cancel%'
 				AND LOWER(upstream_error_kind) NOT LIKE '%rate_limit%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%usage_limit%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%usage limit%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%concurrency_limit%'
+				AND LOWER(upstream_error_kind) NOT LIKE '%concurrency limit%'
 				AND LOWER(upstream_error_kind) NOT LIKE '%bad_request%'
 				AND LOWER(error_message) NOT LIKE '%cyber_policy%'
 				AND LOWER(error_message) NOT LIKE '%content_policy%'
 				AND LOWER(error_message) NOT LIKE '%client%'
 				AND LOWER(error_message) NOT LIKE '%cancel%'
 				AND LOWER(error_message) NOT LIKE '%rate_limit%'
+				AND LOWER(error_message) NOT LIKE '%usage_limit%'
+				AND LOWER(error_message) NOT LIKE '%usage limit%'
+				AND LOWER(error_message) NOT LIKE '%concurrency_limit%'
+				AND LOWER(error_message) NOT LIKE '%concurrency limit%'
 				AND LOWER(error_message) NOT LIKE '%bad_request%'
 			THEN 1 ELSE 0 END AS attributable_failure
 		FROM ranked

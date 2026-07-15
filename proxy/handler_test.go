@@ -318,6 +318,181 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketAcceptsNextTurnWhenTerminalBytesAreVisibleBeforePublicationReturns(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousExec := WebsocketExecuteFunc
+	previousHooks := responsesWSTestHooks.Load()
+	releasePublication := make(chan struct{})
+	var releaseOnce atomic.Bool
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		responsesWSTestHooks.Store(previousHooks)
+		if releaseOnce.CompareAndSwap(false, true) {
+			close(releasePublication)
+		}
+	})
+
+	bodyCh := make(chan []byte, 2)
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		bodyCh <- []byte("hit")
+		sse := `data: {"type":"response.completed","response":{"id":"resp_terminal_gate","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(sse))}, nil
+	}
+	terminalCommitted := make(chan struct{})
+	var hooked atomic.Bool
+	responsesWSTestHooks.Store(&responsesWSTestHookSet{
+		terminalWriteCommitted: func() {
+			if hooked.CompareAndSwap(false, true) {
+				close(terminalCommitted)
+				<-releasePublication
+			}
+		},
+	})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"first"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bodyCh:
+	case <-time.After(time.Second):
+		t.Fatal("first turn did not reach upstream")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, terminal, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(terminal, "type").String() != "response.completed" {
+		t.Fatalf("terminal frame = %s, err=%v", terminal, err)
+	}
+	select {
+	case <-terminalCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("terminal write hook did not run")
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"second"}`)); err != nil {
+		t.Fatalf("next turn write while publication returns: %v", err)
+	}
+	if releaseOnce.CompareAndSwap(false, true) {
+		close(releasePublication)
+	}
+	select {
+	case <-bodyCh:
+	case <-time.After(time.Second):
+		t.Fatal("second turn was rejected after terminal bytes were already visible")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, secondTerminal, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(secondTerminal, "type").String() != "response.completed" {
+		t.Fatalf("second terminal frame = %s, err=%v", secondTerminal, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for atomic.LoadInt64(&account.ActiveRequests) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+		t.Fatalf("active requests = %d after second terminal", got)
+	}
+}
+
+func TestResponsesWebSocketDropsPostTerminalQueuedTurnAfterPeerCloseDuringBookkeeping(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousExec := WebsocketExecuteFunc
+	previousHooks := responsesWSTestHooks.Load()
+	releaseBookkeeping := make(chan struct{})
+	var releaseOnce atomic.Bool
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		responsesWSTestHooks.Store(previousHooks)
+		if releaseOnce.CompareAndSwap(false, true) {
+			close(releaseBookkeeping)
+		}
+	})
+
+	var hits atomic.Int32
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		hits.Add(1)
+		sse := `data: {"type":"response.completed","response":{"id":"resp_bookkeeping","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(sse))}, nil
+	}
+	bookkeepingStarted := make(chan struct{})
+	var postHooked atomic.Bool
+	readerClosed := make(chan struct{})
+	var readHooked atomic.Bool
+	responsesWSTestHooks.Store(&responsesWSTestHookSet{
+		postTerminalBookkeeping: func() {
+			if postHooked.CompareAndSwap(false, true) {
+				close(bookkeepingStarted)
+				<-releaseBookkeeping
+			}
+		},
+		clientReadClosed: func(error) {
+			if readHooked.CompareAndSwap(false, true) {
+				close(readerClosed)
+			}
+		},
+	})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"first"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, terminal, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(terminal, "type").String() != "response.completed" {
+		t.Fatalf("terminal frame = %s, err=%v", terminal, err)
+	}
+	select {
+	case <-bookkeepingStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-terminal bookkeeping hook did not run")
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"must-not-run"}`)); err != nil {
+		t.Fatalf("queue second turn: %v", err)
+	}
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "done"), time.Now().Add(time.Second))
+	select {
+	case <-readerClosed:
+	case <-time.After(time.Second):
+		t.Fatal("server reader did not observe peer close while bookkeeping was blocked")
+	}
+	if releaseOnce.CompareAndSwap(false, true) {
+		close(releaseBookkeeping)
+	}
+	_ = conn.Close()
+
+	deadline := time.Now().Add(upstreamDrainTimeout + time.Second)
+	for atomic.LoadInt64(&account.ActiveRequests) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream hits = %d, want queued post-terminal turn dropped after peer close", got)
+	}
+}
+
 func TestResponsesWebSocketSuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1345,8 +1520,7 @@ func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
+			ctx := context.Background()
 			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
@@ -1390,8 +1564,7 @@ func TestResponsesHTTPEndpointsNormalizeEmptyFunctionCallHistory(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
+			ctx := context.Background()
 			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
@@ -2059,8 +2232,7 @@ func TestResponsesEndpointsAllowGPT55MaxOutputTokens128K(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
+			ctx := context.Background()
 			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
@@ -3919,5 +4091,75 @@ func TestResponsesCompactSuffixOnlyRequestLogsBaseModel(t *testing.T) {
 	}
 	if got := ctx.GetString("x-model"); got != "gpt-5.6-sol" {
 		t.Fatalf("x-model = %q, want base gpt-5.6-sol (suffix stripped for display)", got)
+	}
+}
+
+func TestStreamTranslatorTreatsIncompleteAsLengthTerminal(t *testing.T) {
+	translator := NewStreamTranslator("chatcmpl-incomplete", "gpt-5.4", 123)
+	payload, done := translator.TranslateParsed(gjson.Parse(`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":8,"output_tokens":4,"total_tokens":12}}}`))
+	if !done {
+		t.Fatal("response.incomplete did not terminate the Chat translation stream")
+	}
+	if got := gjson.GetBytes(payload, "choices.0.finish_reason").String(); got != "length" {
+		t.Fatalf("finish_reason = %q, want length; payload=%s", got, payload)
+	}
+}
+
+func TestAnthropicStreamTranslatorTreatsIncompleteAsMaxTokensTerminal(t *testing.T) {
+	translator := newAnthropicStreamTranslator("gpt-5.4")
+	events := translator.translateEvent([]byte(`{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":8,"output_tokens":4,"total_tokens":12}}}`))
+	if len(events) < 2 {
+		t.Fatalf("incomplete events = %+v, want message_delta and message_stop", events)
+	}
+	foundMaxTokens := false
+	foundStop := false
+	for _, event := range events {
+		if event.Type == "message_delta" && event.Delta != nil && event.Delta.StopReason == "max_tokens" {
+			foundMaxTokens = true
+		}
+		if event.Type == "message_stop" {
+			foundStop = true
+		}
+	}
+	if !foundMaxTokens || !foundStop {
+		t.Fatalf("incomplete events = %+v, want max_tokens delta followed by message_stop", events)
+	}
+}
+
+func TestIncompleteResponseRecordsExactContinuationOwner(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, _, relay := newRelayOverflowTestHandler()
+	runtimeCache := cache.NewMemory(32)
+	t.Cleanup(func() { _ = runtimeCache.Close() })
+	handler.SetRuntimeCache(runtimeCache)
+
+	responseCtx := newRouteTestContext()
+	responseCtx.Set(contextAPIKeyID, int64(101))
+	setUpstreamAccountContext(responseCtx, relay)
+	handler.setSelectedRouteDecision(responseCtx, overflowPromptRiskDecision())
+	handler.pinCybRelayResponseID(responseCtx, []byte(`{"type":"response.incomplete","response":{"id":"resp_incomplete_owner","status":"incomplete"}}`))
+
+	continueCtx := newRouteTestContext()
+	continueCtx.Set(contextAPIKeyID, int64(101))
+	handler.loadResponseRouteOwner(continueCtx, []byte(`{"previous_response_id":"resp_incomplete_owner"}`))
+	owner, ok := responseRouteOwnerFromContext(continueCtx)
+	if !ok || owner.AccountID != relay.ID() {
+		t.Fatalf("incomplete response owner = %+v, present=%v; want Relay %d", owner, ok, relay.ID())
+	}
+}
+
+func TestCanceledContextReleasesRetainedFallbackBeforeNewUpstreamAttempt(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	account := &auth.Account{DBID: 1, AccessToken: "token", AccountID: "acct-1"}
+	store.AddAccount(account)
+	atomic.StoreInt64(&account.ActiveRequests, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !releaseRoutedAttemptIfContextDone(ctx, store, account, inactiveRelayCircuitAttempt()) {
+		t.Fatal("canceled context did not stop the retained fallback")
+	}
+	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+		t.Fatalf("active requests = %d, want retained lease released", got)
 	}
 }

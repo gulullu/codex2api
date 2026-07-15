@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -78,6 +79,17 @@ type probeCaptureWriter struct {
 	full  bool
 }
 
+// Unwrap exposes the real response writer to publication-aware flush helpers.
+// gin.ResponseWriter's interface does not declare Unwrap even though Gin's
+// concrete writer implements it, so embedding the interface alone would hide
+// an underlying FlushError implementation.
+func (w *probeCaptureWriter) Unwrap() http.ResponseWriter {
+	if w == nil {
+		return nil
+	}
+	return w.ResponseWriter
+}
+
 func loadProbeShortCircuitConfig() probeShortCircuitConfig {
 	return probeShortCircuitConfig{
 		Enabled:       envBool("CODEX_PROBE_SHORT_CIRCUIT_ENABLED", false),
@@ -109,16 +121,19 @@ func (h *Handler) prepareProbeShortCircuit(c *gin.Context, rawBody []byte, endpo
 		c.Writer = writer
 		return &probeResponseCapture{key: decision.Key, writer: writer, maxCacheBytes: cfg.MaxCacheBytes, maxEntries: cfg.MaxEntries}, false
 	}
-	h.logLocalProbeShortCircuit(c, endpoint, model, stream, responseKind, decision)
-	if decision.Cached != nil {
-		writeCachedProbeResponse(c, *decision.Cached)
-		return nil, true
+	send := func() error {
+		if decision.Cached != nil {
+			return writeCachedProbeResponse(c, *decision.Cached)
+		}
+		if responseKind == "chat" {
+			return writeLocalProbeChatCompletion(c, model, stream)
+		}
+		return writeLocalProbeResponses(c, model, stream)
 	}
-	if responseKind == "chat" {
-		writeLocalProbeChatCompletion(c, model, stream)
-		return nil, true
-	}
-	writeLocalProbeResponses(c, model, stream)
+	publishHTTPFinalWithAuditErr(c, send,
+		func() { h.logLocalProbeShortCircuit(c, endpoint, model, stream, responseKind, decision) },
+		nil,
+	)
 	return nil, true
 }
 
@@ -529,7 +544,7 @@ func localProbeID(prefix string) string {
 	return prefix + "_" + hex.EncodeToString(sum[:])[:24]
 }
 
-func writeLocalProbeResponses(c *gin.Context, model string, stream bool) {
+func writeLocalProbeResponses(c *gin.Context, model string, stream bool) error {
 	now := time.Now().Unix()
 	id := localProbeID("resp_probe")
 	msgID := localProbeID("msg_probe")
@@ -553,17 +568,21 @@ func writeLocalProbeResponses(c *gin.Context, model string, stream bool) {
 	}
 	if !stream {
 		c.JSON(http.StatusOK, resp)
-		return
+		return nil
 	}
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
-	writeSSEJSON(c, gin.H{"type": "response.created", "response": resp})
-	writeSSEJSON(c, gin.H{"type": "response.output_text.delta", "delta": probeShortCircuitMessage, "item_id": msgID, "output_index": 0, "content_index": 0})
-	writeSSEJSON(c, gin.H{"type": "response.completed", "response": resp})
+	if err := writeSSEJSON(c, gin.H{"type": "response.created", "response": resp}); err != nil {
+		return err
+	}
+	if err := writeSSEJSON(c, gin.H{"type": "response.output_text.delta", "delta": probeShortCircuitMessage, "item_id": msgID, "output_index": 0, "content_index": 0}); err != nil {
+		return err
+	}
+	return writeSSEJSON(c, gin.H{"type": "response.completed", "response": resp})
 }
 
-func writeCachedProbeResponse(c *gin.Context, cached probeCachedResponse) {
+func writeCachedProbeResponse(c *gin.Context, cached probeCachedResponse) error {
 	status := cached.StatusCode
 	if status == 0 {
 		status = http.StatusOK
@@ -573,9 +592,13 @@ func writeCachedProbeResponse(c *gin.Context, cached probeCachedResponse) {
 		contentType = "application/json"
 	}
 	c.Data(status, contentType, cached.Body)
+	if strings.Contains(strings.ToLower(contentType), "text/event-stream") {
+		return flushTerminalHTTPResponse(c.Writer)
+	}
+	return nil
 }
 
-func writeLocalProbeChatCompletion(c *gin.Context, model string, stream bool) {
+func writeLocalProbeChatCompletion(c *gin.Context, model string, stream bool) error {
 	now := time.Now().Unix()
 	id := localProbeID("chatcmpl_probe")
 	if !stream {
@@ -591,50 +614,82 @@ func writeLocalProbeChatCompletion(c *gin.Context, model string, stream bool) {
 			}},
 			Usage: &api.UsageInfo{},
 		})
-		return
+		return nil
 	}
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
-	writeSSEJSON(c, api.StreamChunk{
+	if err := writeSSEJSON(c, api.StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: now,
 		Model:   model,
 		Choices: []api.ChatCompletionChoice{{Index: 0, Delta: &api.Message{Role: "assistant"}}},
-	})
-	writeSSEJSON(c, api.StreamChunk{
+	}); err != nil {
+		return err
+	}
+	if err := writeSSEJSON(c, api.StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: now,
 		Model:   model,
 		Choices: []api.ChatCompletionChoice{{Index: 0, Delta: &api.Message{Content: probeShortCircuitMessage}}},
-	})
-	writeSSEJSON(c, api.StreamChunk{
+	}); err != nil {
+		return err
+	}
+	if err := writeSSEJSON(c, api.StreamChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
 		Created: now,
 		Model:   model,
 		Choices: []api.ChatCompletionChoice{{Index: 0, Delta: &api.Message{}, FinishReason: "stop"}},
 		Usage:   &api.UsageInfo{},
-	})
-	_, _ = c.Writer.WriteString("data: [DONE]\n\n")
-	if flusher, ok := c.Writer.(http.Flusher); ok {
-		flusher.Flush()
+	}); err != nil {
+		return err
 	}
+	if err := writeFullProbeString(c.Writer, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	return flushTerminalHTTPResponse(c.Writer)
 }
 
-func writeSSEJSON(c *gin.Context, value any) {
+func writeFullProbeBytes(writer io.Writer, data []byte) error {
+	n, err := writer.Write(data)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func writeFullProbeString(writer io.StringWriter, data string) error {
+	n, err := writer.WriteString(data)
+	if err != nil {
+		return err
+	}
+	if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func writeSSEJSON(c *gin.Context, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = c.Writer.WriteString("data: ")
-	_, _ = c.Writer.Write(data)
-	_, _ = c.Writer.WriteString("\n\n")
-	if flusher, ok := c.Writer.(http.Flusher); ok {
-		flusher.Flush()
+	if err := writeFullProbeString(c.Writer, "data: "); err != nil {
+		return err
 	}
+	if err := writeFullProbeBytes(c.Writer, data); err != nil {
+		return err
+	}
+	if err := writeFullProbeString(c.Writer, "\n\n"); err != nil {
+		return err
+	}
+	return flushTerminalHTTPResponse(c.Writer)
 }
 
 func (h *Handler) logLocalProbeShortCircuit(c *gin.Context, endpoint string, model string, stream bool, responseKind string, decision probeShortCircuitDecision) {

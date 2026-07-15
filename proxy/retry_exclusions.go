@@ -14,6 +14,22 @@ type retryAccountExclusions struct {
 	soft map[int64]bool
 }
 
+// releaseRoutedAttemptIfContextDone closes the scheduler/circuit ownership
+// window between account selection (or a retained WS -> HTTP hand-off) and the
+// actual upstream call. A drainable upstream context may intentionally outlive
+// the client for an in-flight request, but it must never be used to start a new
+// request after the downstream context is already done.
+func releaseRoutedAttemptIfContextDone(ctx context.Context, store *auth.Store, account *auth.Account, circuitAttempt *relayCircuitAttempt) bool {
+	if ctx == nil || ctx.Err() == nil {
+		return false
+	}
+	if circuitAttempt == nil {
+		circuitAttempt = inactiveRelayCircuitAttempt()
+	}
+	circuitAttempt.Release(store, account)
+	return true
+}
+
 // websocketHTTPFallbackState carries the already-acquired account lease across
 // a one-time WebSocket -> HTTP transport downgrade. A close 1009 is a transport
 // limitation, not a reason to release the account and run the scheduler again.
@@ -162,7 +178,7 @@ func (s *websocketHTTPFallbackState) LogHTTPAttemptCompletion(endpoint string, a
 	}
 	wsElapsedMs := s.wsElapsed.Milliseconds()
 	totalElapsedMs, totalFirstEventMs := s.CumulativeHTTPMetrics(httpElapsedMs, httpFirstEventMs)
-	log.Printf("WebSocket 1009 HTTP 降级尝试结束 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=%s, status=%d, ws_elapsed_ms=%d, http_elapsed_ms=%d, http_first_event_ms=%d, total_first_event_ms=%d, total_elapsed_ms=%d)",
+	log.Printf("WebSocket → HTTP 降级尝试结束 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=%s, status=%d, ws_elapsed_ms=%d, http_elapsed_ms=%d, http_first_event_ms=%d, total_first_event_ms=%d, total_elapsed_ms=%d)",
 		s.fallbackID, s.Source(), attemptIndex, accountID, endpoint, statusCode, wsElapsedMs, httpElapsedMs, httpFirstEventMs,
 		totalFirstEventMs, totalElapsedMs)
 }

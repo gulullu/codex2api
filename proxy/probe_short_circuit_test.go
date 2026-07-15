@@ -1,12 +1,16 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -16,6 +20,40 @@ func resetProbeShortCircuitTestState(t *testing.T) {
 	t.Cleanup(func() {
 		probeShortCircuitState = &probeShortCircuitTracker{lastSeen: map[string]time.Time{}, replies: map[string]probeCachedResponse{}}
 	})
+}
+
+func newProbeAuditHandler(t *testing.T) (*Handler, *database.DB) {
+	t.Helper()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "probe-audit.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	db.SetUsageLogConfig(database.UsageLogModeFull, 1, 1)
+	t.Cleanup(func() { _ = db.Close() })
+	return &Handler{db: db}, db
+}
+
+func probeAuditRows(t *testing.T, db *database.DB, want int) []*database.UsageLog {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	settled := time.Now().Add(200 * time.Millisecond)
+	for {
+		rows, err := db.ListUsageLogsByTimeRange(context.Background(), time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+		if err != nil {
+			t.Fatalf("ListUsageLogsByTimeRange: %v", err)
+		}
+		if want == 0 {
+			if len(rows) > 0 || time.Now().After(settled) {
+				return rows
+			}
+		} else if len(rows) >= want {
+			return rows
+		}
+		if time.Now().After(deadline) {
+			return rows
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func TestProbeShortCircuitReplaysFirstResponseWithinWindow(t *testing.T) {
@@ -55,6 +93,111 @@ func TestProbeShortCircuitReplaysFirstResponseWithinWindow(t *testing.T) {
 	}
 	if !strings.Contains(secondRecorder.Body.String(), "first-real-response") {
 		t.Fatalf("body = %q, want cached first response", secondRecorder.Body.String())
+	}
+}
+
+func TestProbeShortCircuitWriteFailureDoesNotCreateCanonicalUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetProbeShortCircuitTestState(t)
+	t.Setenv("CODEX_PROBE_SHORT_CIRCUIT_ENABLED", "true")
+	handler, db := newProbeAuditHandler(t)
+	body := []byte(`{"model":"gpt-5.4","input":"hi"}`)
+
+	firstRecorder := httptest.NewRecorder()
+	firstCtx, _ := gin.CreateTestContext(firstRecorder)
+	firstCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	firstCtx.Set(contextAPIKeyID, int64(11))
+	if _, handled := handler.prepareProbeShortCircuit(firstCtx, body, "/v1/responses", "gpt-5.4", false, "responses"); handled {
+		t.Fatal("first probe was short-circuited")
+	}
+
+	secondRecorder := httptest.NewRecorder()
+	secondCtx, _ := gin.CreateTestContext(secondRecorder)
+	secondCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	secondCtx.Set(contextAPIKeyID, int64(11))
+	secondCtx.Writer = &auditFailingGinWriter{ResponseWriter: secondCtx.Writer, writeErr: errors.New("client write failed")}
+	if _, handled := handler.prepareProbeShortCircuit(secondCtx, body, "/v1/responses", "gpt-5.4", false, "responses"); !handled {
+		t.Fatal("repeated probe was not handled")
+	}
+	if rows := probeAuditRows(t, db, 0); len(rows) != 0 {
+		t.Fatalf("usage rows = %+v, want none for undelivered local response", rows)
+	}
+}
+
+func TestProbeShortCircuitFlushFailureDoesNotCreateCanonicalUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetProbeShortCircuitTestState(t)
+	t.Setenv("CODEX_PROBE_SHORT_CIRCUIT_ENABLED", "true")
+	handler, db := newProbeAuditHandler(t)
+	body := []byte(`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"Count to seven."}]}`)
+
+	firstRecorder := httptest.NewRecorder()
+	firstCtx, _ := gin.CreateTestContext(firstRecorder)
+	firstCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	firstCtx.Set(contextAPIKeyID, int64(12))
+	if _, handled := handler.prepareProbeShortCircuit(firstCtx, body, "/v1/chat/completions", "gpt-5.4", true, "chat"); handled {
+		t.Fatal("first probe was short-circuited")
+	}
+
+	secondRecorder := httptest.NewRecorder()
+	secondCtx, _ := gin.CreateTestContext(secondRecorder)
+	secondCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	secondCtx.Set(contextAPIKeyID, int64(12))
+	secondCtx.Writer = &auditFailingGinWriter{ResponseWriter: secondCtx.Writer, flushErr: errors.New("flush failed")}
+	if _, handled := handler.prepareProbeShortCircuit(secondCtx, body, "/v1/chat/completions", "gpt-5.4", true, "chat"); !handled {
+		t.Fatal("repeated probe was not handled")
+	}
+	if rows := probeAuditRows(t, db, 0); len(rows) != 0 {
+		t.Fatalf("usage rows = %+v, want none for unflushed terminal response", rows)
+	}
+}
+
+func TestProbeCaptureWriterUnwrapExposesUnderlyingFlushError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	flushErr := errors.New("probe underlying flush failed")
+	underlying := &auditFlushErrorHTTPWriter{flushErr: flushErr}
+	ginWrapper := &auditUnwrapAndFlushGinWriter{
+		ResponseWriter: ctx.Writer,
+		target:         underlying,
+	}
+	capture := &probeCaptureWriter{ResponseWriter: ginWrapper, limit: 1024}
+
+	err := flushTerminalHTTPResponse(capture)
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("flush error = %v, want %v", err, flushErr)
+	}
+	if ginWrapper.flushCalls != 0 {
+		t.Fatalf("legacy Gin Flush calls = %d, want 0", ginWrapper.flushCalls)
+	}
+	if underlying.flushCalls != 1 {
+		t.Fatalf("underlying FlushError calls = %d, want 1", underlying.flushCalls)
+	}
+}
+
+func TestProbeShortCircuitSuccessfulPublicationCreatesOneCanonicalUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetProbeShortCircuitTestState(t)
+	t.Setenv("CODEX_PROBE_SHORT_CIRCUIT_ENABLED", "true")
+	handler, db := newProbeAuditHandler(t)
+	body := []byte(`{"model":"gpt-5.4","input":"hi"}`)
+
+	firstCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	firstCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	firstCtx.Set(contextAPIKeyID, int64(13))
+	_, _ = handler.prepareProbeShortCircuit(firstCtx, body, "/v1/responses", "gpt-5.4", false, "responses")
+
+	secondRecorder := httptest.NewRecorder()
+	secondCtx, _ := gin.CreateTestContext(secondRecorder)
+	secondCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+	secondCtx.Set(contextAPIKeyID, int64(13))
+	if _, handled := handler.prepareProbeShortCircuit(secondCtx, body, "/v1/responses", "gpt-5.4", false, "responses"); !handled {
+		t.Fatal("repeated probe was not handled")
+	}
+	rows := probeAuditRows(t, db, 1)
+	if len(rows) != 1 || rows[0].UpstreamErrorKind != "local_probe_short_circuit" || rows[0].StatusCode != http.StatusOK {
+		t.Fatalf("usage rows = %+v, want one canonical local probe success", rows)
 	}
 }
 

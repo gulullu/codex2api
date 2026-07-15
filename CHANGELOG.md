@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.5.4+rb16 - 2026-07-15
+
+### RelayBases integration
+
+- Made canonical usage publication follow the client-visible terminal boundary across Responses, Compact, Chat Completions, Messages, Images and local probe responses. Transparent retries, client cancellations, short writes and flush failures remain hidden attempts with raw upstream status; exactly one canonical row is emitted only after the complete terminal response is accepted. First-attempt route/account exhaustion now receives an account-neutral canonical row instead of disappearing.
+- Hardened downstream and upstream WebSocket state handling. Local busy/capacity contention can fall back once to HTTP only on the same account and only without continuation dependencies; explicit continuations remain bound to their owning connection. The native Responses WebSocket now uses a single reader, a one-message queue and terminal-publication fencing so pipelined frames, disconnects and terminal races cannot start or cross-wire another turn.
+- Added end-to-end `response.incomplete` handling and strengthened encrypted-context ownership. Incomplete responses remain resumable without being mislabeled as success, encrypted owner conflicts and unavailable owners downgrade safely, failed objects never commit owner state, and retained WS-to-HTTP leases are released on cancellation.
+- Recognize HTTP 200 Responses objects whose body is actually `status: failed`, including cyber-policy and retryable gateway failures, and route them through the same cooldown, retry, audit and client-status mapping as streamed `response.failed` events.
+- Made stream publication error-aware through Gin and `net/http` wrappers. Underlying `FlushError`, short writes and the first transport error are preserved, successful terminal flushes are not reversed by redundant flushes, probe/image wrappers expose their real writer, and image client cancellation no longer penalizes or excludes healthy accounts.
+- Excluded local WebSocket contention and downstream quota/concurrency-limit variants from Relay Health Guardian failure evidence. Guardian remains in `monitor`; enabling enforcement still requires a fresh clean soak and explicit approval.
+
 ## v2.5.4+rb15 - 2026-07-15
 
 ### RelayBases integration

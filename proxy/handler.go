@@ -971,6 +971,12 @@ func classifyTransportFailure(err error) string {
 		return ""
 	}
 
+	if isWebsocketSessionBusyError(err) {
+		return upstreamErrorKindWebsocketBusy
+	}
+	if isWebsocketLocalCapacityError(err) {
+		return upstreamErrorKindWebsocketCapacity
+	}
 	if isWebsocketMessageTooBigError(err) {
 		return upstreamErrorKindMessageTooBig
 	}
@@ -982,6 +988,10 @@ func classifyTransportFailure(err error) string {
 		return "timeout"
 	}
 	return "transport"
+}
+
+func requestErrorCausedByClientContext(clientContextErr, requestErr error) bool {
+	return clientContextErr != nil && requestErr != nil && errors.Is(requestErr, clientContextErr)
 }
 
 func shouldRetryTransportFailure(err error, kind string) bool {
@@ -1007,6 +1017,15 @@ func classifyHTTPFailure(statusCode int) string {
 		return "client"
 	default:
 		return ""
+	}
+}
+
+func isResponsesTerminalEventType(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.failed", "response.incomplete":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1113,6 +1132,27 @@ func responseFailedErrorBody(payload []byte) []byte {
 		return []byte(`{"error":` + raw + `}`)
 	}
 	return payload
+}
+
+// responsesFailureEventPayload normalizes a non-stream OpenAI Responses HTTP
+// 200 failure object into the same shape used by response.failed SSE events.
+// This keeps status mapping, cooldowns, cyber-policy logging, retries, and audit
+// visibility identical without treating a failed object as a successful 200.
+func responsesFailureEventPayload(payload []byte) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	status := strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "status").String()))
+	errorResult := gjson.GetBytes(payload, "error")
+	errorRaw := strings.TrimSpace(errorResult.Raw)
+	if status != "failed" && (!errorResult.Exists() || errorRaw == "" || errorRaw == "null") {
+		return nil
+	}
+	wrapped := make([]byte, 0, len(payload)+40)
+	wrapped = append(wrapped, `{"type":"response.failed","response":`...)
+	wrapped = append(wrapped, payload...)
+	wrapped = append(wrapped, '}')
+	return wrapped
 }
 
 // responseFailedRetryable 判断一个 response.failed 终止事件是否属于"换号重试有意义"的上游故障
@@ -1990,36 +2030,92 @@ func (h *Handler) Responses(c *gin.Context) {
 			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, selectionFilter, routeRequirement)
 			requestStickyRetry.Apply(account, &stickyProxyURL)
 		}
+		if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
+			return
+		}
 		promptDecision = selectedDecision
 		if account == nil {
+			if c.Request.Context().Err() != nil {
+				return
+			}
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
-				h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
-				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
+				publishHTTPFinalWithAudit(c,
+					func() { api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode) },
+					func() {
+						h.logRouteSelectionError(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
+					},
+					nil,
+				)
 				return
 			}
 			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
-				h.logPendingFinalFailure(c, pendingFinalFailure)
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
+					func() {
+						h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+					},
+					nil,
+				)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
-				h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt)
-				sendCybRelayUnavailableOpenAI(c)
+				publishHTTPFinalWithAudit(c,
+					func() { sendCybRelayUnavailableOpenAI(c) },
+					func() {
+						h.logCybRelayUnavailable(c, "/v1/responses", logModel, logEffectiveModel, isStream, false, attempt)
+					},
+					nil,
+				)
 				return
 			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
+					func() {
+						h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+					},
+					nil,
+				)
 				return
 			}
-			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			publishHTTPFinalWithAudit(c,
+				func() { c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel)) },
+				func() {
+					h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+						Endpoint:       "/v1/responses",
+						Model:          logModel,
+						EffectiveModel: logEffectiveModel,
+						Stream:         isStream,
+						Attempt:        attempt,
+					}, http.StatusServiceUnavailable, ErrorCodeNoAvailableAccount, noAvailableAccountMessage(effectiveModel))
+				},
+				nil,
+			)
 			return
 		}
+		lastFailureWasRelay = false
+		lastStatusCode = 0
+		lastBody = nil
 		if encryptedContextNeedsDowngrade(c) {
 			repairedRawBody, repair, repairErr := h.repairEncryptedContextForAccountSwitch(c, rawBody)
 			if repairErr != nil {
 				circuitAttempt.Release(h.store, account)
-				api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest))
+				publishHTTPFinalWithAudit(c,
+					func() {
+						api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest))
+					},
+					func() {
+						h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+							Endpoint:       "/v1/responses",
+							Model:          logModel,
+							EffectiveModel: logEffectiveModel,
+							Stream:         isStream,
+							Attempt:        attempt,
+						}, http.StatusBadRequest, "invalid_encrypted_content", repairErr.Error())
+					},
+					nil,
+				)
 				return
 			}
 			rawBody = repairedRawBody
@@ -2036,7 +2132,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		setUpstreamAccountContext(c, account)
 		encryptedCapture := newEncryptedContextCapture(apiKeyID)
 		if wsHTTPFallback.ForceHTTP() {
-			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
+			log.Printf("上游 WebSocket → HTTP 降级尝试启动 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
@@ -2096,12 +2192,23 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
+			if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
+				stopTTFTGuard()
+				upstreamCancel()
+				return
+			}
 			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
 				timedOut := ttftTimedOut()
 				stopTTFTGuard()
+				clientContextErr := c.Request.Context().Err()
+				clientGone := clientContextErr != nil
+				if clientGone && requestErrorCausedByClientContext(clientContextErr, reqErr) {
+					circuitAttempt.Release(h.store, account)
+					return
+				}
 				if timedOut {
 					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 				}
@@ -2114,7 +2221,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				if retryable {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 				}
-				relayTransportFailure := circuitAttempt.UpstreamTransportFailure(c.Request.Context(), kind, timedOut)
+				transportEvidenceContext := c.Request.Context()
+				if clientGone {
+					transportEvidenceContext = context.Background()
+				}
+				relayTransportFailure := circuitAttempt.UpstreamTransportFailure(transportEvidenceContext, kind, timedOut)
 				if relayTransportFailure {
 					recyclePooledClient(account, proxyURL)
 				}
@@ -2127,15 +2238,18 @@ func (h *Handler) Responses(c *gin.Context) {
 					Stream: isStream, ViaWebsocket: useWebsocket,
 					RequestedServiceTier: serviceTier, Attempt: attempt,
 				}
-				if relayRequestFailure && !shouldRetry {
-					h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
-				}
-				if relayRequestFailure && shouldRetry {
+				terminalRequestFailure := !shouldRetry && kind != "" && kind != upstreamErrorKindMessageTooBig
+				if shouldRetry && kind != "" && kind != upstreamErrorKindMessageTooBig && c.Request.Context().Err() == nil {
 					pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
 					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
-					lastStatusCode = pending.StatusCode
-					lastBody = upstreamFailureBody(pending.ErrorMessage)
-					lastFailureWasRelay = true
+					lastFailureWasRelay = relayRequestFailure
+					if relayRequestFailure {
+						lastStatusCode = pending.StatusCode
+						lastBody = upstreamFailureBody(pending.ErrorMessage)
+					} else {
+						lastStatusCode = 0
+						lastBody = nil
+					}
 				}
 				// Global sticky retry remains unchanged for ordinary accounts. A Relay
 				// front door with a confirmed upstream transport error is hard-excluded
@@ -2150,6 +2264,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				circuitAttempt.Release(h.store, account)
 				if !stickyRetry {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				}
+				if clientGone {
+					requestFailureSpec.StatusCode = relayTransportFailureAuditStatus(relayTransportFailure)
+					h.logRetryRequestErrorFailure(c, requestFailureSpec, reqErr, timedOut)
+					return
+				}
+				publishTerminalRequestFailure := func() {
+					publishHTTPFinalWithAudit(c,
+						func() { sendCanonicalRequestFailure(c, reqErr) },
+						func() { h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr) },
+						func() {
+							hiddenSpec := requestFailureSpec
+							hiddenSpec.StatusCode = relayTransportFailureAuditStatus(relayTransportFailure)
+							h.logRetryRequestErrorFailure(c, hiddenSpec, reqErr, timedOut)
+						},
+					)
 				}
 				if timedOut && shouldRetry {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -2174,7 +2304,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 
 				if !retryable {
-					ErrorToGinResponse(c, reqErr)
+					if terminalRequestFailure {
+						publishTerminalRequestFailure()
+					} else {
+						ErrorToGinResponse(c, reqErr)
+					}
 					return
 				}
 
@@ -2201,7 +2335,11 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					continue
 				}
-				ErrorToGinResponse(c, reqErr)
+				if terminalRequestFailure {
+					publishTerminalRequestFailure()
+				} else {
+					ErrorToGinResponse(c, reqErr)
+				}
 				return
 			}
 			if !isStream {
@@ -2215,8 +2353,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				clientGone := c.Request.Context().Err() != nil
 
-				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				if !clientGone && !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 					if repair.Changed && !repair.InputEmpty {
 						h.invalidateEncryptedContextBindings(c)
@@ -2225,7 +2364,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
 						resetOpenAIResponsesBody()
 						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
-						h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+						repairFailure := retryAttemptUsageSpec{
 							AccountID:            account.ID(),
 							Endpoint:             "/v1/responses",
 							Model:                logModel,
@@ -2240,7 +2379,12 @@ func (h *Handler) Responses(c *gin.Context) {
 							Attempt:              attempt,
 							UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 							ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-						})
+						}
+						h.logRetryAttemptFailure(c, repairFailure)
+						pendingFinalFailure = rememberPendingFinalFailure(c, repairFailure)
+						lastFailureWasRelay = false
+						lastStatusCode = 0
+						lastBody = nil
 						circuitAttempt.Release(h.store, account)
 						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
@@ -2261,7 +2405,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 				shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
-				h.logUsageForRequest(c, &database.UsageLogInput{
+				failureUsage := &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses",
 					Model:                logModel,
@@ -2279,34 +2423,43 @@ func (h *Handler) Responses(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 					IsRetryAttempt:       attempt > 0,
 					AttemptIndex:         attempt + 1,
-					GuardianAttemptOnly:  shouldRetry,
+					GuardianAttemptOnly:  shouldRetry || clientGone,
 					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-				})
+				}
 
+				if clientGone {
+					h.logUsageForRequest(c, failureUsage)
+					return
+				}
 				if shouldRetry {
+					h.logUsageForRequest(c, failureUsage)
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
 					lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-					if lastFailureWasRelay {
-						pending := retryAttemptUsageSpec{
-							AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
-							EffectiveModel: attemptLogEffectiveModel, StatusCode: resp.StatusCode,
-							DurationMs: durationMs, ReasoningEffort: reasoningEffort,
-							UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
-							RequestedServiceTier: serviceTier, Attempt: attempt,
-							UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-							ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
-						}
-						pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+					pending := retryAttemptUsageSpec{
+						AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
+						EffectiveModel: attemptLogEffectiveModel, StatusCode: resp.StatusCode,
+						DurationMs: durationMs, ReasoningEffort: reasoningEffort,
+						UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
+						RequestedServiceTier: serviceTier, Attempt: attempt,
+						UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+						ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 					}
+					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
 					continue
 				}
 
-				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, resp.StatusCode, errBody) },
+					func() {
+						h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, openAIFinalResponseStatus(resp.StatusCode, errBody), false))
+					},
+					func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, resp.StatusCode, true)) },
+				)
 				return
 			}
 
@@ -2323,12 +2476,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			deltaCharCount := 0
 			var readErr error
 			var writeErr error
+			clientGone := false
 			wroteAnyBody := false
+			terminalDelivered := false
 			// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 			// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 			abortedForHTTPError := false
 			var imageLogInfo imageUsageLogInfo
 			var terminalFailurePayload []byte
+			var nonStreamResponseBody []byte
+			var nonStreamContentType string
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -2347,12 +2504,14 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				streamWriter := newStreamFlushWriter(c.Writer, flusher)
-				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					encryptedCapture.Observe(data)
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
+					if c.Request.Context().Err() != nil {
+						clientGone = true
+					}
 					ttftGuard.MarkProgress(eventType)
 					isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 					if !ttftRecorded && isFirstToken {
@@ -2364,6 +2523,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					if eventType == "response.completed" {
 						h.commitEncryptedContextCapture(account, encryptedCapture)
+					}
+					if eventType == "response.completed" || eventType == "response.incomplete" {
 						h.pinCybRelayResponseID(c, data)
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -2397,9 +2558,17 @@ func (h *Handler) Responses(c *gin.Context) {
 							clientGone = true
 						} else if wrote {
 							wroteAnyBody = true
+							if isResponsesTerminalEventType(eventType) {
+								if err := streamWriter.Flush(); err != nil {
+									writeErr = err
+									clientGone = true
+								} else {
+									terminalDelivered = true
+								}
+							}
 						}
 					}
-					return eventType != "response.completed" && eventType != "response.failed"
+					return !isResponsesTerminalEventType(eventType)
 				})
 				// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 				// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
@@ -2407,21 +2576,26 @@ func (h *Handler) Responses(c *gin.Context) {
 					writeErr = streamWriter.Flush()
 				}
 			} else {
-				var respBody []byte
-				respBody, readErr = io.ReadAll(resp.Body)
+				nonStreamResponseBody, readErr = io.ReadAll(resp.Body)
+				if readErr == nil && len(nonStreamResponseBody) == 0 {
+					readErr = io.ErrUnexpectedEOF
+				}
 				if readErr == nil {
-					encryptedCapture.Observe(respBody)
-					h.commitEncryptedContextCapture(account, encryptedCapture)
-					h.pinCybRelayResponseID(c, respBody)
-					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
-					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
-					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
+					usage = extractUsageFromResult(gjson.GetBytes(nonStreamResponseBody, "usage"))
+					actualServiceTier = gjson.GetBytes(nonStreamResponseBody, "service_tier").String()
 					gotTerminal = true
-					contentType := resp.Header.Get("Content-Type")
-					if contentType == "" {
-						contentType = "application/json"
+					nonStreamContentType = resp.Header.Get("Content-Type")
+					if nonStreamContentType == "" {
+						nonStreamContentType = "application/json"
 					}
-					c.Data(http.StatusOK, contentType, respBody)
+					if failurePayload := responsesFailureEventPayload(nonStreamResponseBody); len(failurePayload) > 0 {
+						terminalFailurePayload = failurePayload
+					} else {
+						encryptedCapture.Observe(nonStreamResponseBody)
+						h.commitEncryptedContextCapture(account, encryptedCapture)
+						h.pinCybRelayResponseID(c, nonStreamResponseBody)
+						imageLogInfo = imageUsageLogInfoFromResponseJSON(nonStreamResponseBody)
+					}
 				}
 			}
 
@@ -2445,6 +2619,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
+			disconnected := clientGone || c.Request.Context().Err() != nil || writeErr != nil
+			clientGoneFinal := disconnected && !(isStream && terminalDelivered)
 			if wsHTTPFallback.ForceHTTP() {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 			}
@@ -2465,22 +2641,25 @@ func (h *Handler) Responses(c *gin.Context) {
 					ActualServiceTier:    actualServiceTier,
 					Attempt:              attempt,
 				}, outcome)
-				if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+				pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
+					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
+					EffectiveModel: attemptLogEffectiveModel, DurationMs: totalDuration,
+					FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+					UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
+					RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
+					Attempt: attempt,
+				}, outcome)
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+				if lastFailureWasRelay {
 					lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
-					lastFailureWasRelay = true
-					pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
-						AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
-						EffectiveModel: attemptLogEffectiveModel, DurationMs: totalDuration,
-						FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
-						UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
-						RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
-						Attempt: attempt,
-					}, outcome)
-					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 					if outcome.logStatusCode == logStatusUpstreamStreamBreak {
 						lastStatusCode = pending.StatusCode
 						lastBody = upstreamFailureBody(pending.ErrorMessage)
 					}
+				} else {
+					lastStatusCode = 0
+					lastBody = nil
 				}
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
@@ -2499,25 +2678,52 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				continue
 			}
-			logStatusCode := canonicalStreamStatus(outcome)
-			if isStream && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil && outcome.logStatusCode == logStatusUpstreamStreamBreak {
-				c.Header("Content-Type", "application/json; charset=utf-8")
-				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+			canonicalStatusCode := canonicalStreamStatus(outcome)
+			if !clientGoneFinal && isStream && !wroteAnyBody && outcome.logStatusCode == logStatusUpstreamStreamBreak {
+				delivered := publishHTTPFinalResponse(c, func() {
+					c.Header("Content-Type", "application/json; charset=utf-8")
+					c.JSON(canonicalStatusCode, gin.H{
+						"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					})
 				})
-			} else if isStream && abortedForHTTPError && !wroteAnyBody {
+				clientGoneFinal = !delivered
+			} else if !clientGoneFinal && isStream && abortedForHTTPError && !wroteAnyBody {
 				// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 				// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 				// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
-				c.Header("Content-Type", "application/json; charset=utf-8")
-				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				delivered := publishHTTPFinalResponse(c, func() {
+					c.Header("Content-Type", "application/json; charset=utf-8")
+					c.JSON(canonicalStatusCode, gin.H{
+						"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					})
 				})
+				clientGoneFinal = !delivered
+			} else if !clientGoneFinal && !isStream {
+				delivered := false
+				switch {
+				case len(terminalFailurePayload) > 0:
+					delivered = publishHTTPFinalResponse(c, func() {
+						c.JSON(canonicalStatusCode, gin.H{
+							"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+						})
+					})
+				case readErr == nil && gotTerminal && len(nonStreamResponseBody) > 0:
+					delivered = publishHTTPFinalResponse(c, func() {
+						c.Data(http.StatusOK, nonStreamContentType, nonStreamResponseBody)
+					})
+				default:
+					delivered = publishHTTPFinalResponse(c, func() {
+						c.JSON(canonicalStatusCode, gin.H{
+							"error": gin.H{"message": "读取 OpenAI Responses 响应失败", "type": "upstream_error"},
+						})
+					})
+				}
+				clientGoneFinal = !delivered
 			}
-			if !isStream && readErr != nil {
-				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": "读取 OpenAI Responses 响应失败", "type": "upstream_error"},
-				})
+			hiddenAttempt := clientGoneFinal
+			logStatusCode := canonicalStatusCode
+			if hiddenAttempt {
+				logStatusCode = outcome.logStatusCode
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				log.Printf("OpenAI Responses 流异常结束 (account %d, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -2555,6 +2761,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
+				GuardianAttemptOnly:  hiddenAttempt,
 			}
 			if logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -2608,12 +2815,26 @@ func (h *Handler) Responses(c *gin.Context) {
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
+		if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
+			ttftGuard.Stop()
+			upstreamCancel()
+			return
+		}
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
+			localContentionKind := websocketLocalContentionKind(reqErr)
+			localContention := useWebsocket && localContentionKind != ""
+			fallbackEligibleLocalContention := c.Request.Context().Err() == nil && shouldFallbackWebsocketLocalContentionToHTTP(reqErr, useWebsocket, rawBody, sessionIdentity)
+			clientContextErr := c.Request.Context().Err()
+			clientGone := clientContextErr != nil
+			if clientGone && requestErrorCausedByClientContext(clientContextErr, reqErr) {
+				circuitAttempt.Release(h.store, account)
+				return
+			}
 			if timedOut {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
@@ -2621,7 +2842,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}
-			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+			fallbackLocalContention := !timedOut && fallbackEligibleLocalContention
+			if useWebsocket && (kind == upstreamErrorKindMessageTooBig || fallbackLocalContention) {
 				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses",
@@ -2634,18 +2856,36 @@ func (h *Handler) Responses(c *gin.Context) {
 					ViaWebsocket:         true,
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
+					UpstreamErrorKind:    localContentionKind,
 				}, reqErr, false)
 				wsElapsed := time.Since(start)
-				wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()), circuitAttempt, selectedDecision)
-				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
+				fallbackSource := websocketMessageTooBigSource(reqErr.Error())
+				if fallbackLocalContention {
+					fallbackSource = websocketLocalContentionSource(reqErr)
+				}
+				wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, fallbackSource, circuitAttempt, selectedDecision)
+				log.Printf("上游 WebSocket 降级 HTTP，保留账号租约 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := shouldRetryTransportFailure(reqErr, kind)
+			if localContention && !fallbackEligibleLocalContention {
+				// A busy explicit upstream session has already waited the full acquire
+				// timeout. Repeating the same sticky WS attempt only adds another 30s;
+				// rotating or downgrading it could reorder conversation state.
+				retryable = false
+			}
 			shouldRetry := false
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			relayTransportFailure := circuitAttempt.UpstreamTransportFailure(c.Request.Context(), kind, timedOut)
+			relayTransportFailure := false
+			if !localContention {
+				transportEvidenceContext := c.Request.Context()
+				if clientGone {
+					transportEvidenceContext = context.Background()
+				}
+				relayTransportFailure = circuitAttempt.UpstreamTransportFailure(transportEvidenceContext, kind, timedOut)
+			}
 			if relayTransportFailure {
 				recyclePooledClient(account, proxyURL)
 			}
@@ -2658,28 +2898,61 @@ func (h *Handler) Responses(c *gin.Context) {
 				Stream: isStream, ViaWebsocket: useWebsocket,
 				RequestedServiceTier: serviceTier, Attempt: attempt,
 			}
-			if relayRequestFailure && !shouldRetry {
-				h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
-			}
-			if relayRequestFailure && shouldRetry {
-				pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
+			terminalRequestFailure := !shouldRetry && kind != "" && kind != upstreamErrorKindMessageTooBig
+			if shouldRetry && kind != "" && kind != upstreamErrorKindMessageTooBig && c.Request.Context().Err() == nil {
+				pending := canonicalRequestFailureSpecWithKind(requestFailureSpec, reqErr, localContentionKind)
 				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
-				lastStatusCode = pending.StatusCode
-				lastBody = upstreamFailureBody(pending.ErrorMessage)
-				lastFailureWasRelay = true
+				lastFailureWasRelay = relayRequestFailure
+				if relayRequestFailure {
+					lastStatusCode = pending.StatusCode
+					lastBody = upstreamFailureBody(pending.ErrorMessage)
+				} else {
+					lastStatusCode = 0
+					lastBody = nil
+				}
 			}
 			// Preserve sticky retries for non-Relay accounts only. Relay transport
 			// failure must rotate away from the failed front door.
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
-			if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
+			stickyRetry := shouldRetry && !localContention && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
+			if !localContention && shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			if stickyRetry {
 				requestStickyRetry.Retain(account, proxyURL)
 			}
 			circuitAttempt.Release(h.store, account)
-			if !stickyRetry {
+			if !stickyRetry && (!localContention || (timedOut && fallbackEligibleLocalContention)) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			if clientGone {
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					StatusCode:           relayTransportFailureAuditStatus(relayTransportFailure),
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+					UpstreamErrorKind:    localContentionKind,
+				}, reqErr, timedOut)
+				return
+			}
+			publishTerminalRequestFailure := func() {
+				publishHTTPFinalWithAudit(c,
+					func() { sendCanonicalRequestFailure(c, reqErr) },
+					func() { h.logFinalRequestErrorFailureWithKind(c, requestFailureSpec, reqErr, localContentionKind) },
+					func() {
+						hiddenSpec := requestFailureSpec
+						hiddenSpec.StatusCode = relayTransportFailureAuditStatus(relayTransportFailure)
+						hiddenSpec.UpstreamErrorKind = localContentionKind
+						h.logRetryRequestErrorFailure(c, hiddenSpec, reqErr, timedOut)
+					},
+				)
 			}
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -2696,16 +2969,21 @@ func (h *Handler) Responses(c *gin.Context) {
 					ViaWebsocket:         useWebsocket,
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
+					UpstreamErrorKind:    localContentionKind,
 				}, reqErr, true)
 				continue
 			}
-			if !timedOut && !stickyRetry {
+			if !localContention && !timedOut && !stickyRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
 			// 不可重试的结构化错误直接返回
 			if !retryable {
-				ErrorToGinResponse(c, reqErr)
+				if terminalRequestFailure {
+					publishTerminalRequestFailure()
+				} else {
+					ErrorToGinResponse(c, reqErr)
+				}
 				return
 			}
 
@@ -2732,7 +3010,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				continue
 			}
-			ErrorToGinResponse(c, reqErr)
+			if terminalRequestFailure {
+				publishTerminalRequestFailure()
+			} else {
+				ErrorToGinResponse(c, reqErr)
+			}
 			return
 		}
 
@@ -2743,8 +3025,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			clientGone := c.Request.Context().Err() != nil
 
-			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+			if !clientGone && !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 				if repair.Changed && !repair.InputEmpty {
 					h.invalidateEncryptedContextBindings(c)
@@ -2753,7 +3036,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					codexBody, expandedInputRaw = PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
 					resetOpenAIResponsesBody()
 					log.Printf("上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
-					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+					repairFailure := retryAttemptUsageSpec{
 						AccountID:            account.ID(),
 						Endpoint:             "/v1/responses",
 						Model:                logModel,
@@ -2768,7 +3051,12 @@ func (h *Handler) Responses(c *gin.Context) {
 						Attempt:              attempt,
 						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-					})
+					}
+					h.logRetryAttemptFailure(c, repairFailure)
+					pendingFinalFailure = rememberPendingFinalFailure(c, repairFailure)
+					lastFailureWasRelay = false
+					lastStatusCode = 0
+					lastBody = nil
 					circuitAttempt.Release(h.store, account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
@@ -2789,7 +3077,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			failureUsage := &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses",
 				Model:                logModel,
@@ -2807,34 +3095,43 @@ func (h *Handler) Responses(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
-				GuardianAttemptOnly:  shouldRetry,
+				GuardianAttemptOnly:  shouldRetry || clientGone,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-			})
+			}
 
+			if clientGone {
+				h.logUsageForRequest(c, failureUsage)
+				return
+			}
 			if shouldRetry {
+				h.logUsageForRequest(c, failureUsage)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-				if lastFailureWasRelay {
-					pending := retryAttemptUsageSpec{
-						AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
-						EffectiveModel: logEffectiveModel, StatusCode: resp.StatusCode,
-						DurationMs: durationMs, ReasoningEffort: reasoningEffort,
-						UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
-						RequestedServiceTier: serviceTier, Attempt: attempt,
-						UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-						ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
-					}
-					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				pending := retryAttemptUsageSpec{
+					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
+					EffectiveModel: logEffectiveModel, StatusCode: resp.StatusCode,
+					DurationMs: durationMs, ReasoningEffort: reasoningEffort,
+					UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
+					RequestedServiceTier: serviceTier, Attempt: attempt,
+					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 				}
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
 				continue
 			}
 
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			publishHTTPFinalWithAudit(c,
+				func() { h.sendFinalUpstreamError(c, resp.StatusCode, errBody) },
+				func() {
+					h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, openAIFinalResponseStatus(resp.StatusCode, errBody), false))
+				},
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, resp.StatusCode, true)) },
+			)
 			return
 		}
 
@@ -2855,7 +3152,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
 		var readErr error
 		var writeErr error
+		clientGone := false
 		wroteAnyBody := false
+		terminalDelivered := false
 		// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 		// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 		abortedForHTTPError := false
@@ -2884,12 +3183,14 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
-			clientGone := false
 			var pendingFirstTokenEvents bytes.Buffer
 			forward := func(data []byte) bool {
 				encryptedCapture.Observe(data)
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if c.Request.Context().Err() != nil {
+					clientGone = true
+				}
 
 				// TTFT: 记录第一个实际内容事件的时间
 				ttftGuard.MarkProgress(eventType)
@@ -2910,13 +3211,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
 					h.commitEncryptedContextCapture(account, encryptedCapture)
+				}
+				if eventType == "response.completed" || eventType == "response.incomplete" {
 					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+					if eventType == "response.completed" {
+						// 缓存响应上下文，供后续 previous_response_id 展开使用
+						cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -2945,9 +3250,17 @@ func (h *Handler) Responses(c *gin.Context) {
 						clientGone = true
 					} else if wrote {
 						wroteAnyBody = true
+						if isResponsesTerminalEventType(eventType) {
+							if err := streamWriter.Flush(); err != nil {
+								writeErr = err
+								clientGone = true
+							} else {
+								terminalDelivered = true
+							}
+						}
 					}
 				}
-				return eventType != "response.completed" && eventType != "response.failed"
+				return !isResponsesTerminalEventType(eventType)
 			}
 
 			// 思考截断自动续想（默认关闭）：开启时用折叠状态机包裹 forward，
@@ -3044,13 +3357,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				if eventType == "response.completed" {
 					h.commitEncryptedContextCapture(account, encryptedCapture)
+				}
+				if eventType == "response.completed" || eventType == "response.incomplete" {
 					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+					if eventType == "response.completed" {
+						// 缓存响应上下文，供后续 previous_response_id 展开使用
+						cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+					}
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -3096,6 +3413,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if !isStream && len(terminalFailurePayload) == 0 && responseJSON == nil {
+			outcome = streamOutcome{
+				logStatusCode:  logStatusUpstreamStreamBreak,
+				failureKind:    "transport",
+				failureMessage: "上游流提前结束，未收到完整的响应对象",
+				penalize:       true,
+			}
+		}
+		disconnected := clientGone || c.Request.Context().Err() != nil || writeErr != nil
+		clientGoneFinal := disconnected && !(isStream && terminalDelivered)
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 		}
@@ -3138,22 +3465,25 @@ func (h *Handler) Responses(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
-			if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+			pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
+				AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
+				EffectiveModel: logEffectiveModel, DurationMs: totalDuration,
+				FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+				UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
+				RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
+				Attempt: attempt,
+			}, outcome)
+			pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+			lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+			if lastFailureWasRelay {
 				lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
-				lastFailureWasRelay = true
-				pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
-					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel,
-					EffectiveModel: logEffectiveModel, DurationMs: totalDuration,
-					FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
-					UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
-					RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
-					Attempt: attempt,
-				}, outcome)
-				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 				if outcome.logStatusCode == logStatusUpstreamStreamBreak {
 					lastStatusCode = pending.StatusCode
 					lastBody = upstreamFailureBody(pending.ErrorMessage)
 				}
+			} else {
+				lastStatusCode = 0
+				lastBody = nil
 			}
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -3173,7 +3503,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
-		logStatusCode := canonicalStreamStatus(outcome)
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
@@ -3188,31 +3517,57 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 		}
-		if isStream && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil && outcome.logStatusCode == logStatusUpstreamStreamBreak {
-			c.Header("Content-Type", "application/json; charset=utf-8")
-			c.JSON(logStatusCode, gin.H{
-				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+		canonicalStatusCode := canonicalStreamStatus(outcome)
+		if !clientGoneFinal && isStream && !wroteAnyBody && outcome.logStatusCode == logStatusUpstreamStreamBreak {
+			delivered := publishHTTPFinalResponse(c, func() {
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				c.JSON(canonicalStatusCode, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
 			})
-		} else if isStream && abortedForHTTPError && !wroteAnyBody {
+			clientGoneFinal = !delivered
+		} else if !clientGoneFinal && isStream && abortedForHTTPError && !wroteAnyBody {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
-			c.Header("Content-Type", "application/json; charset=utf-8")
-			c.JSON(logStatusCode, gin.H{
-				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
-			})
-		} else if !isStream {
-			if len(terminalFailurePayload) > 0 {
-				c.JSON(logStatusCode, gin.H{
+			delivered := publishHTTPFinalResponse(c, func() {
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				c.JSON(canonicalStatusCode, gin.H{
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 				})
-			} else if responseJSON != nil {
-				c.Data(http.StatusOK, "application/json", responseJSON)
-			} else {
-				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": "未收到完整的上游响应", "type": "upstream_error"},
+			})
+			clientGoneFinal = !delivered
+		} else if !clientGoneFinal && !isStream {
+			delivered := false
+			switch {
+			case len(terminalFailurePayload) > 0:
+				delivered = publishHTTPFinalResponse(c, func() {
+					c.JSON(canonicalStatusCode, gin.H{
+						"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					})
+				})
+			case gotTerminal && outcome.logStatusCode == http.StatusOK && responseJSON != nil:
+				delivered = publishHTTPFinalResponse(c, func() {
+					c.Data(http.StatusOK, "application/json", responseJSON)
+				})
+			default:
+				message := strings.TrimSpace(outcome.failureMessage)
+				if message == "" {
+					message = "未收到完整的上游响应"
+				}
+				delivered = publishHTTPFinalResponse(c, func() {
+					c.JSON(canonicalStatusCode, gin.H{
+						"error": gin.H{"message": message, "type": "upstream_error"},
+					})
 				})
 			}
+			clientGoneFinal = !delivered
+		}
+
+		hiddenAttempt := clientGoneFinal
+		logStatusCode := canonicalStatusCode
+		if hiddenAttempt {
+			logStatusCode = outcome.logStatusCode
 		}
 
 		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
@@ -3237,6 +3592,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			RequestedServiceTier: usageTiers.RequestedServiceTier,
 			ActualServiceTier:    usageTiers.ActualServiceTier,
 			BillingServiceTier:   usageTiers.BillingServiceTier,
+			GuardianAttemptOnly:  hiddenAttempt,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
@@ -3399,34 +3755,87 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
+			if c.Request.Context().Err() != nil {
+				return
+			}
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
-				h.logRouteSelectionError(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt, routeErr, spec)
-				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
+				publishHTTPFinalWithAudit(c,
+					func() { api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode) },
+					func() {
+						h.logRouteSelectionError(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt, routeErr, spec)
+					},
+					nil,
+				)
 				return
 			}
 			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
-				h.logPendingFinalFailure(c, pendingFinalFailure)
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
+					func() {
+						h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+					},
+					nil,
+				)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
-				h.logCybRelayUnavailable(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt)
-				sendCybRelayUnavailableOpenAI(c)
+				publishHTTPFinalWithAudit(c,
+					func() { sendCybRelayUnavailableOpenAI(c) },
+					func() {
+						h.logCybRelayUnavailable(c, "/v1/responses/compact", logModel, logEffectiveModel, false, false, attempt)
+					},
+					nil,
+				)
 				return
 			}
 			if (lastStatusCode == http.StatusTooManyRequests || lastStatusCode == http.StatusBadGateway) && len(lastBody) > 0 {
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
+					func() {
+						h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+					},
+					nil,
+				)
 				return
 			}
-			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			publishHTTPFinalWithAudit(c,
+				func() { c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel)) },
+				func() {
+					h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+						Endpoint:       "/v1/responses/compact",
+						Model:          logModel,
+						EffectiveModel: logEffectiveModel,
+						Stream:         false,
+						Attempt:        attempt,
+					}, http.StatusServiceUnavailable, ErrorCodeNoAvailableAccount, noAvailableAccountMessage(effectiveModel))
+				},
+				nil,
+			)
 			return
 		}
+		lastFailureWasRelay = false
+		lastStatusCode = 0
+		lastBody = nil
 		if encryptedContextNeedsDowngrade(c) {
 			repairedRawBody, repair, repairErr := h.repairEncryptedContextForAccountSwitch(c, rawBody)
 			if repairErr != nil {
 				circuitAttempt.Release(h.store, account)
-				api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest))
+				publishHTTPFinalWithAudit(c,
+					func() {
+						api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, repairErr.Error(), api.ErrorTypeInvalidRequest))
+					},
+					func() {
+						h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+							Endpoint:       "/v1/responses/compact",
+							Model:          logModel,
+							EffectiveModel: logEffectiveModel,
+							Stream:         false,
+							Attempt:        attempt,
+						}, http.StatusBadRequest, "invalid_encrypted_content", repairErr.Error())
+					},
+					nil,
+				)
 				return
 			}
 			rawBody = repairedRawBody
@@ -3464,6 +3873,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
+				if c.Request.Context().Err() != nil {
+					circuitAttempt.Release(h.store, account)
+					return
+				}
 				kind := classifyTransportFailure(reqErr)
 				retryable := shouldRetryTransportFailure(reqErr, kind)
 				shouldRetry := false
@@ -3482,15 +3895,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					ReasoningEffort: reasoningEffort, UpstreamEndpoint: upstreamEndpoint,
 					RequestedServiceTier: serviceTier, Attempt: attempt,
 				}
-				if relayRequestFailure && !shouldRetry {
-					h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
-				}
-				if relayRequestFailure && shouldRetry {
+				terminalRequestFailure := !shouldRetry && kind != ""
+				if shouldRetry && kind != "" && c.Request.Context().Err() == nil {
 					pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
 					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
-					lastStatusCode = pending.StatusCode
-					lastBody = upstreamFailureBody(pending.ErrorMessage)
-					lastFailureWasRelay = true
+					lastFailureWasRelay = relayRequestFailure
+					if relayRequestFailure {
+						lastStatusCode = pending.StatusCode
+						lastBody = upstreamFailureBody(pending.ErrorMessage)
+					} else {
+						lastStatusCode = 0
+						lastBody = nil
+					}
 				}
 				if shouldPenalizeTransportFailure(kind) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
@@ -3499,8 +3915,23 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 
+				publishTerminalRequestFailure := func() {
+					publishHTTPFinalWithAudit(c,
+						func() { sendCanonicalRequestFailure(c, reqErr) },
+						func() { h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr) },
+						func() {
+							hiddenSpec := requestFailureSpec
+							hiddenSpec.StatusCode = relayTransportFailureAuditStatus(relayTransportFailure)
+							h.logRetryRequestErrorFailure(c, hiddenSpec, reqErr, false)
+						},
+					)
+				}
 				if !retryable {
-					ErrorToGinResponse(c, reqErr)
+					if terminalRequestFailure {
+						publishTerminalRequestFailure()
+					} else {
+						ErrorToGinResponse(c, reqErr)
+					}
 					return
 				}
 
@@ -3519,15 +3950,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					}, reqErr, false)
 					continue
 				}
-				ErrorToGinResponse(c, reqErr)
+				if terminalRequestFailure {
+					publishTerminalRequestFailure()
+				} else {
+					ErrorToGinResponse(c, reqErr)
+				}
 				return
 			}
 
 			if resp.StatusCode != http.StatusOK {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				clientGone := c.Request.Context().Err() != nil
 
-				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+				if !clientGone && !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 					if repair.Changed && !repair.InputEmpty {
 						h.invalidateEncryptedContextBindings(c)
@@ -3536,7 +3972,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 						codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
 						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
 						log.Printf("OpenAI Responses compact 上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
-						h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+						repairFailure := retryAttemptUsageSpec{
 							AccountID:            account.ID(),
 							Endpoint:             "/v1/responses/compact",
 							Model:                logModel,
@@ -3549,7 +3985,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 							Attempt:              attempt,
 							UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 							ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-						})
+						}
+						h.logRetryAttemptFailure(c, repairFailure)
+						pendingFinalFailure = rememberPendingFinalFailure(c, repairFailure)
+						lastFailureWasRelay = false
+						lastStatusCode = 0
+						lastBody = nil
 						circuitAttempt.Release(h.store, account)
 						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
@@ -3569,7 +4010,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 				shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
-				h.logUsageForRequest(c, &database.UsageLogInput{
+				failureUsage := &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses/compact",
 					Model:                logModel,
@@ -3585,39 +4026,53 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 					IsRetryAttempt:       attempt > 0,
 					AttemptIndex:         attempt + 1,
-					GuardianAttemptOnly:  shouldRetry,
+					GuardianAttemptOnly:  shouldRetry || clientGone,
 					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-				})
+				}
 
+				if clientGone {
+					h.logUsageForRequest(c, failureUsage)
+					return
+				}
 				if shouldRetry {
+					h.logUsageForRequest(c, failureUsage)
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
 					lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-					if lastFailureWasRelay {
-						pending := retryAttemptUsageSpec{
-							AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
-							EffectiveModel: attemptLogEffectiveModel, StatusCode: resp.StatusCode,
-							DurationMs: durationMs, ReasoningEffort: reasoningEffort,
-							UpstreamEndpoint:     upstreamEndpoint,
-							RequestedServiceTier: serviceTier, Attempt: attempt,
-							UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-							ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
-						}
-						pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+					pending := retryAttemptUsageSpec{
+						AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
+						EffectiveModel: attemptLogEffectiveModel, StatusCode: resp.StatusCode,
+						DurationMs: durationMs, ReasoningEffort: reasoningEffort,
+						UpstreamEndpoint:     upstreamEndpoint,
+						RequestedServiceTier: serviceTier, Attempt: attempt,
+						UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+						ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 					}
+					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
 					}
 					continue
 				}
 
-				h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, resp.StatusCode, errBody) },
+					func() {
+						h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, openAIFinalResponseStatus(resp.StatusCode, errBody), false))
+					},
+					func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, resp.StatusCode, true)) },
+				)
 				return
 			}
 
 			respBody, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if c.Request.Context().Err() != nil {
+				circuitAttempt.Release(h.store, account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				return
+			}
 			if readErr != nil {
 				totalDuration := int(time.Since(start).Milliseconds())
 				kind := classifyTransportFailure(readErr)
@@ -3635,7 +4090,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				retryExclusions.MarkHard(account.ID())
 
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
-				h.logUsageForRequest(c, &database.UsageLogInput{
+				failureUsage := &database.UsageLogInput{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/responses/compact",
 					Model:                logModel,
@@ -3654,26 +4109,31 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					GuardianAttemptOnly:  shouldRetry,
 					UpstreamErrorKind:    kind,
 					ErrorMessage:         fmt.Sprintf("上游响应读取失败: %v", readErr),
-				})
+				}
 				log.Printf("OpenAI Responses compact 上游响应读取失败 (attempt %d): %v", attempt+1, readErr)
 				if shouldRetry {
+					h.logUsageForRequest(c, failureUsage)
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(fmt.Sprintf("Failed to read upstream response: %v", readErr))
 					lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-					if lastFailureWasRelay {
-						pending := retryAttemptUsageSpec{
-							AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
-							EffectiveModel: attemptLogEffectiveModel, StatusCode: http.StatusBadGateway,
-							DurationMs: totalDuration, ReasoningEffort: reasoningEffort,
-							UpstreamEndpoint: upstreamEndpoint, RequestedServiceTier: serviceTier,
-							Attempt: attempt, UpstreamErrorKind: kind,
-							ErrorMessage: fmt.Sprintf("上游响应读取失败: %v", readErr),
-						}
-						pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+					pending := retryAttemptUsageSpec{
+						AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
+						EffectiveModel: attemptLogEffectiveModel, StatusCode: http.StatusBadGateway,
+						DurationMs: totalDuration, ReasoningEffort: reasoningEffort,
+						UpstreamEndpoint: upstreamEndpoint, RequestedServiceTier: serviceTier,
+						Attempt: attempt, UpstreamErrorKind: kind,
+						ErrorMessage: fmt.Sprintf("Failed to read upstream response: %v", readErr),
 					}
+					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 					continue
 				}
-				api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
+				publishHTTPFinalWithAudit(c,
+					func() {
+						api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
+					},
+					func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, http.StatusBadGateway, false)) },
+					func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, http.StatusBadGateway, true)) },
+				)
 				return
 			}
 
@@ -3697,7 +4157,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			c.Set("x-reasoning-effort", reasoningEffort)
 			c.Set("x-service-tier", usageTiers.ServiceTier)
 
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			successUsage := &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses/compact",
 				Model:                logModel,
@@ -3720,7 +4180,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-			})
+			}
 
 			circuitAttempt.Success()
 			circuitAttempt.Release(h.store, account)
@@ -3728,7 +4188,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if contentType == "" {
 				contentType = "application/json"
 			}
-			c.Data(http.StatusOK, contentType, respBody)
+			publishHTTPFinalWithAudit(c,
+				func() { c.Data(http.StatusOK, contentType, respBody) },
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(successUsage, http.StatusOK, false)) },
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(successUsage, http.StatusOK, true)) },
+			)
 			return
 		}
 
@@ -3739,6 +4203,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if c.Request.Context().Err() != nil {
+				circuitAttempt.Release(h.store, account)
+				return
+			}
 			kind := classifyTransportFailure(reqErr)
 			retryable := shouldRetryTransportFailure(reqErr, kind)
 			shouldRetry := false
@@ -3757,15 +4225,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				ReasoningEffort: reasoningEffort, UpstreamEndpoint: "/v1/responses/compact",
 				RequestedServiceTier: serviceTier, Attempt: attempt,
 			}
-			if relayRequestFailure && !shouldRetry {
-				h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
-			}
-			if relayRequestFailure && shouldRetry {
+			terminalRequestFailure := !shouldRetry && kind != ""
+			if shouldRetry && kind != "" && c.Request.Context().Err() == nil {
 				pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
 				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
-				lastStatusCode = pending.StatusCode
-				lastBody = upstreamFailureBody(pending.ErrorMessage)
-				lastFailureWasRelay = true
+				lastFailureWasRelay = relayRequestFailure
+				if relayRequestFailure {
+					lastStatusCode = pending.StatusCode
+					lastBody = upstreamFailureBody(pending.ErrorMessage)
+				} else {
+					lastStatusCode = 0
+					lastBody = nil
+				}
 			}
 			if shouldPenalizeTransportFailure(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
@@ -3774,8 +4245,23 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
+			publishTerminalRequestFailure := func() {
+				publishHTTPFinalWithAudit(c,
+					func() { sendCanonicalRequestFailure(c, reqErr) },
+					func() { h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr) },
+					func() {
+						hiddenSpec := requestFailureSpec
+						hiddenSpec.StatusCode = relayTransportFailureAuditStatus(relayTransportFailure)
+						h.logRetryRequestErrorFailure(c, hiddenSpec, reqErr, false)
+					},
+				)
+			}
 			if !retryable {
-				ErrorToGinResponse(c, reqErr)
+				if terminalRequestFailure {
+					publishTerminalRequestFailure()
+				} else {
+					ErrorToGinResponse(c, reqErr)
+				}
 				return
 			}
 
@@ -3794,15 +4280,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}, reqErr, false)
 				continue
 			}
-			ErrorToGinResponse(c, reqErr)
+			if terminalRequestFailure {
+				publishTerminalRequestFailure()
+			} else {
+				ErrorToGinResponse(c, reqErr)
+			}
 			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			clientGone := c.Request.Context().Err() != nil
 
-			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+			if !clientGone && !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				repairedRawBody, repair := repairInvalidEncryptedContentFromResponsesBody(rawBody)
 				if repair.Changed && !repair.InputEmpty {
 					h.invalidateEncryptedContextBindings(c)
@@ -3811,7 +4302,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					codexBody, _ = PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
 					openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
 					log.Printf("compact 上游拒绝 encrypted_content，已安全修复加密历史并重试一次 (attempt %d, dropped=%d converted=%d)", attempt+1, repair.Dropped, repair.Converted)
-					h.logRetryAttemptFailure(c, retryAttemptUsageSpec{
+					repairFailure := retryAttemptUsageSpec{
 						AccountID:            account.ID(),
 						Endpoint:             "/v1/responses/compact",
 						Model:                logModel,
@@ -3824,7 +4315,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 						Attempt:              attempt,
 						UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, codex429Decision{}),
 						ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-					})
+					}
+					h.logRetryAttemptFailure(c, repairFailure)
+					pendingFinalFailure = rememberPendingFinalFailure(c, repairFailure)
+					lastFailureWasRelay = false
+					lastStatusCode = 0
+					lastBody = nil
 					circuitAttempt.Release(h.store, account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
@@ -3844,7 +4340,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			failureUsage := &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses/compact",
 				Model:                logModel,
@@ -3860,40 +4356,54 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
-				GuardianAttemptOnly:  shouldRetry,
+				GuardianAttemptOnly:  shouldRetry || clientGone,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-			})
+			}
 
+			if clientGone {
+				h.logUsageForRequest(c, failureUsage)
+				return
+			}
 			if shouldRetry {
+				h.logUsageForRequest(c, failureUsage)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-				if lastFailureWasRelay {
-					pending := retryAttemptUsageSpec{
-						AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
-						EffectiveModel: logEffectiveModel, StatusCode: resp.StatusCode,
-						DurationMs: durationMs, ReasoningEffort: reasoningEffort,
-						UpstreamEndpoint:     "/v1/responses/compact",
-						RequestedServiceTier: serviceTier, Attempt: attempt,
-						UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-						ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
-					}
-					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				pending := retryAttemptUsageSpec{
+					AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
+					EffectiveModel: logEffectiveModel, StatusCode: resp.StatusCode,
+					DurationMs: durationMs, ReasoningEffort: reasoningEffort,
+					UpstreamEndpoint:     "/v1/responses/compact",
+					RequestedServiceTier: serviceTier, Attempt: attempt,
+					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 				}
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
 				continue
 			}
 
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			publishHTTPFinalWithAudit(c,
+				func() { h.sendFinalUpstreamError(c, resp.StatusCode, errBody) },
+				func() {
+					h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, openAIFinalResponseStatus(resp.StatusCode, errBody), false))
+				},
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, resp.StatusCode, true)) },
+			)
 			return
 		}
 
 		// 成功：直接透传响应体
 		respBody, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		if c.Request.Context().Err() != nil {
+			circuitAttempt.Release(h.store, account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			return
+		}
 		if readErr != nil {
 			totalDuration := int(time.Since(start).Milliseconds())
 			kind := classifyTransportFailure(readErr)
@@ -3912,7 +4422,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			retryExclusions.MarkHard(account.ID())
 
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			failureUsage := &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/responses/compact",
 				Model:                logModel,
@@ -3931,26 +4441,31 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				GuardianAttemptOnly:  shouldRetry,
 				UpstreamErrorKind:    kind,
 				ErrorMessage:         fmt.Sprintf("上游响应读取失败: %v", readErr),
-			})
+			}
 			log.Printf("compact 上游响应读取失败 (attempt %d): %v", attempt+1, readErr)
 			if shouldRetry {
+				h.logUsageForRequest(c, failureUsage)
 				lastStatusCode = http.StatusBadGateway
 				lastBody = []byte(fmt.Sprintf("Failed to read upstream response: %v", readErr))
 				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-				if lastFailureWasRelay {
-					pending := retryAttemptUsageSpec{
-						AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
-						EffectiveModel: logEffectiveModel, StatusCode: http.StatusBadGateway,
-						DurationMs: totalDuration, ReasoningEffort: reasoningEffort,
-						UpstreamEndpoint: "/v1/responses/compact", RequestedServiceTier: serviceTier,
-						Attempt: attempt, UpstreamErrorKind: kind,
-						ErrorMessage: fmt.Sprintf("上游响应读取失败: %v", readErr),
-					}
-					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				pending := retryAttemptUsageSpec{
+					AccountID: account.ID(), Endpoint: "/v1/responses/compact", Model: logModel,
+					EffectiveModel: logEffectiveModel, StatusCode: http.StatusBadGateway,
+					DurationMs: totalDuration, ReasoningEffort: reasoningEffort,
+					UpstreamEndpoint: "/v1/responses/compact", RequestedServiceTier: serviceTier,
+					Attempt: attempt, UpstreamErrorKind: kind,
+					ErrorMessage: fmt.Sprintf("Failed to read upstream response: %v", readErr),
 				}
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 				continue
 			}
-			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
+			publishHTTPFinalWithAudit(c,
+				func() {
+					api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
+				},
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, http.StatusBadGateway, false)) },
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, http.StatusBadGateway, true)) },
+			)
 			return
 		}
 
@@ -3970,7 +4485,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
 
 		totalDuration := int(time.Since(start).Milliseconds())
-		h.logUsageForRequest(c, &database.UsageLogInput{
+		successUsage := &database.UsageLogInput{
 			AccountID:            account.ID(),
 			Endpoint:             "/v1/responses/compact",
 			Model:                logModel,
@@ -3993,11 +4508,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			RequestedServiceTier: usageTiers.RequestedServiceTier,
 			ActualServiceTier:    usageTiers.ActualServiceTier,
 			BillingServiceTier:   usageTiers.BillingServiceTier,
-		})
+		}
 
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		circuitAttempt.Release(h.store, account)
-		c.Data(http.StatusOK, "application/json", respBody)
+		publishHTTPFinalWithAudit(c,
+			func() { c.Data(http.StatusOK, "application/json", respBody) },
+			func() { h.logUsageForRequest(c, httpFinalUsageCopy(successUsage, http.StatusOK, false)) },
+			func() { h.logUsageForRequest(c, httpFinalUsageCopy(successUsage, http.StatusOK, true)) },
+		)
 		return
 	}
 }
@@ -4127,31 +4646,73 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, selectionFilter, routeRequirement)
 			requestStickyRetry.Apply(account, &stickyProxyURL)
 		}
+		if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
+			return
+		}
 		promptDecision = selectedDecision
 		if account == nil {
+			if c.Request.Context().Err() != nil {
+				return
+			}
 			if routeErr, ok := routeSelectionErrorFromContext(c); ok {
 				spec := routeSelectionFailureSpecFor(routeErr)
-				h.logRouteSelectionError(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
-				api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode)
+				publishHTTPFinalWithAudit(c,
+					func() { api.SendErrorWithStatus(c, routeSelectionAPIError(routeErr, spec), spec.HTTPStatusCode) },
+					func() {
+						h.logRouteSelectionError(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt, routeErr, spec)
+					},
+					nil,
+				)
 				return
 			}
 			if (routeRequirement.routesToCybRelay() || lastFailureWasRelay) && lastStatusCode > 0 && len(lastBody) > 0 {
-				h.logPendingFinalFailure(c, pendingFinalFailure)
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
+					func() {
+						h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+					},
+					nil,
+				)
 				return
 			}
 			if routeRequirement.routesToCybRelay() {
-				h.logCybRelayUnavailable(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt)
-				sendCybRelayUnavailableOpenAI(c)
+				publishHTTPFinalWithAudit(c,
+					func() { sendCybRelayUnavailableOpenAI(c) },
+					func() {
+						h.logCybRelayUnavailable(c, "/v1/chat/completions", logModel, logEffectiveModel, isStream, false, attempt)
+					},
+					nil,
+				)
 				return
 			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				publishHTTPFinalWithAudit(c,
+					func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
+					func() {
+						h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+					},
+					nil,
+				)
 				return
 			}
-			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			publishHTTPFinalWithAudit(c,
+				func() { c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel)) },
+				func() {
+					h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+						Endpoint:       "/v1/chat/completions",
+						Model:          logModel,
+						EffectiveModel: logEffectiveModel,
+						Stream:         isStream,
+						Attempt:        attempt,
+					}, http.StatusServiceUnavailable, ErrorCodeNoAvailableAccount, noAvailableAccountMessage(effectiveModel))
+				},
+				nil,
+			)
 			return
 		}
+		lastFailureWasRelay = false
+		lastStatusCode = 0
+		lastBody = nil
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
@@ -4160,7 +4721,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		setUpstreamAccountContext(c, account)
 		if wsHTTPFallback.ForceHTTP() {
-			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
+			log.Printf("上游 WebSocket → HTTP 降级尝试启动 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
@@ -4205,6 +4766,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		var resp *http.Response
 		var reqErr error
+		if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
+			ttftGuard.Stop()
+			upstreamCancel()
+			return
+		}
 		if isRelayAccount {
 			upstreamBody := codexBody
 			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
@@ -4226,6 +4792,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if reqErr != nil {
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
+			localContentionKind := websocketLocalContentionKind(reqErr)
+			localContention := useWebsocket && localContentionKind != ""
+			fallbackEligibleLocalContention := c.Request.Context().Err() == nil && shouldFallbackWebsocketLocalContentionToHTTP(reqErr, useWebsocket, rawBody, sessionIdentity)
+			clientContextErr := c.Request.Context().Err()
+			clientGone := clientContextErr != nil
+			if clientGone && requestErrorCausedByClientContext(clientContextErr, reqErr) {
+				circuitAttempt.Release(h.store, account)
+				return
+			}
 			if timedOut {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
@@ -4233,7 +4808,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}
-			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+			fallbackLocalContention := !timedOut && fallbackEligibleLocalContention
+			if useWebsocket && (kind == upstreamErrorKindMessageTooBig || fallbackLocalContention) {
 				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
 					AccountID:            account.ID(),
 					Endpoint:             "/v1/chat/completions",
@@ -4246,18 +4822,33 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					ViaWebsocket:         true,
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
+					UpstreamErrorKind:    localContentionKind,
 				}, reqErr, false)
 				wsElapsed := time.Since(start)
-				wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()), circuitAttempt, selectedDecision)
-				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
+				fallbackSource := websocketMessageTooBigSource(reqErr.Error())
+				if fallbackLocalContention {
+					fallbackSource = websocketLocalContentionSource(reqErr)
+				}
+				wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, fallbackSource, circuitAttempt, selectedDecision)
+				log.Printf("上游 WebSocket 降级 HTTP，保留账号租约 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := shouldRetryTransportFailure(reqErr, kind)
+			if localContention && !fallbackEligibleLocalContention {
+				retryable = false
+			}
 			shouldRetry := false
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			relayTransportFailure := circuitAttempt.UpstreamTransportFailure(c.Request.Context(), kind, timedOut)
+			relayTransportFailure := false
+			if !localContention {
+				transportEvidenceContext := c.Request.Context()
+				if clientGone {
+					transportEvidenceContext = context.Background()
+				}
+				relayTransportFailure = circuitAttempt.UpstreamTransportFailure(transportEvidenceContext, kind, timedOut)
+			}
 			if relayTransportFailure {
 				recyclePooledClient(account, proxyURL)
 			}
@@ -4270,28 +4861,61 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				Stream: isStream, ViaWebsocket: useWebsocket,
 				RequestedServiceTier: serviceTier, Attempt: attempt,
 			}
-			if relayRequestFailure && !shouldRetry {
-				h.logFinalRequestErrorFailure(c, requestFailureSpec, reqErr)
-			}
-			if relayRequestFailure && shouldRetry {
-				pending := canonicalRequestFailureSpec(requestFailureSpec, reqErr)
+			terminalRequestFailure := !shouldRetry && kind != "" && kind != upstreamErrorKindMessageTooBig
+			if shouldRetry && kind != "" && kind != upstreamErrorKindMessageTooBig && c.Request.Context().Err() == nil {
+				pending := canonicalRequestFailureSpecWithKind(requestFailureSpec, reqErr, localContentionKind)
 				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
-				lastStatusCode = pending.StatusCode
-				lastBody = upstreamFailureBody(pending.ErrorMessage)
-				lastFailureWasRelay = true
+				lastFailureWasRelay = relayRequestFailure
+				if relayRequestFailure {
+					lastStatusCode = pending.StatusCode
+					lastBody = upstreamFailureBody(pending.ErrorMessage)
+				} else {
+					lastStatusCode = 0
+					lastBody = nil
+				}
 			}
 			// Preserve sticky retries for non-Relay accounts only. Relay transport
 			// failure must rotate away from the failed front door.
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
-			if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
+			stickyRetry := shouldRetry && !localContention && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
+			if !localContention && shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			if stickyRetry {
 				requestStickyRetry.Retain(account, proxyURL)
 			}
 			circuitAttempt.Release(h.store, account)
-			if !stickyRetry {
+			if !stickyRetry && (!localContention || (timedOut && fallbackEligibleLocalContention)) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			if clientGone {
+				h.logRetryRequestErrorFailure(c, retryAttemptUsageSpec{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/chat/completions",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					StatusCode:           relayTransportFailureAuditStatus(relayTransportFailure),
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					RequestedServiceTier: serviceTier,
+					Attempt:              attempt,
+					UpstreamErrorKind:    localContentionKind,
+				}, reqErr, timedOut)
+				return
+			}
+			publishTerminalRequestFailure := func() {
+				publishHTTPFinalWithAudit(c,
+					func() { sendCanonicalRequestFailure(c, reqErr) },
+					func() { h.logFinalRequestErrorFailureWithKind(c, requestFailureSpec, reqErr, localContentionKind) },
+					func() {
+						hiddenSpec := requestFailureSpec
+						hiddenSpec.StatusCode = relayTransportFailureAuditStatus(relayTransportFailure)
+						hiddenSpec.UpstreamErrorKind = localContentionKind
+						h.logRetryRequestErrorFailure(c, hiddenSpec, reqErr, timedOut)
+					},
+				)
 			}
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -4308,16 +4932,21 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					ViaWebsocket:         useWebsocket,
 					RequestedServiceTier: serviceTier,
 					Attempt:              attempt,
+					UpstreamErrorKind:    localContentionKind,
 				}, reqErr, true)
 				continue
 			}
-			if !timedOut && !stickyRetry {
+			if !localContention && !timedOut && !stickyRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
 			// 不可重试的结构化错误直接返回
 			if !retryable {
-				ErrorToGinResponse(c, reqErr)
+				if terminalRequestFailure {
+					publishTerminalRequestFailure()
+				} else {
+					ErrorToGinResponse(c, reqErr)
+				}
 				return
 			}
 
@@ -4344,7 +4973,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				continue
 			}
-			ErrorToGinResponse(c, reqErr)
+			if terminalRequestFailure {
+				publishTerminalRequestFailure()
+			} else {
+				ErrorToGinResponse(c, reqErr)
+			}
 			return
 		}
 
@@ -4353,12 +4986,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			clientGone := c.Request.Context().Err() != nil
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			circuitAttempt.Failure(resp.StatusCode)
 			circuitAttempt.Release(h.store, account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -4370,7 +5004,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			shouldRetry := shouldRetryTextHTTPStatus(resp.StatusCode, account, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			failureUsage := &database.UsageLogInput{
 				AccountID:            account.ID(),
 				Endpoint:             "/v1/chat/completions",
 				Model:                logModel,
@@ -4388,34 +5022,43 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       attempt > 0,
 				AttemptIndex:         attempt + 1,
-				GuardianAttemptOnly:  shouldRetry,
+				GuardianAttemptOnly:  shouldRetry || clientGone,
 				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
-			})
+			}
 
+			if clientGone {
+				h.logUsageForRequest(c, failureUsage)
+				return
+			}
 			if shouldRetry {
+				h.logUsageForRequest(c, failureUsage)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
-				if lastFailureWasRelay {
-					pending := retryAttemptUsageSpec{
-						AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel,
-						EffectiveModel: attemptLogEffectiveModel, StatusCode: resp.StatusCode,
-						DurationMs: durationMs, ReasoningEffort: reasoningEffort,
-						UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
-						RequestedServiceTier: serviceTier, Attempt: attempt,
-						UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
-						ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
-					}
-					pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+				pending := retryAttemptUsageSpec{
+					AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel,
+					EffectiveModel: attemptLogEffectiveModel, StatusCode: resp.StatusCode,
+					DurationMs: durationMs, ReasoningEffort: reasoningEffort,
+					UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
+					RequestedServiceTier: serviceTier, Attempt: attempt,
+					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 				}
+				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
 				continue
 			}
 
-			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			publishHTTPFinalWithAudit(c,
+				func() { h.sendFinalUpstreamError(c, resp.StatusCode, errBody) },
+				func() {
+					h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, openAIFinalResponseStatus(resp.StatusCode, errBody), false))
+				},
+				func() { h.logUsageForRequest(c, httpFinalUsageCopy(failureUsage, resp.StatusCode, true)) },
+			)
 			return
 		}
 
@@ -4436,7 +5079,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
 		var readErr error
 		var writeErr error
+		clientGone := false
 		wroteAnyBody := false
+		terminalDelivered := false
 		// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 		// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 		abortedForHTTPError := false
@@ -4467,13 +5112,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
-			clientGone := false
 			var pendingFirstTokenChunks bytes.Buffer
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				chunk, done := streamTranslator.TranslateParsed(parsed)
 
 				eventType := parsed.Get("type").String()
+				if c.Request.Context().Err() != nil {
+					clientGone = true
+				}
 				ttftGuard.MarkProgress(eventType)
 				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 				if !ttftRecorded && isFirstToken {
@@ -4484,7 +5131,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if eventType == "response.completed" || eventType == "response.incomplete" {
 					h.pinCybRelayResponseID(c, data)
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -4538,6 +5185,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 						clientGone = true
 					} else {
 						wroteAnyBody = true
+						terminalDelivered = true
 					}
 					if !clientGone {
 						return false
@@ -4558,6 +5206,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			var fullContent strings.Builder
 			var fullReasoning strings.Builder
 			var toolCalls []ToolCallResult
+			incompleteReason := ""
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -4576,8 +5225,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					fullReasoning.WriteString(parsed.Get("delta").String())
 				case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 					deltaCharCount += len(parsed.Get("delta").String())
-				case "response.completed":
+				case "response.completed", "response.incomplete":
 					h.pinCybRelayResponseID(c, data)
+					if eventType == "response.incomplete" {
+						incompleteReason = parsed.Get("response.incomplete_details.reason").String()
+					}
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -4594,7 +5246,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
+			if gotTerminal && len(terminalFailurePayload) == 0 {
+				compactResult = BuildCompactResponse(chunkID, responseModel, created, fullContent.String(), fullReasoning.String(), toolCalls, usage)
+				if incompleteReason == "max_output_tokens" {
+					if updated, err := sjson.SetBytes(compactResult, "choices.0.finish_reason", "length"); err == nil {
+						compactResult = updated
+					}
+				}
+			}
 		}
 
 		// 断流检测 + token 估算
@@ -4618,6 +5277,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		disconnected := clientGone || c.Request.Context().Err() != nil || writeErr != nil
+		clientGoneFinal := disconnected && !(isStream && terminalDelivered)
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 		}
@@ -4660,22 +5321,25 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				ActualServiceTier:    actualServiceTier,
 				Attempt:              attempt,
 			}, outcome)
-			if selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI() {
+			pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
+				AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel,
+				EffectiveModel: attemptLogEffectiveModel, DurationMs: totalDuration,
+				FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+				UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
+				RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
+				Attempt: attempt,
+			}, outcome)
+			pendingFinalFailure = rememberPendingFinalFailure(c, pending)
+			lastFailureWasRelay = selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
+			if lastFailureWasRelay {
 				lastStatusCode, lastBody = relayTransparentFailureStatusBody(outcome, terminalFailurePayload)
-				lastFailureWasRelay = true
-				pending := canonicalStreamFailureSpec(retryAttemptUsageSpec{
-					AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel,
-					EffectiveModel: attemptLogEffectiveModel, DurationMs: totalDuration,
-					FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
-					UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
-					RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
-					Attempt: attempt,
-				}, outcome)
-				pendingFinalFailure = rememberPendingFinalFailure(c, pending)
 				if outcome.logStatusCode == logStatusUpstreamStreamBreak {
 					lastStatusCode = pending.StatusCode
 					lastBody = upstreamFailureBody(pending.ErrorMessage)
 				}
+			} else {
+				lastStatusCode = 0
+				lastBody = nil
 			}
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -4696,7 +5360,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
-		logStatusCode := canonicalStreamStatus(outcome)
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
@@ -4711,31 +5374,57 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 			}
 		}
-		if isStream && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil && outcome.logStatusCode == logStatusUpstreamStreamBreak {
-			c.Header("Content-Type", "application/json; charset=utf-8")
-			c.JSON(logStatusCode, gin.H{
-				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+		canonicalStatusCode := canonicalStreamStatus(outcome)
+		if !clientGoneFinal && isStream && !wroteAnyBody && outcome.logStatusCode == logStatusUpstreamStreamBreak {
+			delivered := publishHTTPFinalResponse(c, func() {
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				c.JSON(canonicalStatusCode, gin.H{
+					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				})
 			})
-		} else if isStream && abortedForHTTPError && !wroteAnyBody {
+			clientGoneFinal = !delivered
+		} else if !clientGoneFinal && isStream && abortedForHTTPError && !wroteAnyBody {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
-			c.Header("Content-Type", "application/json; charset=utf-8")
-			c.JSON(logStatusCode, gin.H{
-				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
-			})
-		} else if !isStream {
-			if len(terminalFailurePayload) > 0 {
-				c.JSON(logStatusCode, gin.H{
+			delivered := publishHTTPFinalResponse(c, func() {
+				c.Header("Content-Type", "application/json; charset=utf-8")
+				c.JSON(canonicalStatusCode, gin.H{
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 				})
-			} else if compactResult != nil {
-				c.Data(http.StatusOK, "application/json", compactResult)
-			} else {
-				c.JSON(http.StatusBadGateway, gin.H{
-					"error": gin.H{"message": "未收到完整的上游响应", "type": "upstream_error"},
+			})
+			clientGoneFinal = !delivered
+		} else if !clientGoneFinal && !isStream {
+			delivered := false
+			switch {
+			case len(terminalFailurePayload) > 0:
+				delivered = publishHTTPFinalResponse(c, func() {
+					c.JSON(canonicalStatusCode, gin.H{
+						"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					})
+				})
+			case gotTerminal && outcome.logStatusCode == http.StatusOK && compactResult != nil:
+				delivered = publishHTTPFinalResponse(c, func() {
+					c.Data(http.StatusOK, "application/json", compactResult)
+				})
+			default:
+				message := strings.TrimSpace(outcome.failureMessage)
+				if message == "" {
+					message = "未收到完整的上游响应"
+				}
+				delivered = publishHTTPFinalResponse(c, func() {
+					c.JSON(canonicalStatusCode, gin.H{
+						"error": gin.H{"message": message, "type": "upstream_error"},
+					})
 				})
 			}
+			clientGoneFinal = !delivered
+		}
+
+		hiddenAttempt := clientGoneFinal
+		logStatusCode := canonicalStatusCode
+		if hiddenAttempt {
+			logStatusCode = outcome.logStatusCode
 		}
 
 		usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
@@ -4760,6 +5449,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			RequestedServiceTier: usageTiers.RequestedServiceTier,
 			ActualServiceTier:    usageTiers.ActualServiceTier,
 			BillingServiceTier:   usageTiers.BillingServiceTier,
+			GuardianAttemptOnly:  hiddenAttempt,
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))

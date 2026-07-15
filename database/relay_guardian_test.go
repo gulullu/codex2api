@@ -60,6 +60,20 @@ func TestRelayGuardianReliabilityUsesOnlyFinalUserVisibleLogicalRequests(t *test
 	insert(now.Add(-5*time.Minute), 51, "policy", 500, "content_policy", "direct", false)
 	insert(now.Add(-4*time.Minute), 51, "client-400", 400, "bad_request", "direct", false)
 	insert(now.Add(-3*time.Minute), 51, "strong-502", 502, "server", "direct", false)
+	insert(now.Add(-2*time.Minute), 51, "local-busy", 503, "websocket_busy_session", "direct", false)
+	insert(now.Add(-time.Minute), 51, "local-capacity", 503, "websocket_local_capacity", "direct", false)
+	insert(now.Add(-30*time.Second), 51, "continuation-unavailable", 503, "websocket_continuation_unavailable", "direct", false)
+	insert(now.Add(-20*time.Second), 51, "usage-limit-kind", 503, "usage_limit", "direct", false)
+	insert(now.Add(-10*time.Second), 51, "usage-limit-message", 503, "server", "direct", false)
+	insert(now.Add(-5*time.Second), 51, "concurrency-limit-message", 503, "server", "direct", false)
+	_, err = db.conn.ExecContext(ctx, `UPDATE usage_logs SET error_message='Concurrency usage limit exceeded' WHERE logical_request_id='usage-limit-message'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.conn.ExecContext(ctx, `UPDATE usage_logs SET error_message='Concurrency limit exceeded for user' WHERE logical_request_id='concurrency-limit-message'`)
+	if err != nil {
+		t.Fatal(err)
+	}
 	insert(now.Add(-30*time.Minute), 51, "old-success", 200, "", "direct", false)
 	insert(now.Add(-40*time.Minute), 51, "old-failure", 503, "server", "direct", false)
 

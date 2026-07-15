@@ -569,6 +569,50 @@ func TestRelayGuardianWeakReliabilityThresholdsAndConfirmation(t *testing.T) {
 }
 
 func TestRelayGuardianStrongPathAndOperatorStatusRegressions(t *testing.T) {
+	t.Run("local_websocket_contention_never_counts_as_strong_gateway", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index, kind := range []string{"websocket_busy_session", "websocket_local_capacity", "websocket_continuation_unavailable"} {
+			obs := guardianObservation(51, fmt.Sprintf("local-contention-%d", index), 502, false, clock.Now())
+			obs.UpstreamErrorKind = kind
+			guardian.observe(obs)
+		}
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if len(state.Failures) != 0 || len(state.SeenStrong) != 0 || len(state.SeenFinal) != 0 || state.ShadowAction != "" {
+			t.Fatalf("local websocket contention reached Guardian evidence: %+v", state)
+		}
+	})
+
+	t.Run("usage_limit_never_counts_as_relay_failure", func(t *testing.T) {
+		clock := newRelayCircuitTestClock()
+		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)
+		for index, observation := range []RelayGuardianObservation{
+			guardianObservation(51, "usage-kind", http.StatusServiceUnavailable, false, clock.Now()),
+			guardianObservation(51, "usage-message", http.StatusServiceUnavailable, false, clock.Now()),
+			guardianObservation(51, "concurrency-message", http.StatusServiceUnavailable, false, clock.Now()),
+			guardianObservation(51, "usage-kind-wrapped-502", http.StatusBadGateway, false, clock.Now()),
+			guardianObservation(51, "concurrency-message-wrapped-502", http.StatusBadGateway, false, clock.Now()),
+		} {
+			switch index {
+			case 0, 3:
+				observation.UpstreamErrorKind = "usage_limit"
+			case 1:
+				observation.ErrorMessage = "Concurrency usage limit exceeded for shared user"
+			default:
+				observation.ErrorMessage = "Concurrency limit exceeded for user"
+			}
+			guardian.observe(observation)
+		}
+		guardian.mu.Lock()
+		defer guardian.mu.Unlock()
+		state := guardian.stateLocked(51)
+		if len(state.Failures) != 0 || len(state.SeenStrong) != 0 || len(state.SeenFinal) != 0 || state.ShadowAction != "" {
+			t.Fatalf("usage limit reached Guardian evidence: %+v", state)
+		}
+	})
+
 	t.Run("strong_status_ignores_client_text", func(t *testing.T) {
 		clock := newRelayCircuitTestClock()
 		_, guardian := newGuardianTestStore(t, RelayGuardianMonitor, clock, 51, 50)

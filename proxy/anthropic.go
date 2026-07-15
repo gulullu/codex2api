@@ -621,7 +621,7 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 	case "response.output_item.done":
 		return t.handleOutputItemDone()
 
-	case "response.completed":
+	case "response.completed", "response.incomplete":
 		return t.handleCompleted(eventData)
 
 	case "response.failed":
