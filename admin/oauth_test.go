@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -146,10 +147,11 @@ func TestExchangeOAuthCodeTriggersUsageProbe(t *testing.T) {
 	db := newTestAdminDB(t)
 	store := auth.NewStore(db, cache.NewMemory(1), nil)
 	probed := make(chan int64, 1)
+	probeComplete := errors.New("test usage probe complete")
 	handler := &Handler{db: db, store: store}
 	handler.probeUsage = func(_ context.Context, account *auth.Account) error {
 		probed <- account.DBID
-		return nil
+		return probeComplete
 	}
 
 	newOAuthExchangeTestServer(t)
