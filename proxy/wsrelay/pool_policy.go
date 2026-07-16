@@ -59,9 +59,10 @@ type statelessPoolPolicy struct {
 
 // resolveStatelessPoolPolicy preserves the pre-candidate baseline unless an
 // operator explicitly selects legacy/safe/one-shot behavior. Missing, disabled
-// or invalid scope leaves true stateless requests isolated while keeping prior
-// explicit-session semantics unchanged. CODEX_WS_STATELESS_ONESHOT always wins,
-// including over account tags.
+// or invalid scope keeps that baseline. The tagged rollout is stricter: accounts
+// without the opt-in tag stay on one-shot sockets so enabling one canary cannot
+// silently restore explicit-session or continuation reuse for every other
+// account. CODEX_WS_STATELESS_ONESHOT always wins, including over account tags.
 func resolveStatelessPoolPolicy(account *auth.Account, manager *Manager) statelessPoolPolicy {
 	policy := statelessPoolPolicy{
 		mode:       statelessPoolDefault,
@@ -93,6 +94,7 @@ func resolveStatelessPoolPolicy(account *auth.Account, manager *Manager) statele
 		return policy
 	case "tagged":
 		if !hasExactTag(tags, safePoolAccountTag) {
+			policy.mode = statelessPoolOneShot
 			return policy
 		}
 	case "all":

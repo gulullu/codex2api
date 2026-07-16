@@ -26,6 +26,11 @@ func TestSafePoolPolicyFailsClosedAndKillSwitchWins(t *testing.T) {
 	if got := resolveStatelessPoolPolicy(account, nil).mode; got != statelessPoolDefault {
 		t.Fatalf("invalid scope mode = %v, want unchanged baseline", got)
 	}
+
+	t.Setenv(safePoolScopeEnv, "disabled")
+	if got := resolveStatelessPoolPolicy(account, nil).mode; got != statelessPoolDefault {
+		t.Fatalf("disabled scope mode = %v, want unchanged baseline", got)
+	}
 }
 
 func TestSafePoolPolicyUsesDynamicTagsWithoutAccountIDs(t *testing.T) {
@@ -37,8 +42,8 @@ func TestSafePoolPolicyUsesDynamicTagsWithoutAccountIDs(t *testing.T) {
 	if policy := resolveStatelessPoolPolicy(first, nil); policy.mode != statelessPoolSafe || policy.slots != 17 {
 		t.Fatalf("tagged account policy = %#v, want safe/17", policy)
 	}
-	if policy := resolveStatelessPoolPolicy(second, nil); policy.mode != statelessPoolDefault {
-		t.Fatalf("untagged dynamic account policy = %#v, want unchanged baseline", policy)
+	if policy := resolveStatelessPoolPolicy(second, nil); policy.mode != statelessPoolOneShot {
+		t.Fatalf("untagged dynamic account policy = %#v, want one-shot isolation", policy)
 	}
 
 	first.Mu().Lock()

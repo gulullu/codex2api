@@ -51,10 +51,10 @@ RelayBases 的约束优先于官方默认实现：
 ## 配置优先级
 
 1. `CODEX_WS_STATELESS_ONESHOT=1`：最高优先级硬阀；进入该 one-shot 执行路径的非续链请求每次独享物理 WS，任何 safe 标签都不能绕过。依赖连接本地状态的官方续链不会被搬到新 WS。
-2. `CODEX_WS_STATELESS_ONESHOT=0` 且 `CODEX_WS_SAFE_POOL_SCOPE=tagged`：只有带 `sys:ws-safe-pool` 标签、且有可靠 owner 的账号/请求进入安全池。
+2. `CODEX_WS_STATELESS_ONESHOT=0` 且 `CODEX_WS_SAFE_POOL_SCOPE=tagged`：只有带 `sys:ws-safe-pool` 标签、且有可靠 owner 的账号/请求进入安全池；未打标签账号继续强制 one-shot，不能因单账号灰度而恢复显式会话或续链复用。
 3. `CODEX_WS_SAFE_POOL_SCOPE=all`：所有动态 OAuth 账号均可进入安全池，但请求仍必须有可靠 owner。
 4. `CODEX_WS_SAFE_POOL_SCOPE=legacy`：仅用于明确恢复旧固定槽池行为。
-5. scope 缺失、disabled 或非法：保持候选前基线；真正 stateless 请求仍独享连接，已有明确 session/prompt-cache 的历史路径不因其他账号参加灰度而改变。
+5. scope 缺失、disabled 或非法：保持候选前基线；这与 `tagged` 的严格灰度隔离不同，不能用作单账号 canary。
 
 账号级标签：
 

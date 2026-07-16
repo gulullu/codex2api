@@ -461,13 +461,15 @@ func TestHardOneShotRejectsContinuationWithoutOwnerHandshakeBeforePreferredAcqui
 	}
 }
 
-func TestOfficialPromptCacheUnenrolledAccountsKeepBaselineSessionReuse(t *testing.T) {
+func TestOfficialPromptCacheUnenrolledAccountsFollowScopeIsolation(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		scope string
+		name           string
+		scope          string
+		wantOneShot    bool
+		wantHandshakes int32
 	}{
-		{name: "tagged but account not enrolled", scope: "tagged"},
-		{name: "safe pool disabled", scope: "disabled"},
+		{name: "tagged but account not enrolled", scope: "tagged", wantOneShot: true, wantHandshakes: 2},
+		{name: "safe pool disabled", scope: "disabled", wantOneShot: false, wantHandshakes: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
@@ -505,11 +507,11 @@ func TestOfficialPromptCacheUnenrolledAccountsKeepBaselineSessionReuse(t *testin
 				if err != nil {
 					t.Fatalf("turn %d execute: %v", turn+1, err)
 				}
-				if response.safePool || response.oneShot || response.conn.safeReusable.Load() {
-					t.Fatalf("unenrolled routing safe=%v oneshot=%v reusable=%v, want unchanged explicit-session path", response.safePool, response.oneShot, response.conn.safeReusable.Load())
+				if response.safePool || response.oneShot != tc.wantOneShot || response.conn.safeReusable.Load() {
+					t.Fatalf("unenrolled routing safe=%v oneshot=%v reusable=%v, want oneshot=%v", response.safePool, response.oneShot, response.conn.safeReusable.Load(), tc.wantOneShot)
 				}
-				if response.conn.allowAbruptTerminalProof.Load() {
-					t.Fatal("legacy/default reusable connection received one-shot terminal proof policy")
+				if got := response.conn.allowAbruptTerminalProof.Load(); got != tc.wantOneShot {
+					t.Fatalf("terminal proof policy = %v, want %v", got, tc.wantOneShot)
 				}
 				if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
 					t.Fatalf("turn %d read: %v", turn+1, err)
@@ -517,11 +519,52 @@ func TestOfficialPromptCacheUnenrolledAccountsKeepBaselineSessionReuse(t *testin
 				if err := response.Close(); err != nil {
 					t.Fatalf("turn %d close: %v", turn+1, err)
 				}
+				if tc.wantOneShot && manager.ConnectionCount() != 0 {
+					t.Fatalf("turn %d left an unenrolled one-shot socket pooled", turn+1)
+				}
 			}
-			if got := handshakes.Load(); got != 1 {
-				t.Fatalf("unenrolled baseline used %d handshakes, want 1", got)
+			if got := handshakes.Load(); got != tc.wantHandshakes {
+				t.Fatalf("unenrolled scope %s used %d handshakes, want %d", tc.scope, got, tc.wantHandshakes)
 			}
 		})
+	}
+}
+
+func TestUnenrolledTaggedAccountRejectsContinuationBeforePreferredAcquire(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "tagged")
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(*WsConnection) bool { return true }
+	account := &auth.Account{DBID: 4612, AccountID: "acct-unenrolled-continuation", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+	bound, session := newTestSlotConnection(manager, account, wsURL, "previous-bound")
+	const responseID = "resp_unenrolled_previous"
+	const apiKey = "key-A"
+	manager.BindResponseConn(responseID, bound, "previous-bound", account.ID(), apiKey)
+	connectionCount := manager.ConnectionCount()
+
+	exec := NewExecutorWithManager(manager)
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(), account,
+		[]byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","previous_response_id":"resp_unenrolled_previous","client_metadata":{"session_id":"official-session","thread_id":"official-thread"},"input":"continue"}`),
+		"official-cache", "", apiKey, nil, http.Header{}, "route-key",
+	)
+	if response != nil || !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("unenrolled continuation response=%v err=%v, want fail-closed continuation", response, err)
+	}
+	if got := session.PendingCount(); got != 0 {
+		t.Fatalf("preferred connection pending count = %d, want 0", got)
+	}
+	if got := manager.ConnectionCount(); got != connectionCount {
+		t.Fatalf("connection count = %d, want unchanged %d", got, connectionCount)
+	}
+	if got, _ := manager.lookupResponseConn(responseID, account.ID(), apiKey); got != bound {
+		t.Fatal("unenrolled continuation consumed or discarded the existing binding")
 	}
 }
 
