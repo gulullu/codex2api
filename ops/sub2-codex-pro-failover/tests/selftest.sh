@@ -82,9 +82,54 @@ next_generation() {
   value=$((value + 1))
   printf '%s\n' "$value" >"$FAKE_DIR/generation_counter"
   local generation
-  generation="$(printf '2026-07-14T00:00:00.%06dZ' "$value")"
+  local fraction_value="$value"
+  if [[ -e "$FAKE_DIR/generation_fraction_times_ten" ]]; then
+    fraction_value=$((value * 10))
+  fi
+  local generation_base="2026-07-14T00:00:00"
+  [[ ! -s "$FAKE_DIR/generation_base" ]] ||
+    generation_base="$(<"$FAKE_DIR/generation_base")"
+  generation="$(printf '%s.%06dZ' "$generation_base" "$fraction_value")"
   printf '%s\n' "$generation" >"$FAKE_DIR/meta_generation_$id"
   printf '%s\n' "$generation"
+}
+
+render_go_timestamp() {
+  local value="$1"
+  local id="$2"
+  local scope="${3:-generic}"
+  local style="canonical"
+  if [[ -s "$FAKE_DIR/go_${scope}_timestamp_style_$id" ]]; then
+    style="$(<"$FAKE_DIR/go_${scope}_timestamp_style_$id")"
+  elif [[ -s "$FAKE_DIR/go_timestamp_style_$id" ]]; then
+    style="$(<"$FAKE_DIR/go_timestamp_style_$id")"
+  fi
+  python3 - "$value" "$style" <<'PY'
+import datetime as dt,sys
+value,style=sys.argv[1:]
+stamp=dt.datetime.fromisoformat(value[:-1]+'+00:00' if value.endswith('Z') else value)
+if stamp.tzinfo is None:
+    raise SystemExit(1)
+stamp=stamp.astimezone(dt.timezone.utc)
+if style == 'canonical':
+    print(stamp.isoformat(timespec='microseconds').replace('+00:00','Z'))
+elif style == 'five-offset':
+    if stamp.microsecond % 10:
+        raise SystemExit(1)
+    local=stamp.astimezone(dt.timezone(dt.timedelta(hours=8)))
+    print(local.strftime('%Y-%m-%dT%H:%M:%S')+
+          f'.{local.microsecond // 10:05d}+08:00')
+elif style == 'nine-z':
+    print(stamp.strftime('%Y-%m-%dT%H:%M:%S')+
+          f'.{stamp.microsecond:06d}789Z')
+elif style == 'naive':
+    print(stamp.strftime('%Y-%m-%dT%H:%M:%S')+
+          f'.{stamp.microsecond:06d}')
+elif style == 'invalid':
+    print('not-a-timestamp')
+else:
+    raise SystemExit(1)
+PY
 }
 
 append_access_log() {
@@ -314,7 +359,18 @@ PY
         next_generation "$id" >/dev/null
       fi
     fi
-    python3 - "$FAKE_DIR/members" "$id" "$FAKE_DIR/meta_generation_$id" "$FAKE_DIR/meta_sched_override_$id" <<'PY'
+    rate_limit_reset=""
+    expires_at=""
+    auto_pause_on_expired=false
+    [[ ! -s "$FAKE_DIR/meta_rate_limit_reset_$id" ]] ||
+      rate_limit_reset="$(<"$FAKE_DIR/meta_rate_limit_reset_$id")"
+    [[ ! -s "$FAKE_DIR/meta_expires_at_$id" ]] ||
+      expires_at="$(<"$FAKE_DIR/meta_expires_at_$id")"
+    [[ ! -e "$FAKE_DIR/meta_auto_pause_on_expired_$id" ]] ||
+      auto_pause_on_expired=true
+    python3 - "$FAKE_DIR/members" "$id" "$FAKE_DIR/meta_generation_$id" \
+      "$FAKE_DIR/meta_sched_override_$id" "$rate_limit_reset" "$expires_at" \
+      "$auto_pause_on_expired" <<'PY'
 import json,os,sys
 for line in open(sys.argv[1],encoding='utf-8'):
     p=line.rstrip('\n').split('|')
@@ -325,11 +381,11 @@ for line in open(sys.argv[1],encoding='utf-8'):
         print(json.dumps({
           'Status':p[2],
           'Schedulable':schedulable,
-          'RateLimitResetAt':None,
+          'RateLimitResetAt':sys.argv[5] or None,
           'OverloadUntil':None if p[5] == 't' else '2999-01-01T00:00:00+00:00',
           'TempUnschedulableUntil':None,
-          'ExpiresAt':None,
-          'AutoPauseOnExpired':False,
+          'ExpiresAt':sys.argv[6] or None,
+          'AutoPauseOnExpired':sys.argv[7] == 'true',
         }))
         raise SystemExit(0)
 raise SystemExit(1)
@@ -403,7 +459,8 @@ PY
     if [[ "$id" == "$bridge_id" && -s "$FAKE_DIR/cache_generation_override_$id" ]]; then
       generation_path="$FAKE_DIR/cache_generation_override_$id"
     fi
-    python3 - "$FAKE_DIR/members" "$id" "$generation_path" "$FAKE_DIR/full_account_sched_override_$id" <<'PY'
+    rendered_generation="$(render_go_timestamp "$(<"$generation_path")" "$id" full)"
+    python3 - "$FAKE_DIR/members" "$id" "$rendered_generation" "$FAKE_DIR/full_account_sched_override_$id" <<'PY'
 import json,os,sys
 for line in open(sys.argv[1],encoding='utf-8'):
     p=line.rstrip('\n').split('|')
@@ -414,7 +471,7 @@ for line in open(sys.argv[1],encoding='utf-8'):
         print(json.dumps({
           'Status':p[2],
           'Schedulable':schedulable,
-          'UpdatedAt':open(sys.argv[3],encoding='utf-8').read().strip(),
+          'UpdatedAt':sys.argv[3],
         }))
         raise SystemExit(0)
 raise SystemExit(1)
@@ -531,6 +588,7 @@ PY
       fi
     fi
     generation="$(next_generation "$id")"
+    response_generation="$(render_go_timestamp "$generation" "$id" response)"
     audit_at=""
     access_at=""
     if [[ "$receipted" == true ]]; then
@@ -588,10 +646,10 @@ PY
     fi
     case "$(cat "$FAKE_DIR/bad_primary_response" 2>/dev/null || true)" in
       invalid-json) printf '{not-json\n';;
-      wrong-id) printf '{"data":{"id":999999,"status":"active","schedulable":%s,"updated_at":"%s"}}\n' "$desired" "$generation";;
-      wrong-desired) printf '{"data":{"id":%s,"status":"active","schedulable":%s,"updated_at":"%s"}}\n' "$id" "$([[ "$desired" == true ]] && printf false || printf true)" "$generation";;
+      wrong-id) printf '{"data":{"id":999999,"status":"active","schedulable":%s,"updated_at":"%s"}}\n' "$desired" "$response_generation";;
+      wrong-desired) printf '{"data":{"id":%s,"status":"active","schedulable":%s,"updated_at":"%s"}}\n' "$id" "$([[ "$desired" == true ]] && printf false || printf true)" "$response_generation";;
       missing-generation) printf '{"data":{"id":%s,"status":"active","schedulable":%s}}\n' "$id" "$desired";;
-      *) printf '{"data":{"id":%s,"status":"active","schedulable":%s,"updated_at":"%s"}}\n' "$id" "$desired" "$generation";;
+      *) printf '{"data":{"id":%s,"status":"active","schedulable":%s,"updated_at":"%s"}}\n' "$id" "$desired" "$response_generation";;
     esac
     ;;
   get-account)
@@ -973,7 +1031,9 @@ EOF
 	  "$tmp"/meta_sched_override_* "$tmp"/full_account_sched_override_* \
 	  "$tmp"/meta_error_* "$tmp"/full_account_error_* \
 	  "$tmp"/meta_error_when_unsched_* "$tmp"/full_account_error_when_unsched_* \
-	  "$tmp"/count_meta_reads_* "$tmp"/meta_read_count_*
+	  "$tmp"/count_meta_reads_* "$tmp"/meta_read_count_* \
+	  "$tmp"/meta_rate_limit_reset_* "$tmp"/meta_expires_at_* \
+	  "$tmp"/meta_auto_pause_on_expired_*
   rm -f "$tmp"/started_open_* "$tmp"/wait_for_open_peer_* "$tmp"/saw_open_peer_* \
     "$tmp"/inactivate_backup_at_submit_* "$tmp/backend-write.lock"
   rm -f "$tmp/buckets_fail" "$tmp/bucket_ready_error" "$tmp/health_fail" \
@@ -981,6 +1041,8 @@ EOF
     "$tmp/bump_xmin_on_snapshot_call" "$tmp/primary_snapshot_count" \
     "$tmp/inactivate_backup_on_list_call" "$tmp/backup_list_members_count"
   rm -f "$tmp/apply_then_fail" "$tmp/bad_primary_response" \
+    "$tmp/generation_fraction_times_ten" "$tmp/generation_base" \
+    "$tmp"/go_timestamp_style_* "$tmp"/go_*_timestamp_style_* \
     "$tmp/block_after_primary_apply" "$tmp/primary_apply_blocked" "$tmp/release_primary_apply" \
     "$tmp"/response-barrier.* \
     "$tmp/bucket_error_after_primary_pause" "$tmp/bucket_error_after_primary_restore" \
@@ -1057,6 +1119,42 @@ run_controller() {
     cat "$tmp/controller.log" >&2
     return "$rc"
   fi
+}
+
+# Source only the controller library prefix so tests can exercise otherwise
+# private timestamp fences with the exact production implementation. The main
+# command dispatcher is deliberately excluded; all controller I/O remains on
+# the fake backend and temporary state directories.
+run_controller_function() {
+  local function_name="$1"
+  shift
+  FAKE_DIR="$tmp" \
+    FAKE_BRIDGE_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
+    FAILOVER_TEST_BACKEND="$backend" \
+    FAILOVER_STATE_DIR="$tmp/state" \
+    FAILOVER_RUNTIME_DIR="$tmp/run" \
+    BRIDGE_ACCOUNT_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
+    SNAPSHOT_CONFIRMATIONS=1 SNAPSHOT_TIMEOUT_SECONDS=2 \
+    MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS=2 \
+      bash -s -- "$controller" "$function_name" "$@" <<'BASH'
+controller="$1"
+function_name="$2"
+shift 2
+source <(sed '/^command="${1:-reconcile}"$/,$d' "$controller")
+if [[ "$function_name" == __read_state_dump ]]; then
+  read_state
+  printf '%s|%s|%s\n' "$STATE_PROOF_AFTER" "$STATE_LAST_UNAVAILABLE_AT" \
+    "$STATE_LAST_AVAILABILITY_AT"
+  exit 0
+fi
+if [[ "$function_name" == __api_set_dump ]]; then
+  api_set_primary_schedulable "$@"
+  printf '%s|%s\n' "$SCHEDULABLE_WRITE_HTTP_OK" \
+    "$SCHEDULABLE_WRITE_UPDATED_AT"
+  exit 0
+fi
+"$function_name" "$@"
+BASH
 }
 
 run_controller_from_config() {
@@ -1136,6 +1234,18 @@ assert_eq() {
   fi
 }
 
+assert_controller_function_rc() {
+  local want="$1"
+  local message="$2"
+  shift 2
+  local rc
+  set +e
+  run_controller_function "$@" >/dev/null 2>&1
+  rc=$?
+  set -e
+  assert_eq "$want" "$rc" "$message"
+}
+
 assert_no_forbidden_writes() {
   if grep -Eq '^set:(7845|7850):' "$tmp/events"; then
     printf 'FAIL: inactive/error account was modified\n' >&2
@@ -1169,6 +1279,60 @@ grep -Fq 'PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS=20' "$service_unit"
 grep -Fq 'BACKUP_OPEN_BATCH_TIMEOUT_SECONDS=120' "$service_unit"
 grep -Fxq 'PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS=20' "$env_example"
 grep -Fq 'redis-cli -e --raw' "$controller"
+python3 - "$controller" <<'PY'
+import datetime as dt,re,sys
+
+source=open(sys.argv[1],encoding='utf-8').read()
+pattern=r'(?:\.([0-9]{1,9}))?'
+if source.count(pattern) < 8:
+    raise SystemExit('not every runtime RFC3339 parser accepts 1-9 fractional digits')
+
+def normalize(value):
+    match=re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?'
+        r'(Z|[+-]\d{2}:\d{2})',value)
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or '')+'000000')[:6]
+    zone='+00:00' if zone == 'Z' else zone
+    stamp=dt.datetime.fromisoformat(f'{base}.{fraction}{zone}')
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc).isoformat(
+        timespec='microseconds').replace('+00:00','Z')
+
+valid={
+  '2026-07-17T04:19:48.95867+08:00':'2026-07-16T20:19:48.958670Z',
+  '2026-07-17T04:19:48.9Z':'2026-07-17T04:19:48.900000Z',
+  '2026-07-17T04:19:48.123456789Z':'2026-07-17T04:19:48.123456Z',
+  '2026-07-17T04:19:48Z':'2026-07-17T04:19:48.000000Z',
+  '2026-07-17T04:19:48.123-02:30':'2026-07-17T06:49:48.123000Z',
+}
+for raw,want in valid.items():
+    got=normalize(raw)
+    if got != want:
+        raise SystemExit(f'RFC3339 normalization mismatch: {raw}: {got} != {want}')
+invalid=(
+  '2026-07-17T04:19:48.95867',
+  '2026-07-17T04:19:48',
+  '2026-07-17 04:19:48Z',
+  '2026-07-17T04:19:48.95867+0800',
+  '2026-07-17T04:19:48.1234567890Z',
+  '2026-07-17T04:19:48.Z',
+  '2026-07-17T04:19:48Z trailing',
+  ' 2026-07-17T04:19:48Z',
+  '2026-02-30T04:19:48Z',
+  '2026-07-17T04:19:48+24:00',
+  'not-a-timestamp',
+)
+for raw in invalid:
+    try:
+        normalize(raw)
+    except (ValueError,OverflowError):
+        continue
+    raise SystemExit(f'invalid or timezone-naive RFC3339 was accepted: {raw!r}')
+PY
 if ! grep -Fq "AND LOWER(route_source) <> 'probe'" "$controller" ||
    ! grep -Fq "AND LOWER(finals.route_source) <> 'probe'" "$controller"; then
   printf 'FAIL: probe routes are not excluded from both unavailable and recovery evidence\n' >&2
@@ -1208,6 +1372,141 @@ for availability_setting in \
   fi
   grep -Fq "${availability_setting}_must_be_positive_integer" "$invalid_config_log"
 done
+
+# Exercise each runtime timestamp fence through the real controller functions,
+# not only through a duplicated parser contract. These values cover the exact
+# 5-digit +08:00 representation observed in production, Go-style nanoseconds,
+# zero/one-digit fractions, offsets, and strict timezone rejection.
+reset_fixture
+printf 'true\n' >"$tmp/meta_sched_override_7693"
+printf '2000-07-17T04:19:48.95867+08:00\n' >"$tmp/meta_rate_limit_reset_7693"
+run_controller_function meta_matches 7693 true
+for invalid_meta_future in \
+    '2026-07-17T04:19:48.95867' \
+    'not-a-timestamp'; do
+  printf '%s\n' "$invalid_meta_future" >"$tmp/meta_rate_limit_reset_7693"
+  assert_controller_function_rc 1 \
+    "meta future rejected $invalid_meta_future" meta_matches 7693 true
+done
+rm -f "$tmp/meta_rate_limit_reset_7693"
+touch "$tmp/meta_auto_pause_on_expired_7693"
+printf '2999-07-17T04:19:48.123456789+08:00\n' >"$tmp/meta_expires_at_7693"
+run_controller_function meta_matches 7693 true
+for invalid_expiry in \
+    '2999-07-17T04:19:48.95867' \
+    'not-a-timestamp'; do
+  printf '%s\n' "$invalid_expiry" >"$tmp/meta_expires_at_7693"
+  assert_controller_function_rc 1 \
+    "meta expiry rejected $invalid_expiry" meta_matches 7693 true
+done
+
+reset_fixture
+printf 'five-offset\n' >"$tmp/go_timestamp_style_7692"
+run_controller_function full_account_control_matches 7692 true \
+  2026-07-14T00:00:00.000100Z
+printf 'nine-z\n' >"$tmp/go_timestamp_style_7692"
+run_controller_function full_account_control_matches 7692 true \
+  2026-07-14T00:00:00.000100Z
+for invalid_style in naive invalid; do
+  printf '%s\n' "$invalid_style" >"$tmp/go_timestamp_style_7692"
+  assert_controller_function_rc 1 \
+    "full-account control rejected $invalid_style timestamp" \
+    full_account_control_matches 7692 true 2026-07-14T00:00:00.000100Z
+done
+printf 'five-offset\n' >"$tmp/go_timestamp_style_7693"
+run_controller_function full_account_state_matches 7693 false
+printf 'nine-z\n' >"$tmp/go_timestamp_style_7693"
+run_controller_function full_account_state_matches 7693 false
+for invalid_style in naive invalid; do
+  printf '%s\n' "$invalid_style" >"$tmp/go_timestamp_style_7693"
+  assert_controller_function_rc 1 \
+    "full-account state rejected $invalid_style timestamp" \
+    full_account_state_matches 7693 false
+done
+
+reset_fixture
+printf '2026-07-16T20:19:48\n' >"$tmp/generation_base"
+printf '95866\n' >"$tmp/generation_counter"
+touch "$tmp/generation_fraction_times_ten"
+printf 'five-offset\n' >"$tmp/go_timestamp_style_7692"
+assert_eq 'true|2026-07-16T20:19:48.958670Z' \
+  "$(run_controller_function __api_set_dump 7692 true \
+    codex2api-maint-00000000-0000-0000-0000-000000000000-restore)" \
+  'API response normalized exact production 5-digit +08 timestamp'
+for rejected_api_style in naive invalid; do
+  reset_fixture
+  printf '%s\n' "$rejected_api_style" >"$tmp/go_response_timestamp_style_7692"
+  assert_controller_function_rc 2 \
+    "API response rejected $rejected_api_style timestamp" \
+    __api_set_dump 7692 true \
+    codex2api-maint-00000000-0000-0000-0000-000000000000-restore
+done
+
+run_controller_function relay_event_is_new \
+  2026-07-17T04:19:48.123456789+08:00 101 \
+  2026-07-16T20:19:48.123455Z 100
+assert_controller_function_rc 2 'relay event rejected timezone-naive timestamp' \
+  relay_event_is_new 2026-07-17T04:19:48.123456789 101 \
+  2026-07-16T20:19:48.123455Z 100
+assert_controller_function_rc 2 'relay event rejected invalid timestamp' \
+  relay_event_is_new not-a-timestamp 101 \
+  2026-07-16T20:19:48.123455Z 100
+
+python3 - "$tmp/state/state.json" <<'PY'
+import json,os,sys,tempfile
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['proof_after']='2026-07-17T04:19:48.95867+08:00'
+p['last_unavailable_at']='2026-07-17T04:19:48.123456789Z'
+p['last_availability_at']='2026-07-17T04:19:48Z'
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='timestamp-state.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(p,f,sort_keys=True); f.write('\n')
+os.replace(tmp,path)
+PY
+assert_eq \
+  '2026-07-16T20:19:48.958670Z|2026-07-17T04:19:48.123456Z|2026-07-17T04:19:48.000000Z' \
+  "$(run_controller_function __read_state_dump)" \
+  'read_state normalized offset, nanosecond, and zero-fraction timestamps'
+python3 - "$tmp/state/state.json" <<'PY'
+import json,sys
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['proof_after']='2026-07-17T04:19:48.95867'
+open(path,'w',encoding='utf-8').write(json.dumps(p,sort_keys=True)+'\n')
+PY
+assert_controller_function_rc 1 'read_state rejected timezone-naive timestamp' \
+  __read_state_dump
+
+run_controller_function seal_evidence_chronology_valid \
+  2026-07-17T04:19:48.1Z \
+  2026-07-17T04:19:48.100001234Z \
+  2026-07-17T04:19:48.10001+00:00 5 \
+  2026-07-17T04:19:48.100020000Z
+assert_controller_function_rc 1 'seal chronology rejected timezone-naive timestamp' \
+  seal_evidence_chronology_valid \
+  2026-07-17T04:19:48.1 \
+  2026-07-17T04:19:48.100001234Z \
+  2026-07-17T04:19:48.10001+00:00 5 \
+  2026-07-17T04:19:48.100020000Z
+assert_controller_function_rc 1 'seal chronology rejected invalid timestamp' \
+  seal_evidence_chronology_valid \
+  not-a-timestamp \
+  2026-07-17T04:19:48.100001234Z \
+  2026-07-17T04:19:48.10001+00:00 5 \
+  2026-07-17T04:19:48.100020000Z
+
+run_controller_function timestamp_age_at_least \
+  2026-07-17T04:19:48.95867+08:00 0
+assert_controller_function_rc 1 'age fence rejected timezone-naive timestamp' \
+  timestamp_age_at_least 2026-07-17T04:19:48.95867 0
+assert_controller_function_rc 1 'age fence rejected invalid timestamp' \
+  timestamp_age_at_least not-a-timestamp 0
+
+if [[ "${FAILOVER_TIMESTAMP_TARGETED_ONLY:-0}" == 1 ]]; then
+  printf 'PASS: timestamp targeted selftest\n'
+  exit 0
+fi
 
 # Standby opening uses one dynamic inventory snapshot and submits a bounded
 # parallel batch. A slow/failing first account must overlap a later healthy
@@ -2173,6 +2472,93 @@ make_seal_response_ambiguity() {
   assert_eq f "$(member_schedulable 7692)" 'ambiguous seal left primary disabled'
   assert_eq t "$(member_schedulable 7693)" 'ambiguous seal left standby open'
 }
+
+# API mutation receipts and subsequent Redis full-account ownership checks must
+# agree after UTC-microsecond normalization. First isolate the exact production
+# Redis representation that failed on Python 3.10 while keeping the API body
+# canonical, then invert the sources to prove the API response parser itself.
+reset_fixture
+printf '2026-07-16T20:19:48\n' >"$tmp/generation_base"
+printf '95865\n' >"$tmp/generation_counter"
+touch "$tmp/generation_fraction_times_ten"
+printf 'five-offset\n' >"$tmp/go_full_timestamp_style_7692"
+run_controller prepare-maintenance
+assert_eq OWNED "$(marker_phase)" \
+  '5-digit +08 Redis full-account with canonical API reached owned'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['pause_response_updated_at'] == '2026-07-16T20:19:48.958670Z'
+assert p['seal_response_updated_at'] == '2026-07-16T20:19:48.958680Z'
+assert p['owned_updated_at'] == p['seal_response_updated_at']
+PY
+run_controller finish-maintenance
+test ! -e "$tmp/state/maintenance.json"
+
+reset_fixture
+printf '2026-07-16T20:19:48\n' >"$tmp/generation_base"
+printf '95865\n' >"$tmp/generation_counter"
+touch "$tmp/generation_fraction_times_ten"
+printf 'five-offset\n' >"$tmp/go_response_timestamp_style_7692"
+run_controller prepare-maintenance
+assert_eq OWNED "$(marker_phase)" \
+  '5-digit +08 API with canonical Redis full-account reached owned'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['pause_response_updated_at'] == '2026-07-16T20:19:48.958670Z'
+assert p['seal_response_updated_at'] == '2026-07-16T20:19:48.958680Z'
+assert p['owned_updated_at'] == p['seal_response_updated_at']
+PY
+run_controller finish-maintenance
+test ! -e "$tmp/state/maintenance.json"
+
+reset_fixture
+printf 'nine-z\n' >"$tmp/go_timestamp_style_7692"
+run_controller prepare-maintenance
+assert_eq OWNED "$(marker_phase)" '9-digit Go timestamps reached owned'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,re,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+for key in ('pause_response_updated_at','seal_response_updated_at','owned_updated_at'):
+    assert re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z',p[key])
+    assert not p[key].endswith('789Z')
+PY
+run_controller finish-maintenance
+test ! -e "$tmp/state/maintenance.json"
+
+for rejected_full_style in naive invalid; do
+  reset_fixture
+  printf '%s\n' "$rejected_full_style" >"$tmp/go_full_timestamp_style_7692"
+  expect_controller_failure prepare-maintenance
+  assert_eq PREPARING "$(marker_phase)" \
+    "$rejected_full_style Redis timestamp stopped before primary write"
+  assert_eq 0 "$(event_count '^set:7692:')" \
+    "$rejected_full_style Redis timestamp caused zero primary writes"
+  assert_eq t "$(member_schedulable 7692)" \
+    "$rejected_full_style Redis timestamp kept primary schedulable"
+  test ! -e "$tmp/state/maintenance-ambiguous.json"
+done
+
+for rejected_api_style in naive invalid; do
+  reset_fixture
+  printf '%s\n' "$rejected_api_style" >"$tmp/go_response_timestamp_style_7692"
+  expect_controller_failure prepare-maintenance
+  assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" \
+    "$rejected_api_style API timestamp became sticky ambiguity"
+  test -s "$tmp/state/maintenance-ambiguous.json"
+  assert_eq 1 "$(event_count '^set:7692:false$')" \
+    "$rejected_api_style API timestamp failed only after one primary write"
+  assert_eq f "$(member_schedulable 7692)" \
+    "$rejected_api_style API timestamp left the applied pause visible"
+  assert_eq t "$(member_schedulable 7693)" \
+    "$rejected_api_style API timestamp kept standby open"
+done
+
+if [[ "${FAILOVER_TIMESTAMP_INTEGRATION_ONLY:-0}" == 1 ]]; then
+  printf 'PASS: timestamp state-machine integration selftest\n'
+  exit 0
+fi
 
 # Incomplete Redis control-plane evidence never reaches a primary write.
 reset_fixture

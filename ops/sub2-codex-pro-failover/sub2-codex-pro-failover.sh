@@ -743,7 +743,7 @@ meta_matches() {
   projection="$(meta_projection "$account_id")" || return 1
   [[ -n "$projection" ]] || return 1
   printf '%s' "$projection" | "$PYTHON_BIN" -c '
-import datetime as dt, json, sys
+import datetime as dt, json, re, sys
 expected = sys.argv[1] == "true"
 try:
     a = json.load(sys.stdin)
@@ -754,22 +754,32 @@ if a.get("Status") != "active" or bool(a.get("Schedulable")) is not expected:
 if not expected:
     raise SystemExit(0)
 now = dt.datetime.now(dt.timezone.utc)
+def parse_rfc3339(value):
+    match=re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?"
+        r"(Z|[+-]\d{2}:\d{2})",str(value))
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or "")+"000000")[:6]
+    zone="+00:00" if zone == "Z" else zone
+    stamp=dt.datetime.fromisoformat(f"{base}.{fraction}{zone}")
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc)
 def future(value):
     if not value:
         return False
-    raw = str(value).strip()
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    try:
-        stamp = dt.datetime.fromisoformat(raw)
-    except ValueError:
-        return True
-    if stamp.tzinfo is None:
-        stamp = stamp.replace(tzinfo=dt.timezone.utc)
-    return stamp.astimezone(dt.timezone.utc) > now
-if future(a.get("RateLimitResetAt")) or future(a.get("OverloadUntil")) or future(a.get("TempUnschedulableUntil")):
+    return parse_rfc3339(value) > now
+try:
+    blocked=(future(a.get("RateLimitResetAt")) or
+             future(a.get("OverloadUntil")) or
+             future(a.get("TempUnschedulableUntil")))
+    expired=(a.get("AutoPauseOnExpired") and a.get("ExpiresAt") and
+             not future(a.get("ExpiresAt")))
+except Exception:
     raise SystemExit(1)
-if a.get("AutoPauseOnExpired") and a.get("ExpiresAt") and not future(a.get("ExpiresAt")):
+if blocked or expired:
     raise SystemExit(1)
 ' "$expected"
 }
@@ -803,20 +813,28 @@ full_account_control_matches() {
   projection="$(full_account_control_projection "$account_id")" || return 1
   [[ -n "$projection" ]] || return 1
   printf '%s' "$projection" | "$PYTHON_BIN" -c '
-import datetime as dt,json,sys
+import datetime as dt,json,re,sys
 expected=sys.argv[1] == "true"
 expected_updated_at=sys.argv[2]
+def parse_rfc3339(value):
+    match=re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?"
+        r"(Z|[+-]\d{2}:\d{2})",str(value))
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or "")+"000000")[:6]
+    zone="+00:00" if zone == "Z" else zone
+    stamp=dt.datetime.fromisoformat(f"{base}.{fraction}{zone}")
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc)
 try:
     account=json.load(sys.stdin)
     if account.get("Status") != "active" or bool(account.get("Schedulable")) is not expected:
         raise ValueError
-    raw=str(account.get("UpdatedAt") or "").strip()
-    if raw.endswith("Z"):
-        raw=raw[:-1]+"+00:00"
-    stamp=dt.datetime.fromisoformat(raw)
-    if stamp.tzinfo is None:
-        raise ValueError
-    actual=stamp.astimezone(dt.timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z")
+    stamp=parse_rfc3339(account.get("UpdatedAt") or "")
+    actual=stamp.isoformat(timespec="microseconds").replace("+00:00","Z")
     if actual != expected_updated_at:
         raise ValueError
 except Exception:
@@ -840,18 +858,26 @@ full_account_state_matches() {
   fi
   [[ -n "$projection" ]] || return 1
   printf '%s' "$projection" | "$PYTHON_BIN" -c '
-import datetime as dt,json,sys
+import datetime as dt,json,re,sys
 expected=sys.argv[1] == "true"
+def parse_rfc3339(value):
+    match=re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?"
+        r"(Z|[+-]\d{2}:\d{2})",str(value))
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or "")+"000000")[:6]
+    zone="+00:00" if zone == "Z" else zone
+    stamp=dt.datetime.fromisoformat(f"{base}.{fraction}{zone}")
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc)
 try:
     account=json.load(sys.stdin)
     if account.get("Status") != "active" or bool(account.get("Schedulable")) is not expected:
         raise ValueError
-    raw=str(account.get("UpdatedAt") or "").strip()
-    if raw.endswith("Z"):
-        raw=raw[:-1]+"+00:00"
-    stamp=dt.datetime.fromisoformat(raw)
-    if stamp.tzinfo is None:
-        raise ValueError
+    parse_rfc3339(account.get("UpdatedAt") or "")
 except Exception:
     raise SystemExit(1)
 ' "$expected"
@@ -1116,8 +1142,21 @@ api_set_primary_schedulable() {
   fi
   local response_updated_at
   if ! response_updated_at="$("$PYTHON_BIN" - "$ACTIVE_RESPONSE_FILE" "$account_id" "$desired" <<'PY'
-import datetime as dt,json,sys
+import datetime as dt,json,re,sys
 path,expected_id,desired=sys.argv[1:]
+def parse_rfc3339(value):
+    match=re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?'
+        r'(Z|[+-]\d{2}:\d{2})',str(value))
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or '')+'000000')[:6]
+    zone='+00:00' if zone == 'Z' else zone
+    stamp=dt.datetime.fromisoformat(f'{base}.{fraction}{zone}')
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc)
 try:
     payload=json.load(open(path,encoding='utf-8'))
     account=payload.get('data',payload)
@@ -1130,13 +1169,9 @@ try:
         raise ValueError('schedulable mismatch')
     if account.get('status') != 'active':
         raise ValueError('account not active')
-    raw=str(account.get('updated_at') or account.get('updatedAt') or account.get('UpdatedAt') or '').strip()
-    if raw.endswith('Z'):
-        raw=raw[:-1]+'+00:00'
-    stamp=dt.datetime.fromisoformat(raw)
-    if stamp.tzinfo is None:
-        raise ValueError('updated_at lacks timezone')
-    print(stamp.astimezone(dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00','Z'))
+    raw=account.get('updated_at') or account.get('updatedAt') or account.get('UpdatedAt') or ''
+    stamp=parse_rfc3339(raw)
+    print(stamp.isoformat(timespec='microseconds').replace('+00:00','Z'))
 except Exception:
     raise SystemExit(1)
 PY
@@ -1743,7 +1778,7 @@ relay_event_is_new() {
   local watermark_at="$3"
   local watermark_id="$4"
   "$PYTHON_BIN" - "$latest_at" "$latest_id" "$watermark_at" "$watermark_id" <<'PY'
-import datetime as dt,sys
+import datetime as dt,re,sys
 latest_at,latest_id,watermark_at,watermark_id=sys.argv[1:]
 try:
     latest_id=int(latest_id)
@@ -1753,9 +1788,17 @@ except ValueError:
 if latest_id <= 0:
     raise SystemExit(1)
 def parse(value):
-    parsed=dt.datetime.fromisoformat(value.replace('Z','+00:00'))
+    match=re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?'
+        r'(Z|[+-]\d{2}:\d{2})',value)
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or '')+'000000')[:6]
+    zone='+00:00' if zone == 'Z' else zone
+    parsed=dt.datetime.fromisoformat(f'{base}.{fraction}{zone}')
     if parsed.tzinfo is None:
-        parsed=parsed.replace(tzinfo=dt.timezone.utc)
+        raise ValueError
     return parsed.astimezone(dt.timezone.utc)
 try:
     latest_stamp=parse(latest_at)
@@ -1862,7 +1905,7 @@ read_state() {
   }
   local normalized
   normalized="$("$PYTHON_BIN" - "$STATE_FILE" <<'PY'
-import datetime as dt,json,sys
+import datetime as dt,json,re,sys
 try:
     p=json.load(open(sys.argv[1],encoding='utf-8'))
 except Exception:
@@ -1875,15 +1918,27 @@ if schema not in (1,2,3):
     raise SystemExit(1)
 if str(p.get('mode') or '') not in ('normal','failover','maintenance','recovery_pending'):
     raise SystemExit(1)
+def canonical_rfc3339(value):
+    match=re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?'
+        r'(Z|[+-]\d{2}:\d{2})',str(value))
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or '')+'000000')[:6]
+    zone='+00:00' if zone == 'Z' else zone
+    parsed=dt.datetime.fromisoformat(f'{base}.{fraction}{zone}')
+    if parsed.tzinfo is None:
+        raise ValueError
+    return parsed.astimezone(dt.timezone.utc).isoformat(
+        timespec='microseconds').replace('+00:00','Z')
 for key in ('proof_after','takeover_started_at','last_trigger_at','healthy_since','last_unavailable_at','last_availability_at'):
     value=p.get(key)
     if not value:
         continue
     try:
-        parsed=dt.datetime.fromisoformat(str(value).replace('Z','+00:00'))
+        p[key]=canonical_rfc3339(value)
     except Exception:
-        raise SystemExit(1)
-    if parsed.tzinfo is None:
         raise SystemExit(1)
 print('|'.join((
     str(p.get('mode') or 'normal'),
@@ -2296,9 +2351,15 @@ seal_evidence_chronology_valid() {
     "$((PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS * 1000 + 1000))" <<'PY'
 import datetime as dt,re,sys
 def parse(value):
-    value=re.sub(r'(\.[0-9]{6})[0-9]+(?=Z|[+-][0-9]{2}:[0-9]{2}$)',r'\1',value)
-    raw=value[:-1]+'+00:00' if value.endswith('Z') else value
-    stamp=dt.datetime.fromisoformat(raw)
+    match=re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?'
+        r'(Z|[+-]\d{2}:\d{2})',value)
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or '')+'000000')[:6]
+    zone='+00:00' if zone == 'Z' else zone
+    stamp=dt.datetime.fromisoformat(f'{base}.{fraction}{zone}')
     if stamp.tzinfo is None:
         raise ValueError
     return stamp.astimezone(dt.timezone.utc)
@@ -3561,11 +3622,22 @@ timestamp_age_at_least() {
   local seconds="$2"
   [[ -n "$value" ]] || return 1
   "$PYTHON_BIN" - "$value" "$seconds" <<'PY'
-import datetime as dt,sys
+import datetime as dt,re,sys
+def parse_rfc3339(value):
+    match=re.fullmatch(
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.([0-9]{1,9}))?'
+        r'(Z|[+-]\d{2}:\d{2})',value)
+    if not match:
+        raise ValueError
+    base,fraction,zone=match.groups()
+    fraction=((fraction or '')+'000000')[:6]
+    zone='+00:00' if zone == 'Z' else zone
+    stamp=dt.datetime.fromisoformat(f'{base}.{fraction}{zone}')
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc)
 try:
-    value=dt.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00'))
-    if value.tzinfo is None:
-        value=value.replace(tzinfo=dt.timezone.utc)
+    value=parse_rfc3339(sys.argv[1])
 except Exception:
     raise SystemExit(1)
 raise SystemExit(0 if (dt.datetime.now(dt.timezone.utc)-value).total_seconds() >= int(sys.argv[2]) else 1)

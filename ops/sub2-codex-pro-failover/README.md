@@ -274,6 +274,16 @@ tuple plus scheduler snapshot remain unchanged across two confirmations. Redis
 `sched:meta:<id>` and bucket membership are convergence evidence only; their
 metadata is not treated as a durable mutation generation.
 
+PostgreSQL `accounts.updated_at` is the authoritative mutation generation and
+has microsecond precision. sub2 may serialize that same value through Go/Redis
+RFC3339 with zero through nine fractional digits and either `Z` or a numeric
+timezone offset. Runtime comparisons therefore normalize valid values to UTC
+with exactly six fractional digits. Seven-to-nine digit fractions are
+intentionally truncated to the database's microsecond boundary; they do not
+create nanosecond ownership identity. Missing timezones, malformed values, and
+out-of-range timestamps fail closed. Persisted maintenance markers and poison
+sidecars remain stricter canonical UTC-microsecond `.<six digits>Z` artifacts.
+
 Before each ownership transition and before restoration, a new read-only FIFO
 sentinel is sent to the admin log-health endpoint. Once its exact receipt is
 durable, all earlier enqueued access events are known to have crossed the single
