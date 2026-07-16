@@ -2,7 +2,10 @@ package admin
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,6 +16,89 @@ import (
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
+
+type promptFilterSecretRequest struct {
+	Secret string `json:"secret"`
+}
+
+func relayBasesPromptFilterAdminConfig(cfg promptfilter.Config) promptfilter.Config {
+	// RelayBases delegates moderation to sub2. Keep legacy fields readable for
+	// schema/rollback compatibility, but never advertise or persist a local
+	// blocking, semantic-review, or output-interruption mode from this build.
+	cfg.Mode = promptfilter.ModeMonitor
+	cfg.Review.Enabled = false
+	cfg.Review.All = false
+	cfg.Advanced.Output.Enabled = false
+	return cfg
+}
+
+func relayBasesSemanticReviewEnabled(_ bool) bool {
+	// The standalone legacy semantic-review pool is retained in the schema for
+	// rollback compatibility, but moderation is owned by sub2 in RelayBases.
+	return false
+}
+
+func maskPromptFilterSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	if len(secret) < 12 {
+		return "********"
+	}
+	return secret[:6] + "…" + secret[len(secret)-6:]
+}
+
+func (h *Handler) promptFilterSecretStatus(c *gin.Context, reveal string) {
+	dbSecret, _ := h.db.GetPromptFilterNewAPISecret(c.Request.Context())
+	envSecret := strings.TrimSpace(os.Getenv("PROMPT_FILTER_NEWAPI_SECRET"))
+	effective, source := dbSecret, "database"
+	if envSecret != "" {
+		effective, source = envSecret, "environment"
+	}
+	if effective == "" {
+		source = "none"
+	}
+	c.JSON(http.StatusOK, gin.H{"configured": effective != "", "source": source, "masked": maskPromptFilterSecret(effective), "secret": reveal})
+}
+
+func (h *Handler) GetPromptFilterNewAPISecretStatus(c *gin.Context) {
+	h.promptFilterSecretStatus(c, "")
+}
+
+func (h *Handler) GeneratePromptFilterNewAPISecret(c *gin.Context) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		writeError(c, http.StatusInternalServerError, "生成随机密钥失败")
+		return
+	}
+	h.savePromptFilterNewAPISecret(c, hex.EncodeToString(buf))
+}
+
+func (h *Handler) ReplacePromptFilterNewAPISecret(c *gin.Context) {
+	var req promptFilterSecretRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式无效")
+		return
+	}
+	h.savePromptFilterNewAPISecret(c, strings.TrimSpace(req.Secret))
+}
+
+func (h *Handler) savePromptFilterNewAPISecret(c *gin.Context, secret string) {
+	if len(secret) < 32 {
+		writeError(c, http.StatusBadRequest, "共享密钥至少需要 32 个字符")
+		return
+	}
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
+	if err := h.db.SetPromptFilterNewAPISecret(c.Request.Context(), secret); err != nil {
+		writeError(c, http.StatusInternalServerError, "保存共享密钥失败")
+		return
+	}
+	cfg := h.store.GetPromptFilterConfig()
+	cfg.Advanced.NewAPI.Secret = secret
+	h.store.SetPromptFilterConfig(cfg)
+	h.promptFilterSecretStatus(c, secret)
+}
 
 type promptFilterLogsResponse struct {
 	Logs     []*database.PromptFilterLog `json:"logs"`
@@ -379,7 +465,7 @@ func positiveQueryInt(c *gin.Context, key string, fallback int) int {
 }
 
 func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
-	if verdict.Reviewed || verdict.Action == promptfilter.ActionBlock && verdict.StrictHit {
+	if verdict.Reviewed || verdict.TerminalStrictHit || verdict.Action == promptfilter.ActionBlock && verdict.StrictHit {
 		return false
 	}
 	review := promptfilter.NormalizeReviewConfig(cfg.Review)

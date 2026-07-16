@@ -85,6 +85,13 @@ type WsConnection struct {
 	// healthy idle socket remains in place but cannot receive a new lease.
 	safeReusable   atomic.Bool
 	reuseNotBefore atomic.Int64
+	// allowAbruptTerminalProof is set before the first request write only for
+	// physical sockets that this executor will never reuse (one-shot/default
+	// isolated stateless requests). Together with safeReusable, it permits a
+	// same-lease terminal frame to prove write commitment across close 1006/EOF.
+	// Legacy/default reusable sockets deliberately leave it false so a delayed
+	// terminal from an older lease cannot be attributed to the current write.
+	allowAbruptTerminalProof atomic.Bool
 	// retireAfterLease is set when the global/account rollout policy is removed
 	// while a request is still active. The active response may finish, but this
 	// physical socket can never receive another lease.

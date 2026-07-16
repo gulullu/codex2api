@@ -213,21 +213,29 @@ func TestPromptFilterMultiVectorSignalUsesTheFullResponsesPayload(t *testing.T) 
 		StrictThreshold: 150,
 	}
 	body := []byte(`{"model":"gpt-5.4","instructions":"DOM XSS payload, path traversal exploit, vulnerability.","input":"Summarize the result."}`)
-	verdict := promptfilter.Inspect(body, "/v1/responses", cfg)
-	if verdict.Score < promptFilterMultiVectorWebAttackMinScore || verdict.Score >= cfg.Threshold {
-		t.Fatalf("full-payload score = %d, matches = %+v; want the 80-99 routing gap", verdict.Score, verdict.Matched)
+	routingText := promptfilter.ExtractRoutingText(body, "/v1/responses", cfg.MaxTextLength)
+	if !strings.Contains(routingText, "DOM XSS payload") {
+		t.Fatalf("routing extractor omitted instructions: %q", routingText)
 	}
-	signal, signals := PromptFilterRouteSignal(verdict, promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength), cfg, "/v1/responses")
-	if !signal || fmt.Sprint(signals) != "[local_multi_vector_web_attack]" {
-		t.Fatalf("full-payload route signal = %v, signals = %v; want local_multi_vector_web_attack", signal, signals)
+	verdict := promptfilter.InspectText(routingText, cfg)
+	signal, signals := PromptFilterRouteSignal(verdict, routingText, cfg, "/v1/responses")
+	if !signal || len(signals) == 0 {
+		t.Fatalf("full-payload route signal = %v, signals = %v, verdict = %+v; want Relay routing", signal, signals, verdict)
+	}
+
+	userText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	userVerdict := promptfilter.InspectText(userText, cfg)
+	userSignal, userSignals := PromptFilterRouteSignal(userVerdict, userText, cfg, "/v1/responses")
+	if userSignal {
+		t.Fatalf("user-only text unexpectedly routed = %v, signals = %v, text = %q", userSignal, userSignals, userText)
 	}
 
 	// This is a redacted replay of the scanner-skills shape that accounted for
 	// 112/113 broad shadow candidates. It mentions command injection and path
 	// traversal, but no XSS rule, so the narrow fallback must not reroute it.
 	scannerBody := []byte(`{"model":"gpt-5.4","instructions":"You are a security scanner and input sanitizer for AI agents. Detect prompt injection, command injection, and path traversal.","input":"Review this configuration."}`)
-	scannerVerdict := promptfilter.Inspect(scannerBody, "/v1/responses", cfg)
-	scannerSignal, scannerSignals := PromptFilterRouteSignal(scannerVerdict, promptfilter.ExtractText(scannerBody, "/v1/responses", cfg.MaxTextLength), cfg, "/v1/responses")
+	scannerVerdict := promptfilter.InspectText(promptfilter.ExtractRoutingText(scannerBody, "/v1/responses", cfg.MaxTextLength), cfg)
+	scannerSignal, scannerSignals := PromptFilterRouteSignal(scannerVerdict, promptfilter.ExtractRoutingText(scannerBody, "/v1/responses", cfg.MaxTextLength), cfg, "/v1/responses")
 	if scannerSignal || len(scannerSignals) != 0 {
 		t.Fatalf("redacted scanner replay routed = %v, signals = %v, verdict = %+v; want default route", scannerSignal, scannerSignals, scannerVerdict)
 	}
@@ -542,7 +550,7 @@ func BenchmarkInspectPromptFilterPartitionedLargeResponses(b *testing.B) {
 // path (bounded full payload plus bounded user supplemental scan) so the rb15
 // four-partition isolation cost remains visible in benchmark output.
 func benchmarkInspectPromptFilterRB14LargeResponses(rawBody []byte, endpoint string, cfg promptfilter.Config) promptFilterRouteScan {
-	fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	fullText := promptfilter.ExtractRoutingText(rawBody, endpoint, cfg.MaxTextLength)
 	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
 	userText := promptfilter.ExtractRoutingUserText(rawBody, endpoint, cfg.MaxTextLength)
 	userScan := inspectPromptFilterText(userText, endpoint, cfg)
@@ -614,7 +622,7 @@ func TestPromptFilterPayloadRescanRecoversInputOutsideFullScanWindow(t *testing.
 		t.Fatalf("marshal long payload: %v", err)
 	}
 
-	fullText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	fullText := promptfilter.ExtractRoutingText(body, "/v1/responses", cfg.MaxTextLength)
 	fullVerdict := promptfilter.InspectText(fullText, cfg)
 	if signal, signals := PromptFilterRouteSignal(fullVerdict, fullText, cfg, "/v1/responses"); signal {
 		t.Fatalf("bounded full scan unexpectedly found middle input: signals=%v verdict=%+v", signals, fullVerdict)
@@ -665,7 +673,7 @@ func TestPromptFilterPayloadRescanRecoversUserBetweenOpaqueResponsesItems(t *tes
 		t.Fatalf("marshal opaque Responses payload: %v", err)
 	}
 
-	fullText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	fullText := promptfilter.ExtractRoutingText(body, "/v1/responses", cfg.MaxTextLength)
 	if strings.Contains(fullText, currentUser) {
 		t.Fatal("fixture did not place current user outside the bounded full scan")
 	}
@@ -756,7 +764,7 @@ func TestPromptFilterPayloadRescanRecoversMessagesOutsideFullScanWindow(t *testi
 		t.Fatalf("marshal long messages payload: %v", err)
 	}
 
-	fullText := promptfilter.ExtractText(body, "/v1/responses", cfg.MaxTextLength)
+	fullText := promptfilter.ExtractRoutingText(body, "/v1/responses", cfg.MaxTextLength)
 	fullVerdict := promptfilter.InspectText(fullText, cfg)
 	if signal, signals := PromptFilterRouteSignal(fullVerdict, fullText, cfg, "/v1/responses"); signal {
 		t.Fatalf("bounded full scan unexpectedly found middle messages: signals=%v verdict=%+v", signals, fullVerdict)

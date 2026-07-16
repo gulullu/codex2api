@@ -21,7 +21,41 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/net/http2"
 )
+
+// Codex/OpenAI HTTP/2 上游的连接健康探测参数。
+//
+// 标准库 net/http 会 ALPN 协商升级到 HTTP/2，但 http2.Transport 默认
+// ReadIdleTimeout=0（不发保活 PING），无法感知被代理/NAT 静默掐断的
+// “死连接”（两端都以为存活）。请求一旦落在死连接上，会一直挂到 OS TCP
+// 重传超时（分钟级）才失败——表现为超长 TTFT。启用主动 PING：连接空闲
+// ReadIdleTimeout 后发 PING，PingTimeout 内无响应即判定死连接并关闭，
+// 从源头剔除，请求得以在别的连接上重建，而非挂死。
+//
+// 仅作用于 HTTP/2 直连（标准 transport 与 uTLS transport）；WebSocket
+// relay 链路已有完整的 Ping/Pong 保活与复用前探活，不走这里。
+const (
+	codexHTTP2ReadIdleTimeout = 15 * time.Second
+	codexHTTP2PingTimeout     = 15 * time.Second
+)
+
+// enableCodexHTTP2KeepAlive 在标准 *http.Transport 上显式配置 HTTP/2 并
+// 开启连接健康探测（ReadIdleTimeout/PingTimeout），返回底层 *http2.Transport
+// 便于测试断言。配置失败（如该 transport 已注册过 h2）不影响 h1 回退，仅记录
+// 日志并返回 nil——此时沿用标准库默认（无主动 PING）。
+func enableCodexHTTP2KeepAlive(transport *http.Transport) *http2.Transport {
+	h2, err := http2.ConfigureTransports(transport)
+	if err != nil {
+		log.Printf("[CodexTransport] 启用 HTTP/2 保活失败，沿用默认(无 PING): err=%v", err)
+		return nil
+	}
+	if h2 != nil {
+		h2.ReadIdleTimeout = codexHTTP2ReadIdleTimeout
+		h2.PingTimeout = codexHTTP2PingTimeout
+	}
+	return h2
+}
 
 // ==================== HTTP 连接池（按账号隔离 + TTL 淘汰） ====================
 //
@@ -154,6 +188,9 @@ func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 		transport.Proxy = nil
 		transport.DialContext = baseDialer.DialContext
 	}
+	// 在代理/DialContext 敲定后再启用 HTTP/2 保活 PING，剔除被中间设备静默
+	// 掐断的死连接，避免请求挂到 TCP 重传超时。
+	enableCodexHTTP2KeepAlive(transport)
 	return transport
 }
 
@@ -388,6 +425,12 @@ func resolveUpstreamSessionID(apiKeyID int64, upstreamSeed, explicitSessionID st
 // useWebsocket 可选：未传时遵循全局强制 WS；传 true/false 时由调用方显式控制。
 // headers 下游请求头，用于设备指纹学习
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+	// Payload 规则改写：在 WS/HTTP 分叉前统一应用，两条上游路径共享改写结果。
+	// 生图请求跳过——其 instructions/工具由网关自行构造，改写会破坏桥接协议。
+	if !responsesBodyRequestsImageGeneration(requestBody) {
+		RecordObservedInstructions(requestBody, headers)
+		requestBody = applyPayloadRulesForExecute(ctx, requestBody, gjson.GetBytes(requestBody, "model").String(), headers)
+	}
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]

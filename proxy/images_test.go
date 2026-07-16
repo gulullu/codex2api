@@ -233,7 +233,7 @@ func TestImageGalleryPersisterRecordsAssetAndJob(t *testing.T) {
 	p.finalize(ctx)
 
 	// 应登记一条 asset，且 storage_path 为 s3:// ref。
-	assets, err := db.ListImageAssets(ctx, 1, 10)
+	assets, err := db.ListImageAssets(ctx, 1, 10, 0)
 	if err != nil {
 		t.Fatalf("ListImageAssets: %v", err)
 	}
@@ -289,6 +289,31 @@ func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "input.0.content.0.text").String(); got != "draw a cat" {
 		t.Fatalf("prompt = %q, want draw a cat", got)
+	}
+}
+
+func TestBuildImagesResponsesRequestCarriesMaxEditImages(t *testing.T) {
+	if MaxImageEditInputCount != 16 {
+		t.Fatalf("MaxImageEditInputCount = %d, want 16（对齐官方 gpt-image 编辑上限）", MaxImageEditInputCount)
+	}
+
+	images := make([]string, MaxImageEditInputCount)
+	for i := range images {
+		images[i] = fmt.Sprintf("data:image/png;base64,IMG%d", i)
+	}
+	body := buildImagesResponsesRequest("edit these", images, nil)
+
+	parts := gjson.GetBytes(body, "input.0.content").Array()
+	if len(parts) != MaxImageEditInputCount+1 {
+		t.Fatalf("content parts = %d, want %d（1 条文本 + %d 张图）", len(parts), MaxImageEditInputCount+1, MaxImageEditInputCount)
+	}
+	for i, part := range parts[1:] {
+		if got := part.Get("type").String(); got != "input_image" {
+			t.Fatalf("content[%d].type = %q, want input_image", i+1, got)
+		}
+		if got := part.Get("image_url").String(); got != images[i] {
+			t.Fatalf("content[%d].image_url = %q, want %q", i+1, got, images[i])
+		}
 	}
 }
 
@@ -520,6 +545,238 @@ func TestNextImageAccountFallsBackToFreeWhenNoPaidAccountAvailable(t *testing.T)
 
 	if account.DBID != 1 {
 		t.Fatalf("nextImageAccount picked account %d, want fallback free account 1", account.DBID)
+	}
+}
+
+func TestShouldRetryImageHTTPStatusForRequestUsesAccountAwareForbiddenPolicy(t *testing.T) {
+	oauth := &auth.Account{DBID: 1, AccessToken: "oauth-token"}
+	relay := &auth.Account{
+		DBID:         2,
+		AccessToken:  "relay-token",
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example/v1",
+		APIKey:       "relay-key",
+	}
+
+	for _, test := range []struct {
+		name          string
+		statusCode    int
+		account       *auth.Account
+		bound         bool
+		wantRetry     bool
+		wantGeneral   int
+		wantRateLimit int
+	}{
+		{name: "fresh OAuth 403 switches account", statusCode: http.StatusForbidden, account: oauth, wantRetry: true, wantGeneral: 1},
+		{name: "bound OAuth 403 stays on owner", statusCode: http.StatusForbidden, account: oauth, bound: true},
+		{name: "Relay 403 is not replayed", statusCode: http.StatusForbidden, account: relay},
+		{name: "unknown 403 is not replayed", statusCode: http.StatusForbidden},
+		{name: "OAuth 502 remains non-retryable", statusCode: http.StatusBadGateway, account: oauth},
+		{name: "Relay 502 remains non-retryable", statusCode: http.StatusBadGateway, account: relay},
+		{name: "OAuth 504 remains non-retryable", statusCode: http.StatusGatewayTimeout, account: oauth},
+		{name: "Relay 504 remains non-retryable", statusCode: http.StatusGatewayTimeout, account: relay},
+		{name: "existing 503 policy is preserved", statusCode: http.StatusServiceUnavailable, account: oauth, wantRetry: true, wantGeneral: 1},
+		{name: "existing 429 policy is preserved", statusCode: http.StatusTooManyRequests, account: oauth, wantRetry: true, wantRateLimit: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generalRetries := 0
+			rateLimitRetries := 0
+			got := shouldRetryImageHTTPStatusForRequest(
+				test.statusCode,
+				test.account,
+				test.bound,
+				&generalRetries,
+				&rateLimitRetries,
+				2,
+				1,
+			)
+			if got != test.wantRetry {
+				t.Fatalf("retry = %v, want %v", got, test.wantRetry)
+			}
+			if generalRetries != test.wantGeneral || rateLimitRetries != test.wantRateLimit {
+				t.Fatalf(
+					"retry budgets = general:%d rate:%d, want general:%d rate:%d",
+					generalRetries,
+					rateLimitRetries,
+					test.wantGeneral,
+					test.wantRateLimit,
+				)
+			}
+		})
+	}
+}
+
+func TestForwardImagesOAuthForbiddenSwitchesToAnotherAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var (
+		mu             sync.Mutex
+		authorizations []string
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authorizations = append(authorizations, r.Header.Get("Authorization"))
+		attempt := len(authorizations)
+		mu.Unlock()
+
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"code":"codex_access_restricted","message":"account unavailable"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"`+tinyPNGBase64+`","revised_prompt":"draw a cat","output_format":"png"}]}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "images-oauth-403-test"})
+	t.Cleanup(func() { SetResinConfig(nil) })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          2,
+		MaxRateLimitRetries: 1,
+	})
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{DBID: 101, AccessToken: "oauth-token-a", PlanType: "plus", Status: auth.StatusReady})
+	store.AddAccount(&auth.Account{DBID: 102, AccessToken: "oauth-token-b", PlanType: "plus", Status: auth.StatusReady})
+	handler := NewHandler(store, nil, nil, nil)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	responsesBody := buildImagesResponsesRequest("draw a cat", nil, []byte(`{"type":"image_generation","model":"gpt-image-2"}`))
+	handler.forwardImagesRequest(
+		ctx,
+		"/v1/images/generations",
+		"gpt-image-2",
+		"gpt-image-2",
+		"gpt-image-2",
+		responsesBody,
+		"b64_json",
+		"image_generation",
+		false,
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotAuthorizations := append([]string(nil), authorizations...)
+	mu.Unlock()
+	if len(gotAuthorizations) != 2 {
+		t.Fatalf("upstream attempts = %d, want 2; auth=%v", len(gotAuthorizations), gotAuthorizations)
+	}
+	if gotAuthorizations[0] == "" || gotAuthorizations[1] == "" || gotAuthorizations[0] == gotAuthorizations[1] {
+		t.Fatalf("OAuth 403 did not switch accounts: auth=%v", gotAuthorizations)
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "data.0.b64_json").String(); got != tinyPNGBase64 {
+		t.Fatalf("image payload missing after OAuth account switch: %s", recorder.Body.String())
+	}
+}
+
+func TestForwardImagesRelayForbiddenIsTransparentAndHealthNeutral(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var (
+		mu       sync.Mutex
+		attempts int
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"code":"policy_denied","message":"relay policy denied"}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "images-relay-403-test"})
+	t.Cleanup(func() { SetResinConfig(nil) })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          2,
+		MaxRateLimitRetries: 1,
+	})
+	t.Cleanup(store.Stop)
+	relay := &auth.Account{
+		DBID:         151,
+		AccessToken:  "relay-access-token",
+		PlanType:     "plus",
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL + "/v1",
+		APIKey:       "relay-api-key",
+	}
+	store.AddAccount(relay)
+	handler := NewHandler(store, nil, nil, nil)
+	beforeScheduler := relay.GetSchedulerDebugSnapshot(2)
+	beforeFailureStreak := relay.FailureStreak
+	beforeLastFailureAt := relay.LastFailureAt
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	responsesBody := buildImagesResponsesRequest("draw a cat", nil, []byte(`{"type":"image_generation","model":"gpt-image-2"}`))
+	handler.forwardImagesRequest(
+		ctx,
+		"/v1/images/generations",
+		"gpt-image-2",
+		"gpt-image-2",
+		"gpt-image-2",
+		responsesBody,
+		"b64_json",
+		"image_generation",
+		false,
+	)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want Relay 403 passthrough; body=%s", recorder.Code, recorder.Body.String())
+	}
+	mu.Lock()
+	gotAttempts := attempts
+	mu.Unlock()
+	if gotAttempts != 1 {
+		t.Fatalf("Relay 403 upstream attempts = %d, want 1", gotAttempts)
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); !strings.Contains(got, "relay policy denied") {
+		t.Fatalf("Relay 403 details were not preserved: %s", recorder.Body.String())
+	}
+	afterScheduler := relay.GetSchedulerDebugSnapshot(2)
+	if relay.HealthTier != auth.HealthTierHealthy ||
+		relay.FailureStreak != beforeFailureStreak ||
+		!relay.LastFailureAt.Equal(beforeLastFailureAt) {
+		t.Fatalf(
+			"Relay 403 changed health: tier=%s streak=%d last_failure=%v",
+			relay.HealthTier,
+			relay.FailureStreak,
+			relay.LastFailureAt,
+		)
+	}
+	if afterScheduler.SchedulerScore != beforeScheduler.SchedulerScore ||
+		afterScheduler.DispatchScore != beforeScheduler.DispatchScore ||
+		afterScheduler.DynamicConcurrencyLimit != beforeScheduler.DynamicConcurrencyLimit {
+		t.Fatalf("Relay 403 changed scheduler state: before=%+v after=%+v", beforeScheduler, afterScheduler)
+	}
+	circuit := store.RelayCircuitSnapshot(relay.ID())
+	if circuit.State != auth.RelayCircuitClosed ||
+		circuit.StrongFailures != 0 ||
+		circuit.WeakFailures != 0 ||
+		circuit.WeakSamples != 0 ||
+		circuit.InFlight != 0 ||
+		circuit.LastStatusCode != 0 ||
+		!circuit.LastFailureAt.IsZero() {
+		t.Fatalf("Relay Images 403 polluted circuit evidence: %+v", circuit)
+	}
+	if reason, until := relay.GetCooldownSnapshot(); reason != "" || !until.IsZero() {
+		t.Fatalf("Relay 403 created cooldown: reason=%q until=%v", reason, until)
+	}
+	if relay.ActiveRequests != 0 {
+		t.Fatalf("Relay 403 leaked active request lease: %d", relay.ActiveRequests)
 	}
 }
 

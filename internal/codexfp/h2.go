@@ -15,6 +15,7 @@ package codexfp
 import (
 	"net"
 	"net/http"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -45,6 +46,12 @@ const (
 // via ConfigureTransports; MAX_FRAME_SIZE / MAX_HEADER_LIST_SIZE are set directly
 // on the returned transport.
 func NewCodexH2Transport() (*http2.Transport, error) {
+	return NewCodexH2TransportWithKeepAlive(0, 0)
+}
+
+// NewCodexH2TransportWithKeepAlive preserves the measured codex-rs SETTINGS
+// fingerprint while optionally enabling HTTP/2 idle PING health checks.
+func NewCodexH2TransportWithKeepAlive(readIdleTimeout, pingTimeout time.Duration) (*http2.Transport, error) {
 	t1 := &http.Transport{
 		HTTP2: &http.HTTP2Config{
 			// -> SETTINGS_INITIAL_WINDOW_SIZE (conf.MaxUploadBufferPerStream)
@@ -57,8 +64,10 @@ func NewCodexH2Transport() (*http2.Transport, error) {
 	if err != nil {
 		return nil, err
 	}
-	t2.MaxReadFrameSize = H2MaxFrameSize    // -> SETTINGS_MAX_FRAME_SIZE
+	t2.MaxReadFrameSize = H2MaxFrameSize       // -> SETTINGS_MAX_FRAME_SIZE
 	t2.MaxHeaderListSize = H2MaxHeaderListSize // -> SETTINGS_MAX_HEADER_LIST_SIZE
+	t2.ReadIdleTimeout = readIdleTimeout
+	t2.PingTimeout = pingTimeout
 	return t2, nil
 }
 
@@ -67,6 +76,16 @@ func NewCodexH2Transport() (*http2.Transport, error) {
 // for `(&http2.Transport{}).NewClientConn(conn)`.
 func NewCodexH2ClientConn(conn net.Conn) (*http2.ClientConn, error) {
 	t, err := NewCodexH2Transport()
+	if err != nil {
+		return nil, err
+	}
+	return t.NewClientConn(conn)
+}
+
+// NewCodexH2ClientConnWithKeepAlive is the keep-alive equivalent of
+// NewCodexH2ClientConn and retains the same initial SETTINGS fingerprint.
+func NewCodexH2ClientConnWithKeepAlive(conn net.Conn, readIdleTimeout, pingTimeout time.Duration) (*http2.ClientConn, error) {
+	t, err := NewCodexH2TransportWithKeepAlive(readIdleTimeout, pingTimeout)
 	if err != nil {
 		return nil, err
 	}

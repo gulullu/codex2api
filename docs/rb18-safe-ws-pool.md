@@ -9,7 +9,29 @@
 
 它不是“账号级可互换连接池”。最终形态是：一个明确的 Codex `session_id + thread_id` owner 独占一条物理 WS，多个 owner 之间永不交换连接；同一 owner 的多轮请求才允许顺序复用。
 
-生产默认行为不变：`CODEX_WS_STATELESS_ONESHOT=1` 仍是最高优先级硬逃生阀。候选代码不修改账号状态、调度开关、Guardian、sub2 源码或数据库结构，也不包含任何账号 ID/名称白名单。
+生产默认行为不变：`CODEX_WS_STATELESS_ONESHOT=1` 仍是最高优先级硬逃生阀。候选代码不修改账号状态、调度开关、Guardian 或 sub2 源码，也不包含任何账号 ID/名称白名单。合并官方 v2.5.6 后会执行其必要的数据库自动迁移，但新增公开门户均默认关闭，Payload Rules 默认空配置。
+
+## 官方 v2.5.6 合并边界
+
+RB18 基于官方 `v2.5.6`（`dd105d5ad68fcb7854c2770d6f9c69bb727dca8f`）完成语义合并，吸收：
+
+- zstd/gzip/br/deflate 请求体解压和解压后大小保护；
+- compaction 请求首字超时豁免；
+- 保留 Codex HTTP/2 指纹的 keep-alive PING；
+- Payload Rules 及按 API Key/分组匹配；
+- 5h 用量窗口可选化、账号备注和公开门户等管理功能；
+- 新鲜 OAuth 请求遇到账号侧 403 时换号重试。
+
+RelayBases 的约束优先于官方默认实现：
+
+- Relay 403 可能来自 WAF、内容策略或下游授权，禁止换 Relay 前门、禁止冷却整个 Relay 入口，最终仍按上游 403 返回；
+- 带 `previous_response_id` 或加密上下文的 OAuth 403 禁止换号，避免跨账号续链；
+- Payload Rules 只在真正发送上游时应用一次，但其改写后的 system/instructions 会进入完整 payload 的 Relay 路由扫描；
+- codex2api 本地规则继续只做 Relay 分流，不恢复用户可见拦截，Guardian 继续保持 `monitor`；
+- Account Portal 默认关闭；官方 Image Studio Portal 的默认值也在本分支收紧为关闭，必须由管理员显式开启；
+- 构建版本使用 `v2.5.6+rb18.<build>`，语义版本比较仍等于官方 v2.5.6，不会错误显示“有新版”。
+
+首个生产发布只能在 `CODEX_WS_STATELESS_ONESHOT=1` 下进行，用于验证官方合并本身；安全 WS 池必须另行按 tagged 账号灰度，不能与版本升级同时全量开启。
 
 ## 为什么不能按共享 Key 直接复用
 

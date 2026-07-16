@@ -55,7 +55,9 @@ const (
 	maxImageAttempts = 5
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
-	MaxImageEditInputCount = 10
+	// 与官方 Images API 对 gpt-image 系列的上限一致（16 张）；上游 responses
+	// 通道已实测可接受 16 张 input_image（issue #275）。
+	MaxImageEditInputCount = 16
 
 	imageStreamConnectedComment = ": connected\n\n"
 	imageStreamKeepaliveComment = ": keepalive\n\n"
@@ -972,7 +974,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
-	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/images/generations", imageModel) {
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
@@ -1205,7 +1207,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
-	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/images/edits", imageModel) {
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
@@ -1308,6 +1310,34 @@ func imageSyntheticFailureSpec(inboundEndpoint, logModel, logEffectiveModel stri
 		Stream:           stream,
 		Attempt:          attempt,
 	}
+}
+
+// shouldRetryImageHTTPStatusForRequest preserves the deliberately narrow image
+// replay policy while allowing a fresh OAuth 403 to move to another account.
+// Unlike text requests, image generation must not inherit Relay 502/504 replay:
+// a failed image call can have consumed expensive upstream work even when the
+// gateway response is ambiguous. Relay 403 is also request/front-door scoped,
+// so it is passed through without replaying or punishing the whole Relay pool.
+func shouldRetryImageHTTPStatusForRequest(
+	statusCode int,
+	account *auth.Account,
+	requiresBoundAccount bool,
+	generalRetries *int,
+	rateLimitRetries *int,
+	maxGeneralRetries int,
+	maxRateLimitRetries int,
+) bool {
+	if statusCode == http.StatusForbidden {
+		if account == nil || account.IsOpenAIResponsesAPI() || requiresBoundAccount {
+			return false
+		}
+		if generalRetries == nil || *generalRetries >= maxGeneralRetries {
+			return false
+		}
+		*generalRetries++
+		return true
+	}
+	return shouldRetryHTTPStatus(statusCode, generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries)
 }
 
 // releaseImageAttemptIfClientCanceled mirrors the text endpoints' cancellation
@@ -1419,7 +1449,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					publishHTTPFinalWithAudit(c,
 						func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
 						func() {
-							h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+							h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatusForContext(c, lastStatusCode, lastBody), "", "")
 						},
 						nil,
 					)
@@ -1429,7 +1459,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					publishHTTPFinalWithAudit(c,
 						func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
 						func() {
-							h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+							h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatusForContext(c, lastStatusCode, lastBody), "", "")
 						},
 						nil,
 					)
@@ -1503,12 +1533,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			h.reportUpstreamHTTPFailure(account, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
+			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
@@ -1516,7 +1542,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryImageHTTPStatusForRequest(
+				resp.StatusCode,
+				account,
+				requestRequiresBoundUpstreamAccount(c, responsesBody),
+				&generalRetries,
+				&rateLimitRetries,
+				maxRetries,
+				maxRateLimitRetries,
+			)
 			failureUsage := &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          inboundEndpoint,
@@ -1549,7 +1583,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				func() { h.sendFinalUpstreamError(c, resp.StatusCode, errBody) },
 				func() {
 					canonical := imageUsageLogWithVisibility(failureUsage, false)
-					canonical.StatusCode = openAIFinalResponseStatus(resp.StatusCode, errBody)
+					canonical.StatusCode = openAIFinalResponseStatusForContext(c, resp.StatusCode, errBody)
 					h.logUsageForRequest(c, canonical)
 				},
 				func() { h.logImageUsageWithVisibility(c, failureUsage, true) },
@@ -1702,7 +1736,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		publishHTTPFinalWithAudit(c,
 			func() { h.sendFinalUpstreamError(c, lastStatusCode, lastBody) },
 			func() {
-				h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatus(lastStatusCode, lastBody), "", "")
+				h.logPendingFinalFailureAs(c, pendingFinalFailure, openAIFinalResponseStatusForContext(c, lastStatusCode, lastBody), "", "")
 			},
 			nil,
 		)
@@ -1885,7 +1919,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		deliveryFailed bool
 		terminalSent   bool
 	)
-	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once
@@ -2046,6 +2080,12 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		return true
 	})
 	stopKeepalive()
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		deliveryFailed = true
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	if err != nil {
 		if streamErr := getReadErr(); streamErr != nil {
 			return usage, imageCount, firstTokenMs, imageLogInfo, terminalSent, getDeliveryFailed(), streamErr
@@ -2078,6 +2118,12 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		}
 		setReadErr(err)
 	}
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		deliveryFailed = true
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	return usage, imageCount, firstTokenMs, imageLogInfo, terminalSent, getDeliveryFailed(), getReadErr()
 }
 

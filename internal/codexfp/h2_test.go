@@ -23,6 +23,23 @@ type capturedH2 struct {
 	connWindow uint32
 }
 
+func TestCodexH2TransportKeepAlivePreservesFingerprintSettings(t *testing.T) {
+	const (
+		readIdle = 15 * time.Second
+		ping     = 12 * time.Second
+	)
+	tr, err := NewCodexH2TransportWithKeepAlive(readIdle, ping)
+	if err != nil {
+		t.Fatalf("NewCodexH2TransportWithKeepAlive: %v", err)
+	}
+	if tr.ReadIdleTimeout != readIdle || tr.PingTimeout != ping {
+		t.Fatalf("keepalive = (%s, %s), want (%s, %s)", tr.ReadIdleTimeout, tr.PingTimeout, readIdle, ping)
+	}
+	if tr.MaxReadFrameSize != H2MaxFrameSize || tr.MaxHeaderListSize != H2MaxHeaderListSize {
+		t.Fatalf("fingerprint settings changed: frame=%d headers=%d", tr.MaxReadFrameSize, tr.MaxHeaderListSize)
+	}
+}
+
 // TestCodexH2SettingsMatchRealCodex asserts that a client connection built by
 // NewCodexH2ClientConn emits the exact SETTINGS frame (values AND order) plus
 // the connection WINDOW_UPDATE increment measured from real codex-rs 0.142.5.
@@ -108,10 +125,10 @@ func TestCodexH2SettingsMatchRealCodex(t *testing.T) {
 	case got := <-resultCh:
 		// Exact values measured from real codex-rs 0.142.5.
 		want := map[http2.SettingID]uint32{
-			http2.SettingEnablePush:         0,
-			http2.SettingInitialWindowSize:  H2InitialWindowSize,
-			http2.SettingMaxFrameSize:       H2MaxFrameSize,
-			http2.SettingMaxHeaderListSize:  H2MaxHeaderListSize,
+			http2.SettingEnablePush:        0,
+			http2.SettingInitialWindowSize: H2InitialWindowSize,
+			http2.SettingMaxFrameSize:      H2MaxFrameSize,
+			http2.SettingMaxHeaderListSize: H2MaxHeaderListSize,
 		}
 		for id, wv := range want {
 			if gv, ok := got.settings[id]; !ok || gv != wv {

@@ -42,13 +42,16 @@ import {
   buildFreshOpenAIResponsesDraft,
   buildOpenAIResponsesCopyDraft,
 } from "../lib/openAIResponsesCopy";
-import { formatLongUsageWindowLabel } from "../lib/usageFormat";
 import {
   getRelayGuardianStateMeta,
   mergeRelayGuardianAccounts,
   resolveRelayGuardianState,
   type RelayGuardianTone,
 } from "../lib/relayGuardian";
+import {
+  formatLongUsageWindowLabel,
+  needsUsageReload,
+} from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -1523,29 +1526,6 @@ export default function Accounts() {
   }, [allGroups]);
 
   useEffect(() => {
-    const needsUsageReload = (account: AccountRow) => {
-      if (account.status !== "active" && account.status !== "ready") {
-        return false;
-      }
-
-      const plan = normalizePlanType(account.plan_type);
-      const has7d =
-        account.usage_percent_7d !== null &&
-        account.usage_percent_7d !== undefined;
-      const has5h =
-        account.usage_percent_5h !== null &&
-        account.usage_percent_5h !== undefined;
-      // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
-      // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
-      const looksLikeSubscription =
-        isPremiumUsagePlan(plan) || !!account.reset_5h_at;
-
-      if (looksLikeSubscription) {
-        return !has5h || !has7d;
-      }
-      return !has7d;
-    };
-
     const missingUsageIds = accounts
       .filter(needsUsageReload)
       .map((account) => account.id);
@@ -3010,6 +2990,51 @@ export default function Accounts() {
         "error",
       );
     }
+  };
+
+  // 通过审核:启用自助提交的账号(enabled=true)。
+  const handleApprovePending = async (account: AccountRow) => {
+    try {
+      await api.toggleAccountEnabled(account.id, true);
+      showToast(t("accounts.pendingReview.approved"));
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.enableFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    }
+  };
+
+  // 拒绝:删除自助提交的账号。
+  const handleRejectPending = async (account: AccountRow) => {
+    const confirmed = await confirm({
+      title: t("accounts.pendingReview.rejectTitle"),
+      description: t("accounts.pendingReview.rejectDesc", {
+        account: account.email || `ID ${account.id}`,
+      }),
+      confirmText: t("accounts.pendingReview.rejectConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    try {
+      await api.deleteAccount(account.id);
+      showToast(t("accounts.pendingReview.rejected"));
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.deleteFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    }
+  };
+
+  // 保存账号备注(PATCH /accounts/:id/note)。
+  const handleSaveNote = async (account: AccountRow, note: string) => {
+    await api.updateAccountNote(account.id, note);
+    showToast(t("accounts.pendingReview.noteSaved"));
+    void reloadSilently();
   };
 
   const handleBatchDelete = async () => {
@@ -4773,6 +4798,13 @@ export default function Accounts() {
               </div>
             </div>
           )}
+
+          <PendingSelfServiceReviewPanel
+            accounts={accounts}
+            onApprove={handleApprovePending}
+            onReject={handleRejectPending}
+            onSaveNote={handleSaveNote}
+          />
 
           <Card>
             <CardContent className="p-3 sm:p-4">
@@ -11896,8 +11928,7 @@ function UsageWindowStat({
 // 显示策略不再单独依赖 plan_type:
 // 当 plan_type 还停留在按 RT 刷新出来的旧值(例如 "free")、但账号实际已订阅、
 // 后端已经返回 5h 窗口数据时,只看 plan_type 会把 5h 吞掉。
-// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据,
-// plan_type 仅作为 5h 数据缺位时的辅助提示。
+// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据。
 function UsageCell({
   account,
   wide = false,
@@ -11940,26 +11971,23 @@ function UsageCell({
     </button>
   );
 
-  const plan = normalizePlanType(account.plan_type);
   const has7d =
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
   const has5h =
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
-  const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail);
   const has5hReset = !!account.reset_5h_at;
   const has7dReset = !!account.reset_7d_at;
 
-  const fiveHourPresent = has5h || has5hDetail || has5hReset;
+  const fiveHourPresent = has5h || has5hReset;
   const sevenDayPresent = has7d || has7dDetail || has7dReset;
   // 长窗口标签:free/team plan 实为月窗(约 30 天),按真实周期显示 30d 而非误标 7d (issue #324)
   const longWindowLabel = formatLongUsageWindowLabel(account);
-  // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
-  const planSuggestsPremium = isPremiumUsagePlan(plan);
-  const showFiveHour = fiveHourPresent || planSuggestsPremium;
+  // 5h 是上游可选窗口：仅数据存在时展示，不再因 premium plan 强制占位（issue #382）
+  const showFiveHour = fiveHourPresent;
 
   if (showFiveHour) {
-    if (!has5h && !has7d && !has5hDetail && !has7dDetail && !has5hReset && !has7dReset)
+    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
       <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
@@ -12016,12 +12044,16 @@ function UsageCell({
 function BilledCell({ account }: { account: AccountRow }) {
   const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
   const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
-  if (h5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
+  const has5hWindow =
+    (account.usage_percent_5h !== null && account.usage_percent_5h !== undefined) ||
+    !!account.reset_5h_at;
+  const visibleH5 = has5hWindow ? h5 : null;
+  if (visibleH5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
   const longLabel = formatLongUsageWindowLabel(account);
   return (
     <span className="text-[12px] text-muted-foreground">
-      {h5 !== null ? `5h: $${h5}` : "5h: -"}
-      {" / "}
+      {visibleH5 !== null && `5h: $${visibleH5}`}
+      {visibleH5 !== null && " / "}
       {d7 !== null ? `${longLabel}: $${d7}` : `${longLabel}: -`}
     </span>
   );
@@ -12086,7 +12118,11 @@ function getAccountStatusCountdownUntil(
   const status = account.status;
   if (
     account.cooldown_until &&
-    (status === "rate_limited" || status === "error" || status === "cooldown")
+    (status === "rate_limited" ||
+      status === "rate_limited_5h" ||
+      status === "rate_limited_7d" ||
+      status === "error" ||
+      status === "cooldown")
   ) {
     return account.cooldown_until;
   }
@@ -12153,5 +12189,176 @@ function CooldownTimer({ until }: { until: string }) {
       <Hourglass className="size-3 shrink-0" aria-hidden="true" />
       {remaining}
     </span>
+  );
+}
+
+// 自助提交待审核面板:列出 enabled=false 且带 self-service 标签的账号,
+// 支持查看/编辑备注、通过(启用)与拒绝(删除)。
+const SELF_SERVICE_TAG = "self-service";
+
+function PendingSelfServiceReviewPanel({
+  accounts,
+  onApprove,
+  onReject,
+  onSaveNote,
+}: {
+  accounts: AccountRow[];
+  onApprove: (account: AccountRow) => void;
+  onReject: (account: AccountRow) => void;
+  onSaveNote: (account: AccountRow, note: string) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const pending = useMemo(
+    () =>
+      accounts.filter(
+        (account) =>
+          account.enabled === false &&
+          (account.tags ?? []).includes(SELF_SERVICE_TAG),
+      ),
+    [accounts],
+  );
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draftNote, setDraftNote] = useState("");
+  const [savingId, setSavingId] = useState<number | null>(null);
+
+  if (pending.length === 0) return null;
+
+  const startEdit = (account: AccountRow) => {
+    setEditingId(account.id);
+    setDraftNote(account.note ?? "");
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setDraftNote("");
+  };
+
+  const saveNote = async (account: AccountRow) => {
+    setSavingId(account.id);
+    try {
+      await onSaveNote(account, draftNote.trim());
+      setEditingId(null);
+      setDraftNote("");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  return (
+    <Card className="border-amber-500/40 bg-amber-500/[0.04] shadow-sm">
+      <CardContent className="p-3 sm:p-4">
+        <div className="mb-3 flex items-center gap-2.5">
+          <div className="flex size-9 items-center justify-center rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-300">
+            <Hourglass className="size-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold tracking-tight">
+              {t("accounts.pendingReview.title")}
+            </div>
+            <div className="text-[11px] text-muted-foreground">
+              {t("accounts.pendingReview.count", { count: pending.length })} ·{" "}
+              {t("accounts.pendingReview.desc")}
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          {pending.map((account) => {
+            const editing = editingId === account.id;
+            const saving = savingId === account.id;
+            return (
+              <div
+                key={account.id}
+                className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card p-3 sm:flex-row sm:items-start sm:justify-between"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                      <Mail className="size-3.5 text-muted-foreground" />
+                      {account.email || `ID ${account.id}`}
+                    </span>
+                    <Badge className="border-transparent bg-amber-500/14 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300">
+                      {SELF_SERVICE_TAG}
+                    </Badge>
+                    {account.plan_type ? (
+                      <span className="text-[11px] text-muted-foreground">
+                        {account.plan_type}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {editing ? (
+                    <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                      <Input
+                        value={draftNote}
+                        onChange={(e) => setDraftNote(e.target.value)}
+                        placeholder={t("accounts.pendingReview.notePlaceholder")}
+                        className="h-9"
+                      />
+                      <div className="flex shrink-0 gap-1.5">
+                        <Button
+                          size="sm"
+                          className="h-9"
+                          disabled={saving}
+                          onClick={() => void saveNote(account)}
+                        >
+                          {saving ? (
+                            <RotateCcw className="size-3.5 animate-spin" />
+                          ) : (
+                            <Check className="size-3.5" />
+                          )}
+                          {t("common.save")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-9"
+                          disabled={saving}
+                          onClick={cancelEdit}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => startEdit(account)}
+                      className="mt-1.5 flex w-full items-start gap-1.5 rounded-md text-left text-xs leading-relaxed text-muted-foreground transition-colors hover:text-foreground"
+                      title={t("accounts.pendingReview.editNote")}
+                    >
+                      <Pencil className="mt-0.5 size-3 shrink-0" />
+                      <span className="min-w-0 break-words">
+                        {account.note || t("accounts.pendingReview.noNote")}
+                      </span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex shrink-0 gap-1.5">
+                  <Button
+                    size="sm"
+                    className="h-9"
+                    onClick={() => onApprove(account)}
+                  >
+                    <Check className="size-3.5" />
+                    {t("accounts.pendingReview.approve")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-9"
+                    onClick={() => onReject(account)}
+                  >
+                    <Trash2 className="size-3.5" />
+                    {t("accounts.pendingReview.reject")}
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

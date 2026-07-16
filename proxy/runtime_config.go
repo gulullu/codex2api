@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -251,6 +252,10 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
 		next.AutoResetCreditsEnabled = settings.AutoResetCreditsEnabled
 		next.AutoResetCreditsBeforeExpiryMin = settings.AutoResetCreditsBeforeExpiryMin
+		// Payload 重写规则不进 RuntimeSettings（编译后独立存放），此处顺带完成启动种子。
+		if err := SetPayloadRulesJSON(settings.PayloadRules); err != nil {
+			log.Printf("payload_rules 配置解析失败，已忽略: %v", err)
+		}
 	}
 	return storeRuntimeSettings(next)
 }

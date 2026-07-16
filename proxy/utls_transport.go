@@ -80,9 +80,9 @@ func NewUTLSTransportWithHello(proxyURL string, helloID utls.ClientHelloID, spec
 	}
 
 	return &utlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-		dialer:      dialer,
+		connections:   make(map[string]*http2.ClientConn),
+		pending:       make(map[string]*sync.Cond),
+		dialer:        dialer,
 		clientHelloID: helloID,
 		specFactory:   specFactory,
 	}
@@ -383,8 +383,13 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 	}
 
 	// 4. 创建 HTTP/2 连接（SETTINGS/WINDOW_UPDATE 对齐真实 codex-rs reqwest/h2，
-	//    而非 Go 默认值——否则一开连接就暴露是 Go net/http 客户端）
-	h2Conn, err := codexfp.NewCodexH2ClientConn(tlsConn)
+	//    而非 Go 默认值——否则一开连接就暴露是 Go net/http 客户端）。
+	// 同时启用空闲 PING，及时剔除被代理/NAT 静默掐断的死连接。
+	h2Conn, err := codexfp.NewCodexH2ClientConnWithKeepAlive(
+		tlsConn,
+		codexHTTP2ReadIdleTimeout,
+		codexHTTP2PingTimeout,
+	)
 	if err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("HTTP/2 连接创建失败: %w", err)

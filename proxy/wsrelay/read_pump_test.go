@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -696,17 +697,23 @@ func TestProvisionalTerminalFrameReleasesLeaseOnlyAfterWriteCommit(t *testing.T)
 	}
 }
 
-func TestProvisionalTerminalSurvivesNormalCloseBeforeSuccessfulCommit(t *testing.T) {
+func TestProvisionalTerminalProvesCommitAcrossPeerCloseBeforeWriteReturns(t *testing.T) {
 	for _, tt := range []struct {
-		name string
-		code int
+		name         string
+		readErr      error
+		oneShotProof bool
+		safeReusable bool
 	}{
-		{name: "normal closure", code: websocket.CloseNormalClosure},
-		{name: "going away", code: websocket.CloseGoingAway},
+		{name: "normal closure", readErr: &websocket.CloseError{Code: websocket.CloseNormalClosure, Text: "response complete"}},
+		{name: "going away", readErr: &websocket.CloseError{Code: websocket.CloseGoingAway, Text: "response complete"}},
+		{name: "one-shot abrupt close 1006", readErr: &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "unexpected EOF"}, oneShotProof: true},
+		{name: "safe reusable unexpected EOF", readErr: io.ErrUnexpectedEOF, safeReusable: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			wc := &WsConnection{}
 			wc.state.Store(int32(StateConnected))
+			wc.allowAbruptTerminalProof.Store(tt.oneShotProof)
+			wc.safeReusable.Store(tt.safeReusable)
 			state := wc.ensureReadState()
 			state.mu.Lock()
 			state.pumpStarted = true
@@ -728,9 +735,9 @@ func TestProvisionalTerminalSurvivesNormalCloseBeforeSuccessfulCommit(t *testing
 				t.Fatalf("enqueue provisional terminal: %v", err)
 			}
 
-			wc.finishReadPump(&websocket.CloseError{Code: tt.code, Text: "response complete"}, true)
+			wc.finishReadPump(tt.readErr, true)
 			if err := wc.completeReadLeaseWrite(leaseID, nil); err != nil {
-				t.Fatalf("successful write after complete response and normal close: %v", err)
+				t.Fatalf("successful write after queued terminal and peer close: %v", err)
 			}
 			if err := wc.awaitCapturedReadLease(captured); err != nil {
 				t.Fatalf("completed response was rejected: %v", err)
@@ -739,6 +746,71 @@ func TestProvisionalTerminalSurvivesNormalCloseBeforeSuccessfulCommit(t *testing
 				t.Fatal("normally closed physical connection must remain retired")
 			}
 		})
+	}
+}
+
+func TestLegacyTerminalDoesNotProveCommitAcrossAbruptClose(t *testing.T) {
+	for _, readErr := range []error{
+		&websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "unexpected EOF"},
+		io.ErrUnexpectedEOF,
+	} {
+		wc := &WsConnection{}
+		wc.state.Store(int32(StateConnected))
+		state := wc.ensureReadState()
+		state.mu.Lock()
+		state.pumpStarted = true
+		state.mu.Unlock()
+
+		if err := wc.BeginReadLease("legacy-terminal-before-close"); err != nil {
+			t.Fatalf("BeginReadLease: %v", err)
+		}
+		leaseID, _, err := wc.beginReadLeaseWrite(websocket.TextMessage)
+		if err != nil {
+			t.Fatalf("beginReadLeaseWrite: %v", err)
+		}
+		captured, err := wc.captureReadLease()
+		if err != nil {
+			t.Fatalf("captureReadLease: %v", err)
+		}
+		terminal := []byte(`{"type":"response.completed","response":{"id":"possibly-delayed"}}`)
+		if err := wc.enqueueBusinessFrameForCapturedLease(websocket.TextMessage, terminal, captured); err != nil {
+			t.Fatalf("enqueue provisional terminal: %v", err)
+		}
+
+		wc.finishReadPump(readErr, true)
+		err = wc.completeReadLeaseWrite(leaseID, nil)
+		if !errors.Is(err, readErr) {
+			t.Fatalf("legacy commit error = %v, want abrupt close %v to remain uncommitted", err, readErr)
+		}
+		if wc.IsConnected() || wc.readPumpReusable() {
+			t.Fatal("legacy abrupt close left the connection reusable")
+		}
+	}
+}
+
+func TestAbruptEOFWithoutTerminalDoesNotCommitWrite(t *testing.T) {
+	wc := &WsConnection{}
+	wc.state.Store(int32(StateConnected))
+	state := wc.ensureReadState()
+	state.mu.Lock()
+	state.pumpStarted = true
+	state.mu.Unlock()
+
+	if err := wc.BeginReadLease("abrupt-without-terminal"); err != nil {
+		t.Fatalf("BeginReadLease: %v", err)
+	}
+	leaseID, _, err := wc.beginReadLeaseWrite(websocket.TextMessage)
+	if err != nil {
+		t.Fatalf("beginReadLeaseWrite: %v", err)
+	}
+	wc.finishReadPump(io.ErrUnexpectedEOF, true)
+
+	err = wc.completeReadLeaseWrite(leaseID, nil)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("commit error = %v, want unexpected EOF without terminal proof", err)
+	}
+	if wc.IsConnected() || wc.readPumpReusable() {
+		t.Fatal("abrupt EOF without terminal left the connection reusable")
 	}
 }
 

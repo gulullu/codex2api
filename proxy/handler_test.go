@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -2769,6 +2770,260 @@ func TestSendFinalUpstreamError_MissingScope401Passthrough(t *testing.T) {
 	}
 }
 
+func TestShouldRetryHTTPStatus403RequiresSafeOAuthAccountSwitch(t *testing.T) {
+	if isRetryableStatus(http.StatusForbidden) {
+		t.Fatal("generic 403 must not be retryable without account/request context")
+	}
+	oauth := &auth.Account{DBID: 1}
+	relay := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example", APIKey: "test-key"}
+
+	for _, tc := range []struct {
+		name         string
+		account      *auth.Account
+		boundContext bool
+		wantRetry    bool
+	}{
+		{name: "fresh oauth request", account: oauth, wantRetry: true},
+		{name: "oauth continuation", account: oauth, boundContext: true, wantRetry: false},
+		{name: "relay front door", account: relay, wantRetry: false},
+		{name: "unknown account", account: nil, wantRetry: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			generalRetries := 0
+			rateLimitRetries := 0
+			got := shouldRetryTextHTTPStatusForRequest(
+				http.StatusForbidden,
+				tc.account,
+				tc.boundContext,
+				&generalRetries,
+				&rateLimitRetries,
+				2,
+				1,
+			)
+			if got != tc.wantRetry {
+				t.Fatalf("retry = %v, want %v", got, tc.wantRetry)
+			}
+			wantGeneral := 0
+			if tc.wantRetry {
+				wantGeneral = 1
+			}
+			if generalRetries != wantGeneral || rateLimitRetries != 0 {
+				t.Fatalf("budgets = general:%d rate:%d, want general:%d rate:0", generalRetries, rateLimitRetries, wantGeneral)
+			}
+		})
+	}
+}
+
+func TestRequestRequiresBoundUpstreamAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	if requestRequiresBoundUpstreamAccount(ctx, []byte(`{"input":"fresh"}`)) {
+		t.Fatal("fresh request must not require a bound account")
+	}
+	if !requestRequiresBoundUpstreamAccount(ctx, []byte(`{"previous_response_id":"resp_123"}`)) {
+		t.Fatal("previous_response_id must require the original account")
+	}
+	setEncryptedContextState(ctx, encryptedContextAffinityState{Keys: []string{"encrypted-key"}})
+	if !requestRequiresBoundUpstreamAccount(ctx, []byte(`{"input":"opaque history"}`)) {
+		t.Fatal("encrypted context must require the original account")
+	}
+}
+
+// TestSendFinalUpstreamError_Forbidden403RemappedTo503 验证上游账号 403（额度/套餐/
+// 工作区受限）重试耗尽后改写为 503 池级错误，不原样以 403 透传（issue #396），
+// 避免 Claude Code 误判自身无权限而停工。
+func TestSendFinalUpstreamError_Forbidden403RemappedTo503(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, body := range [][]byte{
+		[]byte(`{"error":{"message":"You have hit your usage limit.","code":"insufficient_quota"},"status":403}`),
+		[]byte(`{"detail":{"code":"deactivated_workspace"}}`),
+		[]byte(`{"error":{"code":"codex_access_restricted"}}`),
+	} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Set(contextUpstreamAccountType, "oauth")
+		handler := &Handler{}
+
+		handler.sendFinalUpstreamError(ctx, http.StatusForbidden, body)
+
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("body=%s status = %d, want %d (上游 403 不应以客户端 403 透传)", body, recorder.Code, http.StatusServiceUnavailable)
+		}
+		if canonical := openAIFinalResponseStatusForContext(ctx, http.StatusForbidden, body); canonical != recorder.Code {
+			t.Fatalf("canonical status = %d, client status = %d", canonical, recorder.Code)
+		}
+		var payload struct {
+			Error struct {
+				Code string `json:"code"`
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if payload.Error.Code != "account_pool_forbidden" {
+			t.Fatalf("body=%s code = %q, want account_pool_forbidden", body, payload.Error.Code)
+		}
+	}
+}
+
+func TestSendFinalUpstreamError_RelayForbidden403Passthrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Set(contextUpstreamAccountType, auth.UpstreamOpenAIResponses)
+	body := []byte(`{"error":{"code":"policy_denied","message":"blocked by relay policy"}}`)
+
+	(&Handler{}).sendFinalUpstreamError(ctx, http.StatusForbidden, body)
+
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", recorder.Code)
+	}
+	if canonical := openAIFinalResponseStatusForContext(ctx, http.StatusForbidden, body); canonical != recorder.Code {
+		t.Fatalf("canonical status = %d, client status = %d", canonical, recorder.Code)
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != "upstream_403" {
+		t.Fatalf("body = %s code = %q, want upstream_403", recorder.Body.String(), got)
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); !strings.Contains(got, "policy_denied") {
+		t.Fatalf("body = %s message = %q, want original Relay error details", recorder.Body.String(), got)
+	}
+}
+
+func TestRelayForbiddenHealthEvidenceIsNeutralWhileOAuthRemainsAccountScoped(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 100})
+	store.SetCybRelayConfig(auth.CybRelayConfig{Enabled: true, GroupID: 7})
+	store.SetRelayGuardianMode(string(auth.RelayGuardianMonitor))
+	relay := &auth.Account{
+		DBID:         51,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example/v1",
+		APIKey:       "relay-key",
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+		GroupIDs:     []int64{7},
+	}
+	store.AddAccount(relay)
+	handler := &Handler{store: store}
+
+	beforeScheduler := relay.GetSchedulerDebugSnapshot(100)
+	beforeFailureStreak := relay.FailureStreak
+	beforeLastFailureAt := relay.LastFailureAt
+	permit, ok := store.BeginRelayCircuitRequestForLogicalRequest(relay, "relay-403-neutral")
+	if !ok || !permit.Active {
+		t.Fatalf("Relay permit = %+v, ok=%v", permit, ok)
+	}
+	attempt := newRelayCircuitAttempt(store, permit)
+	handler.reportUpstreamHTTPFailure(relay, http.StatusForbidden, 250*time.Millisecond)
+	finishRelayHTTPCircuitAttempt(attempt, relay, http.StatusForbidden)
+	attempt.Release(store, relay)
+
+	afterScheduler := relay.GetSchedulerDebugSnapshot(100)
+	if relay.HealthTier != auth.HealthTierHealthy ||
+		relay.FailureStreak != beforeFailureStreak ||
+		!relay.LastFailureAt.Equal(beforeLastFailureAt) {
+		t.Fatalf("Relay 403 changed request health: tier=%s streak=%d last_failure=%v",
+			relay.HealthTier, relay.FailureStreak, relay.LastFailureAt)
+	}
+	if afterScheduler.SchedulerScore != beforeScheduler.SchedulerScore ||
+		afterScheduler.DispatchScore != beforeScheduler.DispatchScore ||
+		afterScheduler.DynamicConcurrencyLimit != beforeScheduler.DynamicConcurrencyLimit {
+		t.Fatalf("Relay 403 changed scheduler snapshot: before=%+v after=%+v", beforeScheduler, afterScheduler)
+	}
+	circuit := store.RelayCircuitSnapshot(relay.ID())
+	if circuit.State != auth.RelayCircuitClosed || circuit.StrongFailures != 0 ||
+		circuit.WeakFailures != 0 || circuit.WeakSamples != 0 || circuit.InFlight != 0 ||
+		circuit.LastStatusCode != 0 || !circuit.LastFailureAt.IsZero() {
+		t.Fatalf("Relay 403 polluted circuit evidence: %+v", circuit)
+	}
+	guardian, found := store.RelayGuardianAccountStatus(relay.ID())
+	if !found {
+		t.Fatal("Relay Guardian account snapshot not found")
+	}
+	if guardian.FailureCount != 0 || guardian.UserVisibleFailures != 0 ||
+		guardian.StrongGatewayFailures != 0 || guardian.LastFailureAt != nil {
+		t.Fatalf("Relay 403 polluted Guardian evidence: %+v", guardian)
+	}
+	nextPermit, ok := store.BeginRelayCircuitRequestForLogicalRequest(relay, "relay-403-next")
+	if !ok || !nextPermit.Active {
+		t.Fatalf("neutral Relay 403 left permit unavailable: %+v, ok=%v", nextPermit, ok)
+	}
+	store.AbandonRelayCircuitRequest(nextPermit)
+
+	oauthStore := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 100})
+	oauth := &auth.Account{
+		DBID:        52,
+		AccessToken: "oauth-token",
+		PlanType:    "plus",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	oauthStore.AddAccount(oauth)
+	oauthHandler := &Handler{store: oauthStore}
+	oauthHandler.reportUpstreamHTTPFailure(oauth, http.StatusForbidden, 250*time.Millisecond)
+	if oauth.HealthTier != auth.HealthTierWarm || oauth.FailureStreak != 1 || oauth.LastFailureAt.IsZero() {
+		t.Fatalf("OAuth 403 lost account-scoped health penalty: tier=%s streak=%d last_failure=%v",
+			oauth.HealthTier, oauth.FailureStreak, oauth.LastFailureAt)
+	}
+	oauthHandler.applyCooldownForModel(
+		oauth,
+		http.StatusForbidden,
+		[]byte(`{"error":{"code":"codex_access_restricted"}}`),
+		&http.Response{Header: make(http.Header)},
+		"gpt-5.5",
+	)
+	if reason, until := oauth.GetCooldownSnapshot(); reason != "payment_required" || !until.After(time.Now()) {
+		t.Fatalf("OAuth 403 cooldown = (%q, %v), want active payment_required", reason, until)
+	}
+	generalRetries, rateLimitRetries := 0, 0
+	if !shouldRetryTextHTTPStatusForRequest(
+		http.StatusForbidden, oauth, false,
+		&generalRetries, &rateLimitRetries, 1, 1,
+	) {
+		t.Fatal("fresh OAuth 403 should still switch accounts")
+	}
+	generalRetries = 0
+	if shouldRetryTextHTTPStatusForRequest(
+		http.StatusForbidden, oauth, true,
+		&generalRetries, &rateLimitRetries, 1, 1,
+	) {
+		t.Fatal("bound OAuth 403 must not switch accounts")
+	}
+}
+
+func TestUpstreamHTTPFailureCallSitesUseRelay403Helpers(t *testing.T) {
+	tests := []struct {
+		file               string
+		minHealthCalls     int
+		minCircuitFinishes int
+	}{
+		{file: "handler.go", minHealthCalls: 5, minCircuitFinishes: 3},
+		{file: "handler_anthropic.go", minHealthCalls: 1, minCircuitFinishes: 1},
+		{file: "responses_ws.go", minHealthCalls: 1, minCircuitFinishes: 1},
+		{file: "images.go", minHealthCalls: 1},
+	}
+	for _, tt := range tests {
+		source, err := os.ReadFile(tt.file)
+		if err != nil {
+			t.Fatalf("read %s: %v", tt.file, err)
+		}
+		text := string(source)
+		if strings.Contains(text, "classifyHTTPFailure(resp.StatusCode)") {
+			t.Fatalf("%s bypasses reportUpstreamHTTPFailure", tt.file)
+		}
+		if strings.Contains(text, "circuitAttempt.Failure(resp.StatusCode)") {
+			t.Fatalf("%s bypasses finishRelayHTTPCircuitAttempt", tt.file)
+		}
+		if got := strings.Count(text, "reportUpstreamHTTPFailure(account, resp.StatusCode"); got < tt.minHealthCalls {
+			t.Fatalf("%s health helper calls = %d, want at least %d", tt.file, got, tt.minHealthCalls)
+		}
+		if got := strings.Count(text, "finishRelayHTTPCircuitAttempt(circuitAttempt, account, resp.StatusCode"); got < tt.minCircuitFinishes {
+			t.Fatalf("%s circuit helper calls = %d, want at least %d", tt.file, got, tt.minCircuitFinishes)
+		}
+	}
+}
+
 func TestCompute429CooldownPlusUsesWindowHeaders(t *testing.T) {
 	handler := &Handler{}
 	account := &auth.Account{PlanType: "plus"}
@@ -3207,6 +3462,186 @@ func TestSyncCodexUsageStateCreditAccountSkips7dUsageLimit(t *testing.T) {
 	pct7d, ok := account.GetUsagePercent7d()
 	if !ok || pct7d != 100 {
 		t.Fatalf("usage_percent_7d = (%v, %v), want 100 with valid snapshot", pct7d, ok)
+	}
+}
+
+// issue #382：响应头仅有 7d 时清除陈旧 5h；完全无用量头时保留 5h。
+func TestSyncCodexUsageState_Clears5hWhenOnly7dHeaders(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "header-clear-5h", map[string]interface{}{
+		"access_token":          "at",
+		"plan_type":             "plus",
+		"codex_5h_used_percent": 90,
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus"}
+	account.SetUsageSnapshot5h(90, time.Now().Add(time.Hour))
+
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "15")
+	resp.Header.Set("x-codex-primary-window-minutes", "10080")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "500000")
+
+	result := SyncCodexUsageState(store, account, resp)
+	if result.HasUsage5h {
+		t.Fatalf("result = %+v, want no 5h", result)
+	}
+	if !result.Cleared5h {
+		t.Fatal("Cleared5h = false, want true")
+	}
+	if !result.HasUsage7d || result.UsagePct7d != 15 {
+		t.Fatalf("result = %+v, want 7d=15", result)
+	}
+	if _, ok := account.GetUsagePercent5h(); ok {
+		t.Fatal("in-memory 5h should be cleared")
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("codex_5h_used_percent"); got != "" {
+		t.Errorf("persisted codex_5h_used_percent = %q, want cleared", got)
+	}
+
+	reloadedStore := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	if err := reloadedStore.LoadAccountByID(ctx, id); err != nil {
+		t.Fatalf("LoadAccountByID: %v", err)
+	}
+	reloaded := reloadedStore.FindByID(id)
+	if reloaded == nil {
+		t.Fatal("reloaded account is nil")
+	}
+	if _, ok := reloaded.GetUsagePercent5h(); ok {
+		t.Fatal("cleared 5h snapshot was hydrated again after reload")
+	}
+}
+
+func TestSyncCodexUsageState_Preserves5hWhenNoUsageHeaders(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 200, PlanType: "plus"}
+	resetAt := time.Now().Add(2 * time.Hour)
+	account.SetUsageSnapshot5h(55, resetAt)
+
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-plan-type", "plus")
+	// 无 primary/secondary 用量头：可能是中间件剥头，不能误清 5h
+
+	result := SyncCodexUsageState(store, account, resp)
+	if result.Cleared5h {
+		t.Fatal("Cleared5h = true, want false when response has no usage windows")
+	}
+	pct, ok := account.GetUsagePercent5h()
+	if !ok || pct != 55 {
+		t.Fatalf("usage_percent_5h = (%v, %v), want (55, true)", pct, ok)
+	}
+}
+
+func TestSyncCodexUsageState_PartialUsedPercentHeaderDoesNotClear5h(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 201, PlanType: "plus"}
+	account.SetUsageSnapshot5h(63, time.Now().Add(2*time.Hour))
+
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "12")
+	result := SyncCodexUsageState(store, account, resp)
+
+	if result.Cleared5h || result.HasUsage7d {
+		t.Fatalf("result = %+v, want partial headers ignored", result)
+	}
+	if pct, ok := account.GetUsagePercent5h(); !ok || pct != 63 {
+		t.Fatalf("usage_percent_5h = (%v, %v), want (63, true)", pct, ok)
+	}
+}
+
+func TestParseCodexUsageHeaders_7dOnlyClearsMemoryWithoutStore(t *testing.T) {
+	account := &auth.Account{DBID: 202, PlanType: "plus"}
+	account.SetUsageSnapshot5h(63, time.Now().Add(2*time.Hour))
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "12")
+	resp.Header.Set("x-codex-primary-window-minutes", "10080")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "500000")
+
+	pct7d, ok := ParseCodexUsageHeaders(resp, account)
+	if !ok || pct7d != 12 {
+		t.Fatalf("ParseCodexUsageHeaders() = (%v, %v), want (12, true)", pct7d, ok)
+	}
+	if _, ok := account.GetUsagePercent5h(); ok {
+		t.Fatal("public parse-only path should clear stale in-memory 5h without a store")
+	}
+}
+
+func TestSyncCodexUsageState_NilStorePreservesPremiumCooldown(t *testing.T) {
+	account := &auth.Account{DBID: 203, PlanType: "plus", Status: auth.StatusReady}
+	account.SetUsageSnapshot5h(100, time.Now().Add(2*time.Hour))
+	account.SetCooldownUntil(time.Now().Add(2*time.Hour), "rate_limited_5h")
+
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "12")
+	resp.Header.Set("x-codex-primary-window-minutes", "10080")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "500000")
+
+	result := SyncCodexUsageState(nil, account, resp)
+	if !result.Cleared5h {
+		t.Fatal("7d-only parse should clear the stale in-memory snapshot")
+	}
+	if account.Status != auth.StatusCooldown || account.GetCooldownReason() != "rate_limited_5h" {
+		t.Fatalf("nil-store parse changed cooldown state: status=%v reason=%q", account.Status, account.GetCooldownReason())
+	}
+}
+
+func TestSyncCodexUsageState_7dOnlyPreservesNewerUnauthorizedCooldown(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	id, err := db.InsertAccountWithCredentials(ctx, "header-preserve-401", map[string]interface{}{
+		"access_token":              "at",
+		"plan_type":                 "plus",
+		"codex_5h_used_percent":     100,
+		"codex_5h_reset_at":         time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+		"codex_5h_usage_updated_at": time.Now().Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy}
+	store.MarkPremium5hRateLimited(account, time.Now().Add(2*time.Hour))
+	atomic.StoreInt32(&account.Disabled, 1)
+	store.MarkCooldown(account, time.Hour, "unauthorized")
+
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "15")
+	resp.Header.Set("x-codex-primary-window-minutes", "10080")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "500000")
+	result := SyncCodexUsageState(store, account, resp)
+
+	if !result.Cleared5h {
+		t.Fatal("Cleared5h = false, want stale snapshot cleared")
+	}
+	if account.GetCooldownReason() != "unauthorized" || atomic.LoadInt32(&account.Disabled) != 1 {
+		t.Fatalf("runtime state = (%q, disabled=%d), want unauthorized and disabled", account.GetCooldownReason(), atomic.LoadInt32(&account.Disabled))
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if row.CooldownReason != "unauthorized" || !row.CooldownUntil.Valid {
+		t.Fatalf("persisted cooldown = (%q, %v), want unauthorized", row.CooldownReason, row.CooldownUntil)
 	}
 }
 

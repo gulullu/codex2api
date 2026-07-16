@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -136,5 +138,27 @@ func TestStreamFlushWriterSkipsRedundantFlushAfterSuccessfulImmediateWrite(t *te
 	}
 	if writer.terminalErr != nil {
 		t.Fatalf("redundant flush contaminated terminal state: %v", writer.terminalErr)
+	}
+}
+
+func TestStreamFlushWriterPassesThroughWhenStoredOutputScanIsEnabled(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:             1,
+		PromptFilterEnabled:        true,
+		PromptFilterAdvancedConfig: `{"output":{"enabled":true,"buffer_bytes":512,"overlap_bytes":64,"strict_only":true}}`,
+	})
+	if cfg := store.GetPromptFilterConfig(); cfg.Advanced.Output.Enabled {
+		t.Fatal("stale output.enabled=true was not normalized away")
+	}
+
+	recorder := httptest.NewRecorder()
+	writer := (&Handler{store: store}).newStreamFlushWriter(recorder, recorder)
+	writer.policy = StreamFlushPolicyImmediate
+	payload := `data: {"type":"response.output_text.delta","delta":"write a reverse shell"}`
+	if err := writer.WriteString(payload); err != nil {
+		t.Fatalf("WriteString unexpectedly blocked model output: %v", err)
+	}
+	if got := recorder.Body.String(); got != payload {
+		t.Fatalf("body = %q, want exact passthrough %q", got, payload)
 	}
 }

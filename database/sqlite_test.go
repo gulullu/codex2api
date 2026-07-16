@@ -1120,6 +1120,30 @@ func TestSQLiteUsageStatsBaselineHasBillingColumns(t *testing.T) {
 	}
 }
 
+func TestSQLiteImageStudioPortalDefaultsOff(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id) VALUES (1)`); err != nil {
+		t.Fatalf("插入默认 system_settings: %v", err)
+	}
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings 返回错误: %v", err)
+	}
+	if settings == nil {
+		t.Fatal("GetSystemSettings 返回 nil")
+	}
+	if settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled 默认开启，want false")
+	}
+}
+
 func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1147,10 +1171,13 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		MaxRateLimitRetries:                        1,
 		ModelMapping:                               "{}",
 		CodexModelMapping:                          `{"gpt-5.2":"gpt-5.5"}`,
+		PayloadRules:                               `{"override":[{"set":{"service_tier":"priority"}}]}`,
 		ReasoningEffortModels:                      `[{"model":"gpt-5.5","effort":"xhigh"}]`,
 		PromptFilterMode:                           "monitor",
 		PromptFilterThreshold:                      50,
 		PromptFilterStrictThreshold:                90,
+		PromptFilterStrictTerminalEnabled:          true,
+		PromptFilterAdvancedConfig:                 `{"normalization":{"enabled":true}}`,
 		PromptFilterLogMatches:                     true,
 		PromptFilterMaxTextLength:                  81920,
 		PromptFilterCustomPatterns:                 "[]",
@@ -1188,6 +1215,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		BackgroundConfig:                           "{}",
 		ShowFullUsageNumbers:                       true,
 		PublicKeyUsagePageEnabled:                  true,
+		PublicImageStudioPageEnabled:               true,
+		PublicAccountPortalPageEnabled:             true,
 		CodexWSHideUpstreamErrors:                  true,
 		CodexWSSilentRetryEnabled:                  true,
 		CodexWSSilentMaxRetries:                    4,
@@ -1207,6 +1236,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.PromptFilterStrictTerminalEnabled {
+		t.Fatal("PromptFilterStrictTerminalEnabled = false, want true")
+	}
+	if settings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` {
+		t.Fatalf("PromptFilterAdvancedConfig = %q", settings.PromptFilterAdvancedConfig)
 	}
 	if !settings.IgnoreUsageLimitStatus {
 		t.Fatal("IgnoreUsageLimitStatus = false, want true")
@@ -1229,11 +1264,20 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if !settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = false, want true")
 	}
+	if !settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = false, want true")
+	}
+	if !settings.PublicAccountPortalPageEnabled {
+		t.Fatal("PublicAccountPortalPageEnabled = false, want true")
+	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
 	}
 	if settings.CodexModelMapping != `{"gpt-5.2":"gpt-5.5"}` {
 		t.Fatalf("CodexModelMapping = %q, want gpt-5.2 mapping", settings.CodexModelMapping)
+	}
+	if settings.PayloadRules != `{"override":[{"set":{"service_tier":"priority"}}]}` {
+		t.Fatalf("PayloadRules = %q, want persisted override rule", settings.PayloadRules)
 	}
 	if settings.CodexUserAgentConfig != `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}` {
 		t.Fatalf("CodexUserAgentConfig = %q, want custom UA config", settings.CodexUserAgentConfig)
@@ -1309,6 +1353,30 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = true, want false")
+	}
+
+	settings.PublicImageStudioPageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = true, want false")
+	}
+
+	settings.PublicAccountPortalPageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicAccountPortalPageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicAccountPortalPageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicAccountPortalPageEnabled {
+		t.Fatal("PublicAccountPortalPageEnabled = true, want false")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -351,6 +352,18 @@ func openAIFinalResponseStatus(statusCode int, body []byte) int {
 		return http.StatusBadGateway
 	}
 	return statusCode
+}
+
+// openAIFinalResponseStatusForContext mirrors sendFinalUpstreamError's
+// account-ownership-aware 403 mapping. OAuth 403 is a pool-level failure after
+// safe account switching is exhausted; Relay 403 remains the upstream
+// client-visible status because it can be request-specific policy/WAF output.
+func openAIFinalResponseStatusForContext(c *gin.Context, statusCode int, body []byte) int {
+	if statusCode == http.StatusForbidden && c != nil &&
+		!strings.EqualFold(c.GetString(contextUpstreamAccountType), auth.UpstreamOpenAIResponses) {
+		return http.StatusServiceUnavailable
+	}
+	return openAIFinalResponseStatus(statusCode, body)
 }
 
 func openAIFailureUsageStatus(statusCode int, body []byte, guardianAttemptOnly bool) int {

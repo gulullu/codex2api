@@ -143,19 +143,19 @@ func TestShouldSuppressRetryableResponseFailedBeforeFirstToken(t *testing.T) {
 	retryableFailed := []byte(`{"type":"response.failed","response":{"error":{"message":"rate limited","status_code":429,"code":"rate_limit_exceeded"}}}`)
 	nonRetryableFailed := []byte(`{"type":"response.failed","response":{"error":{"message":"bad request","status_code":400,"code":"invalid_request_error"}}}`)
 
-	if !shouldSuppressRetryableResponseFailedBeforeFirstToken("response.failed", retryableFailed, false, false, 0, 1, nil, nil) {
+	if !shouldSuppressRetryableResponseFailedBeforeFirstTokenForRequest("response.failed", retryableFailed, nil, false, false, false, 0, 1, nil, nil) {
 		t.Fatal("retryable response.failed before first token should be suppressed while another attempt remains")
 	}
-	if shouldSuppressRetryableResponseFailedBeforeFirstToken("response.failed", retryableFailed, false, false, 1, 1, nil, nil) {
+	if shouldSuppressRetryableResponseFailedBeforeFirstTokenForRequest("response.failed", retryableFailed, nil, false, false, false, 1, 1, nil, nil) {
 		t.Fatal("last attempt should not suppress response.failed")
 	}
-	if shouldSuppressRetryableResponseFailedBeforeFirstToken("response.failed", nonRetryableFailed, false, false, 0, 1, nil, nil) {
+	if shouldSuppressRetryableResponseFailedBeforeFirstTokenForRequest("response.failed", nonRetryableFailed, nil, false, false, false, 0, 1, nil, nil) {
 		t.Fatal("non-retryable response.failed should still be sent to the client")
 	}
-	if shouldSuppressRetryableResponseFailedBeforeFirstToken("response.failed", retryableFailed, true, false, 0, 1, nil, nil) {
+	if shouldSuppressRetryableResponseFailedBeforeFirstTokenForRequest("response.failed", retryableFailed, nil, false, true, false, 0, 1, nil, nil) {
 		t.Fatal("response.failed after first token should not be suppressed")
 	}
-	if shouldSuppressRetryableResponseFailedBeforeFirstToken("response.failed", retryableFailed, false, true, 0, 1, nil, nil) {
+	if shouldSuppressRetryableResponseFailedBeforeFirstTokenForRequest("response.failed", retryableFailed, nil, false, false, true, 0, 1, nil, nil) {
 		t.Fatal("response.failed after writing any body should not be suppressed")
 	}
 }

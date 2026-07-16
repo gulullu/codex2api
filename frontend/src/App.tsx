@@ -19,12 +19,15 @@ const Settings = lazy(() => import('./pages/Settings'))
 const Docs = lazy(() => import('./pages/Docs'))
 const APIKeys = lazy(() => import('./pages/APIKeys'))
 const APIKeyUsagePortal = lazy(() => import('./pages/APIKeyUsagePortal'))
+const ImageStudioPortal = lazy(() => import('./pages/ImageStudioPortal'))
+const AccountPortal = lazy(() => import('./pages/AccountPortal'))
 const Usage = lazy(() => import('./pages/Usage'))
 const ImageStudio = lazy(() => import('./pages/ImageStudio'))
 const PromptFilter = lazy(() => import('./pages/PromptFilter'))
 const CodexAudit = lazy(() => import('./pages/CodexAudit'))
 const ThemeSettings = lazy(() => import('./pages/ThemeSettings'))
 const ModelPricing = lazy(() => import('./pages/ModelPricing'))
+const PayloadRules = lazy(() => import('./pages/PayloadRules'))
 
 export default function App() {
   return (
@@ -36,6 +39,10 @@ export default function App() {
               <Routes>
                 <Route path="/key-usage" element={<Navigate to="/key-usage/overview" replace />} />
                 <Route path="/key-usage/:view" element={<APIKeyUsagePortal />} />
+                <Route path="/image-studio" element={<Navigate to="/image-studio/studio" replace />} />
+                <Route path="/image-studio/:view" element={<ImageStudioPortal />} />
+                <Route path="/account-portal" element={<Navigate to="/account-portal/submit" replace />} />
+                <Route path="/account-portal/:view" element={<AccountPortal />} />
                 <Route path="/*" element={<AdminApp />} />
               </Routes>
             </Suspense>
@@ -67,6 +74,8 @@ function AdminApp() {
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
           <Route path="/model-pricing" element={<ModelPricing />} />
+          <Route path="/payload-rules" element={<Navigate to="/payload-rules/editor" replace />} />
+          <Route path="/payload-rules/:view" element={<PayloadRules />} />
           <Route path="/theme" element={<ThemeSettings />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/docs" element={<Docs />} />

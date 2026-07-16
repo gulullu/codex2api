@@ -311,7 +311,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		if poolPolicy.mode == statelessPoolHTTPFallback {
 			return nil, fmt.Errorf("%w: safe websocket reuse is process-fused and connection-local state cannot move to HTTP", proxy.ErrWebsocketContinuationUnavailable)
 		}
-		if poolPolicy.mode == statelessPoolOneShot && handshakeKnown {
+		if poolPolicy.mode == statelessPoolOneShot {
 			return nil, fmt.Errorf("%w: one-shot websocket policy cannot resume connection-local previous_response_id state", proxy.ErrWebsocketContinuationUnavailable)
 		}
 		var pwc *WsConnection
@@ -402,6 +402,15 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 发送请求，失败时最多重试 2 次（重建连接）。
 	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
 	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
+	markTerminalProofPolicy := func(conn *WsConnection) {
+		if oneShotRequest && conn != nil {
+			// Publish this before the data write begins: an immediate terminal
+			// followed by close 1006/EOF may prove this one non-reusable lease
+			// committed, without relaxing legacy reusable-connection semantics.
+			conn.allowAbruptTerminalProof.Store(true)
+		}
+	}
+	markTerminalProofPolicy(wc)
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
 	for retries := 0; !safePoolRequest && !continuationRequest && shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
@@ -418,6 +427,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		if err2 != nil {
 			return nil, err2
 		}
+		markTerminalProofPolicy(wc)
 		sendErr = e.sendRequest(wc, wsBody, pr.RequestID)
 	}
 	if sendErr != nil {

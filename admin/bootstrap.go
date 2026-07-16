@@ -382,6 +382,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		BillingTierPolicy:                proxy.BillingTierPolicyActual,
 		AffinityMode:                     "bounded",
 		PublicKeyUsagePageEnabled:        true,
+		PublicImageStudioPageEnabled:     false,
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          2,

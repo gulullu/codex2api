@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -101,29 +102,148 @@ func sendPromptCyberPolicyBlockedOpenAI(c *gin.Context) {
 	api.SendErrorWithStatus(c, promptCyberPolicyError(), http.StatusBadRequest)
 }
 
+// These upstream prompt-filter rules are valid for user-input moderation, but
+// they are not evidence that an OAuth request is likely to trigger the upstream
+// CYB policy. Some also commonly occur in trusted system/tool instructions.
+// sub2 owns moderation for these categories; the Relay scanner must not turn
+// them into account-pool routing signals.
+var promptFilterNonCYBRoutePatterns = []string{
+	"prompt_policy_override",
+	"prompt_unrestricted_mode",
+	"prompt_refusal_suppression",
+	"prompt_fake_authorization",
+	"prompt_system_exfiltration",
+	"prompt_config_injection",
+	"prompt_ctf_policy_downgrade",
+	"prompt_semantic_attack_rewrite",
+	"safety_bypass_request",
+	"threats_harassment",
+	"self_harm_facilitation",
+	"sexual_violence_ncii",
+	"terrorism_violent_extremism",
+	"weapons_cbrne",
+	"illicit_goods_services",
+	"fraud_scam_impersonation",
+	"privacy_doxxing",
+	"biometric_surveillance",
+	"minor_exploitation",
+	"political_persuasion_interference",
+	"high_stakes_automated_decision",
+	"academic_dishonesty",
+	"unlicensed_tailored_advice",
+	"real_money_gambling",
+	"likeness_impersonation",
+	"social_scoring_sensitive_inference",
+	"emotion_crime_prediction",
+}
+
 func routingPromptFilterConfig(cfg promptfilter.Config) promptfilter.Config {
 	// codex2api only uses local rules as routing signals. Moderation and
 	// user-visible policy blocking are owned by the upstream sub2 layer.
 	cfg.Mode = promptfilter.ModeMonitor
 	cfg.Review.Enabled = false
 	cfg.Review.All = false
+	cfg.Advanced.Output.Enabled = false
+	disabled := make(map[string]struct{}, len(cfg.DisabledPatterns)+len(promptFilterNonCYBRoutePatterns))
+	for _, name := range cfg.DisabledPatterns {
+		disabled[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+	}
+	for _, name := range promptFilterNonCYBRoutePatterns {
+		key := strings.ToLower(strings.TrimSpace(name))
+		if _, exists := disabled[key]; exists {
+			continue
+		}
+		disabled[key] = struct{}{}
+		cfg.DisabledPatterns = append(cfg.DisabledPatterns, name)
+	}
 	return cfg
 }
 
 func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
+	return h.inspectPromptFilterPayloadShape(c, rawBody, rawBody, endpoint, endpoint, model)
+}
+
+// inspectPromptFilterCanonicalResponses scans a body after the inbound
+// Chat/Anthropic/Responses translation has produced the canonical Codex
+// Responses payload. scanEndpoint selects the JSON shape; inboundEndpoint is
+// retained for route policy and audit attribution. originalBody remains the
+// authority for exact-CYB feedback and probe signatures.
+func (h *Handler) inspectPromptFilterCanonicalResponses(c *gin.Context, baseBody []byte, oauthBody []byte, originalBody []byte, inboundEndpoint string, model string) bool {
+	if c != nil && c.GetBool("prompt_intelligence_internal") {
+		return false
+	}
 	if h == nil || h.store == nil {
 		return false
 	}
-	h.captureUpstreamCybFeedbackRequest(c, endpoint, rawBody, false)
+	h.captureUpstreamCybFeedbackRequest(c, inboundEndpoint, originalBody, false)
 	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
+	scan := inspectPromptFilterCanonicalCandidates(baseBody, oauthBody, cfg, h.cybRelayConfig().UserTextRescanEnabled())
 	c.Set(contextPromptFilterText, scan.AuditText)
 	setPromptFilterScanContext(c, scan)
 	if nested, ok := takeNestedPromptRiskDecision(c); ok {
 		setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
 		return false
 	}
-	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
+	return h.inspectCybRelayPrompt(c, originalBody, scan, inboundEndpoint, model)
+}
+
+// inspectPromptFilterCanonicalCandidates protects both possible final bodies:
+// Relay receives baseBody without Payload Rules, while OAuth receives
+// oauthBody. A filter/override rule must never hide risk that remains in the
+// Relay body, and an OAuth-only injection must still be isolated before account
+// selection.
+func inspectPromptFilterCanonicalCandidates(baseBody []byte, oauthBody []byte, cfg promptfilter.Config, userTextRescanEnabled bool) promptFilterRouteScan {
+	baseScan := inspectPromptFilterPayload(baseBody, "/v1/responses", cfg, userTextRescanEnabled)
+	if bytes.Equal(baseBody, oauthBody) {
+		return baseScan
+	}
+	oauthScan := inspectPromptFilterPayload(oauthBody, "/v1/responses", cfg, userTextRescanEnabled)
+
+	selected := baseScan
+	switch {
+	case baseScan.CYBSignal:
+		// Relay sends baseBody, so its evidence is authoritative even when an
+		// OAuth filter rule removes that content.
+	case oauthScan.CYBSignal:
+		selected = oauthScan
+		selected.Signals = appendUniqueRouteSignal(selected.Signals, "payload_rules_oauth_preview")
+	default:
+		// Preserve the more informative diagnostics when neither candidate
+		// routes. This does not combine scores across two different payloads.
+		if oauthScan.Verdict.Score > baseScan.Verdict.Score {
+			selected = oauthScan
+		}
+	}
+	selected.CYBSignal = baseScan.CYBSignal || oauthScan.CYBSignal
+	for _, signal := range baseScan.Signals {
+		selected.Signals = appendUniqueRouteSignal(selected.Signals, signal)
+	}
+	for _, signal := range oauthScan.Signals {
+		selected.Signals = appendUniqueRouteSignal(selected.Signals, signal)
+	}
+	return selected
+}
+
+func (h *Handler) inspectPromptFilterPayloadShape(c *gin.Context, scanBody []byte, originalBody []byte, inboundEndpoint string, scanEndpoint string, model string) bool {
+	if c != nil && c.GetBool("prompt_intelligence_internal") {
+		return false
+	}
+	if h == nil || h.store == nil {
+		return false
+	}
+	// Public handlers capture the original inbound body before translation.
+	// overwrite=false preserves that exact digest when this function receives a
+	// canonical body for the safety scan.
+	h.captureUpstreamCybFeedbackRequest(c, inboundEndpoint, originalBody, false)
+	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
+	scan := inspectPromptFilterPayload(scanBody, scanEndpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
+	c.Set(contextPromptFilterText, scan.AuditText)
+	setPromptFilterScanContext(c, scan)
+	if nested, ok := takeNestedPromptRiskDecision(c); ok {
+		setPromptRiskDecisionContext(c, nested, h.cybRelayConfig().GroupID)
+		return false
+	}
+	return h.inspectCybRelayPrompt(c, originalBody, scan, inboundEndpoint, model)
 }
 
 func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, endpoint string, model string) bool {
@@ -138,15 +258,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 }
 
 func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
-	if h == nil || h.store == nil {
-		return false
-	}
-	h.captureUpstreamCybFeedbackRequest(c, endpoint, rawBody, false)
-	cfg := routingPromptFilterConfig(h.store.GetPromptFilterConfig())
-	scan := inspectPromptFilterPayload(rawBody, endpoint, cfg, h.cybRelayConfig().UserTextRescanEnabled())
-	c.Set(contextPromptFilterText, scan.AuditText)
-	setPromptFilterScanContext(c, scan)
-	return h.inspectCybRelayPrompt(c, rawBody, scan, endpoint, model)
+	return h.inspectPromptFilterPayloadShape(c, rawBody, rawBody, endpoint, endpoint, model)
 }
 
 func setPromptFilterScanContext(c *gin.Context, scan promptFilterRouteScan) {
@@ -436,7 +548,7 @@ func inspectPromptFilterPayload(rawBody []byte, endpoint string, cfg promptfilte
 	// only mark the user signal as rescued when its bounded witness was absent
 	// from the legacy full-text window.
 	if userRouted {
-		legacyFullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+		legacyFullText := promptfilter.ExtractRoutingText(rawBody, endpoint, cfg.MaxTextLength)
 		if routingTextOutsideLegacyWindow(legacyFullText, userText) {
 			merged.Signals = appendUniqueRouteSignal(merged.Signals, promptFilterUserTextRescueSignal)
 			merged.AuditText = strings.TrimSpace(userText + "\n--- partitioned payload scan ---\n" + merged.FullText)
@@ -473,7 +585,7 @@ func promptFilterPartitionsUsable(partitioned promptfilter.RoutingPayloadPartiti
 }
 
 func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promptfilter.Config, fallbackReason string) promptFilterRouteScan {
-	fullText := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+	fullText := promptfilter.ExtractRoutingText(rawBody, endpoint, cfg.MaxTextLength)
 	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
 	// Never trust the concatenated legacy text for this five-witness rule.
 	// Re-add it only after an independent bounded partition extraction proves
@@ -586,6 +698,13 @@ func mergePromptFilterVerdicts(full promptfilter.Verdict, user promptfilter.Verd
 	if user.StrictHit && !merged.StrictHit {
 		merged.StrictHit = true
 		merged.Reason = user.Reason
+	}
+	if user.TerminalStrictHit && !merged.TerminalStrictHit {
+		merged.TerminalStrictHit = true
+		merged.Reason = user.Reason
+	}
+	if user.TerminalCategoryHit {
+		merged.TerminalCategoryHit = true
 	}
 	merged.Enabled = merged.Enabled || user.Enabled
 
@@ -855,7 +974,7 @@ func populatePromptFilterAPIKeyMeta(c *gin.Context, input *database.PromptFilter
 }
 
 func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
-	if promptFilterVerdictIsFinal(verdict) {
+	if promptFilterVerdictIsFinal(verdict) || verdict.TerminalStrictHit {
 		return false
 	}
 	review := promptfilter.NormalizeReviewConfig(cfg.Review)

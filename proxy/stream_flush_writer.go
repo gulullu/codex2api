@@ -26,6 +26,17 @@ type streamFlushWriter struct {
 	dirty       bool
 }
 
+func (h *Handler) newStreamFlushWriter(writer io.Writer, flusher http.Flusher) *streamFlushWriter {
+	return newStreamFlushWriter(writer, flusher)
+}
+
+func (w *streamFlushWriter) scanOutput(data []byte) ([]byte, error) {
+	// Output moderation is owned by sub2. codex2api must preserve the upstream
+	// SSE bytes even if an older database row still says output scanning is
+	// enabled.
+	return data, nil
+}
+
 func newStreamFlushWriter(writer io.Writer, flusher http.Flusher) *streamFlushWriter {
 	settings := CurrentRuntimeSettings()
 	return &streamFlushWriter{
@@ -84,6 +95,11 @@ func (w *streamFlushWriter) WriteString(data string) error {
 	if w.writer == nil {
 		return nil
 	}
+	filtered, err := w.scanOutput([]byte(data))
+	if err != nil || len(filtered) == 0 {
+		return err
+	}
+	data = string(filtered)
 	if w.policy != StreamFlushPolicyCoalesce {
 		if err := w.writeString(data); err != nil {
 			return err
@@ -108,6 +124,11 @@ func (w *streamFlushWriter) WriteBytes(data []byte) error {
 	}
 	if w.writer == nil || len(data) == 0 {
 		return nil
+	}
+	var err error
+	data, err = w.scanOutput(data)
+	if err != nil || len(data) == 0 {
+		return err
 	}
 	if w.policy != StreamFlushPolicyCoalesce {
 		if err := w.writeBytes(data); err != nil {
@@ -134,19 +155,22 @@ func (w *streamFlushWriter) WriteSSEData(data []byte) error {
 	if w.writer == nil {
 		return nil
 	}
+	framed := make([]byte, 0, len(sseDataPrefix)+len(data)+len(sseDataSuffix))
+	framed = append(framed, sseDataPrefix...)
+	framed = append(framed, data...)
+	framed = append(framed, sseDataSuffix...)
+	var err error
+	framed, err = w.scanOutput(framed)
+	if err != nil || len(framed) == 0 {
+		return err
+	}
 	if w.policy != StreamFlushPolicyCoalesce {
-		if err := w.writeBytes(sseDataPrefix); err != nil {
-			return err
-		}
-		if err := w.writeBytes(data); err != nil {
-			return err
-		}
-		if err := w.writeBytes(sseDataSuffix); err != nil {
+		if err := w.writeBytes(framed); err != nil {
 			return err
 		}
 		return w.flushTransport()
 	}
-	appendSSEData(&w.buffer, data)
+	w.buffer.Write(framed)
 	if w.lastFlush.IsZero() || time.Since(w.lastFlush) >= w.interval {
 		return w.Flush()
 	}
@@ -162,6 +186,23 @@ func (w *streamFlushWriter) Flush() error {
 	}
 	if w.buffer.Len() == 0 && !w.dirty && !w.lastFlush.IsZero() {
 		return nil
+	}
+	if w.buffer.Len() > 0 {
+		if err := w.writeBytes(w.buffer.Bytes()); err != nil {
+			return err
+		}
+		w.buffer.Reset()
+	}
+	return w.flushTransport()
+}
+
+// Finalize flushes any coalesced bytes at a real semantic end-of-stream.
+func (w *streamFlushWriter) Finalize() error {
+	if w == nil {
+		return nil
+	}
+	if w.terminalErr != nil {
+		return w.terminalErr
 	}
 	if w.buffer.Len() > 0 {
 		if err := w.writeBytes(w.buffer.Bytes()); err != nil {

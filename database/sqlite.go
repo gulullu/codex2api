@@ -101,6 +101,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			score_bias_override INTEGER NULL,
 			base_concurrency_override INTEGER NULL,
 			skip_warm_tier INTEGER DEFAULT 0,
+			note TEXT DEFAULT '',
 			error_message TEXT DEFAULT '',
 			deleted_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -235,6 +236,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				image_storage_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
 				public_key_usage_page_enabled INTEGER DEFAULT 1,
+				public_image_studio_page_enabled INTEGER DEFAULT 0,
+				public_account_portal_page_enabled INTEGER DEFAULT 0,
 				scheduler_mode TEXT DEFAULT 'round_robin',
 					affinity_mode TEXT DEFAULT 'bounded',
 					codex_force_websocket INTEGER DEFAULT 0,
@@ -388,6 +391,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			scan_truncated INTEGER DEFAULT 0,
 			scan_details TEXT DEFAULT '{}'
 		);`,
+		`CREATE TABLE IF NOT EXISTS prompt_filter_secrets (
+			id INTEGER PRIMARY KEY,
+			newapi_secret TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -405,6 +413,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "score_bias_override", "INTEGER NULL"},
 		{"accounts", "base_concurrency_override", "INTEGER NULL"},
 		{"accounts", "tags", "TEXT DEFAULT '[]'"},
+		{"accounts", "note", "TEXT DEFAULT ''"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
@@ -505,6 +514,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
 		{"system_settings", "codex_model_mapping", "TEXT DEFAULT '{}'"},
+		{"system_settings", "payload_rules", "TEXT DEFAULT '{}'"},
 		{"system_settings", "reasoning_effort_models", "TEXT DEFAULT '[]'"},
 		{"system_settings", "resin_url", "TEXT DEFAULT ''"},
 		{"system_settings", "resin_platform_name", "TEXT DEFAULT ''"},
@@ -512,6 +522,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_mode", "TEXT DEFAULT 'monitor'"},
 		{"system_settings", "prompt_filter_threshold", "INTEGER DEFAULT 50"},
 		{"system_settings", "prompt_filter_strict_threshold", "INTEGER DEFAULT 90"},
+		{"system_settings", "prompt_filter_strict_terminal_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "prompt_filter_advanced_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "prompt_filter_log_matches", "INTEGER DEFAULT 1"},
 		{"system_settings", "prompt_filter_max_text_length", "INTEGER DEFAULT 81920"},
 		{"system_settings", "prompt_filter_sensitive_words", "TEXT DEFAULT ''"},
@@ -572,6 +584,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},
 		{"system_settings", "public_key_usage_page_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "public_image_studio_page_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "public_account_portal_page_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "TEXT DEFAULT 'bounded'"},
 		{"system_settings", "auto_pause_5h_threshold", "REAL DEFAULT 0"},

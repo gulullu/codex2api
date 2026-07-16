@@ -355,7 +355,7 @@ func (wc *WsConnection) recordReadPumpFailureLocked(state *wsReadState, readErr 
 	deferTerminalCommit := state.leaseTerminalQueued &&
 		state.leasePhase == readLeaseWriting &&
 		state.leaseWrite != nil &&
-		isNormalPeerClose(readErr)
+		wc.terminalFrameProvesCommitAcrossClose(readErr)
 	if leaseID != "" && state.activeLease == leaseID && len(state.queue) < readPumpMaxQueuedItems {
 		state.queue = append(state.queue, readPumpItem{err: readErr, leaseID: leaseID})
 	}
@@ -386,6 +386,13 @@ func isNormalPeerClose(readErr error) bool {
 		return false
 	}
 	return closeErr.Code == websocket.CloseNormalClosure || closeErr.Code == websocket.CloseGoingAway
+}
+
+func (wc *WsConnection) terminalFrameProvesCommitAcrossClose(readErr error) bool {
+	if isNormalPeerClose(readErr) {
+		return true
+	}
+	return wc != nil && (wc.safeReusable.Load() || wc.allowAbruptTerminalProof.Load())
 }
 
 func (wc *WsConnection) finalizeReadPumpFailure(state *wsReadState) {
@@ -515,7 +522,7 @@ func (wc *WsConnection) completeReadLeaseWrite(leaseID string, writeErr error) e
 			state.leasePhase == readLeaseWriting &&
 			state.leaseWrite != nil &&
 			state.leaseTerminalQueued &&
-			isNormalPeerClose(state.readerErr) {
+			wc.terminalFrameProvesCommitAcrossClose(state.readerErr) {
 			state.activeLease = ""
 			state.leasePhase = readLeaseIdle
 			state.leaseTerminalQueued = false

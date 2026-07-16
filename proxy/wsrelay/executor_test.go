@@ -338,6 +338,9 @@ func TestOfficialPromptCacheRequestEntersSafeOwnerPool(t *testing.T) {
 		if !response.safePool || response.oneShot || !response.conn.safeReusable.Load() {
 			t.Fatalf("official request routing: safe=%v oneshot=%v reusable=%v", response.safePool, response.oneShot, response.conn.safeReusable.Load())
 		}
+		if response.conn.allowAbruptTerminalProof.Load() {
+			t.Fatal("safe reusable connection unexpectedly used the one-shot proof bit")
+		}
 		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
 			t.Fatalf("turn %d read: %v", turn+1, err)
 		}
@@ -388,6 +391,9 @@ func TestOfficialPromptCacheRequestHonorsHardOneShotKillSwitch(t *testing.T) {
 		if response.safePool || !response.oneShot {
 			t.Fatalf("hard-kill routing: safe=%v oneshot=%v", response.safePool, response.oneShot)
 		}
+		if !response.conn.allowAbruptTerminalProof.Load() {
+			t.Fatal("one-shot connection did not publish abrupt terminal proof policy before use")
+		}
 		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
 			t.Fatalf("turn %d read: %v", turn+1, err)
 		}
@@ -400,6 +406,58 @@ func TestOfficialPromptCacheRequestHonorsHardOneShotKillSwitch(t *testing.T) {
 	}
 	if got := handshakes.Load(); got != 2 {
 		t.Fatalf("hard kill used %d physical handshakes, want 2", got)
+	}
+}
+
+func TestHardOneShotRejectsContinuationWithoutOwnerHandshakeBeforePreferredAcquire(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
+	t.Setenv(safePoolScopeEnv, "all")
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(*WsConnection) bool { return true }
+
+	account := &auth.Account{
+		DBID:                    4603,
+		AccountID:               "acct-oneshot-continuation",
+		AccessToken:             "token",
+		DynamicConcurrencyLimit: 8,
+	}
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+	bound, session := newTestSlotConnection(manager, account, wsURL, "previous-bound")
+	const (
+		responseID = "resp_oneshot_without_owner"
+		apiKey     = "key-A"
+	)
+	manager.BindResponseConn(responseID, bound, "previous-bound", account.ID(), apiKey)
+	connectionCount := manager.ConnectionCount()
+
+	exec := NewExecutorWithManager(manager)
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(),
+		account,
+		[]byte(`{"model":"gpt-5.6","previous_response_id":"resp_oneshot_without_owner","input":"continue"}`),
+		"stateless-next-turn",
+		"",
+		apiKey,
+		nil,
+		http.Header{},
+		"route-key",
+	)
+	if response != nil || !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("one-shot continuation response=%v err=%v, want fail-closed continuation", response, err)
+	}
+	if got := session.PendingCount(); got != 0 {
+		t.Fatalf("preferred connection pending count = %d, want 0 (AcquirePreferred must not run)", got)
+	}
+	if got := manager.ConnectionCount(); got != connectionCount {
+		t.Fatalf("connection count = %d, want unchanged %d (bound connection must not be acquired or discarded)", got, connectionCount)
+	}
+	if got, _ := manager.lookupResponseConn(responseID, account.ID(), apiKey); got != bound {
+		t.Fatal("one-shot continuation consumed or discarded the existing previous_response_id binding")
 	}
 }
 
@@ -449,6 +507,9 @@ func TestOfficialPromptCacheUnenrolledAccountsKeepBaselineSessionReuse(t *testin
 				}
 				if response.safePool || response.oneShot || response.conn.safeReusable.Load() {
 					t.Fatalf("unenrolled routing safe=%v oneshot=%v reusable=%v, want unchanged explicit-session path", response.safePool, response.oneShot, response.conn.safeReusable.Load())
+				}
+				if response.conn.allowAbruptTerminalProof.Load() {
+					t.Fatal("legacy/default reusable connection received one-shot terminal proof policy")
 				}
 				if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
 					t.Fatalf("turn %d read: %v", turn+1, err)
