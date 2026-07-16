@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  ChevronDown,
   Clock3,
   RefreshCw,
   RotateCcw,
@@ -139,6 +140,10 @@ export default function RelayGuardianPanel({
     () => (status?.accounts ?? []).filter((account) => account.last_resort).length,
     [status?.accounts],
   )
+  const managedCount = status?.accounts.length ?? 0
+  const healthyCount = stateCounts.get('healthy') ?? 0
+  const attentionCount = (stateCounts.get('suspect') ?? 0) + (stateCounts.get('would_quarantine') ?? 0)
+  const recoveringCount = (stateCounts.get('quarantined') ?? 0) + (stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)
   const currentAccountName = useCallback(
     (accountID: number, recordedName?: string | null) => resolveRelayGuardianAccountName(accountID, accounts, recordedName),
     [accounts],
@@ -247,16 +252,17 @@ export default function RelayGuardianPanel({
             </Button>
           </div>
 
-          {status && !isEnforce ? (
-            <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/[0.07] p-3 text-sm leading-6 text-amber-800 dark:text-amber-300">
-              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-              {operationMode === 'off' ? (
-                <span><strong>Guardian 已关闭。</strong> 当前不执行慢性故障判断，也没有可解除或临时旁路的运行态。</span>
-              ) : (
-                <span><strong>监控模式：</strong>只记录建议动作，不改变账号调度。</span>
-              )}
-            </div>
-          ) : null}
+          <div className="mt-4 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border border-border/60 bg-muted/15 px-3 py-2.5 text-xs text-muted-foreground">
+            <span className={`font-medium ${operationMode === 'monitor' ? 'text-amber-700 dark:text-amber-300' : isEnforce ? 'text-emerald-700 dark:text-emerald-300' : 'text-muted-foreground'}`}>
+              {!status ? statusLoading ? '正在读取运行状态' : '运行状态未知' : operationMode === 'off' ? '已关闭' : isEnforce ? '执行中' : '仅监控，不自动调整调度'}
+            </span>
+            <span>受管 {managedCount}</span>
+            <span>健康 {healthyCount}</span>
+            <span className={attentionCount ? 'font-medium text-amber-700 dark:text-amber-300' : ''}>需关注 {attentionCount}</span>
+            {recoveringCount ? <span>恢复中 {recoveringCount}</span> : null}
+            {lastResortCount ? <span>最后兜底 {lastResortCount}</span> : null}
+            <span className="sm:ml-auto">心跳 {status?.heartbeat_at ? formatBeijingTime(status.heartbeat_at) : '-'}</span>
+          </div>
 
           {status?.reliability_query_status === 'degraded' ? (
             <div className="mt-4 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/[0.07] p-3 text-xs leading-5 text-amber-800 dark:text-amber-300">
@@ -269,90 +275,96 @@ export default function RelayGuardianPanel({
             <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{statusError}</div>
           ) : null}
 
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <GuardianSummary label="受管账号" value={status?.accounts.length ?? 0} detail={`${status?.scan_interval_seconds ?? '-'} 秒扫描一次`} />
-            <GuardianSummary label="需关注" value={(stateCounts.get('suspect') ?? 0) + (stateCounts.get('would_quarantine') ?? 0)} detail={`观察 ${stateCounts.get('suspect') ?? 0} · 建议隔离 ${stateCounts.get('would_quarantine') ?? 0}`} tone="warn" />
-            <GuardianSummary label="恢复中" value={(stateCounts.get('quarantined') ?? 0) + (stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)} detail={`隔离 ${stateCounts.get('quarantined') ?? 0} · 探测/试运行 ${(stateCounts.get('half_open') ?? 0) + (stateCounts.get('probation') ?? 0)}`} tone="info" />
-            <GuardianSummary label="最后兜底" value={lastResortCount} detail="仅在普通账号不可用时参与" tone={lastResortCount ? 'warn' : 'neutral'} />
-          </div>
-
-          <div className="mt-4 grid min-w-0 gap-3 md:grid-cols-2 2xl:grid-cols-3">
-            {(status?.accounts ?? []).map((account) => (
-              <GuardianAccountCard
-                key={account.account_id}
-                account={account}
-                accountName={currentAccountName(account.account_id, account.account_name)}
-                mode={operationMode}
-                busy={actionAccountIDs.has(account.account_id)}
-                onRelease={() => void handleRelease(account)}
-                onBypass={() => void handleBypass(account)}
-              />
-            ))}
-            {!statusLoading && !statusError && (status?.accounts.length ?? 0) === 0 ? (
-              <div className="col-span-full rounded-xl border border-border/60 bg-muted/20 p-6 text-center text-sm text-muted-foreground">暂无受管 Relay 账号</div>
-            ) : null}
-          </div>
-
-          <div className="mt-4 flex flex-wrap gap-x-4 gap-y-1 border-t border-border/70 pt-3 text-[11px] text-muted-foreground">
-            <span>状态生成：{status?.generated_at ? formatBeijingTime(status.generated_at) : '-'}</span>
-            <span>Guardian 心跳：{status?.heartbeat_at ? formatBeijingTime(status.heartbeat_at) : '-'}</span>
-            <span>人工禁用优先。</span>
-          </div>
+          <details className="group mt-4 rounded-xl border border-border/60 bg-muted/10">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3.5 py-3 text-sm marker:content-none [&::-webkit-details-marker]:hidden">
+              <div className="min-w-0">
+                <div className="font-medium text-foreground">账号诊断</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {managedCount} 个受管账号 · 健康 {healthyCount} · 需关注 {attentionCount}
+                </div>
+              </div>
+              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+            </summary>
+            <div className="border-t border-border/60 p-3">
+              <div className="grid min-w-0 gap-3 md:grid-cols-2 2xl:grid-cols-3">
+                {(status?.accounts ?? []).map((account) => (
+                  <GuardianAccountCard
+                    key={account.account_id}
+                    account={account}
+                    accountName={currentAccountName(account.account_id, account.account_name)}
+                    mode={operationMode}
+                    busy={actionAccountIDs.has(account.account_id)}
+                    onRelease={() => void handleRelease(account)}
+                    onBypass={() => void handleBypass(account)}
+                  />
+                ))}
+                {!statusLoading && !statusError && managedCount === 0 ? (
+                  <div className="col-span-full rounded-xl border border-border/60 bg-muted/20 p-6 text-center text-sm text-muted-foreground">暂无受管 Relay 账号</div>
+                ) : null}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 border-t border-border/70 pt-3 text-[11px] text-muted-foreground">
+                <span>状态生成：{status?.generated_at ? formatBeijingTime(status.generated_at) : '-'}</span>
+                <span>扫描间隔：{status?.scan_interval_seconds ?? '-'} 秒</span>
+                <span>人工禁用优先。</span>
+              </div>
+            </div>
+          </details>
         </CardContent>
       </Card>
 
       <Card className="min-w-0 overflow-hidden border-border/70 shadow-sm">
         <CardContent className="min-w-0 p-4 sm:p-5">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div className="min-w-0">
-              <h2 className="text-base font-semibold text-foreground">Guardian 事件</h2>
-              <p className="mt-1 text-sm leading-6 text-muted-foreground">
-                当前筛选窗口内的判断与恢复动作。
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">{formatBeijingTime(start)} 至 {formatBeijingTime(end)}</p>
+          <details className="group">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 marker:content-none [&::-webkit-details-marker]:hidden">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="text-base font-semibold text-foreground">Guardian 事件</h2>
+                  <Badge variant="outline" className="bg-muted/40">
+                    {eventsLoading ? '加载中' : `${events?.total ?? 0} 条`}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">按当前筛选窗口分页查询，展开查看诊断记录。</p>
+              </div>
+              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+            </summary>
+
+            <div className="mt-4 border-t border-border/70 pt-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <p className="text-xs text-muted-foreground">{formatBeijingTime(start)} 至 {formatBeijingTime(end)}</p>
+                <Button variant="outline" size="sm" className="self-start" onClick={() => void refreshAuditWindow()} disabled={eventsLoading || refreshing}>
+                  <RefreshCw className={eventsLoading || refreshing ? 'size-3.5 animate-spin' : 'size-3.5'} />
+                  刷新事件
+                </Button>
+              </div>
+
+              {eventsError ? (
+                <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{eventsError}</div>
+              ) : null}
+
+              <div className="mt-4 space-y-2">
+                {(events?.items ?? []).map((event) => <GuardianEventRow key={event.id} event={event} accounts={accounts} />)}
+                {!eventsLoading && !eventsError && (events?.items.length ?? 0) === 0 ? (
+                  <div className="rounded-xl border border-border/60 bg-muted/20 p-6 text-center text-sm text-muted-foreground">当前筛选窗口内暂无 Guardian 事件</div>
+                ) : null}
+              </div>
+
+              {(events?.total ?? 0) > 0 ? (
+                <Pagination
+                  page={Math.min(page, totalPages)}
+                  totalPages={totalPages}
+                  onPageChange={setPage}
+                  totalItems={events?.total ?? 0}
+                  pageSize={pageSize}
+                  onPageSizeChange={setPageSize}
+                  pageSizeOptions={PAGE_SIZE_OPTIONS}
+                />
+              ) : null}
             </div>
-            <Button variant="outline" size="sm" className="self-start" onClick={() => void refreshAuditWindow()} disabled={eventsLoading || refreshing}>
-              <RefreshCw className={eventsLoading || refreshing ? 'size-3.5 animate-spin' : 'size-3.5'} />
-              刷新事件
-            </Button>
-          </div>
-
-          {eventsError ? (
-            <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{eventsError}</div>
-          ) : null}
-
-          <div className="mt-4 space-y-2">
-            {(events?.items ?? []).map((event) => <GuardianEventRow key={event.id} event={event} accounts={accounts} />)}
-            {!eventsLoading && !eventsError && (events?.items.length ?? 0) === 0 ? (
-              <div className="rounded-xl border border-border/60 bg-muted/20 p-6 text-center text-sm text-muted-foreground">当前筛选窗口内暂无 Guardian 事件</div>
-            ) : null}
-          </div>
-
-          {(events?.total ?? 0) > 0 ? (
-            <Pagination
-              page={Math.min(page, totalPages)}
-              totalPages={totalPages}
-              onPageChange={setPage}
-              totalItems={events?.total ?? 0}
-              pageSize={pageSize}
-              onPageSizeChange={setPageSize}
-              pageSizeOptions={PAGE_SIZE_OPTIONS}
-            />
-          ) : null}
+          </details>
         </CardContent>
       </Card>
       {confirmDialog}
     </>
-  )
-}
-
-function GuardianSummary({ label, value, detail, tone = 'neutral' }: { label: string; value: number; detail: string; tone?: RelayGuardianTone }) {
-  return (
-    <div className={`rounded-xl border p-3.5 ${tonePanelClass(tone)}`}>
-      <div className="text-xs font-medium text-muted-foreground">{label}</div>
-      <div className="mt-1.5 text-2xl font-semibold tabular-nums text-foreground">{value.toLocaleString('zh-CN')}</div>
-      <div className="mt-1 text-xs leading-5 text-muted-foreground">{detail}</div>
-    </div>
   )
 }
 
@@ -417,16 +429,18 @@ function GuardianAccountCard({
         <span className="rounded bg-background/70 px-1.5 py-0.5">快熔断 {account.circuit_state || '-'}</span>
       </div>
 
-      <div className="mt-auto grid grid-cols-2 gap-2 border-t border-border/60 pt-3">
-        <Button variant="outline" size="sm" disabled={busy || !availability.canRelease} title={!availability.canRelease ? disabledReason || '当前状态无需解除' : '只解除 Guardian 运行态'} onClick={onRelease}>
-          <RotateCcw className={busy ? 'size-3.5 animate-spin' : 'size-3.5'} />
-          人工解除
-        </Button>
-        <Button variant="outline" size="sm" disabled={busy || !availability.canBypass} title={!availability.canBypass ? disabledReason || '当前已在临时旁路' : '10 分钟内绕过 Guardian 自动临时隔离'} onClick={onBypass}>
-          <Clock3 className="size-3.5" />
-          旁路 10 分钟
-        </Button>
-      </div>
+      {mode === 'enforce' ? (
+        <div className="mt-auto grid grid-cols-2 gap-2 border-t border-border/60 pt-3">
+          <Button variant="outline" size="sm" disabled={busy || !availability.canRelease} title={!availability.canRelease ? disabledReason || '当前状态无需解除' : '只解除 Guardian 运行态'} onClick={onRelease}>
+            <RotateCcw className={busy ? 'size-3.5 animate-spin' : 'size-3.5'} />
+            人工解除
+          </Button>
+          <Button variant="outline" size="sm" disabled={busy || !availability.canBypass} title={!availability.canBypass ? disabledReason || '当前已在临时旁路' : '10 分钟内绕过 Guardian 自动临时隔离'} onClick={onBypass}>
+            <Clock3 className="size-3.5" />
+            旁路 10 分钟
+          </Button>
+        </div>
+      ) : null}
     </article>
   )
 }

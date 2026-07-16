@@ -168,6 +168,19 @@ test('guardian event pagination defaults to five and keeps compact and larger ch
   assert.match(panelSource, /const \[pageSize, setPageSize\] = useState\(5\)/)
 })
 
+test('monitor dashboard stays compact while retaining server-side diagnostics', () => {
+  assert.match(panelSource, /仅监控，不自动调整调度/)
+  assert.match(panelSource, /<details className="group mt-4[\s\S]*?账号诊断/)
+  assert.match(panelSource, /<details className="group">[\s\S]*?Guardian 事件/)
+  assert.doesNotMatch(panelSource, /<details[^>]*\sopen(?:=|\s|>)/)
+  assert.doesNotMatch(panelSource, /<GuardianSummary/)
+  assert.match(panelSource, /api\.getRelayGuardianEvents\(\{ start, end, page, pageSize \}\)/)
+})
+
+test('guardian write controls are rendered only in enforce mode', () => {
+  assert.match(panelSource, /\{mode === 'enforce' \? \([\s\S]*?人工解除[\s\S]*?旁路 10 分钟[\s\S]*?\) : null\}/)
+})
+
 test('account cards show reliability evidence without exposing internal generations', () => {
   assert.doesNotMatch(panelSource, /运行态第\s*\{account\.generation\}/)
   assert.doesNotMatch(panelSource, /label="窗口失败"/)
