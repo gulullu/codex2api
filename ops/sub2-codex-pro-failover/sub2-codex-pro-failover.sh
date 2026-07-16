@@ -44,6 +44,7 @@ readonly FLOCK_BIN="${FLOCK_BIN:-flock}"
 readonly TIMEOUT_BIN="${TIMEOUT_BIN:-timeout}"
 readonly BACKUP_OPEN_PARALLELISM="${BACKUP_OPEN_PARALLELISM:-4}"
 readonly SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS="${SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS:-5}"
+readonly PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS="${PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS:-20}"
 readonly BACKUP_OPEN_BATCH_TIMEOUT_SECONDS="${BACKUP_OPEN_BATCH_TIMEOUT_SECONDS:-120}"
 readonly MAINTENANCE_RECEIPT_TIMEOUT_SECONDS="${MAINTENANCE_RECEIPT_TIMEOUT_SECONDS:-90}"
 readonly MAINTENANCE_DRAIN_SETTLE_SECONDS="${MAINTENANCE_DRAIN_SETTLE_SECONDS:-10}"
@@ -74,6 +75,7 @@ readonly MAINTENANCE_AMBIGUITY_FILE="$STATE_DIR/maintenance-ambiguous.json"
 readonly LOCK_FILE="$RUNTIME_DIR/controller.lock"
 readonly TEST_BACKEND="${FAILOVER_TEST_BACKEND:-}"
 readonly TEST_FAIL_MAINTENANCE_MARKER_WRITE_NUMBER="${FAILOVER_TEST_FAIL_MAINTENANCE_MARKER_WRITE_NUMBER:-0}"
+readonly TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT="${FAILOVER_TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT:-0}"
 
 GROUP_ID=""
 GROUP_DISCOVERY_RESULT="unverifiable"
@@ -273,6 +275,7 @@ readonly bridge_account_id_maximum
 for pair in \
   "BACKUP_OPEN_PARALLELISM:$BACKUP_OPEN_PARALLELISM" \
   "SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS:$SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS" \
+  "PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS:$PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS" \
   "BACKUP_OPEN_BATCH_TIMEOUT_SECONDS:$BACKUP_OPEN_BATCH_TIMEOUT_SECONDS" \
   "MAINTENANCE_RECEIPT_TIMEOUT_SECONDS:$MAINTENANCE_RECEIPT_TIMEOUT_SECONDS" \
   "MAINTENANCE_DRAIN_SETTLE_SECONDS:$MAINTENANCE_DRAIN_SETTLE_SECONDS" \
@@ -299,6 +302,9 @@ for pair in \
 done
 if [[ -n "$TEST_BACKEND" && ! "$TEST_FAIL_MAINTENANCE_MARKER_WRITE_NUMBER" =~ ^[0-9]+$ ]]; then
   die "FAILOVER_TEST_FAIL_MAINTENANCE_MARKER_WRITE_NUMBER_must_be_non_negative_integer"
+fi
+if [[ -n "$TEST_BACKEND" && ! "$TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT" =~ ^[01]$ ]]; then
+  die "FAILOVER_TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT_must_be_boolean_integer"
 fi
 
 install -d -m 0700 "$STATE_DIR" "$RUNTIME_DIR"
@@ -1085,7 +1091,7 @@ api_set_primary_schedulable() {
   ACTIVE_RESPONSE_FILE="$(mktemp "$RUNTIME_DIR/response.XXXXXX")"
   local code="" transport_rc=0
   if [[ -n "$TEST_BACKEND" ]]; then
-    if "$TIMEOUT_BIN" --signal=TERM --kill-after=1s "${SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS}s" \
+    if "$TIMEOUT_BIN" --signal=TERM --kill-after=1s "${PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS}s" \
       "$TEST_BACKEND" set-schedulable-receipted "$account_id" "$desired" "$request_id" \
       >"$ACTIVE_RESPONSE_FILE"; then
       code=200
@@ -1098,7 +1104,7 @@ api_set_primary_schedulable() {
       return 1
     }
     code="$("$CURL_BIN" -sS -o "$ACTIVE_RESPONSE_FILE" -w '%{http_code}' \
-      --connect-timeout 2 --max-time "$SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS" -X POST \
+      --connect-timeout 2 --max-time "$PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS" -X POST \
       --header "@$ACTIVE_HEADER_FILE" -H 'Content-Type: application/json' \
       -H "X-Request-ID: $request_id" \
       --data "{\"schedulable\":${desired}}" \
@@ -1206,6 +1212,19 @@ classify_primary_api_state() {
   [[ "$status" =~ ^[a-z_]+$ && "$sched" =~ ^(true|false)$ &&
      "$concurrency" =~ ^[0-9]+$ ]] || return 1
   if [[ "$status" != active || "$sched" != "$expected_schedulable" ]]; then
+    return 2
+  fi
+}
+
+classify_primary_api_state_drained() {
+  local expected_schedulable="$1"
+  local row status sched concurrency
+  row="$(api_get_account "$BRIDGE_ACCOUNT_ID")" || return 1
+  IFS='|' read -r status sched concurrency <<<"$row"
+  [[ "$status" =~ ^[a-z_]+$ && "$sched" =~ ^(true|false)$ &&
+     "$concurrency" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$status" != active || "$sched" != "$expected_schedulable" ||
+        "$concurrency" != 0 ]]; then
     return 2
   fi
 }
@@ -2167,13 +2186,156 @@ WHERE id > ${watermark}
   AND extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable';"
 }
 
+maintenance_schedulable_audit_record() {
+  local request_id="$1"
+  local desired="$2"
+  [[ "$request_id" =~ ^codex2api-maint-[a-f0-9-]{36}-(pause|seal|restore)$ ]] || return 1
+  [[ "$desired" == true || "$desired" == false ]] || return 1
+  if [[ -n "$TEST_BACKEND" ]]; then
+    backend_call audit-receipt-record "$request_id" "$BRIDGE_ACCOUNT_ID" "$desired"
+    return
+  fi
+  db_query "
+SELECT
+  COUNT(*),
+  COUNT(*) FILTER (
+    WHERE action='admin.accounts.schedulable.create'
+      AND method='POST'
+      AND path='/api/v1/admin/accounts/:id/schedulable'
+      AND status_code=200
+      AND request_body::jsonb=jsonb_build_object('schedulable', ${desired})
+      AND extra->'params'->>'id'='${BRIDGE_ACCOUNT_ID}'
+  ),
+  COALESCE(MIN(id) FILTER (
+    WHERE action='admin.accounts.schedulable.create'
+      AND method='POST'
+      AND path='/api/v1/admin/accounts/:id/schedulable'
+      AND status_code=200
+      AND request_body::jsonb=jsonb_build_object('schedulable', ${desired})
+      AND extra->'params'->>'id'='${BRIDGE_ACCOUNT_ID}'
+  ),0),
+  COALESCE(TO_CHAR(
+    (MIN(created_at) FILTER (
+      WHERE action='admin.accounts.schedulable.create'
+        AND method='POST'
+        AND path='/api/v1/admin/accounts/:id/schedulable'
+        AND status_code=200
+        AND request_body::jsonb=jsonb_build_object('schedulable', ${desired})
+        AND extra->'params'->>'id'='${BRIDGE_ACCOUNT_ID}'
+    )) AT TIME ZONE 'UTC',
+    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+  ),''),
+  COALESCE(MIN(latency_ms) FILTER (
+    WHERE action='admin.accounts.schedulable.create'
+      AND method='POST'
+      AND path='/api/v1/admin/accounts/:id/schedulable'
+      AND status_code=200
+      AND request_body::jsonb=jsonb_build_object('schedulable', ${desired})
+      AND extra->'params'->>'id'='${BRIDGE_ACCOUNT_ID}'
+  ),-1)
+FROM audit_logs
+WHERE request_id='${request_id}';"
+}
+
+maintenance_receipt_evidence_record() {
+  local request_id="$1"
+  local watermark="$2"
+  [[ "$request_id" =~ ^codex2api-maint-[a-f0-9-]{36}-seal$ ]] || return 1
+  [[ "$watermark" =~ ^[0-9]+$ ]] || return 1
+  if [[ -n "$TEST_BACKEND" ]]; then
+    backend_call receipt-evidence-record "$request_id" "$watermark" "$BRIDGE_ACCOUNT_ID"
+    return
+  fi
+  db_query "
+SELECT COUNT(*), COALESCE(MIN(id),0),
+       COALESCE(MIN(extra->>'status_code'),''),
+       COALESCE(TO_CHAR(
+         MIN((extra->>'completed_at')::timestamptz) AT TIME ZONE 'UTC',
+         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'
+       ),'')
+FROM ops_system_logs
+WHERE id > ${watermark}
+  AND request_id='${request_id}'
+  AND component='http.access'
+  AND message='http request completed'
+  AND extra->>'method'='POST'
+  AND extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable';"
+}
+
+unique_successful_seal_receipt() {
+  local request_id="$1"
+  local watermark="$2"
+  local record count log_id status access_at
+  record="$(maintenance_receipt_evidence_record "$request_id" "$watermark")" || return 1
+  IFS='|' read -r count log_id status access_at <<<"$record"
+  [[ "$count" == 1 && "$log_id" =~ ^[1-9][0-9]*$ && "$status" == 200 &&
+     "$access_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*(Z|[+-][0-9]{2}:[0-9]{2})$ ]] || return 2
+  printf '%s|%s\n' "$log_id" "$access_at"
+}
+
+unique_schedulable_audit_record() {
+  local request_id="$1"
+  local desired="$2"
+  local record total exact audit_id audit_at latency_ms
+  record="$(maintenance_schedulable_audit_record "$request_id" "$desired")" || return 1
+  IFS='|' read -r total exact audit_id audit_at latency_ms <<<"$record"
+  [[ "$total" == 1 && "$exact" == 1 && "$audit_id" =~ ^[1-9][0-9]*$ &&
+     "$audit_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$ &&
+     "$latency_ms" =~ ^[0-9]+$ ]] || return 2
+  printf '%s|%s|%s\n' "$audit_id" "$audit_at" "$latency_ms"
+}
+
+seal_evidence_chronology_valid() {
+  local pause_at="$1"
+  local updated_at="$2"
+  local audit_at="$3"
+  local audit_latency_ms="$4"
+  local access_at="$5"
+  "$PYTHON_BIN" - "$pause_at" "$updated_at" "$audit_at" \
+    "$audit_latency_ms" "$access_at" \
+    "$((PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS * 1000 + 1000))" <<'PY'
+import datetime as dt,re,sys
+def parse(value):
+    value=re.sub(r'(\.[0-9]{6})[0-9]+(?=Z|[+-][0-9]{2}:[0-9]{2}$)',r'\1',value)
+    raw=value[:-1]+'+00:00' if value.endswith('Z') else value
+    stamp=dt.datetime.fromisoformat(raw)
+    if stamp.tzinfo is None:
+        raise ValueError
+    return stamp.astimezone(dt.timezone.utc)
+try:
+    pause,updated,audit=parse(sys.argv[1]),parse(sys.argv[2]),parse(sys.argv[3])
+    latency_ms=int(sys.argv[4])
+    access=parse(sys.argv[5])
+    if latency_ms < 0 or latency_ms > int(sys.argv[6]):
+        raise ValueError
+    if not (pause < updated <= audit <= access):
+        raise ValueError
+    if (audit-updated).total_seconds()*1000 > latency_ms + 1000:
+        raise ValueError
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 foreign_account_mutation_count() {
   local watermark="$1"
   local upper_log_id="$2"
   local provisional_restore_log_id="${3:-}"
-  (( $# <= 3 )) || return 1
+  local provisional_seal_log_id="${4:-}"
+  (( $# <= 4 )) || return 1
   [[ "$watermark" =~ ^[0-9]+$ && "$upper_log_id" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "$M_RUN_ID" =~ ^[a-f0-9-]{36}$ ]] || return 1
+
+  local seal_log_id="$M_SEAL_LOG_ID"
+  if [[ -n "$provisional_seal_log_id" ]]; then
+    [[ "$M_PHASE" == PAUSE_AMBIGUOUS &&
+       "$M_AMBIGUITY_PHASE" == SEAL_INTENT &&
+       "$M_AMBIGUITY_REASON" == ownership_seal_response_not_durable_backups_left_open &&
+       "$M_SEAL_REQUEST_ID" =~ ^codex2api-maint-[a-f0-9-]{36}-seal$ &&
+       -z "$seal_log_id" && -z "$M_SEAL_RESPONSE_UPDATED_AT" &&
+       "$provisional_seal_log_id" =~ ^[1-9][0-9]*$ ]] || return 1
+    seal_log_id="$provisional_seal_log_id"
+  fi
 
   local restore_log_id="$M_RESTORE_LOG_ID"
   local restore_allow_2xx=false
@@ -2199,11 +2361,11 @@ foreign_account_mutation_count() {
       AND extra->>'status_code'='200'
     )"
   fi
-  if [[ -n "$M_SEAL_REQUEST_ID" || -n "$M_SEAL_LOG_ID" ]]; then
+  if [[ -n "$M_SEAL_REQUEST_ID" || -n "$seal_log_id" ]]; then
     [[ "$M_SEAL_REQUEST_ID" =~ ^codex2api-maint-[a-f0-9-]{36}-seal$ &&
-       "$M_SEAL_LOG_ID" =~ ^[1-9][0-9]*$ ]] || return 1
+       "$seal_log_id" =~ ^[1-9][0-9]*$ ]] || return 1
     primary_write_exemption+=" OR (
-      id=${M_SEAL_LOG_ID}
+      id=${seal_log_id}
       AND request_id='${M_SEAL_REQUEST_ID}'
       AND extra->>'method'='POST'
       AND extra->>'path'='/api/v1/admin/accounts/${BRIDGE_ACCOUNT_ID}/schedulable'
@@ -2228,7 +2390,7 @@ foreign_account_mutation_count() {
 
   if [[ -n "$TEST_BACKEND" ]]; then
     backend_call foreign-mutation-count "$watermark" "$upper_log_id" "$BRIDGE_ACCOUNT_ID" \
-      "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" "$M_SEAL_REQUEST_ID" "$M_SEAL_LOG_ID" \
+      "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" "$M_SEAL_REQUEST_ID" "$seal_log_id" \
       "$M_RESTORE_REQUEST_ID" "$restore_log_id" "$restore_allow_2xx"
     return
   fi
@@ -2419,7 +2581,8 @@ verify_successful_restore_receipt() {
 
 verify_no_foreign_mutations() {
   local provisional_restore_log_id="${1:-}"
-  (( $# <= 1 )) || return 1
+  local provisional_seal_log_id="${2:-}"
+  (( $# <= 2 )) || return 1
   MAINTENANCE_FOREIGN_FENCE_RESULT="unverifiable"
   local logging_rc=0 runtime_rc=0 sentinel_rc=0 group_rc=0
   verify_maintenance_group_identity "$M_GROUP_ID" || group_rc=$?
@@ -2449,7 +2612,7 @@ verify_no_foreign_mutations() {
     (( sentinel_rc == 2 )) && return 2 || return 1
   fi
   count="$(foreign_account_mutation_count "$M_LOG_WATERMARK" "$fence_log_id" \
-    "$provisional_restore_log_id")" || return 1
+    "$provisional_restore_log_id" "$provisional_seal_log_id")" || return 1
   [[ "$count" =~ ^[0-9]+$ ]] || return 1
   if (( count > 0 )); then
     MAINTENANCE_FOREIGN_FENCE_RESULT="foreign_mutation_confirmed"
@@ -3252,6 +3415,17 @@ validate_maintenance_artifact_identity() {
             MAINTENANCE_IDENTITY_ERROR="maintenance_artifact_phase_conflict"
             return 1
           }
+          ;;
+        SEAL_ACKED)
+          if [[ "$M_AMBIGUITY_PHASE" == SEAL_INTENT &&
+                "$M_AMBIGUITY_REASON" == ownership_seal_response_not_durable_backups_left_open ]]; then
+            :
+          else
+            [[ "$M_AMBIGUITY_PHASE" == SEAL_ACKED ]] || {
+              MAINTENANCE_IDENTITY_ERROR="maintenance_artifact_phase_conflict"
+              return 1
+            }
+          fi
           ;;
         RESTORE_AMBIGUOUS|RESTORE_ACKED)
           [[ "$M_AMBIGUITY_PHASE" =~ ^(RESTORE_INTENT|RESTORE_ACKED|RESTORE_AMBIGUOUS|RESTORED)$ ]] || {
@@ -5076,6 +5250,286 @@ resolve_restore_ambiguity() {
       "$receipt_log_id")"
 }
 
+# Resolve only the seal timeout case where the primary disable completed and
+# both durable log streams prove that exact write, but the synchronous response
+# generation was not persisted. This command never mutates any account.
+resolve_seal_ambiguity() {
+  local action="resolve_seal_ambiguity"
+  discover_group || return 2
+  if [[ ! -e "$MAINTENANCE_FILE" || ! -e "$MAINTENANCE_AMBIGUITY_FILE" ]]; then
+    emit_event "critical" "$action" "seal_ambiguity_artifacts_required" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  fi
+  if ! validate_maintenance_artifact_identity; then
+    reject_maintenance_identity_mismatch "$action"
+    return 2
+  fi
+  local group_rc=0
+  verify_maintenance_group_identity "$M_GROUP_ID" || group_rc=$?
+  (( group_rc == 0 )) || {
+    emit_event "critical" "$action" "maintenance_group_identity_not_proven" \
+      '{"account_writes":0,"artifact_unchanged":true}'
+    return 2
+  }
+  [[ "$M_AMBIGUITY_PHASE" == SEAL_INTENT &&
+     "$M_AMBIGUITY_REASON" == ownership_seal_response_not_durable_backups_left_open ]] || {
+    emit_event "critical" "$action" "seal_ambiguity_sidecar_not_resolvable" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  case "$M_PHASE" in
+    PAUSE_AMBIGUOUS)
+      [[ -n "$M_SEAL_REQUEST_ID" && -z "$M_SEAL_LOG_ID" &&
+         -z "$M_SEAL_RESPONSE_UPDATED_AT" ]] || {
+        emit_event "critical" "$action" "seal_ambiguity_marker_evidence_conflict" \
+          '{"account_writes":0,"operator_action_required":true}'
+        return 2
+      }
+      ;;
+    SEAL_ACKED)
+      [[ -n "$M_SEAL_REQUEST_ID" && "$M_SEAL_LOG_ID" =~ ^[1-9][0-9]*$ &&
+         -n "$M_SEAL_RESPONSE_UPDATED_AT" ]] || {
+        emit_event "critical" "$action" "seal_ambiguity_commit_tail_invalid" \
+          '{"account_writes":0,"operator_action_required":true}'
+        return 2
+      }
+      ;;
+    *)
+      emit_event "critical" "$action" "maintenance_phase_not_resolvable" \
+        "$(printf '{\"phase\":%s,\"account_writes\":0}' "$(json_quote "$M_PHASE")")"
+      return 2
+      ;;
+  esac
+
+  local membership_before membership_after persisted_before committed_state
+  local ambiguity_identity_before ambiguity_identity_after
+  local seal_record seal_check seal_log_id access_at
+  local audit_record audit_check audit_id audit_at audit_latency_ms
+  local tuple_before tuple_after tuple_final pause_occurrences seal_occurrences
+  local receipt_rc=0 primary_rc=0 fence_rc=0
+  persisted_before="$(maintenance_state_line)"
+  ambiguity_identity_before="$M_AMBIGUITY_RUN_ID|$M_AMBIGUITY_PRIMARY_ACCOUNT_ID|$M_AMBIGUITY_GROUP_ID|$M_AMBIGUITY_GROUP_MEMBER_IDS|$M_AMBIGUITY_BACKUP_ACCOUNT_IDS|$M_AMBIGUITY_IDENTITY_DIGEST|$M_AMBIGUITY_PHASE|$M_AMBIGUITY_REASON|$M_AMBIGUITY_CREATED_AT"
+  membership_before="$(maintenance_group_membership_snapshot)" || {
+    emit_event "critical" "$action" "membership_snapshot_unverifiable" '{"account_writes":0}'
+    return 2
+  }
+  [[ "$(loaded_group_member_ids)" == "$M_GROUP_MEMBER_IDS" &&
+     "$(loaded_backup_account_ids)" == "$M_BACKUP_ACCOUNT_IDS" ]] || {
+    emit_event "critical" "$action" "sealed_membership_identity_changed" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  wait_for_backups_ready "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || {
+    emit_event "critical" "$action" "sealed_backups_not_ready" '{"account_writes":0}'
+    return 2
+  }
+  verify_maintenance_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" \
+    "$M_LOG_WATERMARK" || receipt_rc=$?
+  (( receipt_rc == 0 )) || {
+    emit_event "critical" "$action" "pause_receipt_not_uniquely_valid" '{"account_writes":0}'
+    return 2
+  }
+  receipt_rc=0
+  seal_record="$(unique_successful_seal_receipt "$M_SEAL_REQUEST_ID" \
+    "$M_LOG_WATERMARK")" || receipt_rc=$?
+  (( receipt_rc == 0 )) || {
+    emit_event "critical" "$action" "seal_receipt_not_unique_200" '{"account_writes":0}'
+    return 2
+  }
+  IFS='|' read -r seal_log_id access_at <<<"$seal_record"
+  audit_record="$(unique_schedulable_audit_record "$M_SEAL_REQUEST_ID" false)" || {
+    emit_event "critical" "$action" "seal_audit_body_not_uniquely_valid" \
+      '{"account_writes":0}'
+    return 2
+  }
+  IFS='|' read -r audit_id audit_at audit_latency_ms <<<"$audit_record"
+  pause_occurrences="$(maintenance_request_id_occurrences "$M_PAUSE_REQUEST_ID")" || return 2
+  seal_occurrences="$(maintenance_request_id_occurrences "$M_SEAL_REQUEST_ID")" || return 2
+  [[ "$pause_occurrences" == 1 && "$seal_occurrences" == 1 ]] || {
+    emit_event "critical" "$action" "maintenance_request_id_not_unique" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  if [[ "$M_PHASE" == SEAL_ACKED && "$M_SEAL_LOG_ID" != "$seal_log_id" ]]; then
+    emit_event "critical" "$action" "seal_receipt_log_id_conflict" '{"account_writes":0}'
+    return 2
+  fi
+
+  primary_rc=0
+  classify_primary_api_state_drained false || primary_rc=$?
+  (( primary_rc == 0 )) || {
+    emit_event "critical" "$action" "primary_not_active_disabled_and_drained" \
+      '{"account_writes":0}'
+    return 2
+  }
+  tuple_before="$(capture_primary_disabled_tuple)" || {
+    emit_event "critical" "$action" "primary_disabled_tuple_unverifiable" \
+      '{"account_writes":0}'
+    return 2
+  }
+  seal_evidence_chronology_valid "$M_PAUSE_RESPONSE_UPDATED_AT" \
+    "${tuple_before%%|*}" "$audit_at" "$audit_latency_ms" "$access_at" || {
+    emit_event "critical" "$action" "seal_generation_not_bound_to_request_timeline" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  if [[ "$M_PHASE" == SEAL_ACKED &&
+        "${tuple_before%%|*}" != "$M_SEAL_RESPONSE_UPDATED_AT" ]]; then
+    emit_event "critical" "$action" "seal_commit_tail_database_generation_conflict" \
+      '{"account_writes":0}'
+    return 2
+  fi
+  wait_for_account_snapshot "$BRIDGE_ACCOUNT_ID" false \
+    "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" "${tuple_before%%|*}" &&
+  account_snapshot_matches "$BRIDGE_ACCOUNT_ID" false "${tuple_before%%|*}" &&
+  full_account_control_matches "$BRIDGE_ACCOUNT_ID" false "${tuple_before%%|*}" || {
+    emit_event "critical" "$action" "primary_scheduler_generation_not_converged" \
+      '{"account_writes":0}'
+    return 2
+  }
+
+  fence_rc=0
+  if [[ "$M_PHASE" == PAUSE_AMBIGUOUS ]]; then
+    verify_no_foreign_mutations "" "$seal_log_id" || fence_rc=$?
+  else
+    verify_no_foreign_mutations || fence_rc=$?
+  fi
+  (( fence_rc == 0 )) || {
+    emit_event "critical" "$action" "seal_ambiguity_foreign_fence_not_clean" \
+      "$(printf '{\"fence_result\":%s,\"account_writes\":0}' \
+        "$(json_quote "$MAINTENANCE_FOREIGN_FENCE_RESULT")")"
+    return 2
+  }
+  tuple_after="$(capture_primary_disabled_tuple)" || return 2
+  [[ "$tuple_after" == "$tuple_before" ]] || {
+    emit_event "critical" "$action" "primary_tuple_changed_after_first_fence" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  group_rc=0
+  verify_maintenance_group_identity "$M_GROUP_ID" || group_rc=$?
+  (( group_rc == 0 )) || {
+    emit_event "critical" "$action" "maintenance_group_identity_changed_after_first_fence" \
+      '{"account_writes":0,"artifact_unchanged":true}'
+    return 2
+  }
+  membership_after="$(maintenance_group_membership_snapshot)" || return 2
+  [[ "$membership_after" == "$membership_before" ]] || {
+    emit_event "critical" "$action" "maintenance_group_membership_changed" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  wait_for_backups_ready "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || return 2
+  receipt_rc=0
+  seal_check="$(unique_successful_seal_receipt "$M_SEAL_REQUEST_ID" \
+    "$M_LOG_WATERMARK")" || receipt_rc=$?
+  [[ "$receipt_rc" == 0 && "$seal_check" == "$seal_record" ]] || {
+    emit_event "critical" "$action" "seal_receipt_changed_during_resolution" \
+      '{"account_writes":0}'
+    return 2
+  }
+  audit_check="$(unique_schedulable_audit_record "$M_SEAL_REQUEST_ID" false)" || return 2
+  [[ "$audit_check" == "$audit_record" ]] || {
+    emit_event "critical" "$action" "seal_audit_changed_during_resolution" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  receipt_rc=0
+  verify_maintenance_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" \
+    "$M_LOG_WATERMARK" || receipt_rc=$?
+  (( receipt_rc == 0 )) || return 2
+  pause_occurrences="$(maintenance_request_id_occurrences "$M_PAUSE_REQUEST_ID")" || return 2
+  seal_occurrences="$(maintenance_request_id_occurrences "$M_SEAL_REQUEST_ID")" || return 2
+  [[ "$pause_occurrences" == 1 && "$seal_occurrences" == 1 ]] || return 2
+
+  fence_rc=0
+  if [[ "$M_PHASE" == PAUSE_AMBIGUOUS ]]; then
+    verify_no_foreign_mutations "" "$seal_log_id" || fence_rc=$?
+  else
+    verify_no_foreign_mutations || fence_rc=$?
+  fi
+  (( fence_rc == 0 )) || {
+    emit_event "critical" "$action" "seal_ambiguity_final_foreign_fence_not_clean" \
+      "$(printf '{\"fence_result\":%s,\"account_writes\":0}' \
+        "$(json_quote "$MAINTENANCE_FOREIGN_FENCE_RESULT")")"
+    return 2
+  }
+  tuple_final="$(capture_primary_disabled_tuple)" || return 2
+  [[ "$tuple_final" == "$tuple_before" ]] || {
+    emit_event "critical" "$action" "primary_tuple_changed_after_final_fence" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  primary_rc=0
+  classify_primary_api_state_drained false || primary_rc=$?
+  (( primary_rc == 0 )) || return 2
+  seal_evidence_chronology_valid "$M_PAUSE_RESPONSE_UPDATED_AT" \
+    "${tuple_final%%|*}" "$audit_at" "$audit_latency_ms" "$access_at" || return 2
+  account_snapshot_matches "$BRIDGE_ACCOUNT_ID" false "${tuple_before%%|*}" &&
+  full_account_control_matches "$BRIDGE_ACCOUNT_ID" false "${tuple_before%%|*}" || return 2
+  group_rc=0
+  verify_maintenance_group_identity "$M_GROUP_ID" || group_rc=$?
+  (( group_rc == 0 )) || return 2
+  membership_after="$(maintenance_group_membership_snapshot)" || return 2
+  [[ "$membership_after" == "$membership_before" ]] || return 2
+  wait_for_backups_ready "$MAINTENANCE_SNAPSHOT_TIMEOUT_SECONDS" || return 2
+  receipt_rc=0
+  seal_check="$(unique_successful_seal_receipt "$M_SEAL_REQUEST_ID" \
+    "$M_LOG_WATERMARK")" || receipt_rc=$?
+  [[ "$receipt_rc" == 0 && "$seal_check" == "$seal_record" ]] || return 2
+  audit_check="$(unique_schedulable_audit_record "$M_SEAL_REQUEST_ID" false)" || return 2
+  [[ "$audit_check" == "$audit_record" ]] || return 2
+  receipt_rc=0
+  verify_maintenance_receipt "$M_PAUSE_REQUEST_ID" "$M_PAUSE_LOG_ID" \
+    "$M_LOG_WATERMARK" || receipt_rc=$?
+  (( receipt_rc == 0 )) || return 2
+  pause_occurrences="$(maintenance_request_id_occurrences "$M_PAUSE_REQUEST_ID")" || return 2
+  seal_occurrences="$(maintenance_request_id_occurrences "$M_SEAL_REQUEST_ID")" || return 2
+  [[ "$pause_occurrences" == 1 && "$seal_occurrences" == 1 ]] || return 2
+
+  if [[ "$M_PHASE" == PAUSE_AMBIGUOUS ]]; then
+    M_SEAL_LOG_ID="$seal_log_id"
+    M_SEAL_RESPONSE_UPDATED_AT="${tuple_before%%|*}"
+    transition_maintenance_marker PAUSE_AMBIGUOUS SEAL_ACKED "$persisted_before" || {
+      emit_event "critical" "$action" "seal_evidence_transition_failed" \
+        '{"account_writes":0,"retryable":true}'
+      return 2
+    }
+  fi
+  [[ "$M_PHASE" == SEAL_ACKED && "$M_SEAL_LOG_ID" == "$seal_log_id" &&
+     "$M_SEAL_RESPONSE_UPDATED_AT" == "${tuple_before%%|*}" ]] || return 2
+  committed_state="$(maintenance_state_line)"
+  if [[ -n "$TEST_BACKEND" && "$TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT" == 1 ]]; then
+    emit_event "critical" "$action" "test_stop_after_seal_resolution_commit" \
+      '{"account_writes":0,"retryable":true}'
+    return 99
+  fi
+  if ! validate_maintenance_artifact_identity; then
+    emit_event "critical" "$action" "seal_commit_tail_artifact_recheck_failed" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  fi
+  ambiguity_identity_after="$M_AMBIGUITY_RUN_ID|$M_AMBIGUITY_PRIMARY_ACCOUNT_ID|$M_AMBIGUITY_GROUP_ID|$M_AMBIGUITY_GROUP_MEMBER_IDS|$M_AMBIGUITY_BACKUP_ACCOUNT_IDS|$M_AMBIGUITY_IDENTITY_DIGEST|$M_AMBIGUITY_PHASE|$M_AMBIGUITY_REASON|$M_AMBIGUITY_CREATED_AT"
+  [[ "$(maintenance_state_line)" == "$committed_state" &&
+     "$ambiguity_identity_after" == "$ambiguity_identity_before" &&
+     "$M_PHASE" == SEAL_ACKED &&
+     "$M_AMBIGUITY_PHASE" == SEAL_INTENT &&
+     "$M_AMBIGUITY_REASON" == ownership_seal_response_not_durable_backups_left_open ]] || {
+    emit_event "critical" "$action" "seal_commit_tail_artifact_changed_before_cleanup" \
+      '{"account_writes":0,"operator_action_required":true}'
+    return 2
+  }
+  remove_maintenance_ambiguity || {
+    emit_event "critical" "$action" "ambiguity_sidecar_remove_failed" \
+      '{"account_writes":0,"retryable":true}'
+    return 2
+  }
+  emit_event "ok" "$action" "seal_ambiguity_resolved_from_evidence" \
+    "$(printf '{\"seal_log_id\":%s,\"phase\":\"SEAL_ACKED\",\"account_writes\":0,\"evidence_scope\":\"logged_admin_api_and_in_resolution_tuple_stability\"}' \
+      "$seal_log_id")"
+}
+
 status_command() {
   discover_group || return 2
   if [[ -e "$MAINTENANCE_FILE" || -e "$MAINTENANCE_AMBIGUITY_FILE" ]] &&
@@ -5120,17 +5574,17 @@ status_command() {
 }
 
 usage() {
-  printf 'usage: %s {reconcile|status|prepare-maintenance|finish-maintenance|resolve-restore-ambiguity}\n' "$0" >&2
+  printf 'usage: %s {reconcile|status|prepare-maintenance|finish-maintenance|resolve-seal-ambiguity|resolve-restore-ambiguity}\n' "$0" >&2
 }
 
 command="${1:-reconcile}"
 case "$command" in
-  reconcile|status|prepare-maintenance|finish-maintenance|resolve-restore-ambiguity) ;;
+  reconcile|status|prepare-maintenance|finish-maintenance|resolve-seal-ambiguity|resolve-restore-ambiguity) ;;
   *) usage; exit 64 ;;
 esac
 
 case "$command" in
-  prepare-maintenance|finish-maintenance|resolve-restore-ambiguity)
+  prepare-maintenance|finish-maintenance|resolve-seal-ambiguity|resolve-restore-ambiguity)
     if ! "$FLOCK_BIN" --wait "$LOCK_WAIT_SECONDS" 9; then
       emit_event "critical" "$command" "controller_lock_timeout" \
         "$(printf '{"wait_seconds":%s}' "$LOCK_WAIT_SECONDS")"
@@ -5155,5 +5609,6 @@ case "$command" in
   status) status_command ;;
   prepare-maintenance) prepare_maintenance ;;
   finish-maintenance) finish_maintenance ;;
+  resolve-seal-ambiguity) resolve_seal_ambiguity ;;
   resolve-restore-ambiguity) resolve_restore_ambiguity ;;
 esac

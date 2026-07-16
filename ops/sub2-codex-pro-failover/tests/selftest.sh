@@ -92,6 +92,7 @@ append_access_log() {
   local status="$2"
   local path="$3"
   local method="${4:-POST}"
+  local completed_at="${5:-$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')}"
   local primary_receipt=false
   [[ "$method" == POST && "$path" == "/api/v1/admin/accounts/$bridge_id/schedulable" ]] && primary_receipt=true
   if [[ "$primary_receipt" == true && -e "$FAKE_DIR/omit_next_receipt_clean" ]]; then
@@ -117,9 +118,42 @@ append_access_log() {
   for ((i=0; i<copies; i++)); do
     id=$(( $(<"$FAKE_DIR/log_counter") + 1 ))
     printf '%s\n' "$id" >"$FAKE_DIR/log_counter"
-    printf '%s|%s|%s|%s|%s|http.access|http request completed\n' \
-      "$id" "$request_id" "$status" "$path" "$method" >>"$FAKE_DIR/access_logs"
+    printf '%s|%s|%s|%s|%s|http.access|http request completed|%s\n' \
+      "$id" "$request_id" "$status" "$path" "$method" "$completed_at" \
+      >>"$FAKE_DIR/access_logs"
     printf '%s\n' "$(( $(<"$FAKE_DIR/sink_written") + 1 ))" >"$FAKE_DIR/sink_written"
+  done
+}
+
+append_audit_log() {
+  local request_id="$1"
+  local account_id="$2"
+  local desired="$3"
+  local created_at="$4"
+  local latency_ms="${5:-5}"
+  [[ ! -e "$FAKE_DIR/drop_next_audit" ]] || {
+    rm -f "$FAKE_DIR/drop_next_audit"
+    return 0
+  }
+  local copies=1
+  if [[ -e "$FAKE_DIR/duplicate_next_audit" ]]; then
+    rm -f "$FAKE_DIR/duplicate_next_audit"
+    copies=2
+  fi
+  local body="{\"schedulable\":${desired}}"
+  [[ ! -e "$FAKE_DIR/bad_next_audit_body" ]] || {
+    rm -f "$FAKE_DIR/bad_next_audit_body"
+    body='{"schedulable":true}'
+  }
+  local status
+  status="$(cat "$FAKE_DIR/audit_status_override" 2>/dev/null || printf 200)"
+  local i id
+  for ((i=0; i<copies; i++)); do
+    id=$(( $(<"$FAKE_DIR/audit_counter") + 1 ))
+    printf '%s\n' "$id" >"$FAKE_DIR/audit_counter"
+    printf '%s|%s|admin.accounts.schedulable.create|POST|/api/v1/admin/accounts/:id/schedulable|%s|%s|%s|%s|%s\n' \
+      "$id" "$request_id" "$status" "$body" "$account_id" "$created_at" "$latency_ms" \
+      >>"$FAKE_DIR/audit_logs"
   done
 }
 
@@ -497,6 +531,34 @@ PY
       fi
     fi
     generation="$(next_generation "$id")"
+    audit_at=""
+    access_at=""
+    if [[ "$receipted" == true ]]; then
+      chronology_mode=normal
+      if [[ -s "$FAKE_DIR/bad_chronology_on_receipted_call" &&
+            "$receipted_call" == "$(<"$FAKE_DIR/bad_chronology_on_receipted_call")" ]]; then
+        chronology_mode=audit_before_generation
+      fi
+      timeline="$(python3 - "$generation" "$chronology_mode" <<'PY'
+import datetime as dt,sys
+value=sys.argv[1]
+raw=value[:-1]+'+00:00' if value.endswith('Z') else value
+generation=dt.datetime.fromisoformat(raw)
+if sys.argv[2] == 'audit_before_generation':
+    audit=generation-dt.timedelta(milliseconds=1)
+    access=generation+dt.timedelta(milliseconds=7)
+else:
+    audit=generation+dt.timedelta(milliseconds=5)
+    access=generation+dt.timedelta(milliseconds=7)
+def out(value):
+    return value.astimezone(dt.timezone.utc).isoformat(
+        timespec='microseconds').replace('+00:00','Z')
+print(out(audit)+'|'+out(access).replace('Z','000Z'))
+PY
+)"
+      IFS='|' read -r audit_at access_at <<<"$timeline"
+      append_audit_log "$request_id" "$id" "$desired" "$audit_at" 5
+    fi
     if [[ "$id" == "$bridge_id" && -e "$FAKE_DIR/block_after_primary_apply" ]]; then
       touch "$FAKE_DIR/primary_apply_blocked"
       while [[ ! -e "$FAKE_DIR/release_primary_apply" ]]; do sleep 0.05; done
@@ -504,7 +566,8 @@ PY
     if [[ "$receipted" == true || "$requested" == true ]]; then
       receipt_status="$(cat "$FAKE_DIR/receipt_status_override" 2>/dev/null || printf 200)"
       append_access_log "$request_id" "$receipt_status" \
-        "/api/v1/admin/accounts/$id/schedulable"
+        "/api/v1/admin/accounts/$id/schedulable" POST \
+        "${access_at:-$(date -u '+%Y-%m-%dT%H:%M:%S.%6NZ')}"
     fi
     if [[ "$id" == "$bridge_id" && -e "$FAKE_DIR/apply_then_fail" ]]; then
       exit 75
@@ -614,7 +677,13 @@ PY
 
   bump-primary-tuple)
     id="$1"
-    next_generation "$id" >/dev/null
+    generation_override="${2:-}"
+    if [[ -n "$generation_override" ]]; then
+      [[ "$generation_override" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$ ]]
+      printf '%s\n' "$generation_override" >"$FAKE_DIR/meta_generation_$id"
+    else
+      next_generation "$id" >/dev/null
+    fi
     python3 - "$FAKE_DIR/primary_xmin" <<'PY'
 import os,sys,tempfile
 path=sys.argv[1]
@@ -733,6 +802,41 @@ PY
       }
       END {printf "%d|%d|%s\n",count+0,min+0,status}' "$FAKE_DIR/access_logs"
     ;;
+  receipt-evidence-record)
+    request_id="$1"
+    watermark="$2"
+    account_id="$3"
+    awk -F '|' -v request_id="$request_id" -v watermark="$watermark" \
+      -v path="/api/v1/admin/accounts/$account_id/schedulable" '
+      $1>watermark && $2==request_id && $4==path && $5=="POST" &&
+      $6=="http.access" && $7=="http request completed" {
+        count++; if (min==0 || $1<min) min=$1
+        if (status=="" || $3<status) status=$3
+        if (completed=="" || $8<completed) completed=$8
+      }
+      END {printf "%d|%d|%s|%s\n",count+0,min+0,status,completed}' \
+      "$FAKE_DIR/access_logs"
+    ;;
+  audit-receipt-record)
+    request_id="$1"
+    account_id="$2"
+    desired="$3"
+    awk -F '|' -v request_id="$request_id" -v account_id="$account_id" \
+      -v body="{\"schedulable\":${desired}}" '
+      $2==request_id {
+        total++
+        if ($3=="admin.accounts.schedulable.create" && $4=="POST" &&
+            $5=="/api/v1/admin/accounts/:id/schedulable" && $6=="200" &&
+            $7==body && $8==account_id) {
+          exact++
+          if (min==0 || $1<min) {
+            min=$1; created=$9; latency=$10
+          }
+        }
+      }
+      END {printf "%d|%d|%d|%s|%s\n",total+0,exact+0,min+0,created,latency}' \
+      "$FAKE_DIR/audit_logs"
+    ;;
   foreign-mutation-count)
     if [[ -e "$FAKE_DIR/fail_foreign_once_after_primary_paused" ]] &&
        [[ -e "$FAKE_DIR/drain_get_fault_seen" ]] &&
@@ -836,7 +940,9 @@ JSON
   : >"$tmp/events"
   : >"$tmp/controller.log"
   : >"$tmp/access_logs"
+  : >"$tmp/audit_logs"
   printf '0\n' >"$tmp/log_counter"
+  printf '0\n' >"$tmp/audit_counter"
   printf '0\n' >"$tmp/sink_dropped"
   printf '0\n' >"$tmp/sink_failed"
   printf '0\n' >"$tmp/sink_written"
@@ -889,6 +995,9 @@ EOF
     "$tmp/foreign_before_sentinel_path" "$tmp/foreign_before_sentinel_request_id" \
     "$tmp/foreign_before_sentinel_status" "$tmp/foreign_before_sentinel_method" \
     "$tmp/remove_member_before_foreign_sentinel" "$tmp/add_member_before_foreign_sentinel"
+  rm -f "$tmp/drop_next_audit" "$tmp/duplicate_next_audit" \
+    "$tmp/bad_next_audit_body" "$tmp/audit_status_override" \
+    "$tmp/bad_chronology_on_receipted_call"
   rm -f "$tmp/runtime_logging_count" "$tmp/close_backup_on_runtime_logging_call" \
     "$tmp/close_backup_on_first_drain" "$tmp/discover_group_count" \
     "$tmp/flip_group_on_discover_call" "$tmp/flip_group_on_first_drain" \
@@ -912,6 +1021,7 @@ run_controller() {
     FAKE_BRIDGE_ID="${TEST_BRIDGE_ACCOUNT_ID:-7692}" \
     FAILOVER_TEST_BACKEND="$backend" \
     FAILOVER_TEST_FAIL_MAINTENANCE_MARKER_WRITE_NUMBER="${TEST_FAIL_MARKER_WRITE_NUMBER:-0}" \
+    FAILOVER_TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT="${TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT:-0}" \
     MAINTENANCE_TEST_RESPONSE_BARRIER_PREFIX="${TEST_RESPONSE_BARRIER_PREFIX:-}" \
     FAILOVER_STATE_DIR="$tmp/state" \
     FAILOVER_RUNTIME_DIR="$tmp/run" \
@@ -938,6 +1048,7 @@ run_controller() {
     LOCK_WAIT_SECONDS=1 \
     BACKUP_OPEN_PARALLELISM="${TEST_BACKUP_OPEN_PARALLELISM:-4}" \
     SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS=5 \
+    PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS=20 \
     BACKUP_OPEN_BATCH_TIMEOUT_SECONDS=10 \
       bash "$controller" "$command" >>"$tmp/controller.log" 2>&1; then
     return 0
@@ -1054,7 +1165,9 @@ grep -Fq 'RELAY_AVAILABILITY_DETECTION_SECONDS=60' "$service_unit"
 grep -Fq 'RELAY_AVAILABILITY_THRESHOLD=2' "$service_unit"
 grep -Fq 'BACKUP_OPEN_PARALLELISM=4' "$service_unit"
 grep -Fq 'SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS=5' "$service_unit"
+grep -Fq 'PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS=20' "$service_unit"
 grep -Fq 'BACKUP_OPEN_BATCH_TIMEOUT_SECONDS=120' "$service_unit"
+grep -Fxq 'PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS=20' "$env_example"
 grep -Fq 'redis-cli -e --raw' "$controller"
 if ! grep -Fq "AND LOWER(route_source) <> 'probe'" "$controller" ||
    ! grep -Fq "AND LOWER(finals.route_source) <> 'probe'" "$controller"; then
@@ -1905,7 +2018,7 @@ grep -Fq 'readonly MAINTENANCE_DRAIN_SETTLE_SECONDS="${MAINTENANCE_DRAIN_SETTLE_
 grep -Fq "extra->>'path' LIKE '/api/v1/admin/%'" "$controller"
 foreign_contract="$(awk '/^foreign_account_mutation_count\(\)/,/^}/' "$controller")"
 grep -Fq 'id=${M_PAUSE_LOG_ID}' <<<"$foreign_contract"
-grep -Fq 'id=${M_SEAL_LOG_ID}' <<<"$foreign_contract"
+grep -Fq 'id=${seal_log_id}' <<<"$foreign_contract"
 grep -Fq 'local provisional_restore_log_id="${3:-}"' <<<"$foreign_contract"
 if grep -Fq 'request_id IN' <<<"$foreign_contract" ||
    grep -Fq 'c2m-' <<<"$foreign_contract"; then
@@ -2006,6 +2119,19 @@ for invalid_id in 0 +7692 9223372036854775808; do
 done
 grep -Fq 'BRIDGE_ACCOUNT_ID_out_of_bigint_range' "$tmp/invalid-account-id-9223372036854775808.log"
 
+for invalid_primary_timeout in 0 -1 nope; do
+  invalid_timeout_log="$tmp/invalid-primary-timeout-${invalid_primary_timeout//[^0-9]/x}.log"
+  set +e
+  BRIDGE_ACCOUNT_ID=7692 PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS="$invalid_primary_timeout" \
+    bash "$controller" status >"$invalid_timeout_log" 2>&1
+  invalid_timeout_rc=$?
+  set -e
+  assert_eq 3 "$invalid_timeout_rc" \
+    "invalid primary admin timeout $invalid_primary_timeout failed closed"
+  grep -Fq 'PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS_must_be_positive_integer' \
+    "$invalid_timeout_log"
+done
+
 marker_phase() {
   python3 - "$tmp/state/maintenance.json" <<'PY'
 import json,sys
@@ -2032,6 +2158,20 @@ assert_primary_not_written() {
     cat "$tmp/events" >&2
     exit 1
   fi
+}
+
+make_seal_response_ambiguity() {
+  local chronology_mode="${1:-normal}"
+  reset_fixture
+  if [[ "$chronology_mode" == bad ]]; then
+    printf '2\n' >"$tmp/bad_chronology_on_receipted_call"
+  fi
+  printf '2\n' >"$tmp/apply_then_fail_on_receipted_call"
+  expect_controller_failure prepare-maintenance
+  assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" 'seal response loss became sticky ambiguity'
+  test -s "$tmp/state/maintenance-ambiguous.json"
+  assert_eq f "$(member_schedulable 7692)" 'ambiguous seal left primary disabled'
+  assert_eq t "$(member_schedulable 7693)" 'ambiguous seal left standby open'
 }
 
 # Incomplete Redis control-plane evidence never reaches a primary write.
@@ -2109,7 +2249,8 @@ EOF
 printf '2026-07-14T00:00:00.000091Z\n' >"$tmp/meta_generation_7694"
 rotation_events_before="$(wc -l <"$tmp/events")"
 TEST_BRIDGE_ACCOUNT_ID=7693
-for rotated_command in prepare-maintenance finish-maintenance reconcile status; do
+for rotated_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$rotated_command"
   assert_eq "$rotation_events_before" "$(wc -l <"$tmp/events")" \
     "PREPARING config rotation $rotated_command made zero account writes"
@@ -2127,7 +2268,8 @@ assert_eq PREPARING "$(marker_phase)" 'failed pause-intent CAS retained preparin
 assert_eq t "$(member_schedulable 7692)" 'pause-intent CAS failure left primary schedulable'
 sed -i 's/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' "$tmp/members"
 sealed_events_before="$(wc -l <"$tmp/events")"
-for sealed_command in prepare-maintenance finish-maintenance reconcile status; do
+for sealed_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$sealed_command"
   assert_eq "$sealed_events_before" "$(wc -l <"$tmp/events")" \
     "newly eligible unsealed backup $sealed_command made zero account writes"
@@ -2344,7 +2486,8 @@ run_controller prepare-maintenance
 assert_eq OWNED "$(marker_phase)" 'rotation fixture reached owned'
 rotation_events_before="$(wc -l <"$tmp/events")"
 TEST_BRIDGE_ACCOUNT_ID=7693
-for rotated_command in prepare-maintenance finish-maintenance reconcile status; do
+for rotated_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$rotated_command"
   assert_eq "$rotation_events_before" "$(wc -l <"$tmp/events")" \
     "OWNED config rotation $rotated_command made zero account writes"
@@ -2418,7 +2561,8 @@ reset_fixture
 run_controller prepare-maintenance
 sed -i 's/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' "$tmp/members"
 sealed_events_before="$(wc -l <"$tmp/events")"
-for sealed_command in prepare-maintenance finish-maintenance reconcile status; do
+for sealed_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$sealed_command"
   assert_eq "$sealed_events_before" "$(wc -l <"$tmp/events")" \
     "owned unsealed backup $sealed_command made zero account writes"
@@ -2436,7 +2580,8 @@ sed -i 's/7845|\([^|]*\)|inactive|f|t|f/7845|\1|active|f|t|f/' "$tmp/members"
 FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 \
   "$backend" set-schedulable-receipted 7845 true external-new-eligible >/dev/null
 sealed_events_before="$(wc -l <"$tmp/events")"
-for sealed_command in prepare-maintenance finish-maintenance reconcile status; do
+for sealed_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$sealed_command"
   assert_eq "$sealed_events_before" "$(wc -l <"$tmp/events")" \
     "externally opened unsealed backup $sealed_command made zero controller writes"
@@ -2472,7 +2617,8 @@ run_controller prepare-maintenance
 assert_eq EXTERNAL_PAUSED "$(marker_phase)" 'rotation fixture reached external paused'
 rotation_events_before="$(wc -l <"$tmp/events")"
 TEST_BRIDGE_ACCOUNT_ID=7693
-for rotated_command in prepare-maintenance finish-maintenance reconcile status; do
+for rotated_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$rotated_command"
   assert_eq "$rotation_events_before" "$(wc -l <"$tmp/events")" \
     "EXTERNAL_PAUSED config rotation $rotated_command made zero account writes"
@@ -2586,14 +2732,205 @@ assert_eq "$calls_before" "$(<"$tmp/receipted_call_count")" 'poison sidecar prev
 run_controller reconcile
 assert_eq t "$(member_schedulable 7693)" 'sidecar made reconcile hold standby'
 
-# A seal transport error remains ambiguous even when its access receipt exists:
-# ownership requires a normal validated synchronous seal response as well.
-reset_fixture
-printf '2\n' >"$tmp/apply_then_fail_on_receipted_call"
-expect_controller_failure prepare-maintenance
-assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" 'unknown seal outcome became ambiguous'
-assert_eq 2 "$(event_count '^set:7692:false$')" 'seal unknown was not retried'
+# A seal transport timeout can be resolved without any account mutation only
+# when the exact access receipt, audit body, generation timeline, scheduler
+# state, sealed membership, ready standby, and two FIFO fences all agree.
+make_seal_response_ambiguity
+resolver_writes_before="$(wc -l <"$tmp/events")"
+run_controller resolve-seal-ambiguity
+assert_eq SEAL_ACKED "$(marker_phase)" 'seal ambiguity resolver adopted exact durable evidence'
+test ! -e "$tmp/state/maintenance-ambiguous.json"
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'seal ambiguity resolver made zero account writes'
+python3 - "$tmp/state/maintenance.json" <<'PY'
+import json,sys
+p=json.load(open(sys.argv[1],encoding='utf-8'))
+assert p['seal_log_id']
+assert p['seal_response_updated_at']
+assert p['phase'] == 'SEAL_ACKED'
+PY
+run_controller prepare-maintenance
+assert_eq OWNED "$(marker_phase)" 'resolved seal continued through normal ownership proof'
+run_controller finish-maintenance
+
+# A failed final marker compare-and-swap leaves both artifacts byte-identical
+# and still performs no account write.
+make_seal_response_ambiguity
+resolver_marker_hash="$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')"
+resolver_sidecar_hash="$(sha256sum "$tmp/state/maintenance-ambiguous.json" | awk '{print $1}')"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+TEST_FAIL_MARKER_WRITE_NUMBER=1
+expect_controller_failure resolve-seal-ambiguity
+unset TEST_FAIL_MARKER_WRITE_NUMBER
+assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" 'resolver marker CAS failure kept ambiguous phase'
+assert_eq "$resolver_marker_hash" "$(sha256sum "$tmp/state/maintenance.json" | awk '{print $1}')" \
+  'resolver marker CAS failure left marker byte-identical'
+assert_eq "$resolver_sidecar_hash" \
+  "$(sha256sum "$tmp/state/maintenance-ambiguous.json" | awk '{print $1}')" \
+  'resolver marker CAS failure left sidecar byte-identical'
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'resolver marker CAS failure made zero account writes'
+
+# If the process stops after the marker CAS but before sidecar deletion, a
+# second invocation recognizes only the strict SEAL_ACKED/SEAL_INTENT commit
+# tail, repeats the full proof, and removes the sidecar without another write.
+make_seal_response_ambiguity
+resolver_writes_before="$(wc -l <"$tmp/events")"
+TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT=1
+expect_controller_failure resolve-seal-ambiguity
+unset TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT
+assert_eq SEAL_ACKED "$(marker_phase)" 'resolver crash tail retained committed seal marker'
 test -s "$tmp/state/maintenance-ambiguous.json"
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'resolver commit-tail stop made zero account writes'
+run_controller resolve-seal-ambiguity
+test ! -e "$tmp/state/maintenance-ambiguous.json"
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'resolver commit-tail retry made zero account writes'
+
+# A commit-tail sidecar changed after the marker CAS is never cleaned up.
+make_seal_response_ambiguity
+TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT=1
+expect_controller_failure resolve-seal-ambiguity
+unset TEST_STOP_AFTER_SEAL_RESOLUTION_COMMIT
+python3 - "$tmp/state/maintenance-ambiguous.json" <<'PY'
+import json,os,sys,tempfile
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['reason']='ownership_seal_receipt_timeout_backups_left_open'
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='sidecar.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(p,f,sort_keys=True); f.write('\n')
+os.replace(tmp,path)
+PY
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq SEAL_ACKED "$(marker_phase)" 'tampered commit tail retained seal ack'
+test -s "$tmp/state/maintenance-ambiguous.json"
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'tampered commit tail caused zero resolver writes'
+
+# Every ambiguous or conflicting evidence variant is fail-closed, leaves both
+# artifacts intact, and performs no account mutation.
+make_seal_response_ambiguity
+duplicate_audit_row="$(grep -m1 -- '-seal|' "$tmp/audit_logs")"
+printf '%s\n' "$duplicate_audit_row" >>"$tmp/audit_logs"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq PAUSE_AMBIGUOUS "$(marker_phase)" 'duplicate seal audit stayed ambiguous'
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'duplicate seal audit caused zero resolver writes'
+
+make_seal_response_ambiguity
+sed -i '/-seal|/d' "$tmp/audit_logs"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'missing seal audit caused zero resolver writes'
+
+make_seal_response_ambiguity
+duplicate_access_row="$(grep -m1 -- '-seal|' "$tmp/access_logs")"
+printf '%s\n' "$duplicate_access_row" >>"$tmp/access_logs"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'duplicate seal access receipt caused zero resolver writes'
+
+make_seal_response_ambiguity
+sed -i '/-seal|/d' "$tmp/access_logs"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'missing seal access receipt caused zero resolver writes'
+
+make_seal_response_ambiguity
+sed -i '/-seal/s/|200|/|500|/' "$tmp/access_logs"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'non-200 seal receipt caused zero resolver writes'
+
+make_seal_response_ambiguity
+sed -i '/-seal/s/{\"schedulable\":false}/{\"schedulable\":true}/' "$tmp/audit_logs"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'wrong seal audit body caused zero resolver writes'
+
+make_seal_response_ambiguity
+FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 "$backend" inject-foreign 7693 true >/dev/null
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'foreign admin write caused zero resolver writes'
+
+make_seal_response_ambiguity
+touch "$tmp/primary_busy"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'busy primary caused zero resolver writes'
+
+make_seal_response_ambiguity
+FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 "$backend" set-schedulable 7693 false >/dev/null
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq f "$(member_schedulable 7693)" 'resolver never reopened unavailable standby'
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'missing standby readiness caused zero resolver writes'
+
+make_seal_response_ambiguity bad
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'invalid seal chronology caused zero resolver writes'
+
+make_seal_response_ambiguity
+FAKE_DIR="$tmp" FAKE_BRIDGE_ID=7692 "$backend" bump-primary-tuple 7692 \
+  2026-07-14T00:00:01.000000Z >/dev/null
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'post-evidence primary tuple change caused zero resolver writes'
+
+make_seal_response_ambiguity
+printf '2026-07-14T00:00:00.999999Z\n' >"$tmp/cache_generation_override_7692"
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'stale Redis account generation caused zero resolver writes'
+
+make_seal_response_ambiguity
+python3 - "$tmp/state/maintenance-ambiguous.json" <<'PY'
+import json,os,sys,tempfile
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['reason']='ownership_seal_receipt_timeout_backups_left_open'
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='sidecar.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(p,f,sort_keys=True); f.write('\n')
+os.replace(tmp,path)
+PY
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'tampered sidecar reason caused zero resolver writes'
+
+make_seal_response_ambiguity
+python3 - "$tmp/state/maintenance-ambiguous.json" <<'PY'
+import json,os,sys,tempfile
+path=sys.argv[1]
+p=json.load(open(path,encoding='utf-8'))
+p['phase']='PAUSE_ACKED'
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix='sidecar.')
+with os.fdopen(fd,'w',encoding='utf-8') as f:
+    json.dump(p,f,sort_keys=True); f.write('\n')
+os.replace(tmp,path)
+PY
+resolver_writes_before="$(wc -l <"$tmp/events")"
+expect_controller_failure resolve-seal-ambiguity
+assert_eq "$resolver_writes_before" "$(wc -l <"$tmp/events")" \
+  'tampered sidecar phase caused zero resolver writes'
 
 # A pre-pause foreign-log read outage is retryable because no primary write was
 # issued. It keeps PREPARING and can continue once the exact window is readable.
@@ -2726,22 +3063,33 @@ for foreign_path in \
   test ! -e "$tmp/state/maintenance-ambiguous.json"
   python3 - "$tmp/state/maintenance.json" "$tmp/access_logs" \
     "$tmp/controller.log" "$foreign_path" <<'PY'
-import json,sys
+import datetime as dt,json,re,sys
 marker_path,logs_path,controller_log,expected_path=sys.argv[1:]
 marker=json.load(open(marker_path,encoding='utf-8'))
+def parse_stamp(value):
+    value=re.sub(r'(\.[0-9]{6})[0-9]+(?=Z|[+-][0-9]{2}:[0-9]{2}$)',
+                 r'\1',value)
+    stamp=dt.datetime.fromisoformat(value[:-1]+'+00:00'
+                                   if value.endswith('Z') else value)
+    assert stamp.tzinfo is not None
+    return stamp.astimezone(dt.timezone.utc)
 rows=[line.rstrip('\n').split('|') for line in open(logs_path,encoding='utf-8')]
 matches=[i for i,row in enumerate(rows)
-         if len(row)>=7 and row[1]=='foreign-before-fence']
+         if len(row)>=8 and row[1]=='foreign-before-fence']
 assert len(matches)==1
 i=matches[0]
 foreign=rows[i]
-assert foreign[2:] == ['200',expected_path,'POST','http.access','http request completed']
+assert foreign[2:7] == ['200',expected_path,'POST','http.access','http request completed']
+foreign_at=parse_stamp(foreign[7])
 assert int(foreign[0]) > marker['log_watermark']
 assert i+1 < len(rows)
 sentinel=rows[i+1]
 assert int(sentinel[0]) == int(foreign[0])+1
-assert sentinel[2:] == ['200','/api/v1/admin/ops/system-logs/health','GET',
-                       'http.access','http request completed']
+assert sentinel[2:7] == ['200','/api/v1/admin/ops/system-logs/health','GET',
+                         'http.access','http request completed']
+assert len(sentinel) >= 8
+sentinel_at=parse_stamp(sentinel[7])
+assert foreign_at <= sentinel_at
 events=[]
 for line in open(controller_log,encoding='utf-8'):
     try:
@@ -3307,7 +3655,8 @@ test -s "$tmp/state/maintenance-ambiguous.json"
 rm -f "$tmp/state/maintenance.json"
 rotation_events_before="$(wc -l <"$tmp/events")"
 TEST_BRIDGE_ACCOUNT_ID=7693
-for rotated_command in prepare-maintenance finish-maintenance reconcile status; do
+for rotated_command in prepare-maintenance finish-maintenance reconcile status \
+    resolve-seal-ambiguity; do
   expect_controller_failure "$rotated_command"
   assert_eq "$rotation_events_before" "$(wc -l <"$tmp/events")" \
     "sidecar config rotation $rotated_command made zero account writes"
@@ -3349,7 +3698,7 @@ open(path,'w',encoding='utf-8').write(json.dumps(p,sort_keys=True)+'\n')
 PY
   identity_events_before="$(wc -l <"$tmp/events")"
   for identity_command in prepare-maintenance finish-maintenance reconcile status \
-      resolve-restore-ambiguity; do
+      resolve-seal-ambiguity resolve-restore-ambiguity; do
     expect_controller_failure "$identity_command"
     assert_eq "$identity_events_before" "$(wc -l <"$tmp/events")" \
       "marker/sidecar $identity_conflict conflict $identity_command made zero account writes"
@@ -3439,7 +3788,8 @@ payload={
 open(path,'w',encoding='utf-8').write(json.dumps(payload,sort_keys=True)+'\n')
 PY
   legacy_events_before="$(wc -l <"$tmp/events")"
-  for legacy_command in prepare-maintenance finish-maintenance reconcile status; do
+  for legacy_command in prepare-maintenance finish-maintenance reconcile status \
+      resolve-seal-ambiguity; do
     expect_controller_failure "$legacy_command"
     assert_eq "$legacy_events_before" "$(wc -l <"$tmp/events")" \
       "marker schema $schema_version $legacy_command made zero account writes"
@@ -3464,7 +3814,8 @@ payload={
 open(path,'w',encoding='utf-8').write(json.dumps(payload,sort_keys=True)+'\n')
 PY
   legacy_events_before="$(wc -l <"$tmp/events")"
-  for legacy_command in prepare-maintenance finish-maintenance reconcile status; do
+  for legacy_command in prepare-maintenance finish-maintenance reconcile status \
+      resolve-seal-ambiguity; do
     expect_controller_failure "$legacy_command"
     assert_eq "$legacy_events_before" "$(wc -l <"$tmp/events")" \
       "sidecar schema $schema_version $legacy_command made zero account writes"

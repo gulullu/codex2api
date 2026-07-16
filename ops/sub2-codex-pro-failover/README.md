@@ -50,8 +50,8 @@ all traffic.
   count, status, and deletion state are re-read before each batch so an
   operator-paused, removed, shared, or newly inactive account is skipped before
   submission.
-  Schedulability writes run in bounded batches of four, each local admin request
-  has a five-second timeout, and the full submission phase has a 120-second
+  Standby schedulability writes run in bounded batches of four, each ordinary
+  local admin request has a five-second timeout, and the full submission phase has a 120-second
   deadline inside the 175-second service budget. A slow or failed early account
   therefore cannot serialize and hide a later healthy standby. The batch reuses
   one read-only credential header, gives every child a separate response file,
@@ -405,6 +405,57 @@ artifact causes a read-only operator-required abort with zero account writes.
 Such artifacts are never upgraded into ownership or passed through generic
 lost-state recovery.
 
+One narrowly defined seal timeout has an explicit evidence-backed recovery
+path; it is never used automatically by `prepare-maintenance`:
+
+```bash
+sub2-codex-pro-failover resolve-seal-ambiguity
+sub2-codex-pro-failover prepare-maintenance
+```
+
+The command accepts only a schema-v7 marker in `PAUSE_AMBIGUOUS` plus the
+identity-matched schema-v3 sidecar whose original phase is `SEAL_INTENT` and
+whose reason is exactly
+`ownership_seal_response_not_durable_backups_left_open`. It issues no account
+write and never opens a standby. The resolver requires the already recorded
+pause receipt, one exact HTTP 200 seal access receipt, one exact
+`audit_logs` row whose action, route, account id and request body prove
+`schedulable=false`, and exactly one occurrence of both maintenance request
+ids. The adopted PostgreSQL generation must be strictly later than the pause
+generation, no later than the audit row, and close enough to the audit row to
+fit that row's measured request latency plus a one-second clock/commit
+tolerance. The access completion must be no earlier than the audit row.
+
+The primary must remain active, unschedulable and at zero concurrency. Its
+PostgreSQL `updated_at/xmin`, Redis full-account generation, scheduler snapshot,
+sealed group/member identity, ready standby proof, sub2 incarnation,
+unsampled info/debug logging and sink counters must agree across two FIFO
+foreign-write fences. Seal and audit records are reread after each fence and
+must return the identical structured evidence tuple. Any duplicate, missing,
+non-200, malformed, chronologically impossible, foreign-write, membership,
+tuple, cache, runtime, logging or sink evidence leaves the marker and sidecar
+unchanged.
+
+This proof covers the supported sub2 admin API path and any database tuple
+change that occurs while the resolver is running. Admin API writes are ordered
+behind the FIFO sentinels and therefore appear as foreign access records unless
+they are the one exact pause or seal receipt. The current audit/access schemas
+do not contain the response `updated_at` or PostgreSQL `xmin`, so a privileged
+actor who bypasses the API and directly changes the account row before the
+resolver starts, emits no access/audit record, and leaves `updated_at` inside
+the original seal latency window is not distinguishable from the seal write.
+Direct database edits are therefore unsupported while a maintenance marker or
+ambiguity sidecar exists; operators must not run this resolver after such an
+out-of-band edit. The success event records this evidence scope explicitly.
+
+Only the final marker compare-and-swap records `seal_log_id` and
+`seal_response_updated_at` and advances to `SEAL_ACKED`; the sidecar is removed
+after a final on-disk identity reread. If the process stops between those two
+durable operations, the only accepted retry shape is the exact
+`SEAL_ACKED` marker plus the original `SEAL_INTENT` sidecar and reason. The
+resolver repeats the complete read-only proof, then removes the sidecar. No
+other phase/reason pair is adopted.
+
 `RESTORE_AMBIGUOUS` has one explicit evidence-backed recovery path; it is never
 used automatically by `finish-maintenance`:
 
@@ -455,6 +506,13 @@ the primary drain proof has a 600-second budget followed by a 10-second deferred
 settle interval and a second 600-second proof. These maintenance budgets cover
 observed in-flight requests, scheduler convergence, and async-log propagation
 without slowing the 10-second recurring failover loop.
+
+Ordinary sub2 admin calls retain the five-second
+`SUB2_ADMIN_REQUEST_TIMEOUT_SECONDS` default. Only maintenance-owned primary
+pause/seal/restore calls use the separate
+`PRIMARY_ADMIN_REQUEST_TIMEOUT_SECONDS` default of 20 seconds. This absorbs
+observed primary admin latency without slowing standby batches or timer
+reconciliation.
 
 Scheduler convergence is deliberately asymmetric. Standby protection is not
 accepted until every current ready bucket exposes at least one active account
