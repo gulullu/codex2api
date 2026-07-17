@@ -1639,9 +1639,19 @@ func TestSafePoolRuntimeSnapshotReportsAggregateState(t *testing.T) {
 	t.Setenv(safePoolMaxSlotsEnv, "71")
 	t.Setenv(safePoolWaitMillisEnv, "333")
 	t.Setenv(safePoolFenceMillisEnv, "111")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "10000")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "2")
+	t.Setenv(continuationGlobalLimitEnv, "17")
+	t.Setenv(continuationPerAccountLimitEnv, "3")
 
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
+	admission := currentSafePoolOwnerAdmissionConfig()
+	if manager.admitSafePoolOwner(4401, "runtime-owner-A", admission) != safePoolOwnerAdmittedNew ||
+		manager.admitSafePoolOwner(4401, "runtime-owner-B", admission) != safePoolOwnerAdmittedNew {
+		t.Fatal("failed to seed runtime owner admission gauges")
+	}
+	t.Setenv(safePoolOwnerSampleBPSEnv, "7")
 	account := &auth.Account{DBID: 4401, Tags: []string{safePoolAccountTag}}
 	idle, _ := newTestSlotConnection(manager, account, "wss://example.test/responses", "runtime-idle")
 	idle.safeReusable.Store(true)
@@ -1671,6 +1681,16 @@ func TestSafePoolRuntimeSnapshotReportsAggregateState(t *testing.T) {
 	if snapshot.ConfiguredMaxSlots != 71 || snapshot.WaitMillis != 333 || snapshot.ReuseFenceMillis != 111 {
 		t.Fatalf("tuning snapshot = slots:%d wait:%d fence:%d, want 71/333/111", snapshot.ConfiguredMaxSlots, snapshot.WaitMillis, snapshot.ReuseFenceMillis)
 	}
+	if snapshot.OwnerSampleBPS != 7 || snapshot.OwnerBudgetPerAccount != 2 ||
+		!snapshot.OwnerAdmissionConfigValid || !snapshot.OwnerAdmissionSaltReady {
+		t.Fatalf("owner guard config snapshot = sample:%d budget:%d valid:%v salt:%v", snapshot.OwnerSampleBPS, snapshot.OwnerBudgetPerAccount, snapshot.OwnerAdmissionConfigValid, snapshot.OwnerAdmissionSaltReady)
+	}
+	if snapshot.AdmittedOwners != 2 || snapshot.AdmittedOwnerAccounts != 1 || snapshot.OwnerBudgetOvercommitted != 0 {
+		t.Fatalf("owner guard gauges = owners:%d accounts:%d over:%d, want 2/1/0", snapshot.AdmittedOwners, snapshot.AdmittedOwnerAccounts, snapshot.OwnerBudgetOvercommitted)
+	}
+	if snapshot.ContinuationGlobalLimit != 17 || snapshot.ContinuationPerAccountLimit != 3 {
+		t.Fatalf("continuation limits = global:%d account:%d, want 17/3", snapshot.ContinuationGlobalLimit, snapshot.ContinuationPerAccountLimit)
+	}
 	if snapshot.Connections != 2 || snapshot.ActiveConnections != 1 || snapshot.IdleConnections != 1 || snapshot.BoundIdleConnections != 1 {
 		t.Fatalf("connection snapshot = total:%d active:%d idle:%d bound-idle:%d, want 2/1/1/1", snapshot.Connections, snapshot.ActiveConnections, snapshot.IdleConnections, snapshot.BoundIdleConnections)
 	}
@@ -1680,7 +1700,7 @@ func TestSafePoolRuntimeSnapshotReportsAggregateState(t *testing.T) {
 	if snapshot.FusedAccounts != 1 || snapshot.CompatibilityFusedAccounts != 1 || snapshot.TrackedAccounts != 1 {
 		t.Fatalf("account snapshot = fused:%d compatibility:%d tracked:%d, want 1/1/1", snapshot.FusedAccounts, snapshot.CompatibilityFusedAccounts, snapshot.TrackedAccounts)
 	}
-	if snapshot.Metrics.DialAttempts != 3 || snapshot.Metrics.ReuseHits != 2 {
-		t.Fatalf("metrics snapshot = %+v, want dial_attempts=3 reuse_hits=2", snapshot.Metrics)
+	if snapshot.Metrics.DialAttempts != 3 || snapshot.Metrics.ReuseHits != 2 || snapshot.Metrics.OwnerAdmittedNew != 2 {
+		t.Fatalf("metrics snapshot = %+v, want dial_attempts=3 reuse_hits=2 owner_admitted_new=2", snapshot.Metrics)
 	}
 }

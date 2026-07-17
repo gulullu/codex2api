@@ -22,6 +22,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/proxy/wsrelay"
 	"github.com/gin-gonic/gin"
 )
 
@@ -908,6 +909,73 @@ func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 	}
 	if got := payload.Logs[0].Endpoint; got != "/v1/log-000" {
 		t.Fatalf("endpoint = %q, want /v1/log-000", got)
+	}
+}
+
+func TestRuntimeWebsocketResponseMapsOwnerAdmissionGuardrails(t *testing.T) {
+	snapshot := wsrelay.SafePoolRuntime{
+		OwnerSampleBPS:              1,
+		OwnerBudgetPerAccount:       2,
+		OwnerAdmissionConfigValid:   true,
+		OwnerAdmissionSaltReady:     true,
+		AdmittedOwners:              3,
+		AdmittedOwnerAccounts:       4,
+		OwnerBudgetOvercommitted:    5,
+		ContinuationGlobalLimit:     6,
+		ContinuationPerAccountLimit: 7,
+		Metrics: wsrelay.SafePoolMetrics{
+			OwnerAdmittedNew:      8,
+			OwnerAdmittedExisting: 9,
+			OwnerSampleRejected:   10,
+			OwnerBudgetRejected:   11,
+			OwnerOneShotFallbacks: 12,
+			OwnerConfigErrors:     13,
+			ContinuationEvictions: 14,
+		},
+	}
+	got := runtimeWebsocketResponseFromSnapshot(snapshot)
+	if got.OwnerSampleBPS != 1 || got.OwnerBudgetPerAccount != 2 ||
+		!got.OwnerAdmissionConfigValid || !got.OwnerAdmissionSaltReady ||
+		got.AdmittedOwners != 3 || got.AdmittedOwnerAccounts != 4 ||
+		got.OwnerBudgetOvercommitted != 5 || got.ContinuationGlobalLimit != 6 ||
+		got.ContinuationPerAccountLimit != 7 {
+		t.Fatalf("owner guard response = %+v", got)
+	}
+	if got.OwnerAdmittedNew != 8 || got.OwnerAdmittedExisting != 9 ||
+		got.OwnerSampleRejected != 10 || got.OwnerBudgetRejected != 11 ||
+		got.OwnerOneShotFallbacks != 12 || got.OwnerConfigErrors != 13 ||
+		got.ContinuationEvictions != 14 {
+		t.Fatalf("owner guard counters = %+v", got)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal websocket runtime response: %v", err)
+	}
+	var fields map[string]interface{}
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatalf("decode websocket runtime response: %v", err)
+	}
+	for _, name := range []string{
+		"owner_sample_bps",
+		"owner_budget_per_account",
+		"owner_admission_config_valid",
+		"owner_admission_salt_ready",
+		"admitted_owners",
+		"admitted_owner_accounts",
+		"owner_budget_overcommitted_accounts",
+		"continuation_global_limit",
+		"continuation_per_account_limit",
+		"owner_admitted_new",
+		"owner_admitted_existing",
+		"owner_sample_rejected",
+		"owner_budget_rejected",
+		"owner_oneshot_fallbacks",
+		"owner_config_errors",
+		"continuation_evictions",
+	} {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("runtime websocket JSON missing %q: %s", name, encoded)
+		}
 	}
 }
 

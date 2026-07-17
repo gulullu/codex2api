@@ -458,6 +458,17 @@ type Manager struct {
 	safePoolOwnerMissing           atomic.Uint64
 	safePoolOwnerRejected          atomic.Uint64
 	safePoolRequestIneligible      atomic.Uint64
+	safePoolOwnerAdmittedNew       atomic.Uint64
+	safePoolOwnerAdmittedExisting  atomic.Uint64
+	safePoolOwnerSampleRejected    atomic.Uint64
+	safePoolOwnerBudgetRejected    atomic.Uint64
+	safePoolOwnerOneShotFallbacks  atomic.Uint64
+	safePoolOwnerConfigErrors      atomic.Uint64
+	continuationBudgetEvictions    atomic.Uint64
+	ownerAdmissionMu               sync.Mutex
+	safePoolAdmittedOwners         map[int64]map[string]struct{}
+	ownerAdmissionSalt             [32]byte
+	ownerAdmissionSaltValid        bool
 
 	// response_id -> 连接 绑定（续链亲和）。上游 chatgpt backend 无服务端存储时，
 	// previous_response_id 的上下文只存活在产生该响应的那条 WS 连接里；带续链 ID
@@ -497,6 +508,7 @@ type Manager struct {
 	afterReplacementRemoved        func(key string)
 	beforeCapacityEviction         func()
 	beforeContinuationRevalidation func(wc *WsConnection)
+	beforeOwnerAdmissionCommit     func()
 }
 
 var ErrManagerStopped = errors.New("websocket manager stopped")
@@ -577,6 +589,7 @@ var wsWriteBufferPool = &sync.Pool{}
 func NewManager() *Manager {
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	continuationGlobalLimit, continuationPerAccountLimit := continuationSocketLimitsFromEnv()
+	ownerAdmissionSalt, ownerAdmissionSaltValid := newSafePoolOwnerSampleSalt()
 	m := &Manager{
 		dialer: &websocket.Dialer{
 			HandshakeTimeout:  HandshakeTimeout,
@@ -596,6 +609,8 @@ func NewManager() *Manager {
 		stopCancel:                  stopCancel,
 		continuationGlobalLimit:     continuationGlobalLimit,
 		continuationPerAccountLimit: continuationPerAccountLimit,
+		ownerAdmissionSalt:          ownerAdmissionSalt,
+		ownerAdmissionSaltValid:     ownerAdmissionSaltValid,
 	}
 
 	// 启动后台清理
@@ -696,6 +711,9 @@ func (m *Manager) Stop() {
 		// before the sweep is important because Session.Close is not a terminal
 		// admission gate: closing first could otherwise be followed by AddPending.
 		m.closeAll()
+		m.ownerAdmissionMu.Lock()
+		m.safePoolAdmittedOwners = nil
+		m.ownerAdmissionMu.Unlock()
 	})
 }
 
@@ -1332,6 +1350,7 @@ func (m *Manager) discardContinuationBudgetCandidate(
 	if !removed {
 		return false
 	}
+	m.continuationBudgetEvictions.Add(1)
 	if wc.session != nil {
 		wc.session.Close()
 	}

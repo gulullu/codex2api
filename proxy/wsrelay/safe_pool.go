@@ -93,6 +93,13 @@ type SafePoolMetrics struct {
 	OwnerMissing           uint64
 	OwnerRejected          uint64
 	RequestIneligible      uint64
+	OwnerAdmittedNew       uint64
+	OwnerAdmittedExisting  uint64
+	OwnerSampleRejected    uint64
+	OwnerBudgetRejected    uint64
+	OwnerOneShotFallbacks  uint64
+	OwnerConfigErrors      uint64
+	ContinuationEvictions  uint64
 }
 
 // SafePoolRuntime is an approximate, read-only process snapshot for rollout
@@ -100,22 +107,31 @@ type SafePoolMetrics struct {
 // move while the snapshot is collected and therefore must not be used as a
 // synchronization primitive.
 type SafePoolRuntime struct {
-	Metrics                    SafePoolMetrics
-	GlobalOneShot              bool
-	Scope                      string
-	ConfiguredMaxSlots         int
-	WaitMillis                 int64
-	ReuseFenceMillis           int64
-	Connections                int
-	ActiveConnections          int
-	IdleConnections            int
-	BoundIdleConnections       int
-	RetiringConnections        int
-	PendingDials               int
-	ResponseBindings           int
-	FusedAccounts              int
-	CompatibilityFusedAccounts int
-	TrackedAccounts            int
+	Metrics                     SafePoolMetrics
+	GlobalOneShot               bool
+	Scope                       string
+	ConfiguredMaxSlots          int
+	WaitMillis                  int64
+	ReuseFenceMillis            int64
+	Connections                 int
+	ActiveConnections           int
+	IdleConnections             int
+	BoundIdleConnections        int
+	RetiringConnections         int
+	PendingDials                int
+	ResponseBindings            int
+	FusedAccounts               int
+	CompatibilityFusedAccounts  int
+	TrackedAccounts             int
+	OwnerSampleBPS              int
+	OwnerBudgetPerAccount       int
+	OwnerAdmissionConfigValid   bool
+	OwnerAdmissionSaltReady     bool
+	AdmittedOwners              int
+	AdmittedOwnerAccounts       int
+	OwnerBudgetOvercommitted    int
+	ContinuationGlobalLimit     int
+	ContinuationPerAccountLimit int
 }
 
 func (m *Manager) SafePoolMetricsSnapshot() SafePoolMetrics {
@@ -135,18 +151,29 @@ func (m *Manager) SafePoolMetricsSnapshot() SafePoolMetrics {
 		OwnerMissing:           m.safePoolOwnerMissing.Load(),
 		OwnerRejected:          m.safePoolOwnerRejected.Load(),
 		RequestIneligible:      m.safePoolRequestIneligible.Load(),
+		OwnerAdmittedNew:       m.safePoolOwnerAdmittedNew.Load(),
+		OwnerAdmittedExisting:  m.safePoolOwnerAdmittedExisting.Load(),
+		OwnerSampleRejected:    m.safePoolOwnerSampleRejected.Load(),
+		OwnerBudgetRejected:    m.safePoolOwnerBudgetRejected.Load(),
+		OwnerOneShotFallbacks:  m.safePoolOwnerOneShotFallbacks.Load(),
+		OwnerConfigErrors:      m.safePoolOwnerConfigErrors.Load(),
+		ContinuationEvictions:  m.continuationBudgetEvictions.Load(),
 	}
 }
 
 // SafePoolRuntimeSnapshot exposes only aggregate transport state. It never
 // returns account IDs, API keys, owner keys, response IDs, or fuse reasons.
 func (m *Manager) SafePoolRuntimeSnapshot() SafePoolRuntime {
+	ownerConfig := currentSafePoolOwnerAdmissionConfig()
 	snapshot := SafePoolRuntime{
-		GlobalOneShot:      statelessOneShotEnabled(),
-		Scope:              strings.ToLower(strings.TrimSpace(os.Getenv(safePoolScopeEnv))),
-		ConfiguredMaxSlots: configuredSafePoolSlots(nil),
-		WaitMillis:         durationFromMillisEnv(safePoolWaitMillisEnv, defaultSafePoolWait, minimumSafePoolWait, maximumSafePoolWait).Milliseconds(),
-		ReuseFenceMillis:   durationFromMillisEnv(safePoolFenceMillisEnv, defaultSafePoolReuseFence, minimumSafePoolReuseFence, maximumSafePoolReuseFence).Milliseconds(),
+		GlobalOneShot:             statelessOneShotEnabled(),
+		Scope:                     strings.ToLower(strings.TrimSpace(os.Getenv(safePoolScopeEnv))),
+		ConfiguredMaxSlots:        configuredSafePoolSlots(nil),
+		WaitMillis:                durationFromMillisEnv(safePoolWaitMillisEnv, defaultSafePoolWait, minimumSafePoolWait, maximumSafePoolWait).Milliseconds(),
+		ReuseFenceMillis:          durationFromMillisEnv(safePoolFenceMillisEnv, defaultSafePoolReuseFence, minimumSafePoolReuseFence, maximumSafePoolReuseFence).Milliseconds(),
+		OwnerSampleBPS:            ownerConfig.sampleBPS,
+		OwnerBudgetPerAccount:     ownerConfig.budget,
+		OwnerAdmissionConfigValid: ownerConfig.valid,
 	}
 	if snapshot.Scope == "" {
 		snapshot.Scope = "disabled"
@@ -155,6 +182,10 @@ func (m *Manager) SafePoolRuntimeSnapshot() SafePoolRuntime {
 		return snapshot
 	}
 	snapshot.Metrics = m.SafePoolMetricsSnapshot()
+	snapshot.OwnerAdmissionSaltReady = m.ownerAdmissionSaltValid
+	snapshot.ContinuationGlobalLimit = m.continuationGlobalLimit
+	snapshot.ContinuationPerAccountLimit = m.continuationPerAccountLimit
+	snapshot.AdmittedOwners, snapshot.AdmittedOwnerAccounts, snapshot.OwnerBudgetOvercommitted = m.safePoolOwnerAdmissionSnapshot(ownerConfig.budget)
 
 	boundSafeConnections := make(map[*WsConnection]struct{})
 	now := time.Now()

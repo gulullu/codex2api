@@ -295,6 +295,8 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 func TestOfficialPromptCacheRequestEntersSafeOwnerPool(t *testing.T) {
 	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
 	t.Setenv(safePoolScopeEnv, "all")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "10000")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "10000")
 	t.Setenv(safePoolFenceMillisEnv, "10")
 	var handshakes atomic.Int32
 	var turns atomic.Int32
@@ -353,6 +355,278 @@ func TestOfficialPromptCacheRequestEntersSafeOwnerPool(t *testing.T) {
 	}
 	if got := manager.SafePoolMetricsSnapshot().ReuseHits; got != 1 {
 		t.Fatalf("safe reuse hits = %d, want 1", got)
+	}
+}
+
+func TestSafePoolOwnerSampleMissUsesRequestLocalOneShot(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "0")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "1")
+	var handshakes atomic.Int32
+	var turns atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			return
+		}
+		handshakes.Add(1)
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		responseID := fmt.Sprintf("resp_sample_miss_%d", turns.Add(1))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.created\",\"response\":{\"id\":%q}}", responseID)))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.completed\",\"response\":{\"id\":%q,\"status\":\"completed\"}}", responseID)))
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4650, AccountID: "acct-sample-miss", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	body := []byte("{\"model\":\"gpt-5.6\",\"prompt_cache_key\":\"sample-cache\",\"client_metadata\":{\"session_id\":\"sample-session\",\"thread_id\":\"sample-thread\"},\"input\":\"hello\"}")
+	for turn := 0; turn < 2; turn++ {
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "sample-cache", "", "key-A", nil, http.Header{}, "")
+		if err != nil {
+			t.Fatalf("turn %d execute: %v", turn+1, err)
+		}
+		if response.safePool || !response.oneShot || response.conn.safeReusable.Load() {
+			t.Fatalf("turn %d routing safe=%v oneshot=%v reusable=%v, want request-local one-shot", turn+1, response.safePool, response.oneShot, response.conn.safeReusable.Load())
+		}
+		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
+			t.Fatalf("turn %d read: %v", turn+1, err)
+		}
+		if err := response.Close(); err != nil {
+			t.Fatalf("turn %d close: %v", turn+1, err)
+		}
+		if manager.ConnectionCount() != 0 {
+			t.Fatalf("turn %d left request-local one-shot pooled", turn+1)
+		}
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("sample misses used %d handshakes, want 2 same-account one-shot sockets", got)
+	}
+	metrics := manager.SafePoolMetricsSnapshot()
+	if metrics.OwnerSampleRejected != 2 || metrics.OwnerOneShotFallbacks != 2 || metrics.OwnerAdmittedNew != 0 {
+		t.Fatalf("sample-miss metrics=%+v", metrics)
+	}
+}
+
+func TestSafePoolOwnerBudgetKeepsExistingOwnerAndOneShotsNewOwner(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "10000")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "1")
+	t.Setenv(safePoolFenceMillisEnv, "10")
+	var handshakes atomic.Int32
+	var turns atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			return
+		}
+		handshakes.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			responseID := fmt.Sprintf("resp_budget_%d", turns.Add(1))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.created\",\"response\":{\"id\":%q}}", responseID)))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.completed\",\"response\":{\"id\":%q,\"status\":\"completed\"}}", responseID)))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4651, AccountID: "acct-budget", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	bodyFor := func(owner string) []byte {
+		return []byte(fmt.Sprintf("{\"model\":\"gpt-5.6\",\"prompt_cache_key\":%q,\"client_metadata\":{\"session_id\":%q,\"thread_id\":%q},\"input\":\"hello\"}", owner, owner, owner))
+	}
+	run := func(owner string, wantSafe bool) {
+		t.Helper()
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, bodyFor(owner), owner, "", "key-A", nil, http.Header{}, "")
+		if err != nil {
+			t.Fatalf("owner %s execute: %v", owner, err)
+		}
+		if response.safePool != wantSafe || response.oneShot == wantSafe {
+			t.Fatalf("owner %s safe=%v oneshot=%v, want safe=%v", owner, response.safePool, response.oneShot, wantSafe)
+		}
+		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
+			t.Fatalf("owner %s read: %v", owner, err)
+		}
+		if err := response.Close(); err != nil {
+			t.Fatalf("owner %s close: %v", owner, err)
+		}
+	}
+	run("owner-A", true)
+	run("owner-B", false)
+	run("owner-A", true)
+
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("budget path used %d handshakes, want one reusable plus one request-local socket", got)
+	}
+	metrics := manager.SafePoolMetricsSnapshot()
+	if metrics.OwnerAdmittedNew != 1 || metrics.OwnerAdmittedExisting != 1 ||
+		metrics.OwnerBudgetRejected != 1 || metrics.OwnerOneShotFallbacks != 1 || metrics.ReuseHits != 1 {
+		t.Fatalf("budget metrics=%+v", metrics)
+	}
+}
+
+func TestSafePoolContinuationBypassesTightenedOwnerAdmission(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "10000")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "1")
+	t.Setenv(safePoolFenceMillisEnv, "10")
+	var handshakes atomic.Int32
+	var turns atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			return
+		}
+		handshakes.Add(1)
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+			responseID := fmt.Sprintf("resp_continuation_%d", turns.Add(1))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.created\",\"response\":{\"id\":%q}}", responseID)))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.completed\",\"response\":{\"id\":%q,\"status\":\"completed\"}}", responseID)))
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{DBID: 4652, AccountID: "acct-continuation", AccessToken: "token", DynamicConcurrencyLimit: 8}
+	firstBody := []byte("{\"model\":\"gpt-5.6\",\"prompt_cache_key\":\"continuation-owner\",\"client_metadata\":{\"session_id\":\"continuation-owner\",\"thread_id\":\"continuation-owner\"},\"input\":\"hello\"}")
+	first, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, firstBody, "continuation-owner", "", "key-A", nil, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("first execute: %v", err)
+	}
+	if err := first.ReadStream(func([]byte) bool { return true }); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+
+	t.Setenv(safePoolOwnerSampleBPSEnv, "0")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "0")
+	continuationBody := []byte("{\"model\":\"gpt-5.6\",\"prompt_cache_key\":\"continuation-owner\",\"previous_response_id\":\"resp_continuation_1\",\"client_metadata\":{\"session_id\":\"continuation-owner\",\"thread_id\":\"continuation-owner\"},\"input\":\"continue\"}")
+	second, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, continuationBody, "continuation-owner", "", "key-A", nil, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("continuation execute after tightening: %v", err)
+	}
+	if !second.safePool || second.oneShot {
+		t.Fatalf("continuation safe=%v oneshot=%v, want bound safe socket", second.safePool, second.oneShot)
+	}
+	if err := second.ReadStream(func([]byte) bool { return true }); err != nil {
+		t.Fatalf("continuation read: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatalf("continuation close: %v", err)
+	}
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("continuation used %d handshakes, want original bound socket", got)
+	}
+	metrics := manager.SafePoolMetricsSnapshot()
+	if metrics.OwnerAdmittedNew != 1 || metrics.OwnerAdmittedExisting != 0 ||
+		metrics.OwnerSampleRejected != 0 || metrics.OwnerBudgetRejected != 0 {
+		t.Fatalf("continuation unexpectedly entered admission gate: %+v", metrics)
+	}
+}
+
+func TestSafePoolTagRemovalLinearizesBeforeOwnerAdmission(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "tagged")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "10000")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "1")
+	var handshakes atomic.Int32
+	var turns atomic.Int32
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		conn, err := upgrader.Upgrade(w, req, nil)
+		if err != nil {
+			return
+		}
+		handshakes.Add(1)
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		responseID := fmt.Sprintf("resp_tag_race_%d", turns.Add(1))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.created\",\"response\":{\"id\":%q}}", responseID)))
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("{\"type\":\"response.completed\",\"response\":{\"id\":%q,\"status\":\"completed\"}}", responseID)))
+	}))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	account := &auth.Account{
+		DBID:                    4653,
+		AccountID:               "acct-tag-race",
+		AccessToken:             "token",
+		DynamicConcurrencyLimit: 8,
+		Tags:                    []string{safePoolAccountTag},
+	}
+	body := []byte("{\"model\":\"gpt-5.6\",\"prompt_cache_key\":\"tag-owner\",\"client_metadata\":{\"session_id\":\"tag-owner\",\"thread_id\":\"tag-owner\"},\"input\":\"hello\"}")
+	exec.beforeOwnerAdmissionTest = func() {
+		account.Mu().Lock()
+		account.Tags = nil
+		account.Mu().Unlock()
+		exec.beforeOwnerAdmissionTest = nil
+	}
+	runOneShot := func(label string) {
+		t.Helper()
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "tag-owner", "", "key-A", nil, http.Header{}, "")
+		if err != nil {
+			t.Fatalf("%s execute: %v", label, err)
+		}
+		if response.safePool || !response.oneShot {
+			t.Fatalf("%s safe=%v oneshot=%v, want one-shot", label, response.safePool, response.oneShot)
+		}
+		if err := response.ReadStream(func([]byte) bool { return true }); err != nil {
+			t.Fatalf("%s read: %v", label, err)
+		}
+		if err := response.Close(); err != nil {
+			t.Fatalf("%s close: %v", label, err)
+		}
+	}
+	runOneShot("tag removed before commit")
+	if owners, accounts, over := manager.safePoolOwnerAdmissionSnapshot(1); owners != 0 || accounts != 0 || over != 0 {
+		t.Fatalf("tag removal still admitted owner: owners=%d accounts=%d over=%d", owners, accounts, over)
+	}
+
+	account.Mu().Lock()
+	account.Tags = []string{safePoolAccountTag}
+	account.Mu().Unlock()
+	t.Setenv(safePoolOwnerSampleBPSEnv, "0")
+	runOneShot("tag re-added under zero sample")
+	if owners, accounts, over := manager.safePoolOwnerAdmissionSnapshot(1); owners != 0 || accounts != 0 || over != 0 {
+		t.Fatalf("re-added tag bypassed sample via stale admission: owners=%d accounts=%d over=%d", owners, accounts, over)
+	}
+	if got := handshakes.Load(); got != 2 {
+		t.Fatalf("tag race used %d handshakes, want two isolated one-shot requests", got)
+	}
+	metrics := manager.SafePoolMetricsSnapshot()
+	if metrics.OwnerAdmittedNew != 0 || metrics.OwnerSampleRejected != 1 || metrics.OwnerOneShotFallbacks != 1 {
+		t.Fatalf("tag-race metrics=%+v", metrics)
 	}
 }
 

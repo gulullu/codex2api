@@ -177,9 +177,10 @@ func canonicalSafePoolTurnMetadata(raw, flatSessionID, flatThreadID string) ([]b
 
 // Executor WebSocket 执行器
 type Executor struct {
-	manager           *Manager
-	mu                sync.RWMutex
-	wsURLOverrideTest string
+	manager                  *Manager
+	mu                       sync.RWMutex
+	wsURLOverrideTest        string
+	beforeOwnerAdmissionTest func()
 }
 
 // NewExecutor 创建 WebSocket 执行器
@@ -335,6 +336,41 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			}
 		}
 	}
+	requestLocalOneShot := false
+	if wc == nil && !continuationRequest && poolPolicy.mode == statelessPoolSafe && ownerKnown {
+		// Admission is deliberately owner-scoped and process-lifetime. A sample
+		// miss or a full per-account budget changes only this request's transport:
+		// it stays on the already-selected account and uses one unique WS socket.
+		// Continuations never enter this gate because their connection-local state
+		// is authoritative and must be resumed on the bound connection above.
+		if e.beforeOwnerAdmissionTest != nil {
+			e.beforeOwnerAdmissionTest()
+		}
+		// Hold only the account read lock across the final tag/policy check and
+		// the in-memory admission commit. A concurrent tag removal therefore
+		// linearizes either before this check (no admission) or after the commit
+		// (the already-admitted owner may finish, while the normal pre-write gate
+		// retires the connection). No network operation occurs under this lock.
+		account.Mu().RLock()
+		latestPolicy := resolveStatelessPoolPolicyWithTags(account, e.manager, account.Tags)
+		decision := safePoolOwnerRejectedBySample
+		if latestPolicy.mode == statelessPoolSafe {
+			decision = e.manager.admitSafePoolOwner(
+				account.ID(),
+				ownerKey,
+				currentSafePoolOwnerAdmissionConfig(),
+			)
+		}
+		account.Mu().RUnlock()
+		poolPolicy = latestPolicy
+		if poolPolicy.mode != statelessPoolSafe {
+			e.manager.RetireSafePoolAccount(account.ID())
+		} else if decision == safePoolOwnerRejectedByLifecycle {
+			return nil, ErrManagerStopped
+		} else {
+			requestLocalOneShot = !decision.admitted()
+		}
+	}
 	baseKey := strings.TrimSpace(poolRouteKey)
 	if baseKey == "" && headerSessionID != sessionID {
 		baseKey = headerSessionID
@@ -343,6 +379,12 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if wc == nil {
 		if poolPolicy.mode == statelessPoolHTTPFallback {
 			return nil, fmt.Errorf("%w: safe websocket reuse is process-fused before request write", proxy.ErrWebsocketSafePoolFallback)
+		} else if poolPolicy.mode == statelessPoolSafe && ownerKnown && requestLocalOneShot {
+			wsBody = safeBody
+			headers = safeHeaders
+			poolSessionID = "stateless-" + uuid.NewString()
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+			oneShotRequest = err2 == nil && wc != nil
 		} else if poolPolicy.mode == statelessPoolSafe && ownerKnown {
 			wsBody = safeBody
 			headers = safeHeaders

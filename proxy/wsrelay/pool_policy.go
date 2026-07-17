@@ -64,6 +64,13 @@ type statelessPoolPolicy struct {
 // silently restore explicit-session or continuation reuse for every other
 // account. CODEX_WS_STATELESS_ONESHOT always wins, including over account tags.
 func resolveStatelessPoolPolicy(account *auth.Account, manager *Manager) statelessPoolPolicy {
+	return resolveStatelessPoolPolicyWithTags(account, manager, accountTagSnapshot(account))
+}
+
+// resolveStatelessPoolPolicyWithTags lets callers that already hold the
+// account read lock linearize a policy check with a short in-memory commit.
+// The supplied tags are read only for the duration of this call.
+func resolveStatelessPoolPolicyWithTags(account *auth.Account, manager *Manager, tags []string) statelessPoolPolicy {
 	policy := statelessPoolPolicy{
 		mode:       statelessPoolDefault,
 		slots:      defaultSafePoolMaxSlots,
@@ -75,7 +82,6 @@ func resolveStatelessPoolPolicy(account *auth.Account, manager *Manager) statele
 		return policy
 	}
 
-	tags := accountTagSnapshot(account)
 	if hasExactTag(tags, oneShotAccountTag) {
 		policy.mode = statelessPoolOneShot
 		return policy
