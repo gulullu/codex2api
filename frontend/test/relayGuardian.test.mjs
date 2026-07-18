@@ -163,18 +163,33 @@ test('event query carries the audit window and pagination exactly', () => {
   assert.equal(query.get('page_size'), '5')
 })
 
-test('guardian event pagination defaults to five and keeps compact and larger choices', () => {
+test('guardian event pagination defaults to one and keeps compact and larger choices', () => {
   assert.match(panelSource, /const PAGE_SIZE_OPTIONS = \[1, 5, 10, 20, 50\]/)
-  assert.match(panelSource, /const \[pageSize, setPageSize\] = useState\(5\)/)
+  assert.match(panelSource, /const \[pageSize, setPageSize\] = useState\(1\)/)
+})
+
+test('guardian event rows stay collapsed until diagnostics are requested', () => {
+  assert.match(panelSource, /function GuardianEventRow[\s\S]*?<details className="group\/event min-w-0 rounded-lg/)
+  assert.match(panelSource, /<summary className="flex cursor-pointer[\s\S]*?getRelayGuardianEventLabel/)
+  assert.doesNotMatch(panelSource, /function GuardianEventRow[\s\S]*?<details[^>]*\sopen(?:=|\s|>)/)
+  assert.match(panelSource, /border-t border-border\/50 px-3 py-3[\s\S]*?label="统计窗口"/)
 })
 
 test('monitor dashboard stays compact while retaining server-side diagnostics', () => {
   assert.match(panelSource, /仅监控，不自动调整调度/)
-  assert.match(panelSource, /<details className="group mt-4[\s\S]*?账号诊断/)
-  assert.match(panelSource, /<details className="group">[\s\S]*?Guardian 事件/)
+  assert.match(panelSource, /<details className="group\/runtime mt-4[\s\S]*?账号诊断/)
+  assert.match(panelSource, /<details className="group\/events">[\s\S]*?Guardian 事件/)
   assert.doesNotMatch(panelSource, /<details[^>]*\sopen(?:=|\s|>)/)
   assert.doesNotMatch(panelSource, /<GuardianSummary/)
   assert.match(panelSource, /api\.getRelayGuardianEvents\(\{ start, end, page, pageSize \}\)/)
+})
+
+test('Guardian nested disclosures use isolated named groups', () => {
+  assert.match(panelSource, /group\/events/)
+  assert.match(panelSource, /group-open\/events:rotate-180/)
+  assert.match(panelSource, /group\/event/)
+  assert.match(panelSource, /group-open\/event:rotate-180/)
+  assert.doesNotMatch(panelSource, /\bgroup-open:rotate-180\b/)
 })
 
 test('guardian write controls are rendered only in enforce mode', () => {

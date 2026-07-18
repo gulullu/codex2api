@@ -150,6 +150,24 @@ func (h *Handler) nextRoutedAccountForSession(
 	baseFilter auth.AccountFilter,
 	required promptRiskDecision,
 ) (*auth.Account, string, promptRiskDecision) {
+	return h.nextRoutedAccountForSessionWithMode(c, ctx, affinityKey, apiKeyID, exclusions, baseFilter, required, true)
+}
+
+// nextRoutedAccountForSessionWithMode keeps all route-owner and Relay-only
+// invariants shared between ordinary selection and the request-local sticky
+// preference probe. The probe uses waitForCapacity=false: it gets one atomic
+// immediate chance at the retained account, then the caller falls back to the
+// full official scheduler instead of waiting behind that one account.
+func (h *Handler) nextRoutedAccountForSessionWithMode(
+	c *gin.Context,
+	ctx context.Context,
+	affinityKey string,
+	apiKeyID int64,
+	exclusions *retryAccountExclusions,
+	baseFilter auth.AccountFilter,
+	required promptRiskDecision,
+	waitForCapacity bool,
+) (*auth.Account, string, promptRiskDecision) {
 	clearRouteSelectionError(c)
 	if owner, ok := responseRouteOwnerFromContext(c); ok {
 		if encryptedOwner, encryptedOK := encryptedContextOwnerFromContext(c); encryptedOK {
@@ -194,14 +212,15 @@ func (h *Handler) nextRoutedAccountForSession(
 		if ownerIsRelay {
 			ownerBaseFilter = h.applyCybRelayAccountFilter(baseFilter, promptRiskDecision{Disposition: promptRiskDispositionRelay})
 		}
-		account, proxyURL := h.nextRetryAccountForSession(
-			ctx,
-			affinityKey,
-			apiKeyID,
-			exclusions,
-			responseOwnerAccountFilter(ownerBaseFilter, owner),
-		)
-		if account == nil {
+		ownerFilter := responseOwnerAccountFilter(ownerBaseFilter, owner)
+		var account *auth.Account
+		var proxyURL string
+		if waitForCapacity {
+			account, proxyURL = h.nextRetryAccountForSession(ctx, affinityKey, apiKeyID, exclusions, ownerFilter)
+		} else {
+			account, proxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclusions.ForSelection(), ownerFilter)
+		}
+		if account == nil && waitForCapacity {
 			setRouteSelectionError(c, continuationOwnerUnavailable, "The account that owns previous_response_id is unavailable; retry later or resend full context")
 		}
 		decision = h.setSelectedRouteDecision(c, decision)
@@ -251,13 +270,25 @@ func (h *Handler) nextRoutedAccountForSession(
 				decision = h.setSelectedRouteDecision(c, decision)
 				return account, proxyURL, decision
 			}
+			// The request-local sticky probe is only an immediate preference.
+			// A capacity miss here must not erase the encrypted owner before the
+			// ordinary selector gets its normal chance to reacquire that owner.
+			if !waitForCapacity {
+				return nil, "", required
+			}
 			markEncryptedContextDowngrade(c, encryptedOwnerUnavailableSignal)
 		}
 	}
 
 	if required.routesToCybRelay() {
 		relayFilter := h.applyCybRelayAccountFilter(baseFilter, required)
-		account, proxyURL := h.nextRetryRelayAccountForSession(ctx, affinityKey, apiKeyID, exclusions, relayFilter)
+		var account *auth.Account
+		var proxyURL string
+		if waitForCapacity {
+			account, proxyURL = h.nextRetryRelayAccountForSession(ctx, affinityKey, apiKeyID, exclusions, relayFilter)
+		} else {
+			account, proxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclusions.ForSelection(), relayFilter)
+		}
 		required = h.setSelectedRouteDecision(c, required)
 		return account, proxyURL, required
 	}
@@ -266,7 +297,13 @@ func (h *Handler) nextRoutedAccountForSession(
 	overflowDecision := overflowPromptRiskDecision()
 	cfg := h.cybRelayConfig()
 	if !cfg.Enabled || cfg.GroupID <= 0 {
-		account, proxyURL := h.nextRetryAccountForSession(ctx, affinityKey, apiKeyID, exclusions, baseFilter)
+		var account *auth.Account
+		var proxyURL string
+		if waitForCapacity {
+			account, proxyURL = h.nextRetryAccountForSession(ctx, affinityKey, apiKeyID, exclusions, baseFilter)
+		} else {
+			account, proxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclusions.ForSelection(), baseFilter)
+		}
 		decision := defaultPromptRiskDecision()
 		decision = h.setSelectedRouteDecision(c, decision)
 		return account, proxyURL, decision
@@ -282,9 +319,21 @@ func (h *Handler) nextRoutedAccountForSession(
 			decision = h.setSelectedRouteDecision(c, decision)
 			return account, proxyURL, decision
 		}
-		if account, proxyURL := h.nextRelayAccountForSessionWithInvariant(affinityKey, apiKeyID, exclude, relayFilter); account != nil {
+		var relayAccount *auth.Account
+		var relayProxyURL string
+		if waitForCapacity {
+			relayAccount, relayProxyURL = h.nextRelayAccountForSessionWithInvariant(affinityKey, apiKeyID, exclude, relayFilter)
+		} else {
+			relayAccount, relayProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, relayFilter)
+		}
+		if relayAccount != nil {
 			overflowDecision = h.setSelectedRouteDecision(c, overflowDecision)
-			return account, proxyURL, overflowDecision
+			return relayAccount, relayProxyURL, overflowDecision
+		}
+		if !waitForCapacity {
+			decision := defaultPromptRiskDecision()
+			decision = h.setSelectedRouteDecision(c, decision)
+			return nil, "", decision
 		}
 
 		account, proxyURL := h.store.WaitForSessionAvailableWithFilter(

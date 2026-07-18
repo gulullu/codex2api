@@ -63,7 +63,7 @@ export default function RelayGuardianPanel({
   const [eventsError, setEventsError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(5)
+  const [pageSize, setPageSize] = useState(1)
   const [actionAccountIDs, setActionAccountIDs] = useState<Set<number>>(() => new Set())
   const actionAccountIDsRef = useRef(new Set<number>())
   const statusRequestIDRef = useRef(0)
@@ -275,7 +275,7 @@ export default function RelayGuardianPanel({
             <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">{statusError}</div>
           ) : null}
 
-          <details className="group mt-4 rounded-xl border border-border/60 bg-muted/10">
+          <details className="group/runtime mt-4 rounded-xl border border-border/60 bg-muted/10">
             <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3.5 py-3 text-sm marker:content-none [&::-webkit-details-marker]:hidden">
               <div className="min-w-0">
                 <div className="font-medium text-foreground">账号诊断</div>
@@ -283,7 +283,7 @@ export default function RelayGuardianPanel({
                   {managedCount} 个受管账号 · 健康 {healthyCount} · 需关注 {attentionCount}
                 </div>
               </div>
-              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open/runtime:rotate-180" />
             </summary>
             <div className="border-t border-border/60 p-3">
               <div className="grid min-w-0 gap-3 md:grid-cols-2 2xl:grid-cols-3">
@@ -314,7 +314,7 @@ export default function RelayGuardianPanel({
 
       <Card className="min-w-0 overflow-hidden border-border/70 shadow-sm">
         <CardContent className="min-w-0 p-4 sm:p-5">
-          <details className="group">
+          <details className="group/events">
             <summary className="flex cursor-pointer list-none items-center justify-between gap-3 marker:content-none [&::-webkit-details-marker]:hidden">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
@@ -325,7 +325,7 @@ export default function RelayGuardianPanel({
                 </div>
                 <p className="mt-1 text-xs text-muted-foreground">按当前筛选窗口分页查询，展开查看诊断记录。</p>
               </div>
-              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+              <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open/events:rotate-180" />
             </summary>
 
             <div className="mt-4 border-t border-border/70 pt-4">
@@ -461,45 +461,49 @@ function GuardianEventRow({ event, accounts }: { event: RelayGuardianEvent; acco
   const accountLabel = resolveRelayGuardianAccountName(event.account_id, accounts, event.account_name)
   const hasTransition = Boolean(event.from_state?.trim() || event.to_state?.trim())
   return (
-    <article className="min-w-0 rounded-xl border border-border/60 bg-muted/15 p-3.5">
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
+    <details className="group/event min-w-0 rounded-lg border border-border/50 bg-muted/10">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 marker:content-none [&::-webkit-details-marker]:hidden">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
             <Badge variant="outline" className="bg-background/80">{getRelayGuardianEventLabel(event.event_type)}</Badge>
             <span className="truncate text-sm font-semibold text-foreground">{accountLabel}</span>
             {hasTransition ? <span className="text-xs text-muted-foreground">{from.label} → {to.label}</span> : null}
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <time className="text-[11px] text-muted-foreground">{formatBeijingTime(event.created_at)}</time>
+          <ChevronDown className="size-3.5 text-muted-foreground transition-transform group-open/event:rotate-180" />
+        </div>
+      </summary>
+
+      <div className="border-t border-border/50 px-3 py-3">
+        <p className="text-xs leading-5 text-muted-foreground">{getRelayGuardianReasonLabel(event.reason)}</p>
+
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <GuardianField label="统计窗口" value={formatDuration(event.window_seconds)} />
+          <GuardianField label="归因失败" value={String(event.failure_count)} />
+          <GuardianField label="用户可见" value={String(event.user_visible_failures)} />
+          <GuardianField label="强网关" value={String(event.strong_gateway_failures)} />
+        </div>
+
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+          <span>操作者 {actorLabel(event.actor)}</span>
+          <span>触发规则 {getRelayGuardianTriggerLabel(event.trigger_source)}</span>
+          <span>隔离时长 {event.quarantine_seconds ? formatDuration(event.quarantine_seconds) : '-'}</span>
+          <span>代次 {event.generation}</span>
+          {(event.logical_request_ids?.length ?? 0) > 0 ? <span title={event.logical_request_ids?.join('\n')}>关联请求 {event.logical_request_ids?.length}</span> : null}
+        </div>
+        {details.summary ? (
+          <div className="mt-2 rounded-lg border border-border/50 bg-background/70 px-2.5 py-2 text-xs leading-5 text-foreground">
+            {details.summary}
           </div>
-          <p className="mt-2 text-xs leading-5 text-muted-foreground">{getRelayGuardianReasonLabel(event.reason)}</p>
-        </div>
-        <time className="shrink-0 text-[11px] text-muted-foreground">{formatBeijingTime(event.created_at)}</time>
+        ) : null}
+        {details.raw && details.raw !== details.summary ? (
+          <details className="mt-2 rounded-lg border border-border/50 bg-background/50 px-2.5 py-2 text-[11px] text-muted-foreground">
+            <summary className="cursor-pointer select-none font-medium">高级详情（原始数据）</summary>
+            <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-4">{details.raw}</pre>
+          </details>
+        ) : null}
       </div>
-
-      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <GuardianField label="统计窗口" value={formatDuration(event.window_seconds)} />
-        <GuardianField label="归因失败" value={String(event.failure_count)} />
-        <GuardianField label="用户可见" value={String(event.user_visible_failures)} />
-        <GuardianField label="强网关" value={String(event.strong_gateway_failures)} />
-      </div>
-
-      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-        <span>操作者 {actorLabel(event.actor)}</span>
-        <span>触发规则 {getRelayGuardianTriggerLabel(event.trigger_source)}</span>
-        <span>隔离时长 {event.quarantine_seconds ? formatDuration(event.quarantine_seconds) : '-'}</span>
-        <span>代次 {event.generation}</span>
-        {(event.logical_request_ids?.length ?? 0) > 0 ? <span title={event.logical_request_ids?.join('\n')}>关联请求 {event.logical_request_ids?.length}</span> : null}
-      </div>
-      {details.summary ? (
-        <div className="mt-2 rounded-lg border border-border/50 bg-background/70 px-2.5 py-2 text-xs leading-5 text-foreground">
-          {details.summary}
-        </div>
-      ) : null}
-      {details.raw && details.raw !== details.summary ? (
-        <details className="mt-2 rounded-lg border border-border/50 bg-background/50 px-2.5 py-2 text-[11px] text-muted-foreground">
-          <summary className="cursor-pointer select-none font-medium">高级详情（原始数据）</summary>
-          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words text-[10px] leading-4">{details.raw}</pre>
-        </details>
-      ) : null}
-    </article>
+    </details>
   )
 }
 

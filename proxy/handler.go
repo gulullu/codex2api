@@ -2267,9 +2267,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
 		if !retainedHTTPFallback {
-			selectionFilter := requestStickyRetry.AccountFilter(accountFilter)
-			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, selectionFilter, routeRequirement)
-			requestStickyRetry.Apply(account, &stickyProxyURL)
+			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSessionWithStickyFallback(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement, &requestStickyRetry)
 		}
 		if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
 			return
@@ -2518,7 +2516,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				// Global sticky retry remains unchanged for ordinary accounts. A Relay
 				// front door with a confirmed upstream transport error is hard-excluded
 				// for this logical request and contributes breaker evidence.
-				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
+				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure && h.requestStickyRetryAccountEligible(account)
 				if shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
@@ -3190,7 +3188,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			// Preserve sticky retries for non-Relay accounts only. Relay transport
 			// failure must rotate away from the failed front door.
-			stickyRetry := shouldRetry && !localContention && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
+			stickyRetry := shouldRetry && !localContention && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure && h.requestStickyRetryAccountEligible(account)
 			if !localContention && shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -4928,9 +4926,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
 		if !retainedHTTPFallback {
-			selectionFilter := requestStickyRetry.AccountFilter(accountFilter)
-			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, selectionFilter, routeRequirement)
-			requestStickyRetry.Apply(account, &stickyProxyURL)
+			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSessionWithStickyFallback(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement, &requestStickyRetry)
 		}
 		if releaseRoutedAttemptIfContextDone(c.Request.Context(), h.store, account, circuitAttempt) {
 			return
@@ -5180,7 +5176,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			// Preserve sticky retries for non-Relay accounts only. Relay transport
 			// failure must rotate away from the failed front door.
-			stickyRetry := shouldRetry && !localContention && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure
+			stickyRetry := shouldRetry && !localContention && !timedOut && kind != "" && h.stickyTransportRetryEnabled() && !relayTransportFailure && h.requestStickyRetryAccountEligible(account)
 			if !localContention && shouldPenalizeTransportFailure(kind) && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}

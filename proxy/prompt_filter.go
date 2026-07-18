@@ -28,6 +28,7 @@ const promptFilterTargetedCovertSurveillanceSignal = "local_targeted_covert_surv
 const promptFilterMLModelBackdoorTrainingSignal = "local_ml_model_backdoor_training"
 const promptFilterRemoteCommandControlPlatformSignal = "local_remote_command_control_platform"
 const promptFilterSecurityCodeAuditSignal = "local_security_code_audit"
+const promptFilterLoginProtectionReverseEngineeringSignal = "local_login_protection_reverse_engineering"
 const contextPromptFilterScanMeta = "promptFilterScanMeta"
 
 type promptFilterRouteScan struct {
@@ -116,6 +117,21 @@ var promptFilterSecurityCodeAuditPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(?:read[- ]?only|do\s+not\s+modify|without\s+modifying|no\s+code\s+changes|report\s+only|static\s+review)\b|(?:完全)?只读|不(?:要|得)?修改|不改(?:共享)?文件|仅?报告[^。！？\n]{0,24}(?:漏洞|问题)|静态审查`),
 	regexp.MustCompile(`(?i)\b(?:toctou|race\s+condition|bypass|tamper|forg(?:e|ed|ery)|spoof|fail[- ]?open|fail[- ]?closed|path\s+traversal|injection|arbitrary\s+error|unsafe\s+deserialization)\b|(?:竞态|绕过|篡改|伪造|漏洞|任意错误|删除文件|缺失文件|失败关闭|保护性失败)`),
 }
+
+// This rule covers a production-observed upstream CYB gap around operational
+// reverse engineering of obfuscated login-protection code. The conjunction is
+// intentionally narrow: ordinary login development, high-level explanations,
+// and generic VM/debugging work do not satisfy all four witnesses. As with the
+// other observed-gap rules, it only selects the Relay pool and never blocks.
+var promptFilterLoginProtectionReverseEngineeringPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\blogin[\s_-]*p\b|\bp\s+(?:generation|parameter|algorithm|payload)\b[^.!?\n]{0,80}\b(?:login|log[- ]?in|authentication|auth)\b|(?:登录|认证|鉴权)[^。！？\n]{0,60}(?:P值|P参数|P生成|P算法)|(?:P值|P参数|P生成|P算法)[^。！？\n]{0,60}(?:登录|认证|鉴权)`),
+	regexp.MustCompile(`(?i)\b(?:obfuscat(?:e|ed|ion)|deobfuscat(?:e|ed|ion)|raw\s+script|eval\s+script|interpreter|virtual\s+machine|vm|opcode|bootstrap)\b|(?:混淆|反混淆|原始脚本|动态脚本|解释器|虚拟机|操作码|引导状态|保护实例)`),
+	regexp.MustCompile(`(?i)\b(?:reverse[- ]?engineer(?:ing)?|captur(?:e|es|ed|ing)|replay(?:s|ed|ing)?|locali[sz](?:e|ed|ing|ation)|reimplement(?:s|ed|ing)?|patch(?:es|ed|ing)?|hook(?:s|ed|ing)?|instrument(?:s|ed|ing|ation)?|dump(?:s|ed|ing)?|extract(?:s|ed|ing)?|recover(?:s|ed|ing)?|trace|tracing)\b|(?:逆向|捕获|重放|回放|本地化|重新实现|补丁|钩子|插桩|导出|提取|恢复|追踪|跟踪|改写)`),
+}
+
+var promptFilterLoginProtectionOperationalPattern = regexp.MustCompile(`(?i)\b(?:please\s+|help\s+me\s+|need\s+to\s+|continue(?:\s+to)?\s+|now\s+|next\s+step(?:\s+is\s+to)?\s*[:,-]?\s*)(?:verify|test|debug|reverse[- ]?engineer|locali[sz]e|implement|modif(?:y|ies|ied|ying)|fix|generate|run|build|complete|bridge|patch|replay|instrument)\b|\b(?:implement|modif(?:y|ies|ied|ying)|fix|generate|build|complete)\b[^.!?\n]{0,100}\b(?:script|interpreter|vm|patch|hook|tool|code)\b|(?:继续|下一步(?:是)?|现在|请|需要)(?:帮我|我们|去|再|来)?[\s，,:：-]{0,4}(?:验证|测试|调试|逆向|本地化|实现|修改|修复|生成|运行|构建|完成|桥接|补丁|回放|重放|插桩)|(?:实现|修改|修复|生成|构建|完成)[^。！？\n]{0,80}(?:脚本|解释器|虚拟机|VM|补丁|钩子|工具|代码)`)
+var promptFilterLoginProtectionNonOperationalSentencePattern = regexp.MustCompile(`(?i)\b(?:summarize|explain|compare|give\s+an\s+overview|analy[sz]e\s+(?:a\s+)?paper)\b[^.!?\n]{0,400}\b(?:do\s+not|without)\b[^.!?\n]{0,160}\b(?:capture|replay|locali[sz]e|implement|patch|hook|reverse[- ]?engineer)\b|(?:总结|解释|对比|概述|分析论文)[^。！？\n]{0,300}(?:不要|无需|不需要)[^。！？\n]{0,120}(?:捕获|重放|回放|本地化|实现|修改|补丁|钩子|逆向)`)
+var promptFilterSentenceSplitter = regexp.MustCompile(`[.!?\n。！？]+`)
 
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
@@ -399,8 +415,23 @@ func promptFilterSecurityCodeAuditVerdict(text string) bool {
 	return promptFilterAllWitnessesMatch(text, promptFilterSecurityCodeAuditPatterns)
 }
 
+func promptFilterLoginProtectionReverseEngineeringVerdict(text string) bool {
+	if !promptFilterAllWitnessesMatch(text, promptFilterLoginProtectionReverseEngineeringPatterns) {
+		return false
+	}
+	for _, sentence := range promptFilterSentenceSplitter.Split(strings.TrimSpace(text), -1) {
+		if promptFilterLoginProtectionNonOperationalSentencePattern.MatchString(sentence) {
+			continue
+		}
+		if promptFilterLoginProtectionOperationalPattern.MatchString(sentence) {
+			return true
+		}
+	}
+	return false
+}
+
 func promptFilterObservedGapSignals(text string) []string {
-	signals := make([]string, 0, 3)
+	signals := make([]string, 0, 4)
 	if promptFilterMLModelBackdoorTrainingVerdict(text) {
 		signals = append(signals, promptFilterMLModelBackdoorTrainingSignal)
 	}
@@ -409,6 +440,9 @@ func promptFilterObservedGapSignals(text string) []string {
 	}
 	if promptFilterSecurityCodeAuditVerdict(text) {
 		signals = append(signals, promptFilterSecurityCodeAuditSignal)
+	}
+	if promptFilterLoginProtectionReverseEngineeringVerdict(text) {
+		signals = append(signals, promptFilterLoginProtectionReverseEngineeringSignal)
 	}
 	return signals
 }
@@ -684,6 +718,7 @@ func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promp
 		promptFilterMLModelBackdoorTrainingSignal,
 		promptFilterRemoteCommandControlPlatformSignal,
 		promptFilterSecurityCodeAuditSignal,
+		promptFilterLoginProtectionReverseEngineeringSignal,
 	} {
 		fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, signal)
 	}

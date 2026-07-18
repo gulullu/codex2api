@@ -146,15 +146,29 @@ func (h *Handler) nextCircuitPermittedRoutedAccountForSession(
 	baseFilter auth.AccountFilter,
 	required promptRiskDecision,
 ) (*auth.Account, string, promptRiskDecision, *relayCircuitAttempt) {
+	return h.nextCircuitPermittedRoutedAccountForSessionWithMode(c, affinityKey, apiKeyID, exclusions, baseFilter, baseFilter, required, true)
+}
+
+func (h *Handler) nextCircuitPermittedRoutedAccountForSessionWithMode(
+	c *gin.Context,
+	affinityKey string,
+	apiKeyID int64,
+	exclusions *retryAccountExclusions,
+	selectionFilter auth.AccountFilter,
+	permitPoolFilter auth.AccountFilter,
+	required promptRiskDecision,
+	waitForCapacity bool,
+) (*auth.Account, string, promptRiskDecision, *relayCircuitAttempt) {
 	for {
-		account, proxyURL, selected := h.nextRoutedAccountForSession(
+		account, proxyURL, selected := h.nextRoutedAccountForSessionWithMode(
 			c,
 			c.Request.Context(),
 			affinityKey,
 			apiKeyID,
 			exclusions,
-			baseFilter,
+			selectionFilter,
 			required,
+			waitForCapacity,
 		)
 		if account == nil {
 			return nil, "", selected, inactiveRelayCircuitAttempt()
@@ -170,7 +184,7 @@ func (h *Handler) nextCircuitPermittedRoutedAccountForSession(
 			if candidate == nil || !candidate.AllowsAPIKey(apiKeyID) || !h.store.APIKeyAllowsAccount(apiKeyID, candidate) {
 				return false
 			}
-			return baseFilter == nil || baseFilter(candidate)
+			return permitPoolFilter == nil || permitPoolFilter(candidate)
 		}
 		permit, ok := h.store.BeginRelayCircuitRequestForLogicalRequestWithFilter(account, logicalRequestID(c), poolFilter)
 		if ok {
@@ -186,4 +200,34 @@ func (h *Handler) nextCircuitPermittedRoutedAccountForSession(
 		}
 		exclusions.MarkHard(account.ID())
 	}
+}
+
+// nextCircuitPermittedRoutedAccountForSessionWithStickyFallback gives the
+// retained account one immediate, fully policy-checked chance. If it cannot be
+// acquired, ordinary requests resume with the original filter and the full
+// OAuth/Relay scheduler. Explicit route-owner errors remain fail-closed.
+func (h *Handler) nextCircuitPermittedRoutedAccountForSessionWithStickyFallback(
+	c *gin.Context,
+	affinityKey string,
+	apiKeyID int64,
+	exclusions *retryAccountExclusions,
+	baseFilter auth.AccountFilter,
+	required promptRiskDecision,
+	sticky *requestStickyRetryState,
+) (*auth.Account, string, promptRiskDecision, *relayCircuitAttempt) {
+	if preferenceFilter, retainedProxyURL, ok := sticky.TakeAccountFilter(baseFilter); ok {
+		account, _, selected, attempt := h.nextCircuitPermittedRoutedAccountForSessionWithMode(
+			c, affinityKey, apiKeyID, exclusions, preferenceFilter, baseFilter, required, false,
+		)
+		if account != nil {
+			return account, retainedProxyURL, selected, attempt
+		}
+		if c.Request.Context().Err() != nil {
+			return nil, "", selected, attempt
+		}
+		if _, routeBoundFailure := routeSelectionErrorFromContext(c); routeBoundFailure {
+			return nil, "", selected, attempt
+		}
+	}
+	return h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, exclusions, baseFilter, required)
 }
