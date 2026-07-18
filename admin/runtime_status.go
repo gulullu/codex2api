@@ -154,6 +154,10 @@ func runtimeWebsocketResponseFromSnapshot(snapshot wsrelay.SafePoolRuntime) runt
 		OwnerBudgetRejected:         metrics.OwnerBudgetRejected,
 		OwnerOneShotFallbacks:       metrics.OwnerOneShotFallbacks,
 		OwnerConfigErrors:           metrics.OwnerConfigErrors,
+		OwnerHandshakeRejected:      metrics.OwnerHandshakeRejected,
+		FrameMetadataRejected:       metrics.FrameMetadataRejected,
+		GenerationInvalidations:     metrics.GenerationInvalidations,
+		RetiredOwners:               metrics.RetiredOwners,
 		ContinuationEvictions:       metrics.ContinuationEvictions,
 	}
 }

@@ -89,6 +89,8 @@ type Handler struct {
 	resetCreditPostCancel     context.CancelFunc
 	resetCreditPostClosed     bool
 	settingsUpdateMu          sync.Mutex
+	accountSchedulerRuntimeMu sync.Mutex
+	accountTagsUpdated        func(accountID int64, previousTags, currentTags []string)
 
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
@@ -372,6 +374,15 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 	h.pgMaxConns = pgMaxConns
 	h.redisPoolSize = redisPoolSize
+}
+
+// SetAccountTagsUpdatedHook wires transport-specific live cleanup without
+// importing the WebSocket package into admin. The callback runs synchronously
+// after the in-memory tag update while scheduler runtime updates are serialized.
+func (h *Handler) SetAccountTagsUpdatedHook(fn func(accountID int64, previousTags, currentTags []string)) {
+	h.accountSchedulerRuntimeMu.Lock()
+	h.accountTagsUpdated = fn
+	h.accountSchedulerRuntimeMu.Unlock()
 }
 
 // RegisterRoutes 注册管理 API 路由
@@ -1403,7 +1414,16 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		}
 	}
 
-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
+	// Persist and publish scheduler metadata as one ordered operation. A
+	// concurrent safe-tag remove/re-add must not commit to the database in one
+	// order and reach the live WebSocket generation hook in the reverse order.
+	h.accountSchedulerRuntimeMu.Lock()
+	err = h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates)
+	if err == nil {
+		h.applyAccountSchedulerRuntimeUpdateLocked(id, update)
+	}
+	h.accountSchedulerRuntimeMu.Unlock()
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -1411,14 +1431,29 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "更新账号调度配置失败: "+err.Error())
 		return
 	}
-	h.applyAccountSchedulerRuntimeUpdate(id, update)
-
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
 }
 
 func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSchedulerUpdate) {
+	h.accountSchedulerRuntimeMu.Lock()
+	defer h.accountSchedulerRuntimeMu.Unlock()
+	h.applyAccountSchedulerRuntimeUpdateLocked(id, update)
+}
+
+// applyAccountSchedulerRuntimeUpdateLocked requires accountSchedulerRuntimeMu.
+// It lets endpoint callers keep the database commit and live tag generation in
+// exactly the same serialization order.
+func (h *Handler) applyAccountSchedulerRuntimeUpdateLocked(id int64, update accountSchedulerUpdate) {
 	if h.store == nil {
 		return
+	}
+	var previousTags []string
+	if update.Tags.Set {
+		if account := h.store.FindByID(id); account != nil {
+			account.Mu().RLock()
+			previousTags = append([]string(nil), account.Tags...)
+			account.Mu().RUnlock()
+		}
 	}
 	if update.ScoreBiasOverride.Set || update.BaseConcurrencyOverride.Set || update.SkipWarmTier.Set {
 		h.store.ApplyAccountSchedulerOverridePatch(
@@ -1452,7 +1487,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 		h.store.ApplyAccountSchedulerPriority(id, nullableInt64Pointer(update.SchedulerPriority.Value))
 	}
 	if update.Tags.Set {
-		h.store.ApplyAccountTags(id, update.Tags.Values)
+		if h.store.ApplyAccountTags(id, update.Tags.Values) && h.accountTagsUpdated != nil {
+			h.accountTagsUpdated(id, previousTags, append([]string(nil), update.Tags.Values...))
+		}
 	}
 	if update.GroupIDs.Set {
 		h.store.ApplyAccountGroups(id, update.GroupIDs.Values)
@@ -4545,6 +4582,10 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		}
 	}
 
+	// Serialize the batch database commit and its runtime publications with
+	// single-account updates. This keeps remove/re-add generations linearizable
+	// even when the two admin endpoints race.
+	h.accountSchedulerRuntimeMu.Lock()
 	updatedIDs, err := h.db.BatchUpdateAccountMetadata(ctx, ids, database.BatchAccountMetadataUpdate{
 		Enabled:                 enabled,
 		Locked:                  locked,
@@ -4558,6 +4599,7 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		CredentialUpdates:       schedulerUpdate.CredentialUpdates,
 	})
 	if err != nil {
+		h.accountSchedulerRuntimeMu.Unlock()
 		writeError(c, http.StatusInternalServerError, "批量更新账号失败: "+err.Error())
 		return
 	}
@@ -4576,9 +4618,10 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 					}
 				}
 			}
-			h.applyAccountSchedulerRuntimeUpdate(id, schedulerUpdate)
+			h.applyAccountSchedulerRuntimeUpdateLocked(id, schedulerUpdate)
 		}
 	}
+	h.accountSchedulerRuntimeMu.Unlock()
 
 	success := int64(len(updatedIDs))
 	failed := int64(len(ids)) - success

@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2041,6 +2043,23 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	store.AddAccount(runtimeAccount1)
 	store.AddAccount(runtimeAccount2)
 	handler := &Handler{db: db, store: store}
+	type tagEvent struct {
+		accountID int64
+		previous  []string
+		current   []string
+		observed  []string
+	}
+	var tagEvents []tagEvent
+	handler.SetAccountTagsUpdatedHook(func(accountID int64, previous, current []string) {
+		account := store.FindByID(accountID)
+		var observed []string
+		if account != nil {
+			account.Mu().RLock()
+			observed = append([]string(nil), account.Tags...)
+			account.Mu().RUnlock()
+		}
+		tagEvents = append(tagEvents, tagEvent{accountID: accountID, previous: append([]string(nil), previous...), current: append([]string(nil), current...), observed: observed})
+	})
 
 	body := fmt.Sprintf(`{"ids":[%d,%d,%d,%d],"enabled":false,"locked":true,"tags":["Ops","ops","blue"],"group_ids":[%d],"score_bias_override":33,"base_concurrency_override":5,"scheduler_priority":7,"auto_pause_5h_threshold":0.8,"auto_pause_7d_disabled":true}`,
 		accountID1, accountID2, accountID1, accountID2+1000, groupID)
@@ -2060,6 +2079,19 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	}
 	if payload["success"] != float64(2) || payload["failed"] != float64(1) {
 		t.Fatalf("payload = %#v, want success=2 failed=1", payload)
+	}
+	if len(tagEvents) != 2 {
+		t.Fatalf("tag hook events=%d, want one for each actually updated account", len(tagEvents))
+	}
+	seenTagAccounts := map[int64]bool{}
+	for _, event := range tagEvents {
+		seenTagAccounts[event.accountID] = true
+		if len(event.previous) != 0 || !reflect.DeepEqual(event.current, []string{"Ops", "blue"}) || !reflect.DeepEqual(event.observed, event.current) {
+			t.Fatalf("tag hook event=%+v, want previous empty and callback after runtime publication", event)
+		}
+	}
+	if !seenTagAccounts[accountID1] || !seenTagAccounts[accountID2] || seenTagAccounts[accountID2+1000] {
+		t.Fatalf("tag hook account IDs=%v, want only updated IDs %d/%d", seenTagAccounts, accountID1, accountID2)
 	}
 
 	rows, err := db.ListActive(ctx)
@@ -2167,6 +2199,109 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 		if priority := account.GetSchedulerPriority(); priority != 0 {
 			t.Fatalf("runtime account %d scheduler priority after reset = %d, want 0", account.ID(), priority)
 		}
+	}
+}
+
+func TestSchedulerTagRemoveAndBatchReaddSerializeDatabaseAndRuntime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertAccount(context.Background(), "tag-linear", "rt_tag_linear", "")
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+	runtimeAccount := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady, PlanType: "pro"}
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patchSingle := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(accountID, 10)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/accounts/1/scheduler", strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+	if recorder := patchSingle(`{"tags":["sys:ws-safe-pool"]}`); recorder.Code != http.StatusOK {
+		t.Fatalf("seed safe tag status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	type tagEvent struct {
+		previous []string
+		current  []string
+		observed []string
+	}
+	events := make(chan tagEvent, 2)
+	firstHookEntered := make(chan struct{})
+	releaseFirstHook := make(chan struct{})
+	var hookCalls atomic.Int32
+	handler.SetAccountTagsUpdatedHook(func(_ int64, previous, current []string) {
+		runtimeAccount.Mu().RLock()
+		observed := append([]string(nil), runtimeAccount.Tags...)
+		runtimeAccount.Mu().RUnlock()
+		events <- tagEvent{previous: append([]string(nil), previous...), current: append([]string(nil), current...), observed: observed}
+		if hookCalls.Add(1) == 1 {
+			close(firstHookEntered)
+			<-releaseFirstHook
+		}
+	})
+
+	removeDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { removeDone <- patchSingle(`{"tags":[]}`) }()
+	select {
+	case <-firstHookEntered:
+	case <-time.After(time.Second):
+		t.Fatal("remove tag hook did not start")
+	}
+
+	readdDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		body := fmt.Sprintf(`{"ids":[%d],"tags":["sys:ws-safe-pool"]}`, accountID)
+		ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-update", strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.BatchUpdateAccounts(ginCtx)
+		readdDone <- recorder
+	}()
+	select {
+	case recorder := <-readdDone:
+		t.Fatalf("batch re-add crossed blocked remove commit: status=%d body=%s", recorder.Code, recorder.Body.String())
+	case <-time.After(40 * time.Millisecond):
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID while remove hook blocked: %v", err)
+	}
+	if len(row.Tags) != 0 {
+		t.Fatalf("database tags=%v while remove hook blocked, batch re-add committed out of order", row.Tags)
+	}
+
+	close(releaseFirstHook)
+	if recorder := <-removeDone; recorder.Code != http.StatusOK {
+		t.Fatalf("remove status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder := <-readdDone; recorder.Code != http.StatusOK {
+		t.Fatalf("batch re-add status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	first := <-events
+	second := <-events
+	if !reflect.DeepEqual(first.previous, []string{"sys:ws-safe-pool"}) || len(first.current) != 0 || !reflect.DeepEqual(first.observed, first.current) {
+		t.Fatalf("remove event=%+v", first)
+	}
+	if len(second.previous) != 0 || !reflect.DeepEqual(second.current, []string{"sys:ws-safe-pool"}) || !reflect.DeepEqual(second.observed, second.current) {
+		t.Fatalf("re-add event=%+v", second)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil || !reflect.DeepEqual(row.Tags, []string{"sys:ws-safe-pool"}) {
+		t.Fatalf("final database tags=%v err=%v", row.Tags, err)
+	}
+	runtimeAccount.Mu().RLock()
+	finalRuntimeTags := append([]string(nil), runtimeAccount.Tags...)
+	runtimeAccount.Mu().RUnlock()
+	if !reflect.DeepEqual(finalRuntimeTags, row.Tags) {
+		t.Fatalf("final runtime tags=%v database tags=%v", finalRuntimeTags, row.Tags)
 	}
 }
 

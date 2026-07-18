@@ -883,17 +883,22 @@ func TestOfficialPromptCacheFuseFallsBackBeforeDialInsteadOfHandshakeStorm(t *te
 	}
 }
 
-func TestSafeScopeUnprovableOwnerFallsBackToHTTPBeforeDial(t *testing.T) {
+func TestSafeScopeUnprovableOwnerPreservesIsolatedOneShotWebsocket(t *testing.T) {
 	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
 	t.Setenv(safePoolScopeEnv, "all")
+	t.Setenv(safePoolOwnerSampleBPSEnv, "1")
+	t.Setenv(safePoolOwnerBudgetPerAccountEnv, "1")
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		handshakes.Add(1)
 		conn, err := upgrader.Upgrade(w, req, nil)
-		if err == nil {
-			_ = conn.Close()
+		if err != nil {
+			return
 		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		<-req.Context().Done()
 	}))
 	t.Cleanup(server.Close)
 
@@ -903,22 +908,47 @@ func TestSafeScopeUnprovableOwnerFallsBackToHTTPBeforeDial(t *testing.T) {
 	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
 	account := &auth.Account{DBID: 4604, AccountID: "acct-owner-missing", AccessToken: "token", DynamicConcurrencyLimit: 8}
 	for _, tc := range []struct {
-		name string
-		body []byte
+		name    string
+		body    []byte
+		headers http.Header
 	}{
 		{name: "missing owner", body: []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","input":"hello"}`)},
-		{name: "conflicting owner", body: []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"session_id\":\"session-A\",\"thread_id\":\"thread-B\"}"},"input":"hello"}`)},
+		{name: "conflicting frame metadata", body: []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"session-A","thread_id":"thread-A","x-codex-turn-metadata":"{\"session_id\":\"session-A\",\"thread_id\":\"thread-B\"}"},"input":"hello"}`)},
+		{name: "conflicting handshake identity", body: []byte(`{"model":"gpt-5.6","client_metadata":{"session_id":"session-A","thread_id":"thread-A"},"input":"hello"}`), headers: http.Header{"X-Client-Request-Id": {"different-thread"}}},
 		{name: "audio ineligible", body: []byte(`{"model":"gpt-5.6","modalities":["text","audio"],"client_metadata":{"session_id":"session-A","thread_id":"thread-A"},"input":"hello"}`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, tc.body, "official-cache", "", "key-A", nil, http.Header{}, "")
-			if response != nil || !errors.Is(err, proxy.ErrWebsocketSafePoolFallback) {
-				t.Fatalf("response=%v err=%v, want pre-write same-account HTTP fallback", response, err)
+			response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, tc.body, "official-cache", "", "key-A", nil, tc.headers, "")
+			if err != nil || response == nil {
+				t.Fatalf("response=%v err=%v, want isolated one-shot websocket", response, err)
 			}
+			if !response.oneShot || response.safePool || response.conn.safeReusable.Load() {
+				t.Fatalf("one-shot routing = oneShot:%v safePool:%v reusable:%v", response.oneShot, response.safePool, response.conn.safeReusable.Load())
+			}
+			response.Close()
 		})
 	}
-	if got := handshakes.Load(); got != 0 {
-		t.Fatalf("owner-missing request opened %d websocket handshakes, want 0", got)
+	// Reproduce the production-sized owner-unknown class: even at a one-basis-
+	// point reusable-owner rollout, these requests are never sampled into the
+	// pool and never surface the typed HTTP fallback. Each keeps one exclusive
+	// physical WebSocket, exactly like the untagged baseline.
+	for request := 4; request < 1098; request++ {
+		body := []byte(`{"model":"gpt-5.6","prompt_cache_key":"official-cache","input":"hello"}`)
+		response, err := exec.ExecuteRequestViaWebsocket(context.Background(), account, body, "official-cache", "", "key-A", nil, http.Header{}, "")
+		if err != nil || response == nil {
+			t.Fatalf("owner-unknown request %d response=%v err=%v, want isolated one-shot websocket", request+1, response, err)
+		}
+		if !response.oneShot || response.safePool || response.conn.safeReusable.Load() {
+			t.Fatalf("owner-unknown request %d routing = oneShot:%v safePool:%v reusable:%v", request+1, response.oneShot, response.safePool, response.conn.safeReusable.Load())
+		}
+		response.Close()
+	}
+	if got := handshakes.Load(); got != 1098 {
+		t.Fatalf("owner-ineligible requests opened %d websocket handshakes, want one isolated socket each", got)
+	}
+	metrics := manager.SafePoolMetricsSnapshot()
+	if metrics.OwnerMissing != 1095 || metrics.FrameMetadataRejected != 1 || metrics.OwnerHandshakeRejected != 1 || metrics.RequestIneligible != 1 || metrics.OwnerOneShotFallbacks != 1098 {
+		t.Fatalf("owner-ineligible metrics=%+v, want 1095 missing and one per remaining reason across 1098 one-shot websockets", metrics)
 	}
 }
 

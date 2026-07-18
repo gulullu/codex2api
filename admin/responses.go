@@ -254,6 +254,10 @@ type runtimeWebsocketResponse struct {
 	OwnerBudgetRejected         uint64 `json:"owner_budget_rejected"`
 	OwnerOneShotFallbacks       uint64 `json:"owner_oneshot_fallbacks"`
 	OwnerConfigErrors           uint64 `json:"owner_config_errors"`
+	OwnerHandshakeRejected      uint64 `json:"owner_handshake_rejected"`
+	FrameMetadataRejected       uint64 `json:"frame_metadata_rejected"`
+	GenerationInvalidations     uint64 `json:"generation_invalidations"`
+	RetiredOwners               uint64 `json:"retired_owners"`
 	ContinuationEvictions       uint64 `json:"continuation_evictions"`
 }
 

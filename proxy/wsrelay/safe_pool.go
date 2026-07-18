@@ -23,16 +23,31 @@ const safePoolTerminalReleaseWait = 500 * time.Millisecond
 type safeConnectionIdentity struct {
 	ownerKey             string
 	handshakeFingerprint string
+	generation           uint64
 }
 
 func (identity safeConnectionIdentity) valid() bool {
-	return strings.TrimSpace(identity.ownerKey) != "" && strings.TrimSpace(identity.handshakeFingerprint) != ""
+	return strings.TrimSpace(identity.ownerKey) != "" &&
+		strings.TrimSpace(identity.handshakeFingerprint) != "" &&
+		identity.generation > 0
 }
 
 func (identity safeConnectionIdentity) matches(wc *WsConnection) bool {
 	return identity.valid() && wc != nil &&
 		wc.safeOwnerKey == identity.ownerKey &&
-		wc.handshakeFingerprint == identity.handshakeFingerprint
+		wc.handshakeFingerprint == identity.handshakeFingerprint &&
+		wc.safeGeneration == identity.generation
+}
+
+func (wc *WsConnection) safeIdentity() safeConnectionIdentity {
+	if wc == nil {
+		return safeConnectionIdentity{}
+	}
+	return safeConnectionIdentity{
+		ownerKey:             wc.safeOwnerKey,
+		handshakeFingerprint: wc.handshakeFingerprint,
+		generation:           wc.safeGeneration,
+	}
 }
 
 func maxDuration(left, right time.Duration) time.Duration {
@@ -81,25 +96,29 @@ type safePoolFuseState struct {
 }
 
 type SafePoolMetrics struct {
-	DialAttempts           uint64
-	DialSuccess            uint64
-	DialFailures           uint64
-	ReuseHits              uint64
-	Saturations            uint64
-	FuseTrips              uint64
-	CompatibilityDrops     uint64
-	CompatibilityFallbacks uint64
-	OwnerEligible          uint64
-	OwnerMissing           uint64
-	OwnerRejected          uint64
-	RequestIneligible      uint64
-	OwnerAdmittedNew       uint64
-	OwnerAdmittedExisting  uint64
-	OwnerSampleRejected    uint64
-	OwnerBudgetRejected    uint64
-	OwnerOneShotFallbacks  uint64
-	OwnerConfigErrors      uint64
-	ContinuationEvictions  uint64
+	DialAttempts            uint64
+	DialSuccess             uint64
+	DialFailures            uint64
+	ReuseHits               uint64
+	Saturations             uint64
+	FuseTrips               uint64
+	CompatibilityDrops      uint64
+	CompatibilityFallbacks  uint64
+	OwnerEligible           uint64
+	OwnerMissing            uint64
+	OwnerRejected           uint64
+	RequestIneligible       uint64
+	OwnerAdmittedNew        uint64
+	OwnerAdmittedExisting   uint64
+	OwnerSampleRejected     uint64
+	OwnerBudgetRejected     uint64
+	OwnerOneShotFallbacks   uint64
+	OwnerConfigErrors       uint64
+	OwnerHandshakeRejected  uint64
+	FrameMetadataRejected   uint64
+	GenerationInvalidations uint64
+	RetiredOwners           uint64
+	ContinuationEvictions   uint64
 }
 
 // SafePoolRuntime is an approximate, read-only process snapshot for rollout
@@ -139,25 +158,29 @@ func (m *Manager) SafePoolMetricsSnapshot() SafePoolMetrics {
 		return SafePoolMetrics{}
 	}
 	return SafePoolMetrics{
-		DialAttempts:           m.safePoolDialAttempts.Load(),
-		DialSuccess:            m.safePoolDialSuccess.Load(),
-		DialFailures:           m.safePoolDialFailures.Load(),
-		ReuseHits:              m.safePoolReuseHits.Load(),
-		Saturations:            m.safePoolSaturations.Load(),
-		FuseTrips:              m.safePoolFuseTrips.Load(),
-		CompatibilityDrops:     m.safePoolCompatibilityDrops.Load(),
-		CompatibilityFallbacks: m.safePoolCompatibilityFallbacks.Load(),
-		OwnerEligible:          m.safePoolOwnerEligible.Load(),
-		OwnerMissing:           m.safePoolOwnerMissing.Load(),
-		OwnerRejected:          m.safePoolOwnerRejected.Load(),
-		RequestIneligible:      m.safePoolRequestIneligible.Load(),
-		OwnerAdmittedNew:       m.safePoolOwnerAdmittedNew.Load(),
-		OwnerAdmittedExisting:  m.safePoolOwnerAdmittedExisting.Load(),
-		OwnerSampleRejected:    m.safePoolOwnerSampleRejected.Load(),
-		OwnerBudgetRejected:    m.safePoolOwnerBudgetRejected.Load(),
-		OwnerOneShotFallbacks:  m.safePoolOwnerOneShotFallbacks.Load(),
-		OwnerConfigErrors:      m.safePoolOwnerConfigErrors.Load(),
-		ContinuationEvictions:  m.continuationBudgetEvictions.Load(),
+		DialAttempts:            m.safePoolDialAttempts.Load(),
+		DialSuccess:             m.safePoolDialSuccess.Load(),
+		DialFailures:            m.safePoolDialFailures.Load(),
+		ReuseHits:               m.safePoolReuseHits.Load(),
+		Saturations:             m.safePoolSaturations.Load(),
+		FuseTrips:               m.safePoolFuseTrips.Load(),
+		CompatibilityDrops:      m.safePoolCompatibilityDrops.Load(),
+		CompatibilityFallbacks:  m.safePoolCompatibilityFallbacks.Load(),
+		OwnerEligible:           m.safePoolOwnerEligible.Load(),
+		OwnerMissing:            m.safePoolOwnerMissing.Load(),
+		OwnerRejected:           m.safePoolOwnerRejected.Load(),
+		RequestIneligible:       m.safePoolRequestIneligible.Load(),
+		OwnerAdmittedNew:        m.safePoolOwnerAdmittedNew.Load(),
+		OwnerAdmittedExisting:   m.safePoolOwnerAdmittedExisting.Load(),
+		OwnerSampleRejected:     m.safePoolOwnerSampleRejected.Load(),
+		OwnerBudgetRejected:     m.safePoolOwnerBudgetRejected.Load(),
+		OwnerOneShotFallbacks:   m.safePoolOwnerOneShotFallbacks.Load(),
+		OwnerConfigErrors:       m.safePoolOwnerConfigErrors.Load(),
+		OwnerHandshakeRejected:  m.safePoolOwnerHandshakeRejected.Load(),
+		FrameMetadataRejected:   m.safePoolFrameMetadataRejected.Load(),
+		GenerationInvalidations: m.safePoolGenerationInvalidations.Load(),
+		RetiredOwners:           m.safePoolRetiredOwners.Load(),
+		ContinuationEvictions:   m.continuationBudgetEvictions.Load(),
 	}
 }
 
@@ -304,43 +327,104 @@ func (m *Manager) TripSafePoolCompatibilityFuse(accountID int64, reason error) {
 }
 
 // RetireSafePoolAccount applies a live rollout-policy removal without touching
-// account status, tags, schedulability, Guardian or the database. Idle safe
-// sockets are closed immediately; active sockets finish their current response
-// and are destroyed by ReleaseConnection. The process-local hint makes calls
-// for accounts that never used the safe pool O(1).
+// account status, tags, schedulability, Guardian or the database. Generation
+// invalidation is unconditional: an owner admitted before a cold dial is still
+// retired even when no socket ever populated safePoolAccounts.
 func (m *Manager) RetireSafePoolAccount(accountID int64) {
 	if m == nil || accountID <= 0 {
 		return
 	}
-	if _, tracked := m.safePoolAccounts.LoadAndDelete(accountID); !tracked {
+	m.retireSafePoolAccount(accountID, false)
+}
+
+// HandleAccountTagsUpdated is the low-coupling admin hook for dynamic rollout
+// tags. IDs and names remain runtime data. Retirement follows the effective
+// policy transition rather than one literal tag: under scope=tagged removing
+// sys:ws-safe-pool disables reuse, while under scope=all that removal is a
+// no-op and adding sys:ws-oneshot is the disabling transition.
+func (m *Manager) HandleAccountTagsUpdated(accountID int64, previousTags, currentTags []string) {
+	if m == nil || accountID <= 0 {
 		return
 	}
-	m.retireSafePoolAccount(accountID, false)
+	account := &auth.Account{DBID: accountID}
+	previousSafe := resolveStatelessPoolPolicyWithTags(account, m, previousTags).mode == statelessPoolSafe
+	currentSafe := resolveStatelessPoolPolicyWithTags(account, m, currentTags).mode == statelessPoolSafe
+	if previousSafe && !currentSafe {
+		m.RetireSafePoolAccount(accountID)
+	}
 }
 
 func (m *Manager) retireSafePoolAccount(accountID int64, force bool) {
 	if m == nil || accountID <= 0 {
 		return
 	}
-	if force {
-		m.safePoolAccounts.Delete(accountID)
+	m.ownerAdmissionMu.Lock()
+	m.invalidateSafePoolGenerationLocked(accountID)
+	m.ownerAdmissionMu.Unlock()
+	m.retireSafePoolAccountSockets(accountID, force)
+}
+
+// retireSafePoolAccountIfPolicyDisabled revalidates the current master policy
+// under the account read lock before invalidating a generation. This prevents a
+// request carrying an old non-safe policy snapshot from retiring a generation
+// that a concurrent tag re-add just admitted.
+func (m *Manager) retireSafePoolAccountIfPolicyDisabled(account *auth.Account) {
+	if m == nil || account == nil || account.ID() <= 0 {
+		return
 	}
+	account.Mu().RLock()
+	policy := resolveStatelessPoolPolicyWithTags(account, m, account.Tags)
+	if policy.mode == statelessPoolSafe {
+		account.Mu().RUnlock()
+		return
+	}
+	m.ownerAdmissionMu.Lock()
+	if len(m.safePoolAdmittedOwners[account.ID()]) == 0 {
+		m.ownerAdmissionMu.Unlock()
+		account.Mu().RUnlock()
+		return
+	}
+	m.invalidateSafePoolGenerationLocked(account.ID())
+	m.ownerAdmissionMu.Unlock()
+	account.Mu().RUnlock()
+	m.retireSafePoolAccountSockets(account.ID(), false)
+}
+
+func (m *Manager) retireSafePoolAccountSockets(accountID int64, force bool) {
 	accountLock := m.accountLock(accountID)
 	accountLock.Lock()
 	idle := make([]*WsConnection, 0)
+	retired := make([]*WsConnection, 0)
 	m.connections.Range(func(_, value any) bool {
 		wc, ok := value.(*WsConnection)
 		if !ok || wc == nil || !wc.safeReusable.Load() || wc.session == nil || wc.session.AccountID != accountID {
 			return true
 		}
 		wc.retireAfterLease.Store(true)
+		retired = append(retired, wc)
 		if wc.session.PendingCount() == 0 {
 			idle = append(idle, wc)
 		}
 		return true
 	})
 	accountLock.Unlock()
+	// Bindings are continuation capabilities and must disappear as soon as the
+	// admitting generation is invalidated, including for an active old socket.
+	for _, wc := range retired {
+		m.removeResponseConnBindings(wc)
+	}
 	for _, wc := range idle {
+		m.DiscardConnection(wc)
+	}
+}
+
+func (m *Manager) retireStaleSafeConnection(wc *WsConnection) {
+	if m == nil || wc == nil {
+		return
+	}
+	wc.retireAfterLease.Store(true)
+	m.removeResponseConnBindings(wc)
+	if wc.session == nil || wc.session.PendingCount() == 0 {
 		m.DiscardConnection(wc)
 	}
 }
@@ -391,6 +475,30 @@ func currentSafePoolSlots(account *auth.Account, manager *Manager) (int, bool) {
 	return slots, true
 }
 
+// safePoolIdentityUsable atomically rechecks the dynamic master policy and the
+// account-local owner generation. The lock order (account RLock ->
+// ownerAdmissionMu) matches admission and tag-update retirement.
+func (m *Manager) safePoolIdentityUsable(account *auth.Account, identity safeConnectionIdentity) bool {
+	if m == nil || account == nil || !identity.valid() {
+		return false
+	}
+	account.Mu().RLock()
+	policyActive := resolveStatelessPoolPolicyWithTags(account, m, account.Tags).mode == statelessPoolSafe
+	m.ownerAdmissionMu.Lock()
+	generationCurrent := m.safePoolIdentityGenerationCurrentLocked(account.ID(), identity)
+	m.ownerAdmissionMu.Unlock()
+	account.Mu().RUnlock()
+	return policyActive && generationCurrent
+}
+
+func (m *Manager) safePoolConnectionUsable(wc *WsConnection) bool {
+	return wc != nil && wc.safeReusable.Load() && m.safePoolIdentityUsable(wc.account, wc.safeIdentity())
+}
+
+func safePoolAcquireFallback(message string) error {
+	return fmt.Errorf("%w: %s", proxy.ErrWebsocketSafePoolFallback, message)
+}
+
 // AcquireSafeReusableConnection provides the tagged/all rollout path. Unlike
 // the historical pool it never creates an unbounded one-shot overflow socket.
 // At saturation it waits briefly for a clean slot, then returns the existing
@@ -413,6 +521,9 @@ func (m *Manager) AcquireSafeReusableConnection(
 	if !identity.valid() {
 		return nil, nil, "", fmt.Errorf("%w: missing session/thread owner or handshake fingerprint", errSafePoolIsolationViolation)
 	}
+	if !m.safePoolIdentityUsable(account, identity) {
+		return nil, nil, "", safePoolAcquireFallback("safe websocket owner generation or rollout policy is no longer current")
+	}
 	opCtx, finishOperation, err := m.beginOperation(ctx)
 	if err != nil {
 		return nil, nil, "", err
@@ -421,7 +532,7 @@ func (m *Manager) AcquireSafeReusableConnection(
 	ctx = opCtx
 	currentSlots, policyActive := currentSafePoolSlots(account, m)
 	if !policyActive {
-		return nil, nil, "", newLocalCapacityAcquireError(0, fmt.Errorf("safe websocket reuse is no longer enabled"))
+		return nil, nil, "", safePoolAcquireFallback("safe websocket reuse is no longer enabled")
 	}
 	slots = currentSlots
 
@@ -439,32 +550,35 @@ func (m *Manager) AcquireSafeReusableConnection(
 	started := time.Now()
 	backoff := 5 * time.Millisecond
 	for {
+		if !m.safePoolIdentityUsable(account, identity) {
+			return nil, nil, "", safePoolAcquireFallback("safe websocket generation changed during acquire")
+		}
 		currentSlots, policyActive = currentSafePoolSlots(account, m)
 		if !policyActive {
-			m.RetireSafePoolAccount(account.ID())
-			return nil, nil, "", newLocalCapacityAcquireError(time.Since(started), fmt.Errorf("safe websocket reuse was disabled during acquire"))
+			m.retireSafePoolAccountIfPolicyDisabled(account)
+			return nil, nil, "", safePoolAcquireFallback("safe websocket reuse was disabled during acquire")
 		}
 		slots = currentSlots
 		probeCtx, cancelProbe := context.WithTimeout(ctx, maxDuration(time.Until(started.Add(waitLimit)), time.Millisecond))
-		wc, pending, slot, ok, probeInterrupted := m.tryAcquireExistingSafeSlot(probeCtx, account, wsURL, baseKey, slots, identity, proxyOverride)
+		wc, pending, slot, ok, probeInterrupted, acquireErr := m.tryAcquireExistingSafeSlot(probeCtx, account, wsURL, baseKey, slots, identity, proxyOverride)
 		parentInterruption := contextInterruptionError(ctx)
 		cancelProbe()
 		if parentInterruption != nil {
 			return nil, nil, "", newLocalCapacityAcquireError(time.Since(started), parentInterruption)
 		}
+		if acquireErr != nil {
+			return nil, nil, "", acquireErr
+		}
 		if ok {
-			if _, stillActive := currentSafePoolSlots(account, m); !stillActive {
+			if !m.safePoolIdentityUsable(account, identity) {
 				wc.session.RemovePendingRequest(pending.RequestID)
-				wc.retireAfterLease.Store(true)
-				m.DiscardConnection(wc)
-				m.RetireSafePoolAccount(account.ID())
-				return nil, nil, "", newLocalCapacityAcquireError(time.Since(started), fmt.Errorf("safe websocket reuse was disabled after probe"))
+				m.retireStaleSafeConnection(wc)
+				return nil, nil, "", safePoolAcquireFallback("safe websocket generation changed after probe")
 			}
 			return wc, pending, slot, nil
 		}
-		if _, stillActive := currentSafePoolSlots(account, m); !stillActive {
-			m.RetireSafePoolAccount(account.ID())
-			return nil, nil, "", newLocalCapacityAcquireError(time.Since(started), fmt.Errorf("safe websocket reuse was disabled after probe"))
+		if !m.safePoolIdentityUsable(account, identity) {
+			return nil, nil, "", safePoolAcquireFallback("safe websocket generation changed after probe")
 		}
 		if probeInterrupted {
 			m.safePoolSaturations.Add(1)
@@ -516,7 +630,10 @@ func (m *Manager) tryAcquireExistingSafeSlot(
 	slots int,
 	identity safeConnectionIdentity,
 	proxyOverride string,
-) (*WsConnection, *PendingRequest, string, bool, bool) {
+) (*WsConnection, *PendingRequest, string, bool, bool, error) {
+	if !m.safePoolIdentityUsable(account, identity) {
+		return nil, nil, "", false, false, safePoolAcquireFallback("safe websocket generation changed before existing-slot acquire")
+	}
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 	accountLock := m.accountLock(account.ID())
 	for i := 0; i < 1; i++ {
@@ -552,9 +669,14 @@ func (m *Manager) tryAcquireExistingSafeSlot(
 		}
 		if canReuseConnection(wc) {
 			if m.probeWithContext(ctx, wc) {
+				if !m.safePoolIdentityUsable(account, identity) {
+					m.retireStaleSafeConnection(wc)
+					lock.Unlock()
+					return nil, nil, "", false, false, safePoolAcquireFallback("safe websocket generation changed during liveness probe")
+				}
 				accountLock.Lock()
 				current, currentExists := m.connections.Load(key)
-				if !currentExists || current != wc || wc.reuseFenceActive() || !canReuseConnection(wc) {
+				if !currentExists || current != wc || wc.reuseFenceActive() || !canReuseConnection(wc) || !m.safePoolIdentityUsable(account, identity) {
 					accountLock.Unlock()
 					lock.Unlock()
 					continue
@@ -573,7 +695,7 @@ func (m *Manager) tryAcquireExistingSafeSlot(
 					m.safePoolReuseHits.Add(1)
 					accountLock.Unlock()
 					lock.Unlock()
-					return wc, pending, slotSession, true, false
+					return wc, pending, slotSession, true, false, nil
 				}
 				m.DiscardConnection(wc)
 				accountLock.Unlock()
@@ -582,7 +704,7 @@ func (m *Manager) tryAcquireExistingSafeSlot(
 			}
 			if contextInterruptionError(ctx) != nil {
 				lock.Unlock()
-				return nil, nil, "", false, true
+				return nil, nil, "", false, true, nil
 			}
 			m.DiscardConnection(wc)
 		} else if !wc.IsConnected() || wc.session == nil || (wc.session.PendingCount() == 0 && !wc.readPumpReusable()) {
@@ -590,7 +712,7 @@ func (m *Manager) tryAcquireExistingSafeSlot(
 		}
 		lock.Unlock()
 	}
-	return nil, nil, "", false, false
+	return nil, nil, "", false, false, nil
 }
 
 // ensureSafePoolAccountCapacity enforces the configured count of active or
@@ -603,8 +725,15 @@ func (m *Manager) ensureSafePoolAccountCapacity(accountID int64, limit int, prot
 	return m.convergeSafePoolAccountCapacity(accountID, limit, protectedKey, m.safePoolPendingCreateCount(accountID), 1)
 }
 
-func (m *Manager) ensureSafePoolPromotionCapacity(accountID int64, limit int, protectedKey string) bool {
-	return m.convergeSafePoolAccountCapacity(accountID, limit, protectedKey, m.safePoolPendingCreateCount(accountID), 0)
+func (m *Manager) ensureSafePoolPromotionCapacity(accountID int64, limit int, protectedKey string, published bool) bool {
+	pendingCreates := m.safePoolPendingCreateCount(accountID)
+	// The promoting dial remains reserved until publication is fully validated.
+	// Once its socket is in the map, counting both that socket and its own
+	// reservation would consume two slots and reject every slots=1 cold start.
+	if published && pendingCreates > 0 {
+		pendingCreates--
+	}
+	return m.convergeSafePoolAccountCapacity(accountID, limit, protectedKey, pendingCreates, 0)
 }
 
 func (m *Manager) convergeSafePoolAccountCapacity(accountID int64, limit int, protectedKey string, pendingCreates, additionalSlots int) bool {
@@ -668,6 +797,9 @@ func (m *Manager) tryCreateSafeSlot(
 	identity safeConnectionIdentity,
 	proxyOverride string,
 ) (*WsConnection, *PendingRequest, string, bool, error) {
+	if !m.safePoolIdentityUsable(account, identity) {
+		return nil, nil, "", false, safePoolAcquireFallback("safe websocket generation changed before dial")
+	}
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 	accountLock := m.accountLock(account.ID())
 	for i := 0; i < 1; i++ {
@@ -680,6 +812,11 @@ func (m *Manager) tryCreateSafeSlot(
 			continue
 		}
 		accountLock.Lock()
+		if !m.safePoolIdentityUsable(account, identity) {
+			accountLock.Unlock()
+			lock.Unlock()
+			return nil, nil, "", false, safePoolAcquireFallback("safe websocket generation changed before dial reservation")
+		}
 		if _, exists := m.connections.Load(key); exists {
 			accountLock.Unlock()
 			lock.Unlock()
@@ -708,16 +845,20 @@ func (m *Manager) tryCreateSafeSlot(
 			return nil, nil, "", false, err
 		}
 		m.safePoolDialSuccess.Add(1)
-		if _, policyActive := currentSafePoolSlots(account, m); !policyActive {
+		if !m.safePoolIdentityUsable(account, identity) {
 			m.releaseSafePoolPendingCreate(account.ID())
 			m.releaseAccountConnectionCapacity(account.ID())
 			m.DiscardConnection(wc)
 			lock.Unlock()
-			return nil, nil, "", false, nil
+			return nil, nil, "", false, safePoolAcquireFallback("safe websocket generation changed after dial")
 		}
 		pending, leaseErr := m.storeConnectionAndBeginReadLeaseChecked(ctx, account, accountLock, wc, slotSession, func() bool {
 			currentSlots, policyActive := currentSafePoolSlots(account, m)
-			return policyActive && m.ensureSafePoolPromotionCapacity(account.ID(), currentSlots, key)
+			published := false
+			if current, exists := m.connections.Load(key); exists && current == wc {
+				published = true
+			}
+			return policyActive && m.safePoolIdentityUsable(account, identity) && m.ensureSafePoolPromotionCapacity(account.ID(), currentSlots, key, published)
 		})
 		m.releaseSafePoolPendingCreate(account.ID())
 		if leaseErr == nil {
@@ -733,6 +874,12 @@ func (m *Manager) tryCreateSafeSlot(
 				return nil, nil, "", false, ctx.Err()
 			}
 			continue
+		}
+		if !m.safePoolIdentityUsable(account, identity) {
+			wc.session.RemovePendingRequest(pending.RequestID)
+			m.retireStaleSafeConnection(wc)
+			lock.Unlock()
+			return nil, nil, "", false, safePoolAcquireFallback("safe websocket generation changed after store")
 		}
 		lock.Unlock()
 		if connected := m.getOnConnected(); connected != nil {

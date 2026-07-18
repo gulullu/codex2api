@@ -101,6 +101,11 @@ type WsConnection struct {
 	// from crossing a Codex session/thread or a connection-scoped identity.
 	safeOwnerKey         string
 	handshakeFingerprint string
+	// safeGeneration binds the socket to the account-local master-tag
+	// generation that admitted its owner. Removing and re-adding the tag always
+	// creates a new generation; an old socket can finish an already-written turn
+	// but can never be acquired, published, or written again.
+	safeGeneration uint64
 	// recent response IDs detect a delayed duplicate response.created from a
 	// prior lease before any such frame can reach the downstream callback.
 	safeHistoryMu     sync.Mutex
@@ -349,11 +354,20 @@ func (wc *WsConnection) SetState(state ConnectionState) {
 
 // WriteMessage 安全写入消息
 func (wc *WsConnection) WriteMessage(messageType int, data []byte) error {
+	return wc.writeMessageChecked(messageType, data, nil)
+}
+
+func (wc *WsConnection) writeMessageChecked(messageType int, data []byte, beforeWrite func() error) error {
 	wc.writeMu.Lock()
 	defer wc.writeMu.Unlock()
 
 	if !wc.IsConnected() || (wc.conn == nil && wc.writeMessageFunc == nil) {
 		return fmt.Errorf("%w: websocket connection is not connected", errWebsocketWriteNotStarted)
+	}
+	if beforeWrite != nil {
+		if err := beforeWrite(); err != nil {
+			return fmt.Errorf("%w: %w", errWebsocketWriteNotStarted, err)
+		}
 	}
 	leaseID, tracksLease, err := wc.beginReadLeaseWrite(messageType)
 	if err != nil {
@@ -443,8 +457,9 @@ type Manager struct {
 	// account ID -> safePoolFuseState. Process-local by design: it is a
 	// transport escape hatch, never a database/account-status mutation.
 	safePoolFuses sync.Map
-	// safePoolAccounts is a cheap process-local hint used to avoid scanning all
-	// sockets on every ordinary request after the rollout is disabled.
+	// safePoolAccounts tracks account-level safe-pool lifecycle presence for the
+	// read-only runtime snapshot. Admission publishes it before any cold dial so
+	// a tag retirement cannot miss an owner that has not created a socket yet.
 	safePoolAccounts               sync.Map
 	safePoolDialAttempts           atomic.Uint64
 	safePoolDialSuccess            atomic.Uint64
@@ -464,9 +479,14 @@ type Manager struct {
 	safePoolOwnerBudgetRejected    atomic.Uint64
 	safePoolOwnerOneShotFallbacks  atomic.Uint64
 	safePoolOwnerConfigErrors      atomic.Uint64
+	safePoolOwnerHandshakeRejected atomic.Uint64
+	safePoolFrameMetadataRejected  atomic.Uint64
+	safePoolGenerationInvalidations atomic.Uint64
+	safePoolRetiredOwners           atomic.Uint64
 	continuationBudgetEvictions    atomic.Uint64
 	ownerAdmissionMu               sync.Mutex
-	safePoolAdmittedOwners         map[int64]map[string]struct{}
+	safePoolAdmittedOwners         map[int64]map[string]uint64
+	safePoolAccountGenerations     map[int64]uint64
 	ownerAdmissionSalt             [32]byte
 	ownerAdmissionSaltValid        bool
 
@@ -530,6 +550,7 @@ type responseConnBinding struct {
 	apiKey               string
 	safeOwnerKey         string
 	handshakeFingerprint string
+	safeGeneration       uint64
 	expiresAt            time.Time
 	generation           uint64
 }
@@ -713,7 +734,9 @@ func (m *Manager) Stop() {
 		m.closeAll()
 		m.ownerAdmissionMu.Lock()
 		m.safePoolAdmittedOwners = nil
+		m.safePoolAccountGenerations = nil
 		m.ownerAdmissionMu.Unlock()
+		m.safePoolAccounts = sync.Map{}
 	})
 }
 
@@ -1723,6 +1746,12 @@ func (m *Manager) storeConnectionAndBeginReadLeaseChecked(
 	if m.afterConnectionStored != nil {
 		m.afterConnectionStored(wc)
 	}
+	if promotionCheck != nil && !promotionCheck() {
+		wc.session.RemovePendingRequest(pr.RequestID)
+		m.releaseAccountConnectionCapacity(accountID)
+		m.discardConnectionState(wc)
+		return nil, fmt.Errorf("promote websocket connection: rollout generation or policy changed during publication")
+	}
 	storedConnection, connectionStored := m.connections.Load(wc.PoolKey)
 	storedSession, sessionStored := m.sessions.Load(wc.PoolKey)
 	if !wc.IsConnected() || !wc.session.IsConnected() || !connectionStored || storedConnection != wc || !sessionStored || storedSession != wc.session {
@@ -2296,6 +2325,7 @@ func (m *Manager) createConnectionWithIdentity(
 		// fuse instead of passing through the ordinary idle-frame path.
 		wc.safeOwnerKey = identity.ownerKey
 		wc.handshakeFingerprint = identity.handshakeFingerprint
+		wc.safeGeneration = identity.generation
 		wc.safeReusable.Store(true)
 		m.safePoolAccounts.Store(account.ID(), struct{}{})
 	}
@@ -2317,7 +2347,7 @@ func (m *Manager) ReleaseConnection(wc *WsConnection) {
 	if wc.account == nil || wc.session == nil {
 		return
 	}
-	if wc.safeReusable.Load() && (wc.retireAfterLease.Load() || m.IsSafePoolFused(wc.session.AccountID)) {
+	if wc.safeReusable.Load() && (wc.retireAfterLease.Load() || m.IsSafePoolFused(wc.session.AccountID) || !m.safePoolConnectionUsable(wc)) {
 		m.DiscardConnection(wc)
 		return
 	}
@@ -2418,16 +2448,39 @@ func (m *Manager) BindResponseConn(responseID string, wc *WsConnection, sessionK
 	if m == nil || responseID == "" || wc == nil {
 		return
 	}
+	unlockSafeValidation := func() {}
+	if wc.safeReusable.Load() {
+		if wc.account == nil {
+			wc.retireAfterLease.Store(true)
+			return
+		}
+		wc.account.Mu().RLock()
+		m.ownerAdmissionMu.Lock()
+		identityCurrent := resolveStatelessPoolPolicyWithTags(wc.account, m, wc.account.Tags).mode == statelessPoolSafe &&
+			m.safePoolIdentityGenerationCurrentLocked(accountID, wc.safeIdentity())
+		if !identityCurrent {
+			m.ownerAdmissionMu.Unlock()
+			wc.account.Mu().RUnlock()
+			wc.retireAfterLease.Store(true)
+			return
+		}
+		unlockSafeValidation = func() {
+			m.ownerAdmissionMu.Unlock()
+			wc.account.Mu().RUnlock()
+		}
+	}
 	m.respConnMu.Lock()
 	// Validate while holding the same mutex that protects publication. Discard
 	// removes the pool entry and closes the connection before taking this lock,
 	// so a bind racing with discard cannot resurrect a dead pointer.
 	if !wc.IsConnected() {
 		m.respConnMu.Unlock()
+		unlockSafeValidation()
 		return
 	}
 	if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc {
 		m.respConnMu.Unlock()
+		unlockSafeValidation()
 		return
 	}
 	if m.respConnBindings == nil {
@@ -2480,11 +2533,13 @@ func (m *Manager) BindResponseConn(responseID string, wc *WsConnection, sessionK
 		apiKey:               apiKey,
 		safeOwnerKey:         wc.safeOwnerKey,
 		handshakeFingerprint: wc.handshakeFingerprint,
+		safeGeneration:       wc.safeGeneration,
 		expiresAt:            now.Add(responseConnBindingTTL),
 		generation:           m.responseBindingGeneration,
 	}
 	m.publishResponseConnBindingLocked(responseID, binding)
 	m.respConnMu.Unlock()
+	unlockSafeValidation()
 }
 
 func (m *Manager) lookupResponseBinding(responseID string, accountID int64, apiKey string) (responseConnBinding, bool) {
@@ -2572,13 +2627,13 @@ func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID str
 		if requireSafeIdentity && (binding.safeOwnerKey != expectedIdentity.ownerKey || binding.handshakeFingerprint != expectedIdentity.handshakeFingerprint) {
 			return nil, nil, "", fmt.Errorf("%w: response binding owner or handshake identity mismatch", proxy.ErrWebsocketContinuationUnavailable)
 		}
+		if requireSafeIdentity && binding.safeGeneration != expectedIdentity.generation {
+			return nil, nil, "", fmt.Errorf("%w: response binding belongs to an obsolete safe-pool generation", proxy.ErrWebsocketContinuationUnavailable)
+		}
 		if wc.safeReusable.Load() {
-			if resolveStatelessPoolPolicy(wc.account, m).mode != statelessPoolSafe {
-				m.RetireSafePoolAccount(accountID)
-				return nil, nil, "", fmt.Errorf("%w: safe websocket reuse is disabled by current rollout policy", proxy.ErrWebsocketContinuationUnavailable)
-			}
-			if !expectedIdentity.matches(wc) {
-				return nil, nil, "", fmt.Errorf("%w: safe websocket continuation owner or handshake identity mismatch", proxy.ErrWebsocketContinuationUnavailable)
+			if !expectedIdentity.matches(wc) || !m.safePoolIdentityUsable(wc.account, expectedIdentity) {
+				m.retireStaleSafeConnection(wc)
+				return nil, nil, "", fmt.Errorf("%w: safe websocket continuation owner, generation, or rollout policy is stale", proxy.ErrWebsocketContinuationUnavailable)
 			}
 			if m.IsSafePoolFused(accountID) {
 				return nil, nil, "", fmt.Errorf("%w: safe websocket pool is fused for account", proxy.ErrWebsocketContinuationUnavailable)
@@ -2627,9 +2682,9 @@ func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID str
 	if !bindingOK || currentBinding.conn != wc || currentBinding.generation != binding.generation {
 		return nil, nil, "", fmt.Errorf("%w: response binding changed while reserving its websocket", proxy.ErrWebsocketContinuationUnavailable)
 	}
-	if wc.safeReusable.Load() && (resolveStatelessPoolPolicy(wc.account, m).mode != statelessPoolSafe || !expectedIdentity.matches(wc) || m.IsSafePoolFused(accountID)) {
-		m.RetireSafePoolAccount(accountID)
-		return nil, nil, "", fmt.Errorf("%w: safe websocket continuation identity changed or reuse was fused", proxy.ErrWebsocketContinuationUnavailable)
+	if wc.safeReusable.Load() && (!expectedIdentity.matches(wc) || !m.safePoolIdentityUsable(wc.account, expectedIdentity)) {
+		m.retireStaleSafeConnection(wc)
+		return nil, nil, "", fmt.Errorf("%w: safe websocket continuation identity, generation, or policy changed", proxy.ErrWebsocketContinuationUnavailable)
 	}
 	if !canReuseConnection(wc) {
 		if wc.IsConnected() && wc.session != nil && wc.session.IsConnected() && wc.session.PendingCount() > 0 {
@@ -2650,6 +2705,10 @@ func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID str
 	if err := preferredContinuationContextError(opCtx, "after the liveness probe"); err != nil {
 		return nil, nil, "", err
 	}
+	if wc.safeReusable.Load() && !m.safePoolIdentityUsable(wc.account, expectedIdentity) {
+		m.retireStaleSafeConnection(wc)
+		return nil, nil, "", fmt.Errorf("%w: safe websocket continuation generation changed during liveness probe", proxy.ErrWebsocketContinuationUnavailable)
+	}
 	// probe 可能等待网络，不能占用账号锁。拿到账号锁后再次复验，防止
 	// probe 期间连接被其它 pool key 的容量裁剪安全回收。
 	accountLock.Lock()
@@ -2666,7 +2725,7 @@ func (m *Manager) AcquirePreferredConnection(ctx context.Context, responseID str
 		}
 		return nil, nil, "", fmt.Errorf("%w: response-bound websocket connection became unusable during probe", proxy.ErrWebsocketContinuationUnavailable)
 	}
-	if wc.safeReusable.Load() && (resolveStatelessPoolPolicy(wc.account, m).mode != statelessPoolSafe || !expectedIdentity.matches(wc) || wc.reuseFenceActive() || m.IsSafePoolFused(accountID)) {
+	if wc.safeReusable.Load() && (!expectedIdentity.matches(wc) || !m.safePoolIdentityUsable(wc.account, expectedIdentity) || wc.reuseFenceActive()) {
 		// accountLock is held here, so do not call the account-wide retire
 		// helper recursively. Mark this exact socket non-reusable; the earlier
 		// policy gate handles normal hot-disable cleanup for all idle sockets.

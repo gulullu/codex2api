@@ -98,13 +98,13 @@ func (decision safePoolOwnerAdmissionDecision) admitted() bool {
 }
 
 // admitSafePoolOwner is the process-lifetime blast-radius guard. Existing
-// owners are checked before the current sample/budget, so hot tightening never
-// revokes an admitted owner or its connection-local continuation. Retire and
-// account tag changes deliberately do not clear this registry.
-func (m *Manager) admitSafePoolOwner(accountID int64, ownerKey string, config safePoolOwnerAdmissionConfig) safePoolOwnerAdmissionDecision {
+// owners in the current rollout generation are checked before the current
+// sample/budget, so hot tightening does not revoke them. A policy/tag retire
+// invalidates that generation and deliberately clears its owner registry.
+func (m *Manager) admitSafePoolOwner(accountID int64, ownerKey string, config safePoolOwnerAdmissionConfig) (safePoolOwnerAdmissionDecision, uint64) {
 	ownerKey = strings.TrimSpace(ownerKey)
 	if m == nil || accountID <= 0 || ownerKey == "" {
-		return safePoolOwnerRejectedBySample
+		return safePoolOwnerRejectedBySample, 0
 	}
 	// Admission participates in the same Manager lifecycle as socket acquire.
 	// Stop closes the operation gate, waits for any already-admitted commit,
@@ -112,7 +112,7 @@ func (m *Manager) admitSafePoolOwner(accountID int64, ownerKey string, config sa
 	// process-lifetime registry has reached its terminal empty state.
 	_, finishOperation, err := m.beginOperation(context.Background())
 	if err != nil {
-		return safePoolOwnerRejectedByLifecycle
+		return safePoolOwnerRejectedByLifecycle, 0
 	}
 	defer finishOperation()
 	if m.beforeOwnerAdmissionCommit != nil {
@@ -122,10 +122,18 @@ func (m *Manager) admitSafePoolOwner(accountID int64, ownerKey string, config sa
 	m.ownerAdmissionMu.Lock()
 	defer m.ownerAdmissionMu.Unlock()
 
+	generation := m.safePoolAccountGenerations[accountID]
+	if generation == 0 {
+		if m.safePoolAccountGenerations == nil {
+			m.safePoolAccountGenerations = make(map[int64]uint64)
+		}
+		generation = 1
+		m.safePoolAccountGenerations[accountID] = generation
+	}
 	owners := m.safePoolAdmittedOwners[accountID]
-	if _, exists := owners[ownerKey]; exists {
+	if ownerGeneration, exists := owners[ownerKey]; exists && ownerGeneration == generation {
 		m.safePoolOwnerAdmittedExisting.Add(1)
-		return safePoolOwnerAdmittedExisting
+		return safePoolOwnerAdmittedExisting, generation
 	}
 	if !config.valid || !m.ownerAdmissionSaltValid {
 		m.safePoolOwnerConfigErrors.Add(1)
@@ -133,23 +141,94 @@ func (m *Manager) admitSafePoolOwner(accountID int64, ownerKey string, config sa
 	if !config.valid || !m.safePoolOwnerSampled(accountID, ownerKey, config.sampleBPS) {
 		m.safePoolOwnerSampleRejected.Add(1)
 		m.safePoolOwnerOneShotFallbacks.Add(1)
-		return safePoolOwnerRejectedBySample
+		return safePoolOwnerRejectedBySample, 0
 	}
 	if config.budget <= 0 || len(owners) >= config.budget {
 		m.safePoolOwnerBudgetRejected.Add(1)
 		m.safePoolOwnerOneShotFallbacks.Add(1)
-		return safePoolOwnerRejectedByBudget
+		return safePoolOwnerRejectedByBudget, 0
 	}
 	if owners == nil {
 		if m.safePoolAdmittedOwners == nil {
-			m.safePoolAdmittedOwners = make(map[int64]map[string]struct{})
+			m.safePoolAdmittedOwners = make(map[int64]map[string]uint64)
 		}
-		owners = make(map[string]struct{})
+		owners = make(map[string]uint64)
 		m.safePoolAdmittedOwners[accountID] = owners
 	}
-	owners[ownerKey] = struct{}{}
+	owners[ownerKey] = generation
+	// Track the account at the admission commit, not only after a socket dial.
+	// Retire must be able to invalidate an admitted owner even when no physical
+	// socket was ever created (for example, a tag removal racing a cold dial).
+	m.safePoolAccounts.Store(accountID, struct{}{})
 	m.safePoolOwnerAdmittedNew.Add(1)
-	return safePoolOwnerAdmittedNew
+	return safePoolOwnerAdmittedNew, generation
+}
+
+func (m *Manager) safePoolOwnerGeneration(accountID int64, ownerKey string) (uint64, bool) {
+	ownerKey = strings.TrimSpace(ownerKey)
+	if m == nil || accountID <= 0 || ownerKey == "" {
+		return 0, false
+	}
+	m.ownerAdmissionMu.Lock()
+	defer m.ownerAdmissionMu.Unlock()
+	return m.safePoolOwnerGenerationLocked(accountID, ownerKey)
+}
+
+func (m *Manager) safePoolOwnerGenerationLocked(accountID int64, ownerKey string) (uint64, bool) {
+	generation := m.safePoolAccountGenerations[accountID]
+	if generation == 0 {
+		return 0, false
+	}
+	ownerGeneration, exists := m.safePoolAdmittedOwners[accountID][ownerKey]
+	return generation, exists && ownerGeneration == generation
+}
+
+func (m *Manager) safePoolIdentityGenerationCurrent(accountID int64, identity safeConnectionIdentity) bool {
+	if m == nil || !identity.valid() || accountID <= 0 {
+		return false
+	}
+	m.ownerAdmissionMu.Lock()
+	defer m.ownerAdmissionMu.Unlock()
+	return m.safePoolIdentityGenerationCurrentLocked(accountID, identity)
+}
+
+func (m *Manager) safePoolIdentityGenerationCurrentLocked(accountID int64, identity safeConnectionIdentity) bool {
+	generation, ok := m.safePoolOwnerGenerationLocked(accountID, identity.ownerKey)
+	return ok && identity.generation == generation
+}
+
+// invalidateSafePoolGenerationLocked is the linearization point for a master
+// tag removal or force-fuse. Caller holds ownerAdmissionMu. Every invalidation
+// advances the account-local generation and clears all admitted owners, even
+// when the old generation never reached socket creation.
+func (m *Manager) invalidateSafePoolGenerationLocked(accountID int64) int {
+	retiredOwners := len(m.safePoolAdmittedOwners[accountID])
+	if m.safePoolAccountGenerations == nil {
+		m.safePoolAccountGenerations = make(map[int64]uint64)
+	}
+	next := m.safePoolAccountGenerations[accountID] + 1
+	if next == 0 {
+		// A process cannot realistically exhaust uint64 generations. Fail closed
+		// on wrap instead of making an old generation current again.
+		next = ^uint64(0)
+	}
+	m.safePoolAccountGenerations[accountID] = next
+	delete(m.safePoolAdmittedOwners, accountID)
+	m.safePoolAccounts.Delete(accountID)
+	m.safePoolGenerationInvalidations.Add(1)
+	if retiredOwners > 0 {
+		m.safePoolRetiredOwners.Add(uint64(retiredOwners))
+	}
+	return retiredOwners
+}
+
+func (m *Manager) safePoolAccountHasAdmittedOwners(accountID int64) bool {
+	if m == nil || accountID <= 0 {
+		return false
+	}
+	m.ownerAdmissionMu.Lock()
+	defer m.ownerAdmissionMu.Unlock()
+	return len(m.safePoolAdmittedOwners[accountID]) > 0
 }
 
 func (m *Manager) safePoolOwnerAdmissionSnapshot(budget int) (owners int, accounts int, overcommittedAccounts int) {

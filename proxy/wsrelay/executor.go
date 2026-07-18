@@ -266,14 +266,18 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			e.manager.safePoolOwnerEligible.Add(1)
 		case !ownerKeyKnown:
 			e.manager.safePoolOwnerMissing.Add(1)
+		case !handshakeKnown:
+			e.manager.safePoolOwnerRejected.Add(1)
+			e.manager.safePoolOwnerHandshakeRejected.Add(1)
+		case !frameMetadataKnown:
+			e.manager.safePoolOwnerRejected.Add(1)
+			e.manager.safePoolFrameMetadataRejected.Add(1)
 		case !requestEligible:
 			e.manager.safePoolRequestIneligible.Add(1)
-		default:
-			e.manager.safePoolOwnerRejected.Add(1)
 		}
 	}
 	if poolPolicy.mode != statelessPoolSafe {
-		e.manager.RetireSafePoolAccount(account.ID())
+		e.manager.retireSafePoolAccountIfPolicyDisabled(account)
 	}
 	safeIdentity := safeConnectionIdentity{}
 	if ownerKnown && poolPolicy.mode == statelessPoolSafe {
@@ -315,6 +319,16 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		if poolPolicy.mode == statelessPoolOneShot {
 			return nil, fmt.Errorf("%w: one-shot websocket policy cannot resume connection-local previous_response_id state", proxy.ErrWebsocketContinuationUnavailable)
 		}
+		if poolPolicy.mode == statelessPoolSafe {
+			if !ownerKnown {
+				return nil, fmt.Errorf("%w: safe websocket owner is missing, conflicting, or ineligible for previous_response_id", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			generation, current := e.manager.safePoolOwnerGeneration(account.ID(), ownerKey)
+			if !current {
+				return nil, fmt.Errorf("%w: safe websocket owner is not admitted in the current tag generation", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			safeIdentity.generation = generation
+		}
 		var pwc *WsConnection
 		var ppr *PendingRequest
 		var slotKey string
@@ -354,8 +368,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		account.Mu().RLock()
 		latestPolicy := resolveStatelessPoolPolicyWithTags(account, e.manager, account.Tags)
 		decision := safePoolOwnerRejectedBySample
+		generation := uint64(0)
 		if latestPolicy.mode == statelessPoolSafe {
-			decision = e.manager.admitSafePoolOwner(
+			decision, generation = e.manager.admitSafePoolOwner(
 				account.ID(),
 				ownerKey,
 				currentSafePoolOwnerAdmissionConfig(),
@@ -364,11 +379,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		account.Mu().RUnlock()
 		poolPolicy = latestPolicy
 		if poolPolicy.mode != statelessPoolSafe {
-			e.manager.RetireSafePoolAccount(account.ID())
+			e.manager.retireSafePoolAccountIfPolicyDisabled(account)
 		} else if decision == safePoolOwnerRejectedByLifecycle {
 			return nil, ErrManagerStopped
 		} else {
 			requestLocalOneShot = !decision.admitted()
+			if decision.admitted() {
+				safeIdentity.generation = generation
+			}
 		}
 	}
 	baseKey := strings.TrimSpace(poolRouteKey)
@@ -392,14 +410,23 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			wc, pr, poolSessionID, err2 = e.manager.AcquireSafeReusableConnection(ctx, account, wsURL, safeBaseKey, poolPolicy.slots, poolPolicy.wait, safeHeaders, safeIdentity, proxyOverride)
 			safePoolRequest = err2 == nil && wc != nil
 		} else if poolPolicy.mode == statelessPoolSafe {
-			// A tagged/all safe rollout must never turn an unprovable owner into a
-			// per-request handshake storm. Before any WS write, retain the selected
-			// account and let the caller downgrade this request to HTTP. Connection-
-			// local continuation state cannot be moved and therefore fails closed.
+			// Owner-ineligible traffic preserves the unenrolled tagged baseline: one
+			// isolated physical WS for this request. It never enters the reusable
+			// pool and therefore cannot cross a session/thread boundary. Recording
+			// it as an HTTP fallback produced thousands of misleading hidden 502s.
 			if continuationRequest {
 				return nil, fmt.Errorf("%w: safe websocket owner is unavailable for previous_response_id", proxy.ErrWebsocketContinuationUnavailable)
 			}
-			return nil, fmt.Errorf("%w: safe websocket owner is missing, conflicting, or ineligible before request write", proxy.ErrWebsocketSafePoolFallback)
+			e.manager.safePoolOwnerOneShotFallbacks.Add(1)
+			poolSessionID = "stateless-" + uuid.NewString()
+			if frameMetadataKnown {
+				wsBody = safeBody
+			}
+			if handshakeKnown {
+				headers = safeHeaders
+			}
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+			oneShotRequest = err2 == nil && wc != nil
 		} else if poolPolicy.mode == statelessPoolOneShot {
 			// The operator's explicit hard kill switch is the only policy that
 			// deliberately receives a unique physical socket per request.
@@ -428,7 +455,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, err2
 	}
 	if safePoolRequest {
-		if _, policyActive := currentSafePoolSlots(account, e.manager); !policyActive {
+		if !e.manager.safePoolIdentityUsable(account, safeIdentity) {
 			if wc != nil && wc.session != nil && pr != nil {
 				wc.session.RemovePendingRequest(pr.RequestID)
 			}
@@ -436,8 +463,10 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 				wc.retireAfterLease.Store(true)
 				e.manager.DiscardConnection(wc)
 			}
-			e.manager.RetireSafePoolAccount(account.ID())
-			return nil, newLocalCapacityAcquireError(0, fmt.Errorf("safe websocket reuse was disabled before request write"))
+			if continuationRequest {
+				return nil, fmt.Errorf("%w: safe websocket generation or policy changed before request write", proxy.ErrWebsocketContinuationUnavailable)
+			}
+			return nil, fmt.Errorf("%w: safe websocket generation or policy changed before request write", proxy.ErrWebsocketSafePoolFallback)
 		}
 	}
 
@@ -453,7 +482,13 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		}
 	}
 	markTerminalProofPolicy(wc)
-	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
+	sendCurrentRequest := func(conn *WsConnection, body []byte, requestID string) error {
+		if safePoolRequest {
+			return e.sendSafePoolRequest(conn, body, requestID, account, safeIdentity, continuationRequest)
+		}
+		return e.sendRequest(conn, body, requestID)
+	}
+	sendErr := sendCurrentRequest(wc, wsBody, pr.RequestID)
 	for retries := 0; !safePoolRequest && !continuationRequest && shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.DiscardConnection(wc)
@@ -470,7 +505,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			return nil, err2
 		}
 		markTerminalProofPolicy(wc)
-		sendErr = e.sendRequest(wc, wsBody, pr.RequestID)
+		sendErr = sendCurrentRequest(wc, wsBody, pr.RequestID)
 	}
 	if sendErr != nil {
 		wc.session.RemovePendingRequest(pr.RequestID)
@@ -616,6 +651,25 @@ func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) 
 	return wc.WriteMessage(websocket.TextMessage, body)
 }
 
+func (e *Executor) sendSafePoolRequest(wc *WsConnection, body []byte, requestID string, account *auth.Account, identity safeConnectionIdentity, continuation bool) error {
+	if !wc.IsConnected() {
+		return fmt.Errorf("%w: websocket connection is not connected", errWebsocketWriteNotStarted)
+	}
+	if err := wc.ensureReadLeaseForSend(requestID); err != nil {
+		return fmt.Errorf("%w: %v", errWebsocketWriteNotStarted, err)
+	}
+	return wc.writeMessageChecked(websocket.TextMessage, body, func() error {
+		if e.manager.safePoolIdentityUsable(account, identity) && identity.matches(wc) {
+			return nil
+		}
+		wc.retireAfterLease.Store(true)
+		if continuation {
+			return fmt.Errorf("%w: safe websocket generation or policy changed at the write boundary", proxy.ErrWebsocketContinuationUnavailable)
+		}
+		return fmt.Errorf("%w: safe websocket generation or policy changed at the write boundary", proxy.ErrWebsocketSafePoolFallback)
+	})
+}
+
 // ==================== WebSocket 响应处理 ====================
 
 // WsResponse WebSocket 响应包装器
@@ -639,8 +693,8 @@ type WsResponse struct {
 	streamCompleted bool
 	// safePool enables strict response identity/sequence validation and a
 	// terminal reuse fence. It is set only for the explicit opt-in safe pool;
-	// owner-rejected requests fall back to same-account HTTP before dialing,
-	// while only the explicit hard-kill policy uses oneShot.
+	// owner-rejected requests preserve isolated one-shot WS, while generation or
+	// policy invalidation before a reusable write falls back on the same account.
 	safePool          bool
 	oneShot           bool
 	reuseFence        time.Duration

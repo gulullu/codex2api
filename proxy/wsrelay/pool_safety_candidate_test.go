@@ -19,10 +19,15 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func candidateSafeIdentity(owner string, headers http.Header) safeConnectionIdentity {
+func candidateSafeIdentity(manager *Manager, accountID int64, owner string, headers http.Header) safeConnectionIdentity {
+	decision, generation := manager.admitSafePoolOwner(accountID, owner, safePoolOwnerAdmissionConfig{sampleBPS: 10000, budget: 10000, valid: true})
+	if !decision.admitted() || generation == 0 {
+		panic("test safe-pool owner admission failed")
+	}
 	return safeConnectionIdentity{
 		ownerKey:             owner,
 		handshakeFingerprint: safePoolHeaderFingerprint(headers),
+		generation:           generation,
 	}
 }
 
@@ -746,6 +751,8 @@ func TestSafePoolFuseIsAccountLocalAndIdempotent(t *testing.T) {
 }
 
 func TestSafePoolOwnerCapacityDoesNotEvictBoundContinuationSockets(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "0")
+	t.Setenv(safePoolScopeEnv, "all")
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
 	account := &auth.Account{DBID: 9010, Name: "dynamic-pool"}
@@ -755,6 +762,10 @@ func TestSafePoolOwnerCapacityDoesNotEvictBoundContinuationSockets(t *testing.T)
 	for i := 0; i < ownerSlots; i++ {
 		owner := fmt.Sprintf("owner-%02d", i)
 		conn, _ := newTestSlotConnection(manager, account, "wss://example.test/responses", owner)
+		identity := candidateSafeIdentity(manager, account.ID(), owner, http.Header{})
+		conn.safeOwnerKey = identity.ownerKey
+		conn.handshakeFingerprint = identity.handshakeFingerprint
+		conn.safeGeneration = identity.generation
 		conn.safeReusable.Store(true)
 		manager.BindResponseConn("resp_"+owner, conn, owner, account.ID(), "key-A")
 		connections = append(connections, conn)
@@ -804,7 +815,7 @@ func TestSafePoolSaturationReturnsCapacityWithoutOverflowHandshake(t *testing.T)
 	account := &auth.Account{DBID: 4201, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{}
-	identity := candidateSafeIdentity("owner", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner", headers)
 
 	first, pending, _, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 50*time.Millisecond, headers, identity, "")
@@ -866,7 +877,7 @@ func TestSafePoolPendingDialsRespectOwnerSlotLimit(t *testing.T) {
 		err     error
 	}, 1)
 	go func() {
-		identity := candidateSafeIdentity("pending-owner-1", http.Header{})
+		identity := candidateSafeIdentity(manager, account.ID(), "pending-owner-1", http.Header{})
 		baseKey := safePoolOwnedRouteKey("shared", "pending-owner-1", http.Header{})
 		wc, pending, _, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 500*time.Millisecond, http.Header{}, identity, "")
 		firstDone <- struct {
@@ -881,7 +892,7 @@ func TestSafePoolPendingDialsRespectOwnerSlotLimit(t *testing.T) {
 		t.Fatal("first pending dial did not reach the server")
 	}
 
-	secondIdentity := candidateSafeIdentity("pending-owner-2", http.Header{})
+	secondIdentity := candidateSafeIdentity(manager, account.ID(), "pending-owner-2", http.Header{})
 	secondBaseKey := safePoolOwnedRouteKey("shared", "pending-owner-2", http.Header{})
 	_, _, _, secondErr := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, secondBaseKey, 1, 35*time.Millisecond, http.Header{}, secondIdentity, "")
 	if !errors.Is(secondErr, proxy.ErrWebsocketLocalCapacity) {
@@ -941,7 +952,7 @@ func TestSafePoolKillSwitchDuringDialPreventsPublication(t *testing.T) {
 	t.Cleanup(manager.Stop)
 	account := &auth.Account{DBID: 4207, DynamicConcurrencyLimit: 8}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	identity := candidateSafeIdentity("dial-kill-owner", http.Header{})
+	identity := candidateSafeIdentity(manager, account.ID(), "dial-kill-owner", http.Header{})
 	baseKey := safePoolOwnedRouteKey("shared", "dial-kill-owner", http.Header{})
 	resultCh := make(chan error, 1)
 	go func() {
@@ -957,8 +968,8 @@ func TestSafePoolKillSwitchDuringDialPreventsPublication(t *testing.T) {
 	release()
 	select {
 	case err := <-resultCh:
-		if !errors.Is(err, proxy.ErrWebsocketLocalCapacity) {
-			t.Fatalf("hot-disabled dial error = %v, want local capacity fallback", err)
+		if !errors.Is(err, proxy.ErrWebsocketSafePoolFallback) {
+			t.Fatalf("hot-disabled dial error = %v, want typed safe-pool fallback", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("hot-disabled dial did not finish")
@@ -1013,7 +1024,7 @@ func TestSafePoolDelayedOldFrameAfterNewLeaseTripsFuseBeforeForward(t *testing.T
 	account := &auth.Account{DBID: 4202, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{}
-	identity := candidateSafeIdentity("owner", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner", headers)
 
 	wc, firstPending, slot, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 200*time.Millisecond, headers, identity, "")
@@ -1112,7 +1123,7 @@ func TestCandidateHandshakeIdentityChangeForcesFreshConnection(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		stableHeaders := safePoolHandshakeHeaders(headers)
-		identity := candidateSafeIdentity("owner-A", stableHeaders)
+		identity := candidateSafeIdentity(manager, account.ID(), "owner-A", stableHeaders)
 		baseKey := safePoolOwnedRouteKey("shared-api-key", "owner-A", stableHeaders)
 		wc, pending, slot, err := manager.AcquireSafeReusableConnection(
 			ctx,
@@ -1190,7 +1201,7 @@ func TestSafePoolContinuationWaitsForFenceAndPreservesIdentity(t *testing.T) {
 	account := &auth.Account{DBID: 4301, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{"X-Client-Request-Id": {"thread-A"}}
-	identity := candidateSafeIdentity("owner-A", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner-A", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner-A", headers)
 
 	wc, pending, slot, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 200*time.Millisecond, headers, identity, "")
@@ -1209,7 +1220,7 @@ func TestSafePoolContinuationWaitsForFenceAndPreservesIdentity(t *testing.T) {
 		t.Fatalf("pending before response Close = %d, want 1", got)
 	}
 
-	wrongIdentity := candidateSafeIdentity("owner-B", headers)
+	wrongIdentity := candidateSafeIdentity(manager, account.ID(), "owner-B", headers)
 	if _, _, _, err := manager.AcquirePreferredConnection(context.Background(), "resp_fence_1", account.ID(), "key-A", wrongIdentity); !errors.Is(err, proxy.ErrWebsocketContinuationUnavailable) {
 		t.Fatalf("owner mismatch error = %v, want continuation unavailable", err)
 	}
@@ -1286,7 +1297,7 @@ func TestSafePoolTerminalCallbackFailureCannotWakeContinuationBeforeDiscard(t *t
 	account := &auth.Account{DBID: 4305, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{"X-Client-Request-Id": {"thread-callback"}}
-	identity := candidateSafeIdentity("owner-callback", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner-callback", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner-callback", headers)
 	wc, pending, slot, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 200*time.Millisecond, headers, identity, "")
 	if err != nil {
@@ -1392,7 +1403,7 @@ func TestSafePoolAcquireProbeTimeoutIsPreSendAndSideEffectFree(t *testing.T) {
 	account := &auth.Account{DBID: 4302, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{}
-	identity := candidateSafeIdentity("owner-probe", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner-probe", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner-probe", headers)
 	wc, pending, slot, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 100*time.Millisecond, headers, identity, "")
 	if err != nil {
@@ -1448,7 +1459,7 @@ func TestSafePoolImmediateIdleBusinessFrameTripsFuse(t *testing.T) {
 	t.Cleanup(manager.Stop)
 	account := &auth.Account{DBID: 4303, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	identity := candidateSafeIdentity("owner-immediate", http.Header{})
+	identity := candidateSafeIdentity(manager, account.ID(), "owner-immediate", http.Header{})
 	wc, err := manager.createConnectionWithIdentity(context.Background(), account, wsURL, "immediate", http.Header{}, identity, "")
 	if err != nil {
 		t.Fatalf("create safe connection: %v", err)
@@ -1495,7 +1506,7 @@ func TestSafePoolPostTerminalControlsCannotCrossIntoNextLease(t *testing.T) {
 			t.Cleanup(manager.Stop)
 			account := &auth.Account{DBID: int64(4310 + index), DynamicConcurrencyLimit: 4}
 			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			identity := candidateSafeIdentity(fmt.Sprintf("post-terminal-%d", index), http.Header{})
+			identity := candidateSafeIdentity(manager, account.ID(), fmt.Sprintf("post-terminal-%d", index), http.Header{})
 			baseKey := safePoolOwnedRouteKey("shared", fmt.Sprintf("post-terminal-%d", index), http.Header{})
 			wc, pending, slot, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 100*time.Millisecond, http.Header{}, identity, "")
 			if err != nil {
@@ -1554,7 +1565,7 @@ func TestSafePoolKillSwitchBlocksContinuationAndRetiresIdleSocket(t *testing.T) 
 	account := &auth.Account{DBID: 4304, Name: "renamable", Tags: []string{"business-tag"}, DynamicConcurrencyLimit: 9}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{}
-	identity := candidateSafeIdentity("owner-kill", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner-kill", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner-kill", headers)
 	wc, pending, slot, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 100*time.Millisecond, headers, identity, "")
 	if err != nil {
@@ -1609,19 +1620,26 @@ func TestSafePoolRetireLetsActiveLeaseFinishButNeverReturn(t *testing.T) {
 	account := &auth.Account{DBID: 4305, DynamicConcurrencyLimit: 4}
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 	headers := http.Header{}
-	identity := candidateSafeIdentity("owner-active", headers)
+	identity := candidateSafeIdentity(manager, account.ID(), "owner-active", headers)
 	baseKey := safePoolOwnedRouteKey("shared", "owner-active", headers)
 	wc, pending, _, err := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 100*time.Millisecond, headers, identity, "")
 	if err != nil {
 		t.Fatalf("initial acquire: %v", err)
 	}
+	manager.BindResponseConn("resp_retired_generation", wc, baseKey, account.ID(), "key-active")
+	if _, ok := manager.lookupResponseBinding("resp_retired_generation", account.ID(), "key-active"); !ok {
+		t.Fatal("failed to publish old-generation continuation binding")
+	}
 	manager.RetireSafePoolAccount(account.ID())
 	if !wc.IsConnected() || !wc.retireAfterLease.Load() {
 		t.Fatal("policy retirement interrupted the active lease instead of marking it for close")
 	}
+	if _, _, _, preferredErr := manager.AcquirePreferredConnection(context.Background(), "resp_retired_generation", account.ID(), "key-active", identity); !errors.Is(preferredErr, proxy.ErrWebsocketContinuationUnavailable) {
+		t.Fatalf("old-generation continuation error=%v, want continuation unavailable", preferredErr)
+	}
 	reacquired, reacquiredPending, _, reacquireErr := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 20*time.Millisecond, headers, identity, "")
-	if reacquired != nil || reacquiredPending != nil || !errors.Is(reacquireErr, proxy.ErrWebsocketLocalCapacity) {
-		t.Fatalf("concurrent reacquire = conn:%v pending:%v err:%v, want local-capacity wait while retired lease finishes", reacquired, reacquiredPending, reacquireErr)
+	if reacquired != nil || reacquiredPending != nil || !errors.Is(reacquireErr, proxy.ErrWebsocketSafePoolFallback) {
+		t.Fatalf("concurrent reacquire = conn:%v pending:%v err:%v, want stale-generation fallback while retired lease finishes", reacquired, reacquiredPending, reacquireErr)
 	}
 	if !wc.IsConnected() || wc.session.PendingCount() != 1 {
 		t.Fatalf("concurrent reacquire interrupted active retired socket: connected=%v pending=%d", wc.IsConnected(), wc.session.PendingCount())
@@ -1631,6 +1649,19 @@ func TestSafePoolRetireLetsActiveLeaseFinishButNeverReturn(t *testing.T) {
 	if wc.IsConnected() {
 		t.Fatal("retired active socket returned to the pool after its lease ended")
 	}
+	newIdentity := candidateSafeIdentity(manager, account.ID(), "owner-active", headers)
+	if newIdentity.generation <= identity.generation {
+		t.Fatalf("re-add generation=%d, want newer than %d", newIdentity.generation, identity.generation)
+	}
+	newConn, newPending, _, newErr := manager.AcquireSafeReusableConnection(context.Background(), account, wsURL, baseKey, 1, 100*time.Millisecond, headers, newIdentity, "")
+	if newErr != nil || newConn == nil || newPending == nil {
+		t.Fatalf("new-generation acquire conn=%v pending=%v err=%v", newConn, newPending, newErr)
+	}
+	if newConn == wc {
+		t.Fatal("new generation reacquired the retired physical socket")
+	}
+	newConn.session.RemovePendingRequest(newPending.RequestID)
+	manager.DiscardConnection(newConn)
 }
 
 func TestSafePoolRuntimeSnapshotReportsAggregateState(t *testing.T) {
@@ -1647,17 +1678,31 @@ func TestSafePoolRuntimeSnapshotReportsAggregateState(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
 	admission := currentSafePoolOwnerAdmissionConfig()
-	if manager.admitSafePoolOwner(4401, "runtime-owner-A", admission) != safePoolOwnerAdmittedNew ||
-		manager.admitSafePoolOwner(4401, "runtime-owner-B", admission) != safePoolOwnerAdmittedNew {
+	if admitOwnerDecision(manager, 4401, "runtime-owner-A", admission) != safePoolOwnerAdmittedNew ||
+		admitOwnerDecision(manager, 4401, "runtime-owner-B", admission) != safePoolOwnerAdmittedNew {
 		t.Fatal("failed to seed runtime owner admission gauges")
 	}
 	t.Setenv(safePoolOwnerSampleBPSEnv, "7")
 	account := &auth.Account{DBID: 4401, Tags: []string{safePoolAccountTag}}
 	idle, _ := newTestSlotConnection(manager, account, "wss://example.test/responses", "runtime-idle")
+	idleGeneration, idleCurrent := manager.safePoolOwnerGeneration(account.ID(), "runtime-owner-A")
+	if !idleCurrent {
+		t.Fatal("runtime owner A generation is missing")
+	}
+	idle.safeOwnerKey = "runtime-owner-A"
+	idle.handshakeFingerprint = safePoolHeaderFingerprint(http.Header{})
+	idle.safeGeneration = idleGeneration
 	idle.safeReusable.Store(true)
 	manager.BindResponseConn("resp_runtime", idle, "runtime-idle", account.ID(), "sk-runtime")
 
 	active, _ := newTestSlotConnection(manager, account, "wss://example.test/responses", "runtime-active")
+	activeGeneration, activeCurrent := manager.safePoolOwnerGeneration(account.ID(), "runtime-owner-B")
+	if !activeCurrent {
+		t.Fatal("runtime owner B generation is missing")
+	}
+	active.safeOwnerKey = "runtime-owner-B"
+	active.handshakeFingerprint = safePoolHeaderFingerprint(http.Header{})
+	active.safeGeneration = activeGeneration
 	active.safeReusable.Store(true)
 	active.retireAfterLease.Store(true)
 	pending := active.session.AddPendingRequest("runtime-active")
