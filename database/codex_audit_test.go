@@ -620,6 +620,39 @@ func TestCodexAuditRouteCyberAndUnavailableAccounting(t *testing.T) {
 	}
 }
 
+func TestCodexAuditLocalWebsocketPreflightSignalDoesNotCreateRouteInvariant(t *testing.T) {
+	db := newCodexAuditSQLiteTestDB(t)
+	insertCodexAuditUsage(t, db, &UsageLogInput{
+		LogicalRequestID:  "local-ws-frame-413",
+		AccountID:         0,
+		StatusCode:        413,
+		RouteClass:        "default",
+		RouteSource:       "default",
+		RouteSignals:      `["websocket_large_frame_context_bound"]`,
+		UpstreamErrorKind: "websocket_large_frame_context_bound",
+	})
+
+	report := buildCodexAuditTestReport(t, db)
+	if report.Summary.RoutePoolViolations != 0 ||
+		report.Summary.EncryptedOwnerViolations != 0 ||
+		report.Summary.RouteInvariantViolations != 0 ||
+		report.Summary.RouteMetadataConflicts != 0 {
+		t.Fatalf("local WS preflight safety findings = pool:%d owner:%d invariant:%d metadata:%d, want 0/0/0/0",
+			report.Summary.RoutePoolViolations,
+			report.Summary.EncryptedOwnerViolations,
+			report.Summary.RouteInvariantViolations,
+			report.Summary.RouteMetadataConflicts)
+	}
+	for _, point := range report.Timeline {
+		if point.RoutePoolViolations != 0 ||
+			point.EncryptedOwnerViolations != 0 ||
+			point.RouteInvariantViolations != 0 ||
+			point.RouteMetadataConflicts != 0 {
+			t.Fatalf("local WS preflight timeline safety findings = %+v, want no route invariant", point)
+		}
+	}
+}
+
 func TestCodexAuditEncryptedOwnerMatrixAndAttemptSafety(t *testing.T) {
 	db := newCodexAuditSQLiteTestDB(t)
 	ownerHit := `["encrypted_owner_hit"]`

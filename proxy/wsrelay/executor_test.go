@@ -23,6 +23,117 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestWebsocketFramePreflightBoundary(t *testing.T) {
+	const limit = 16 * 1024 * 1024
+	if err := websocketFramePreflightError(limit-1, limit, false); err != nil {
+		t.Fatalf("below-limit frame rejected: %v", err)
+	}
+	if err := websocketFramePreflightError(limit, limit, false); err == nil || err.ContextBound {
+		t.Fatalf("at-limit frame = %#v, want unbound preflight decision", err)
+	}
+	if err := websocketFramePreflightError(limit+1, limit, true); err == nil || !err.ContextBound {
+		t.Fatalf("above-limit bound frame = %#v", err)
+	}
+}
+
+func TestWebsocketMaxRequestFrameBytesFromEnv(t *testing.T) {
+	t.Setenv(websocketMaxRequestFrameBytesEnv, "")
+	if got := websocketMaxRequestFrameBytes(); got != defaultWebsocketMaxRequestFrameBytes {
+		t.Fatalf("default = %d", got)
+	}
+	t.Setenv(websocketMaxRequestFrameBytesEnv, "1048576")
+	if got := websocketMaxRequestFrameBytes(); got != 1048576 {
+		t.Fatalf("minimum valid = %d", got)
+	}
+	t.Setenv(websocketMaxRequestFrameBytesEnv, "50331648")
+	if got := websocketMaxRequestFrameBytes(); got != 50331648 {
+		t.Fatalf("maximum valid = %d", got)
+	}
+	for _, invalid := range []string{"0", "1048575", "not-a-number", "50331649", "134217729"} {
+		t.Run(invalid, func(t *testing.T) {
+			t.Setenv(websocketMaxRequestFrameBytesEnv, invalid)
+			if got := websocketMaxRequestFrameBytes(); got != defaultWebsocketMaxRequestFrameBytes {
+				t.Fatalf("invalid %q = %d, want default", invalid, got)
+			}
+		})
+	}
+}
+
+func websocketRequestBodyAtPreparedSize(t *testing.T, exec *Executor, target int, sessionID string) []byte {
+	t.Helper()
+	base := []byte(`{"model":"gpt-5.4","input":"x"}`)
+	prepared := exec.prepareWebsocketBody(base, sessionID)
+	padding := target - len(prepared)
+	if padding < 0 {
+		t.Fatalf("target %d smaller than prepared base %d", target, len(prepared))
+	}
+	body := []byte(fmt.Sprintf(`{"model":"gpt-5.4","input":"%s"}`, strings.Repeat("x", 1+padding)))
+	if got := len(exec.prepareWebsocketBody(body, sessionID)); got != target {
+		t.Fatalf("prepared frame size = %d, want %d", got, target)
+	}
+	return body
+}
+
+func TestExecuteRequestViaWebsocketBaseFramePreflightBeforeDialOrAcquire(t *testing.T) {
+	const limit = 1024 * 1024
+	t.Setenv(websocketMaxRequestFrameBytesEnv, fmt.Sprint(limit))
+	var dialHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dialHits.Add(1) }))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	sessionID := "stateless-preflight-base"
+	body := websocketRequestBodyAtPreparedSize(t, exec, limit, sessionID)
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(), &auth.Account{DBID: 901, AccessToken: "token"}, body,
+		sessionID, "", "key", nil, http.Header{}, "pool-key",
+	)
+	var frameErr *proxy.WebsocketFramePreflightError
+	if !errors.As(err, &frameErr) || frameErr.FrameBytes != limit || frameErr.ContextBound {
+		t.Fatalf("response=%#v err=%v frameErr=%#v", response, err, frameErr)
+	}
+	if dialHits.Load() != 0 || manager.ConnectionCount() != 0 {
+		t.Fatalf("preflight side effects: dial=%d connections=%d", dialHits.Load(), manager.ConnectionCount())
+	}
+}
+
+func TestExecuteRequestViaWebsocketSafeMetadataCrossesLimitBeforeDialOrAcquire(t *testing.T) {
+	const limit = 1024 * 1024
+	t.Setenv(websocketMaxRequestFrameBytesEnv, fmt.Sprint(limit))
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
+	var dialHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dialHits.Add(1) }))
+	t.Cleanup(server.Close)
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	exec := NewExecutorWithManager(manager)
+	exec.wsURLOverrideTest = "ws" + strings.TrimPrefix(server.URL, "http")
+	sessionID := "stateless-preflight-metadata"
+	body := websocketRequestBodyAtPreparedSize(t, exec, limit-512, sessionID)
+	headers := http.Header{"X-Codex-Turn-State": []string{strings.Repeat("s", 1024)}}
+	base := exec.prepareWebsocketBody(body, sessionID)
+	safe, known := prepareSafePoolFrameMetadata(base, headers)
+	if !known || len(base) >= limit || len(safe) < limit {
+		t.Fatalf("fixture sizes base=%d safe=%d known=%t limit=%d", len(base), len(safe), known, limit)
+	}
+
+	response, err := exec.ExecuteRequestViaWebsocket(
+		context.Background(), &auth.Account{DBID: 902, AccessToken: "token"}, body,
+		sessionID, "", "key", nil, headers, "pool-key",
+	)
+	var frameErr *proxy.WebsocketFramePreflightError
+	if !errors.As(err, &frameErr) || frameErr.FrameBytes != len(safe) || frameErr.ContextBound {
+		t.Fatalf("response=%#v err=%v frameErr=%#v", response, err, frameErr)
+	}
+	if dialHits.Load() != 0 || manager.ConnectionCount() != 0 {
+		t.Fatalf("safe metadata preflight side effects: dial=%d connections=%d", dialHits.Load(), manager.ConnectionCount())
+	}
+}
+
 func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing.T) {
 	t.Setenv("CODEX_WS_SEND_USER_AGENT", "true")
 	exec := NewExecutor()

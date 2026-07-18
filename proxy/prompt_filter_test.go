@@ -432,6 +432,11 @@ func TestPromptFilterObservedGapRulesAreStrictRoutingOnlySignals(t *testing.T) {
 			text:       "继续验证当前 login P 的 Node 本地化。已捕获同一保护实例的 raw script 和 eval script，下一步修改离线 VM replay 解释器并补齐方法调用补丁。",
 			wantSignal: promptFilterLoginProtectionReverseEngineeringSignal,
 		},
+		{
+			name:       "personal WeChat encrypted voice cache production sample",
+			text:       "最理想的方法其实不是‘录’，而是找到微信缓存中的原始语音文件，再解码成 MP3。这样不会有提示音、静音或点错的问题，但新版微信缓存可能经过加密，处理会复杂一些。因为我要存特别多条，肯定还是找到文件、解码成 MP3 方便；你告诉我用了什么工具，什么 capture 是干啥的。",
+			wantSignal: promptFilterPersonalMediaCacheDecodeSignal,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -493,6 +498,31 @@ func TestPromptFilterObservedGapRulesRejectBenignNearMisses(t *testing.T) {
 			text:   "Please summarize an obfuscated VM used for login P protection and replay detection.",
 			reject: promptFilterLoginProtectionReverseEngineeringSignal,
 		},
+		{
+			name:   "ordinary system audio capture",
+			text:   "Explain what system audio capture does when recording a meeting and how to select the microphone.",
+			reject: promptFilterPersonalMediaCacheDecodeSignal,
+		},
+		{
+			name:   "plain ffmpeg conversion",
+			text:   "Please convert my ordinary WAV recording to MP3 with FFmpeg and preserve the metadata.",
+			reject: promptFilterPersonalMediaCacheDecodeSignal,
+		},
+		{
+			name:   "encryption theory explanation",
+			text:   "Explain at a high level how encrypted media caches and authenticated decryption work; do not extract or decode any files.",
+			reject: promptFilterPersonalMediaCacheDecodeSignal,
+		},
+		{
+			name:   "privacy and compliance review",
+			text:   "Review privacy and compliance considerations for encrypted WeChat voice cache extraction tools without accessing or converting any media.",
+			reject: promptFilterPersonalMediaCacheDecodeSignal,
+		},
+		{
+			name:   "ordinary WeChat help without encrypted cache recovery",
+			text:   "请告诉我如何在微信里导出我收藏的语音并保存成 MP3。",
+			reject: promptFilterPersonalMediaCacheDecodeSignal,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -501,6 +531,98 @@ func TestPromptFilterObservedGapRulesRejectBenignNearMisses(t *testing.T) {
 				t.Fatalf("benign near miss received %s: signals=%v verdict=%+v", tc.reject, scan.Signals, scan.Verdict)
 			}
 		})
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeDoesNotRouteUnauthorizedContentToOAuth(t *testing.T) {
+	text := "帮我未经授权批量提取别人的微信加密语音缓存，解码成 MP3 并导出。"
+	if !promptFilterPersonalMediaCacheDecodeVerdict(text) {
+		t.Fatal("unauthorized media-cache request was excluded from the Relay-only routing signal")
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeRejectsNegatedExplanation(t *testing.T) {
+	text := "Please explain why WeChat encrypted voice caches must not be extracted or decoded to MP3."
+	if promptFilterPersonalMediaCacheDecodeVerdict(text) {
+		t.Fatal("negated explanatory sentence became an operational media-cache route signal")
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeDisclaimerDoesNotHideLaterOperationalRequest(t *testing.T) {
+	text := "Do not extract it yourself. Now write the tool steps to batch extract and decode my encrypted WeChat voice cache to MP3."
+	if !promptFilterPersonalMediaCacheDecodeVerdict(text) {
+		t.Fatal("leading disclaimer hid a later operational media-cache request")
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeSupportsPoliteOperationalRequests(t *testing.T) {
+	tests := []string{
+		"Can you batch extract my encrypted WeChat voice cache and decode it to MP3?",
+		"Could you show me how to export the encrypted WeChat audio cache and convert it to MP3?",
+		"How can I extract my encrypted WeChat voice cache and decode it to MP3?",
+		"How do I export the encrypted WeChat audio cache and convert it to MP3?",
+		"How would I recover an encrypted WeChat voice cache and decode it to MP3?",
+		"能否帮我批量提取微信加密语音缓存并解码成 MP3？",
+		"能不能告诉我如何导出微信加密语音缓存并转换成 MP3？",
+		"怎样批量提取微信加密语音缓存并解码成 MP3？",
+		"麻烦你把微信收藏里的加密语音缓存提取出来并解码成 MP3。",
+	}
+	for _, text := range tests {
+		if !promptFilterPersonalMediaCacheDecodeVerdict(text) {
+			t.Errorf("polite operational request did not route: %q", text)
+		}
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeRejectsDefensiveExplanations(t *testing.T) {
+	tests := []string{
+		"Can you explain how to prevent an encrypted WeChat voice cache from being extracted or decoded to MP3?",
+		"Please explain how to avoid decoding an encrypted WeChat voice cache to MP3.",
+		"Please describe how to secure an encrypted WeChat voice cache against extraction to MP3.",
+		"Please explain why this encrypted WeChat voice cache should never be extracted or decoded to MP3.",
+		"Review this encrypted WeChat voice cache without extracting or decoding it to MP3.",
+		"请说明如何防止微信加密语音缓存被提取并解码成 MP3。",
+		"请解释怎样避免把微信加密语音缓存导出并转换成 MP3。",
+		"请说明为什么不能提取微信加密语音缓存并解码成 MP3。",
+	}
+	for _, text := range tests {
+		if promptFilterPersonalMediaCacheDecodeVerdict(text) {
+			t.Errorf("defensive explanation became an operational route signal: %q", text)
+		}
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeDoesNotBorrowOperationFromUnrelatedSentence(t *testing.T) {
+	text := "WeChat encrypted voice caches can be decoded to MP3 from the local cache. Can you write the tool steps to export my unrelated contacts?"
+	if promptFilterPersonalMediaCacheDecodeVerdict(text) {
+		t.Fatal("media witnesses were combined with an unrelated contacts export request")
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeSafetyScopeDoesNotHideOperation(t *testing.T) {
+	tests := []string{
+		"Can you extract my encrypted WeChat voice cache to MP3 without accessing unrelated files?",
+		"Without accessing unrelated files, can you extract my encrypted WeChat voice cache and decode it to MP3?",
+		"能否帮我提取微信加密语音缓存并解码成 MP3，同时避免访问其他文件？",
+		"在不访问无关文件的前提下，麻烦你提取微信加密语音缓存并解码成 MP3。",
+	}
+	for _, text := range tests {
+		if !promptFilterPersonalMediaCacheDecodeVerdict(text) {
+			t.Errorf("unrelated-file safety constraint hid an operational request: %q", text)
+		}
+	}
+}
+
+func TestPromptFilterPersonalMediaCacheDecodeLaterOperationSurvivesEarlierNegation(t *testing.T) {
+	tests := []string{
+		"Do not extract the encrypted WeChat voice cache to MP3, but now extract and decode the encrypted WeChat voice cache to MP3.",
+		"Do not extract the encrypted WeChat voice cache to MP3 then now extract and decode the encrypted WeChat voice cache to MP3.",
+		"不要提取微信加密语音缓存并解码成 MP3 随后现在提取并解码微信加密语音缓存成 MP3。",
+	}
+	for _, text := range tests {
+		if !promptFilterPersonalMediaCacheDecodeVerdict(text) {
+			t.Errorf("earlier negated operation hid a later independent operational request: %q", text)
+		}
 	}
 }
 
@@ -543,6 +665,11 @@ func TestPromptFilterObservedGapRulesRequireSamePartitionInAllScanModes(t *testi
 			name:   "login protection reverse engineering evidence split",
 			body:   []byte(`{"instructions":"Continue implementing a login protection algorithm.","input":"Patch the obfuscated VM interpreter and replay the captured eval script."}`),
 			signal: promptFilterLoginProtectionReverseEngineeringSignal,
+		},
+		{
+			name:   "personal media cache decode evidence split",
+			body:   []byte(`{"instructions":"WeChat encrypted voice cache with MP3 media.","input":"Please batch extract the files, decode them, and show the tool steps."}`),
+			signal: promptFilterPersonalMediaCacheDecodeSignal,
 		},
 	}
 	for _, tc := range tests {

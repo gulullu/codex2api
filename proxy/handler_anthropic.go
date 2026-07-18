@@ -377,11 +377,36 @@ func (h *Handler) Messages(c *gin.Context) {
 			} else {
 				serviceTier = EffectiveRequestedServiceTierWithSnapshot(freezePayloadRuleSnapshot(c), codexBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
 			}
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			httpSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
+			upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
+			var actualWebsocket bool
+			resp, reqErr, actualWebsocket = executeRequestWithWebsocketFramePreflight(
+				upstreamCtx, account, codexBody, codexBody, upstreamSessionID, httpSessionID,
+				proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+			)
+			useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if frameErr, ok := websocketContextBoundFrameError(reqErr); ok {
+				ttftGuard.Stop()
+				circuitAttempt.Release(h.store, account)
+				message := websocketLargeFrameContextBoundMessage(frameErr)
+				publishHTTPFinalWithAudit(c,
+					func() { sendAnthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", message) },
+					func() {
+						h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+							AccountID: 0, Endpoint: "/v1/messages", Model: model,
+							EffectiveModel: attemptEffectiveModel, DurationMs: durationMs,
+							ReasoningEffort: reasoningEffort, UpstreamEndpoint: upstreamEndpoint,
+							Stream: isStream, ViaWebsocket: false, RequestedServiceTier: serviceTier, Attempt: attempt,
+						}, http.StatusRequestEntityTooLarge, websocketLargeFrameContextBoundKind, message)
+					},
+					nil,
+				)
+				return
+			}
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
 			localContentionKind := websocketLocalContentionKind(reqErr)

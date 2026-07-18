@@ -465,12 +465,16 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
+		observeUpstreamTransport(ctx, true, "", 0, 0)
 		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
 	if wantWebsocket && WebsocketExecuteFunc == nil {
 		// 请求/配置要求走 WebSocket，但 WS 执行器未注册（如嵌入式调用或初始化顺序问题）。
 		// 静默落回 HTTP 会让“以为开了 WS 实际走 HTTP”难以排查，这里显式告警。
 		log.Printf("[WS] 警告: 期望走 WebSocket 上游，但 WebsocketExecuteFunc 未注册，已回退到 HTTP (account %d)", account.ID())
+	}
+	if !wantWebsocket {
+		observeDefaultUpstreamTransport(ctx, false)
 	}
 
 	if ctx == nil {

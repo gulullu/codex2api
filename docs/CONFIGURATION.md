@@ -57,6 +57,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_UPSTREAM_TRANSPORT` | 否 | `http` | Codex 上游协议：`http` / `auto` / `ws`。HTTP 入站在 `auto` 下仍走 HTTP 上游 |
 | `CODEX_PROXY_URL` | 否 | - | 全局代理 URL，适用于需要为所有 Codex 上游请求统一配置代理的场景 |
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
+| `CODEX_WS_MAX_REQUEST_FRAME_BYTES` | 否 | `16777216` | 最终 `response.create` WS 帧的经验安全阈值（1 MiB..48 MiB，并非上游协议保证）。无上下文绑定的超限请求在任何 WS 连接/写入前保留同一账号改走 HTTP；带 `previous_response_id` 或显式上游会话的请求返回 413，禁止跨传输迁移上下文 |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `true` | WS 握手是否发送 Codex `User-Agent`/`Version`；设为 `false` 可关闭 |
 | `CODEX_WS_CONTINUATION_MAX_CONNECTIONS_GLOBAL` | 否 | `512` | `previous_response_id` 续链保留的全局 bound-idle WS 物理连接上限，范围 `1..4096`，非法值回退默认值；超限按每条连接最新 live binding 的单调代次淘汰最旧连接 |

@@ -680,6 +680,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateClientIPFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	populateCybUsageRouteMeta(h, c, input)
+	appendWebsocketTransportAuditSignal(c, input)
 	input.LogicalRequestID = logicalRequestID(c)
 	markCyberPolicyUsageKind(input)
 	h.store.ObserveRelayGuardianUsage(input)
@@ -3095,10 +3096,34 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			serviceTier = EffectiveRequestedServiceTierWithSnapshot(freezePayloadRuleSnapshot(c), upstreamBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
 		}
-		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		httpSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
+		upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
+		resp, reqErr, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+			upstreamCtx, account, upstreamBody, codexBody, upstreamSessionID, httpSessionID,
+			proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+		)
+		useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if frameErr, ok := websocketContextBoundFrameError(reqErr); ok {
+				ttftGuard.Stop()
+				circuitAttempt.Release(h.store, account)
+				localErr := websocketLargeFrameContextBoundAPIError(frameErr)
+				publishHTTPFinalWithAudit(c,
+					func() { api.SendErrorWithStatus(c, localErr, http.StatusRequestEntityTooLarge) },
+					func() {
+						h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+							AccountID: 0, Endpoint: "/v1/responses", Model: logModel,
+							EffectiveModel: attemptLogEffectiveModel, DurationMs: durationMs,
+							ReasoningEffort: reasoningEffort, UpstreamEndpoint: "/v1/responses",
+							Stream: isStream, ViaWebsocket: false, RequestedServiceTier: serviceTier, Attempt: attempt,
+						}, http.StatusRequestEntityTooLarge, websocketLargeFrameContextBoundKind, localErr.Message)
+					},
+					nil,
+				)
+				return
+			}
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
 			localContentionKind := websocketLocalContentionKind(reqErr)
@@ -5085,11 +5110,36 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if useWebsocket {
 				upstreamBody = stripResponsesImageGenerationTool(codexBody)
 			}
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			httpSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
+			upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
+			var actualWebsocket bool
+			resp, reqErr, actualWebsocket = executeRequestWithWebsocketFramePreflight(
+				upstreamCtx, account, upstreamBody, codexBody, upstreamSessionID, httpSessionID,
+				proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+			)
+			useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if frameErr, ok := websocketContextBoundFrameError(reqErr); ok {
+				ttftGuard.Stop()
+				circuitAttempt.Release(h.store, account)
+				localErr := websocketLargeFrameContextBoundAPIError(frameErr)
+				publishHTTPFinalWithAudit(c,
+					func() { api.SendErrorWithStatus(c, localErr, http.StatusRequestEntityTooLarge) },
+					func() {
+						h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+							AccountID: 0, Endpoint: "/v1/chat/completions", Model: logModel,
+							EffectiveModel: attemptLogEffectiveModel, DurationMs: durationMs,
+							ReasoningEffort: reasoningEffort, UpstreamEndpoint: upstreamEndpoint,
+							Stream: isStream, ViaWebsocket: false, RequestedServiceTier: serviceTier, Attempt: attempt,
+						}, http.StatusRequestEntityTooLarge, websocketLargeFrameContextBoundKind, localErr.Message)
+					},
+					nil,
+				)
+				return
+			}
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
 			localContentionKind := websocketLocalContentionKind(reqErr)

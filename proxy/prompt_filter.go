@@ -29,6 +29,7 @@ const promptFilterMLModelBackdoorTrainingSignal = "local_ml_model_backdoor_train
 const promptFilterRemoteCommandControlPlatformSignal = "local_remote_command_control_platform"
 const promptFilterSecurityCodeAuditSignal = "local_security_code_audit"
 const promptFilterLoginProtectionReverseEngineeringSignal = "local_login_protection_reverse_engineering"
+const promptFilterPersonalMediaCacheDecodeSignal = "local_personal_media_cache_decode"
 const contextPromptFilterScanMeta = "promptFilterScanMeta"
 
 type promptFilterRouteScan struct {
@@ -132,6 +133,25 @@ var promptFilterLoginProtectionReverseEngineeringPatterns = []*regexp.Regexp{
 var promptFilterLoginProtectionOperationalPattern = regexp.MustCompile(`(?i)\b(?:please\s+|help\s+me\s+|need\s+to\s+|continue(?:\s+to)?\s+|now\s+|next\s+step(?:\s+is\s+to)?\s*[:,-]?\s*)(?:verify|test|debug|reverse[- ]?engineer|locali[sz]e|implement|modif(?:y|ies|ied|ying)|fix|generate|run|build|complete|bridge|patch|replay|instrument)\b|\b(?:implement|modif(?:y|ies|ied|ying)|fix|generate|build|complete)\b[^.!?\n]{0,100}\b(?:script|interpreter|vm|patch|hook|tool|code)\b|(?:继续|下一步(?:是)?|现在|请|需要)(?:帮我|我们|去|再|来)?[\s，,:：-]{0,4}(?:验证|测试|调试|逆向|本地化|实现|修改|修复|生成|运行|构建|完成|桥接|补丁|回放|重放|插桩)|(?:实现|修改|修复|生成|构建|完成)[^。！？\n]{0,80}(?:脚本|解释器|虚拟机|VM|补丁|钩子|工具|代码)`)
 var promptFilterLoginProtectionNonOperationalSentencePattern = regexp.MustCompile(`(?i)\b(?:summarize|explain|compare|give\s+an\s+overview|analy[sz]e\s+(?:a\s+)?paper)\b[^.!?\n]{0,400}\b(?:do\s+not|without)\b[^.!?\n]{0,160}\b(?:capture|replay|locali[sz]e|implement|patch|hook|reverse[- ]?engineer)\b|(?:总结|解释|对比|概述|分析论文)[^。！？\n]{0,300}(?:不要|无需|不需要)[^。！？\n]{0,120}(?:捕获|重放|回放|本地化|实现|修改|补丁|钩子|逆向)`)
 var promptFilterSentenceSplitter = regexp.MustCompile(`[.!?\n。！？]+`)
+
+// This rule covers a production-observed false positive when a user asks how
+// to recover their own WeChat voice/favourite media from an encrypted local
+// cache. It requires four content witnesses plus a sentence-level operational
+// request inside one routing partition. Generic recording, FFmpeg conversion,
+// encryption explanations, and ordinary WeChat help therefore do not match.
+// The signal only selects Relay; it does not declare the request benign or
+// block it.
+var promptFilterPersonalMediaCacheDecodePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bwechat\b|微信`),
+	regexp.MustCompile(`(?i)\b(?:voice|audio|mp3)\b|(?:收藏|语音|音频|录音|MP3)`),
+	regexp.MustCompile(`(?i)\bcach(?:e|ed|es|ing)\b|缓存`),
+	regexp.MustCompile(`(?i)\b(?:encrypt(?:ed|ion)?|decrypt(?:s|ed|ing|ion)?|decode(?:s|d|ing|r)?)\b|(?:加密|解密|解码)`),
+}
+
+var promptFilterPersonalMediaCacheDecodeRequestPattern = regexp.MustCompile(`(?i)\b(?:please|can\s+you|could\s+you|would\s+you|need(?:\s+to)?|want(?:\s+to)?|how\s+to|how\s+(?:can|do|would)\s+i|show\s+me|tell\s+me|help\s+me|provide|write|build|create|batch|bulk|now|continue)\b|(?:请|帮我|告诉我|需要|我要|我想|如何|怎么|怎样|批量|大量|特别多条|能否|能不能|可否|麻烦(?:你)?|可以帮我|现在|继续|接着)`)
+var promptFilterPersonalMediaCacheDecodeOperationPattern = regexp.MustCompile(`(?i)\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|save(?:s|d|ing)?|convert(?:s|ed|ing|ion)?|decode(?:s|d|ing|r)?|recover(?:s|ed|ing|y)?|find(?:s|ing)?)\b[^.!?,;，；\n]{0,140}\b(?:wechat|voice|audio|mp3|media|cache)\b|\b(?:wechat|voice|audio|mp3|media|cache)\b[^.!?,;，；\n]{0,140}\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|save(?:s|d|ing)?|convert(?:s|ed|ing|ion)?|decode(?:s|d|ing|r)?|recover(?:s|ed|ing|y)?|find(?:s|ing)?)\b|(?:找到|提取|导出|保存|存下|转换|转成|解码|恢复)[^。！？,;，；\n]{0,100}(?:微信|收藏|语音|音频|MP3|媒体|缓存)|(?:微信|收藏|语音|音频|MP3|媒体|缓存)[^。！？,;，；\n]{0,100}(?:找到|提取|导出|保存|存下|转换|转成|解码|恢复)`)
+var promptFilterPersonalMediaCacheDecodeNonOperationalSentencePattern = regexp.MustCompile(`(?i)\b(?:explain|describe|summarize|discuss|review)\b[^.!?,;，；\n]{0,220}\b(?:must|should|do|can)\s+not\b[^.!?,;，；\n]{0,100}\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|decode(?:s|d|ing|r)?|convert(?:s|ed|ing|ion)?|recover(?:s|ed|ing|y)?)\b|\b(?:(?:do|must|should|can)\s+not|don['’]t|mustn['’]t|shouldn['’]t|cannot|can['’]t)\b[^.!?,;，；\n]{0,100}\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|decode(?:s|d|ing|r)?|convert(?:s|ed|ing|ion)?|recover(?:s|ed|ing|y)?)\b|\b(?:prevent|avoid|stop|block|prohibit|forbid)\b[^.!?,;，；\n]{0,160}\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|decode(?:s|d|ing|r)?|convert(?:s|ed|ing|ion)?|recover(?:s|ed|ing|y)?)\b|\b(?:secure|protect)\b[^.!?,;，；\n]{0,100}\b(?:against|from)\b[^.!?,;，；\n]{0,100}\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|decode(?:s|d|ing|r)?|convert(?:s|ed|ing|ion)?|recover(?:s|ed|ing|y)?)\b|\b(?:never|without)\b[^.!?,;，；\n]{0,100}\b(?:extract(?:s|ed|ing|ion)?|export(?:s|ed|ing)?|decode(?:s|d|ing|r)?|convert(?:s|ed|ing|ion)?|recover(?:s|ed|ing|y)?)\b|(?:解释|说明|总结|讨论|评估)[^。！？,;，；\n]{0,180}(?:不要|不应|不能|无需|不得|绝不|永不)[^。！？,;，；\n]{0,100}(?:提取|导出|解码|转换|恢复)|(?:不要|不应|不能|无需|不得|绝不|永不|别)[^。！？,;，；\n]{0,100}(?:提取|导出|解码|转换|恢复)|(?:防止|避免|阻止|禁止)[^。！？,;，；\n]{0,120}(?:提取|导出|解码|转换|恢复)|(?:保护)[^。！？,;，；\n]{0,80}(?:免遭|免于|不被|不要被)[^。！？,;，；\n]{0,80}(?:提取|导出|解码|转换|恢复)`)
+var promptFilterPersonalMediaCacheDecodeClauseBoundaryPattern = regexp.MustCompile(`(?i)\b(?:but|however|then|instead|separately)\b|(?:但是|不过|然而|但|然后|随后|接着|转而)`)
 
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
@@ -430,8 +450,64 @@ func promptFilterLoginProtectionReverseEngineeringVerdict(text string) bool {
 	return false
 }
 
+func promptFilterPersonalMediaCacheDecodeVerdict(text string) bool {
+	sentences := promptFilterSentenceSplitter.Split(strings.TrimSpace(text), -1)
+	for index, sentence := range sentences {
+		sentence = strings.TrimSpace(sentence)
+		if sentence == "" {
+			continue
+		}
+		if !promptFilterPersonalMediaCacheDecodeRequestPattern.MatchString(sentence) {
+			continue
+		}
+		operationText := promptFilterPersonalMediaCacheDecodeClauseBoundaryPattern.ReplaceAllString(sentence, ",")
+		operations := promptFilterPersonalMediaCacheDecodeOperationPattern.FindAllStringIndex(operationText, -1)
+		if len(operations) == 0 {
+			continue
+		}
+		negativeRanges := promptFilterPersonalMediaCacheDecodeNonOperationalSentencePattern.FindAllStringIndex(operationText, -1)
+		hasUnnegatedOperation := false
+		for _, operation := range operations {
+			negated := false
+			for _, negativeRange := range negativeRanges {
+				// "能不能" is a polite request marker, not the standalone
+				// prohibition "不能". Keep byte offsets unchanged so the
+				// negative and operation ranges remain directly comparable.
+				if negativeRange[0] >= len("能") &&
+					strings.HasSuffix(operationText[:negativeRange[0]], "能") &&
+					strings.HasPrefix(operationText[negativeRange[0]:negativeRange[1]], "不能") {
+					continue
+				}
+				if operation[0] < negativeRange[1] && negativeRange[0] < operation[1] {
+					negated = true
+					break
+				}
+			}
+			if !negated {
+				hasUnnegatedOperation = true
+				break
+			}
+		}
+		if !hasUnnegatedOperation {
+			continue
+		}
+		start := index - 1
+		if start < 0 {
+			start = 0
+		}
+		end := index + 2
+		if end > len(sentences) {
+			end = len(sentences)
+		}
+		if promptFilterAllWitnessesMatch(strings.Join(sentences[start:end], " "), promptFilterPersonalMediaCacheDecodePatterns) {
+			return true
+		}
+	}
+	return false
+}
+
 func promptFilterObservedGapSignals(text string) []string {
-	signals := make([]string, 0, 4)
+	signals := make([]string, 0, 5)
 	if promptFilterMLModelBackdoorTrainingVerdict(text) {
 		signals = append(signals, promptFilterMLModelBackdoorTrainingSignal)
 	}
@@ -443,6 +519,9 @@ func promptFilterObservedGapSignals(text string) []string {
 	}
 	if promptFilterLoginProtectionReverseEngineeringVerdict(text) {
 		signals = append(signals, promptFilterLoginProtectionReverseEngineeringSignal)
+	}
+	if promptFilterPersonalMediaCacheDecodeVerdict(text) {
+		signals = append(signals, promptFilterPersonalMediaCacheDecodeSignal)
 	}
 	return signals
 }
@@ -719,6 +798,7 @@ func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promp
 		promptFilterRemoteCommandControlPlatformSignal,
 		promptFilterSecurityCodeAuditSignal,
 		promptFilterLoginProtectionReverseEngineeringSignal,
+		promptFilterPersonalMediaCacheDecodeSignal,
 	} {
 		fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, signal)
 	}

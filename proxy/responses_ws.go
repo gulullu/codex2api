@@ -326,6 +326,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return errResponsesWSClientGone
 	}
 	beginLogicalRequest(c)
+	// Gin context survives across inbound WebSocket turns. Reset per-turn
+	// transport evidence even when this turn selects a Relay HTTP account and
+	// never creates a Codex WS transport observer.
+	c.Set(contextWebsocketTransportReason, "")
 	h.beginPayloadRuleRequest(c)
 	h.captureUpstreamCybFeedbackRequest(c, "/v1/responses", rawPayload, true)
 	originalInboundBody := append([]byte(nil), rawPayload...)
@@ -631,11 +635,33 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if account.IsOpenAIResponsesAPI() {
 			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			httpSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
+			upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
+			var actualWebsocket bool
+			resp, reqErr, actualWebsocket = executeRequestWithWebsocketFramePreflight(
+				upstreamCtx, account, upstreamBody, codexBody, upstreamSessionID, httpSessionID,
+				proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+			)
+			useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if frameErr, ok := websocketContextBoundFrameError(reqErr); ok {
+				ttftGuard.Stop()
+				circuitAttempt.Release(h.store, account)
+				apiErr = websocketLargeFrameContextBoundAPIError(frameErr)
+				if err := writeResponsesWSError(conn, apiErr); err != nil {
+					return errResponsesWSClientGone
+				}
+				h.logPendingOrSyntheticFinalFailureAs(c, pendingFinalFailure, retryAttemptUsageSpec{
+					AccountID: 0, Endpoint: "/v1/responses", Model: logModel,
+					EffectiveModel: attemptLogEffectiveModel, DurationMs: durationMs,
+					ReasoningEffort: reasoningEffort, UpstreamEndpoint: "/v1/responses",
+					Stream: true, ViaWebsocket: false, RequestedServiceTier: serviceTier, Attempt: attempt,
+				}, http.StatusRequestEntityTooLarge, websocketLargeFrameContextBoundKind, apiErr.Message)
+				return newResponsesWSCloseError(websocket.CloseMessageTooBig, apiErr.Message, frameErr)
+			}
 			timedOut := ttftGuard.TimedOut()
 			ttftGuard.Stop()
 			localContentionKind := websocketLocalContentionKind(reqErr)

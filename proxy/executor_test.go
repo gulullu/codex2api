@@ -1293,6 +1293,66 @@ func TestExecuteRequestForcedWebsocketUsesExplicitSession(t *testing.T) {
 	}
 }
 
+func TestExecuteRequestLargeUnboundWebsocketFrameFallsBackBeforeHTTPWithoutLosingAuditReason(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+	wsCalls := 0
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		wsCalls++
+		return nil, &WebsocketFramePreflightError{FrameBytes: 17 * 1024 * 1024, LimitBytes: 16 * 1024 * 1024}
+	}
+
+	ctx, observation := withUpstreamTransportObservation(context.Background())
+	body := []byte(`{"model":"gpt-5.4","input":"large"}`)
+	_, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+		ctx, &auth.Account{DBID: 71}, body, body, "", "http-session", "", "sk-local", nil, http.Header{}, true,
+	)
+	if err == nil {
+		t.Fatal("ExecuteRequest() error = nil, want the HTTP path's missing-account error")
+	}
+	if wsCalls != 1 {
+		t.Fatalf("WebsocketExecuteFunc calls = %d, want exactly one pre-write decision", wsCalls)
+	}
+	if actualWebsocket || observation.ViaWebsocket(true) {
+		t.Fatal("actual transport remained websocket after preflight HTTP downgrade")
+	}
+	reason, frameBytes, limitBytes := observation.Snapshot()
+	if reason != websocketLargeFrameHTTPPreflightReason || frameBytes != 17*1024*1024 || limitBytes != 16*1024*1024 {
+		t.Fatalf("observation = (%q,%d,%d)", reason, frameBytes, limitBytes)
+	}
+}
+
+func TestExecuteRequestLargeContextBoundWebsocketFrameReturnsLocal413(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+	wsCalls := 0
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		wsCalls++
+		return nil, &WebsocketFramePreflightError{FrameBytes: 17 * 1024 * 1024, LimitBytes: 16 * 1024 * 1024, ContextBound: true}
+	}
+
+	ctx, observation := withUpstreamTransportObservation(context.Background())
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_owner","input":"large"}`)
+	resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+		ctx, &auth.Account{DBID: 72, AccessToken: "must-not-be-used"}, body, body,
+		"explicit-session", "explicit-session", "", "sk-local", nil, http.Header{}, true,
+	)
+	frameErr, ok := websocketContextBoundFrameError(err)
+	if !ok || frameErr == nil {
+		t.Fatalf("error = %v, want context-bound frame decision", err)
+	}
+	if resp != nil {
+		t.Fatalf("response = %#v, want no synthetic upstream response", resp)
+	}
+	if wsCalls != 1 || actualWebsocket || observation.ViaWebsocket(true) {
+		t.Fatalf("wsCalls=%d actualWS=%t, want one preflight and no upstream transport", wsCalls, actualWebsocket)
+	}
+	reason, _, _ := observation.Snapshot()
+	if reason != websocketLargeFrameContextBoundKind {
+		t.Fatalf("reason = %q", reason)
+	}
+}
+
 // TestResolveUpstreamSessionID 覆盖上游身份键派生的各分支。
 func TestResolveUpstreamSessionID(t *testing.T) {
 	previousSettings := CurrentRuntimeSettings()

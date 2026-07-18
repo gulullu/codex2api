@@ -131,6 +131,18 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: '登录保护逆向组合',
     description: '同一请求分区同时出现登录保护目标、混淆脚本或 VM、捕获回放及继续实现信号，因此改走 Relay；不代表本地拦截。',
   },
+  local_personal_media_cache_decode: {
+    label: '个人媒体缓存解码组合',
+    description: '同一请求分区同时出现微信语音或收藏媒体、加密缓存及提取解码的实操需求，因此改走 Relay；不代表本地拦截。',
+  },
+  ws_large_payload_http_preflight: {
+    label: 'WS 大帧预检改走 HTTP',
+    description: '最终上游 WebSocket 请求帧达到安全上限，系统在写入前保留同一账号并直接改走 HTTP；没有发生失败重试。',
+  },
+  websocket_large_frame_context_bound: {
+    label: '上下文绑定大帧已拒绝',
+    description: '请求依赖上一响应或显式上游会话，无法安全切换到 HTTP；系统在写入前返回 413，避免上下文迁移或重复执行。',
+  },
   upstream_cyb_feedback_hash: {
     label: '上游 CYB 反馈指纹',
     description: '请求内容命中近期上游 cyber_policy 反馈形成的内容指纹，因此提前改走 Relay；仅用于路由，不代表本地拦截。',

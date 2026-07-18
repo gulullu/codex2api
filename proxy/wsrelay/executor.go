@@ -34,6 +34,15 @@ const (
 	CodexWsEndpoint = "/responses"
 )
 
+const (
+	websocketMaxRequestFrameBytesEnv     = "CODEX_WS_MAX_REQUEST_FRAME_BYTES"
+	defaultWebsocketMaxRequestFrameBytes = 16 * 1024 * 1024
+	// Keep the configurable ceiling aligned with the normal HTTP request-body
+	// ceiling. A larger WS threshold could select HTTP fallback for a payload the
+	// HTTP ingress/runtime cannot safely accept.
+	maximumWebsocketMaxRequestFrameBytes = 48 * 1024 * 1024
+)
+
 func shouldSendWebsocketUserAgent() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WS_SEND_USER_AGENT"))) {
 	case "0", "false", "no", "n", "off":
@@ -224,6 +233,32 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 准备请求体
 	wsBody := e.prepareWebsocketBody(requestBody, sessionID)
+	prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String())
+	continuationRequest := prevRespID != ""
+	contextBound := continuationRequest || (strings.TrimSpace(sessionID) != "" && !proxy.IsStatelessWebsocketSessionID(sessionID))
+	frameLimit := websocketMaxRequestFrameBytes()
+	// Reject the base serialized frame before prepareSafePoolFrameMetadata clones
+	// it. This avoids an unnecessary second ~27 MiB allocation for the incident
+	// class while still occurring after prepareWebsocketBody has produced the
+	// actual response.create wire payload.
+	if frameErr := websocketFramePreflightError(len(wsBody), frameLimit, contextBound); frameErr != nil {
+		return nil, frameErr
+	}
+
+	// Safe-pool frame metadata changes the serialized response.create frame but
+	// does not depend on handshake headers. Select and preflight the exact frame
+	// before prepareWebsocketHeaders, because device-profile stabilization may
+	// update its cache while constructing headers. Oversized frames must remain
+	// completely side-effect free up to this point.
+	safeBody, frameMetadataKnown := prepareSafePoolFrameMetadata(wsBody, ginHeaders)
+	poolPolicy := resolveStatelessPoolPolicy(account, e.manager)
+	frameBody := wsBody
+	if frameMetadataKnown && (poolPolicy.mode == statelessPoolSafe || poolPolicy.mode == statelessPoolOneShot) {
+		frameBody = safeBody
+	}
+	if frameErr := websocketFramePreflightError(len(frameBody), frameLimit, contextBound); frameErr != nil {
+		return nil, frameErr
+	}
 
 	headerSessionID := resolveHandshakeSessionID(sessionID, poolRouteKey, wsBody)
 
@@ -251,15 +286,13 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		headers.Set("X-Resin-Account", proxy.ResinAccountID(account))
 	}
 
-	// Safe reuse is scoped to the official Codex session+thread owner. Prepare
-	// both the per-frame metadata and stable handshake identity before looking up
-	// a previous_response_id binding so continuation cannot bypass owner checks.
-	safeBody, frameMetadataKnown := prepareSafePoolFrameMetadata(wsBody, ginHeaders)
+	// Safe reuse is scoped to the official Codex session+thread owner. Complete
+	// the handshake half of the identity after the exact frame has passed
+	// preflight, then perform the same owner checks as before.
 	safeHeaders, handshakeKnown := safePoolOwnerHandshakeHeaders(headers, safeBody)
 	ownerKey, ownerKeyKnown := safePoolOwnerKey(safeBody, apiKey)
 	requestEligible := safePoolRequestEligible(safeBody)
 	ownerKnown := ownerKeyKnown && handshakeKnown && frameMetadataKnown && requestEligible
-	poolPolicy := resolveStatelessPoolPolicy(account, e.manager)
 	if poolPolicy.mode == statelessPoolSafe {
 		switch {
 		case ownerKnown:
@@ -310,8 +343,6 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	var pr *PendingRequest
 	var err2 error
 	safePoolRequest := false
-	prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String())
-	continuationRequest := prevRespID != ""
 	if continuationRequest {
 		if poolPolicy.mode == statelessPoolHTTPFallback {
 			return nil, fmt.Errorf("%w: safe websocket reuse is process-fused and connection-local state cannot move to HTTP", proxy.ErrWebsocketContinuationUnavailable)
@@ -577,6 +608,21 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	wsBody, _ = sjson.SetBytes(wsBody, "stream", true)
 
 	return wsBody
+}
+
+func websocketMaxRequestFrameBytes() int {
+	return integerFromEnv(websocketMaxRequestFrameBytesEnv, defaultWebsocketMaxRequestFrameBytes, 1024*1024, maximumWebsocketMaxRequestFrameBytes)
+}
+
+func websocketFramePreflightError(frameBytes, limitBytes int, contextBound bool) *proxy.WebsocketFramePreflightError {
+	if frameBytes < limitBytes {
+		return nil
+	}
+	return &proxy.WebsocketFramePreflightError{
+		FrameBytes:   frameBytes,
+		LimitBytes:   limitBytes,
+		ContextBound: contextBound,
+	}
 }
 
 // prepareWebsocketHeaders 准备 WebSocket 请求头
