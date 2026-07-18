@@ -25,6 +25,9 @@ const promptCyberPolicyMessage = "This request was blocked by the content policy
 const promptFilterUserTextRescueSignal = "user_text_rescue"
 const promptFilterSQLCredentialExfiltrationSignal = "local_sql_credential_exfiltration"
 const promptFilterTargetedCovertSurveillanceSignal = "local_targeted_covert_surveillance"
+const promptFilterMLModelBackdoorTrainingSignal = "local_ml_model_backdoor_training"
+const promptFilterRemoteCommandControlPlatformSignal = "local_remote_command_control_platform"
+const promptFilterSecurityCodeAuditSignal = "local_security_code_audit"
 const contextPromptFilterScanMeta = "promptFilterScanMeta"
 
 type promptFilterRouteScan struct {
@@ -89,6 +92,30 @@ var promptFilterTargetedCovertSurveillancePatterns = []*regexp.Regexp{
 }
 
 var promptFilterTargetedCovertSurveillanceDefensivePattern = regexp.MustCompile(`(?i)\b(?:detect|identify|stop|block|remove|report)\b[^.!?\n]{0,60}\b(?:stalking|tracking|surveillance|interception|wiretapping|eavesdropping|spyware)\b|\bprotect\b[^.!?\n]{0,50}\bfrom\b[^.!?\n]{0,50}\b(?:stalking|tracking|surveillance|interception|wiretapping|eavesdropping|spyware)\b|(?:检测|识别|举报|清除)[^。！？\n]{0,50}(?:跟踪|监控|监听|窃听|拦截|间谍软件)|(?:制止|阻止)(?:非法|秘密|隐蔽)?(?:跟踪|监控|监听|窃听|拦截)`)
+
+// These rules fill three production-observed OAuth CYB routing gaps. Every
+// witness must coexist inside one independently scanned payload partition.
+// They only choose the Relay account pool; they never block a request locally.
+var promptFilterMLModelBackdoorTrainingPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:train|fine[- ]?tune|implant|inject|embed|optimi[sz]e|implement|continue|complete)\b[^.!?\n]{0,180}\b(?:backdoor|trojan(?:ed)?\s+model|trigger|poison(?:ing)?|on[- ]?off[- ]?gap|attack\s+success\s+rate)\b|(?:训练|微调|植入|注入|嵌入|实现|优化|继续|完成)[^。！？\n]{0,120}(?:模型后门|后门训练|触发器|投毒|联合优化|全触发|子集关闭)`),
+	regexp.MustCompile(`(?i)\b(?:machine\s+learning|deep\s+learning|neural\s+network|classifier|model\s+training|training\s+loop|weights?|gradients?|loss(?:es)?|dataset)\b|(?:机器学习|深度学习|神经网络|分类模型|模型训练|训练循环|权重|梯度|损失函数|数据集)`),
+	regexp.MustCompile(`(?i)\b(?:backdoor|trojan(?:ed)?\s+model)\b|(?:模型|神经网络|分类器|训练)[^。！？\n]{0,24}(?:后门|木马)|(?:后门|木马)[^。！？\n]{0,24}(?:模型|训练|触发器)`),
+	regexp.MustCompile(`(?i)\b(?:loss[- ]?representation|clean[- ]?preservation|target(?:ed)?\s+label|attack\s+success\s+rate|on[- ]?off[- ]?gap|full[- ]?trigger|subset[- ]?off|l[_-]?inf\s+projection|soft[- ]?dro|poison(?:ing)?\s+ratio)\b|(?:损失表示|干净样本保持|目标标签|攻击成功率|全触发|子集关闭|联合目标|投毒比例)`),
+}
+
+var promptFilterRemoteCommandControlPlatformPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:build|create|generate|develop|implement|deliver)\b[^.!?\n]{0,160}\b(?:platform|system|project|server)\b|(?:构建|创建|生成|开发|实现|提供)[^。！？\n]{0,100}(?:平台|系统|项目|服务端)`),
+	regexp.MustCompile(`(?i)\b(?:command[- ]and[- ]control|c2)\s+(?:platform|server|framework|system)\b|(?:远程)?指挥控制(?:平台|系统)|c2(?:平台|服务器|框架|系统)`),
+	regexp.MustCompile(`(?i)\b(?:agent|endpoint|client|implant|terminal)s?\b[^.!?\n]{0,120}\b(?:execute|run|dispatch|receive)\b[^.!?\n]{0,60}\b(?:commands?|scripts?|tasks?)\b|\b(?:command|task)\s+dispatch\b|(?:终端|代理端|客户端|设备)[^。！？\n]{0,90}(?:执行|接收|下发)[^。！？\n]{0,50}(?:命令|指令|脚本|任务)|(?:指令|命令)下发`),
+	regexp.MustCompile(`(?i)\b(?:silent(?:ly)?|hidden\s+window|no\s+window|self[- ]?(?:guard|restart)|daemon(?:ize)?|socks5|nat\s+traversal|proxy\s+tunn?el|reverse\s+tunnel)\b|(?:静默运行|无窗口|自守护|崩溃重启|socks5|nat内网穿透|代理穿透|反向隧道|高性能隧道)`),
+}
+
+var promptFilterSecurityCodeAuditPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:perform|conduct|continue|complete|review|audit|inspect|verify|reproduce)\b[^.!?\n]{0,120}\b(?:security|vulnerabilit(?:y|ies)|fail[- ]?closed|bypass|exploit|mre)\b|\b(?:security|vulnerabilit(?:y|ies)|fail[- ]?closed|bypass|exploit|mre)\b[^.!?\n]{0,120}\b(?:review|audit|inspection|verification|reproduction)\b|(?:只读|静态|安全)?(?:审查|审计|复核|验证)[^。！？\n]{0,100}(?:漏洞|安全|绕过|fail[- ]?closed|mre|伪造)|(?:漏洞|安全|绕过|fail[- ]?closed|mre|伪造)[^。！？\n]{0,100}(?:审查|审计|复核|验证)`),
+	regexp.MustCompile(`(?i)\b(?:source\s+code|codebase|scripts?|functions?|verifier|validator|completion\s+gate|sidecar|receipt|tests?|\.go|\.py|\.rs|\.js)\b|(?:源码|代码库|代码|脚本|函数|验证器|校验器|完成门|测试|制品|回执|侧车文件)`),
+	regexp.MustCompile(`(?i)\b(?:read[- ]?only|do\s+not\s+modify|without\s+modifying|no\s+code\s+changes|report\s+only|static\s+review)\b|(?:完全)?只读|不(?:要|得)?修改|不改(?:共享)?文件|仅?报告[^。！？\n]{0,24}(?:漏洞|问题)|静态审查`),
+	regexp.MustCompile(`(?i)\b(?:toctou|race\s+condition|bypass|tamper|forg(?:e|ed|ery)|spoof|fail[- ]?open|fail[- ]?closed|path\s+traversal|injection|arbitrary\s+error|unsafe\s+deserialization)\b|(?:竞态|绕过|篡改|伪造|漏洞|任意错误|删除文件|缺失文件|失败关闭|保护性失败)`),
+}
 
 func promptCyberPolicyError() *api.APIError {
 	return api.NewAPIError(
@@ -347,6 +374,65 @@ func promptFilterTargetedCovertSurveillanceVerdict(text string) bool {
 	return true
 }
 
+func promptFilterAllWitnessesMatch(text string, patterns []*regexp.Regexp) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || len(patterns) == 0 {
+		return false
+	}
+	for _, pattern := range patterns {
+		if pattern == nil || !pattern.MatchString(text) {
+			return false
+		}
+	}
+	return true
+}
+
+func promptFilterMLModelBackdoorTrainingVerdict(text string) bool {
+	return promptFilterAllWitnessesMatch(text, promptFilterMLModelBackdoorTrainingPatterns)
+}
+
+func promptFilterRemoteCommandControlPlatformVerdict(text string) bool {
+	return promptFilterAllWitnessesMatch(text, promptFilterRemoteCommandControlPlatformPatterns)
+}
+
+func promptFilterSecurityCodeAuditVerdict(text string) bool {
+	return promptFilterAllWitnessesMatch(text, promptFilterSecurityCodeAuditPatterns)
+}
+
+func promptFilterObservedGapSignals(text string) []string {
+	signals := make([]string, 0, 3)
+	if promptFilterMLModelBackdoorTrainingVerdict(text) {
+		signals = append(signals, promptFilterMLModelBackdoorTrainingSignal)
+	}
+	if promptFilterRemoteCommandControlPlatformVerdict(text) {
+		signals = append(signals, promptFilterRemoteCommandControlPlatformSignal)
+	}
+	if promptFilterSecurityCodeAuditVerdict(text) {
+		signals = append(signals, promptFilterSecurityCodeAuditSignal)
+	}
+	return signals
+}
+
+// promptFilterObservedGapPayloadSignals is used only by the legacy scanner.
+// It fails open unless the normal field-aware extractor can prove that every
+// witness for a signal lives in one real payload partition.
+func promptFilterObservedGapPayloadSignals(rawBody []byte, endpoint string) []string {
+	if !cybRelayTextEndpoint(endpoint) {
+		return nil
+	}
+	partitioned := promptfilter.ExtractRoutingPartitions(rawBody, endpoint)
+	if !promptFilterPartitionsUsable(partitioned) {
+		return nil
+	}
+	var signals []string
+	for _, partition := range partitioned.Partitions {
+		for _, signal := range promptFilterObservedGapSignals(partition.Text) {
+			signals = appendUniqueRouteSignal(signals, signal)
+		}
+	}
+	return signals
+}
+
 // promptFilterTargetedCovertSurveillancePayloadVerdict preserves the strict
 // same-partition guarantee even when the broader user-text rescan feature is
 // disabled and the request otherwise uses legacy_full scanning. Invalid or
@@ -413,6 +499,9 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	}
 	if promptFilterTargetedCovertSurveillanceVerdict(text) {
 		signals = append(signals, promptFilterTargetedCovertSurveillanceSignal)
+	}
+	for _, signal := range promptFilterObservedGapSignals(text) {
+		signals = appendUniqueRouteSignal(signals, signal)
 	}
 	// Only fill the evidence-backed gap below the normal routing threshold.
 	// Existing stronger signals retain their original, more specific reason.
@@ -591,8 +680,20 @@ func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promp
 	// Re-add it only after an independent bounded partition extraction proves
 	// all witnesses coexist in one real payload compartment.
 	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
+	for _, signal := range []string{
+		promptFilterMLModelBackdoorTrainingSignal,
+		promptFilterRemoteCommandControlPlatformSignal,
+		promptFilterSecurityCodeAuditSignal,
+	} {
+		fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, signal)
+	}
 	if cfg.Enabled && promptFilterTargetedCovertSurveillancePayloadVerdict(rawBody, endpoint) {
 		fullScan.Signals = appendUniqueRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
+	}
+	if cfg.Enabled {
+		for _, signal := range promptFilterObservedGapPayloadSignals(rawBody, endpoint) {
+			fullScan.Signals = appendUniqueRouteSignal(fullScan.Signals, signal)
+		}
 	}
 	fullScan.CYBSignal = len(fullScan.Signals) > 0
 	legacyBudget := cfg.MaxTextLength

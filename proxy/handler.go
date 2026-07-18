@@ -120,6 +120,16 @@ func (h *Handler) shouldUseWebsocketForHTTP() bool {
 	}
 }
 
+// responsesAttemptUsesWebsocket reports the transport that the selected
+// account will actually use. OpenAI Responses API relay accounts always go
+// through ExecuteOpenAIResponsesRequest (HTTP), even when the global Codex
+// transport preference is WebSocket. Keeping this decision in one helper
+// prevents usage_logs.via_websocket from describing the requested transport
+// instead of the transport that was used.
+func responsesAttemptUsesWebsocket(account *auth.Account, requested bool) bool {
+	return requested && account != nil && !account.IsOpenAIResponsesAPI()
+}
+
 func (h *Handler) resolveProxyForAttempt(account *auth.Account, stickyProxyURL string) string {
 	if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" {
 		return proxyURL
@@ -2389,7 +2399,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP()
+		useWebsocket := responsesAttemptUsesWebsocket(account, h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP())
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -5002,7 +5012,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		useWebsocket := responsesAttemptUsesWebsocket(account, h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP())
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {

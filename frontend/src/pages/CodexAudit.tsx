@@ -115,6 +115,18 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: '定向隐蔽监控意图',
     description: '同一请求分区同时要求针对特定个人、未经同意截获通信并规避发现，因此改走 Relay；不代表本地拦截。',
   },
+  local_ml_model_backdoor_training: {
+    label: '模型后门训练组合',
+    description: '同一请求分区同时出现模型后门、训练动作与触发器/损失目标，因此改走 Relay；不代表本地拦截。',
+  },
+  local_remote_command_control_platform: {
+    label: '远程指挥控制平台组合',
+    description: '同一请求分区同时要求构建指挥控制平台、终端执行命令和隐蔽隧道能力，因此改走 Relay。',
+  },
+  local_security_code_audit: {
+    label: '安全代码审计组合',
+    description: '同一请求分区同时包含只读安全审计、具体代码制品和漏洞证据；为避免上游误拦而改走 Relay。',
+  },
   upstream_cyb_feedback_hash: {
     label: '上游 CYB 反馈指纹',
     description: '请求内容命中近期上游 cyber_policy 反馈形成的内容指纹，因此提前改走 Relay；仅用于路由，不代表本地拦截。',
