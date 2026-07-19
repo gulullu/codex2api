@@ -309,8 +309,10 @@ func TestEncryptedOwnerLargeUnboundWebsocketFrameFallsBackToSameAccountHTTP(t *t
 		}
 		httpBody, _ = io.ReadAll(r.Body)
 		_ = r.Body.Close()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"id":"resp_encrypted_owner","object":"response","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			`data: {"type":"response.completed","response":{"id":"resp_encrypted_owner","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}`+"\n\n",
+		)
 	}))
 	t.Cleanup(upstream.Close)
 	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
