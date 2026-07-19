@@ -752,6 +752,7 @@ export interface SystemSettings {
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_ws_size_router_enabled: boolean
   codex_continue_thinking_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string
@@ -1407,6 +1408,9 @@ export interface UsageLog {
   id: number
   account_id: number
   client_ip: string
+  client_user_agent: string
+  upstream_user_agent: string
+  user_agent_overridden: boolean
   endpoint: string
   model: string
   effective_model: string

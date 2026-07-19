@@ -678,6 +678,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	applyWebsocketHTTPFallbackAuditMetrics(c, input)
 	populateAPIKeyMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
+	populateUserAgentMetaFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	populateCybUsageRouteMeta(h, c, input)
 	appendWebsocketTransportAuditSignal(c, input)
@@ -910,6 +911,33 @@ func extractReasoningEffort(body []byte) string {
 		return effort
 	}
 	return ""
+}
+
+// responsesPhaseTimingHeader /v1/responses 请求准备阶段分段耗时的响应头。
+// 首个 attempt 开始前写入(SSE 首字节尚未发出),下游网关可据此把
+// "网关侧首字慢 vs codex2api first_token_ms 快"的差值归因到具体阶段(issue #405)。
+const responsesPhaseTimingHeader = "X-Codex2API-Phase-Timing"
+
+// emitResponsesPhaseTimings 输出 /v1/responses 首个 attempt 之前的分段耗时。
+// 各分段含义:mw=进入 handler 前的中间件链(含 body 缓存/解压/鉴权),
+// read=handler 内读取请求体,validate=模型映射与请求校验,
+// prepare=上游请求体重建(Unmarshal→map→Marshal),schedule=Key 限流检查与账号调度。
+// attempt 开始后的耗时由既有 first_token_ms 覆盖,两者相加即 handler 全程。
+func emitResponsesPhaseTimings(c *gin.Context, logModel string, bodySize int, handlerStart, bodyReadDone, validateDone, prepareDone time.Time) {
+	now := time.Now()
+	middlewareMs := int64(0)
+	if reqCtx := api.GetRequestContext(c); reqCtx != nil && !reqCtx.StartTime.IsZero() {
+		middlewareMs = handlerStart.Sub(reqCtx.StartTime).Milliseconds()
+	}
+	summary := fmt.Sprintf("mw=%d;read=%d;validate=%d;prepare=%d;schedule=%d;body_kb=%d",
+		middlewareMs,
+		bodyReadDone.Sub(handlerStart).Milliseconds(),
+		validateDone.Sub(bodyReadDone).Milliseconds(),
+		prepareDone.Sub(validateDone).Milliseconds(),
+		now.Sub(prepareDone).Milliseconds(),
+		bodySize/1024)
+	c.Header(responsesPhaseTimingHeader, summary)
+	log.Printf("[TIMING] /v1/responses model=%s %s", logModel, summary)
 }
 
 // extractServiceTier 从请求体提取服务等级
@@ -1707,6 +1735,7 @@ func (h *Handler) APIKeyAuthMiddleware() gin.HandlerFunc {
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
+		attachUserAgentAudit(c)
 		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
 			if allowAnonymous {
@@ -1863,6 +1892,17 @@ func requestRequiresBoundUpstreamAccount(c *gin.Context, rawBody []byte) bool {
 	}
 	_, hasEncryptedContext := encryptedContextStateFromContext(c)
 	return hasEncryptedContext
+}
+
+// websocketSizeRouterAdvisoryAllowed limits the learned size shortcut to
+// requests without conversation, affinity, or opaque owner state. The router
+// is only a transport advisory: context-bound requests must still enter the
+// normal WebSocket/preflight path rather than being switched directly to HTTP.
+func websocketSizeRouterAdvisoryAllowed(c *gin.Context, headers http.Header, rawBody []byte) bool {
+	if requestRequiresBoundUpstreamAccount(c, rawBody) {
+		return false
+	}
+	return resolveSchedulerAffinityID(headers, rawBody) == ""
 }
 
 // shouldRetryTextHTTPStatusForRequest adds OAuth 403 failover only when an
@@ -2045,11 +2085,13 @@ func (h *Handler) Responses(c *gin.Context) {
 	h.beginPayloadRuleRequest(c)
 
 	// 1. 读取请求体
+	handlerStart := time.Now()
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	bodyReadDone := time.Now()
 	h.captureUpstreamCybFeedbackRequest(c, "/v1/responses", rawBody, false)
 	originalInboundBody := append([]byte(nil), rawBody...)
 	supportedModels := h.supportedModelIDs(c.Request.Context())
@@ -2174,12 +2216,15 @@ func (h *Handler) Responses(c *gin.Context) {
 	h.loadResponseRouteOwner(c, rawBody)
 	h.loadEncryptedContextAffinity(c, rawBody)
 	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, rawBody), apiKeyID)
+	wsSizeRouterAdvisoryAllowed := websocketSizeRouterAdvisoryAllowed(c, c.Request.Header, rawBody)
 	ruleIdentity := h.freezePayloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
+
+	validateDone := time.Now()
 
 	// 2. 准备 Codex 上游请求体（Unmarshal→map→Marshal，一次序列化）。
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
@@ -2200,6 +2245,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	prepareDone := time.Now()
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
@@ -2386,6 +2432,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			log.Printf("加密历史原账号不可用或冲突，已安全降级后继续调度 (endpoint=/v1/responses dropped=%d converted=%d)", repair.Dropped, repair.Converted)
 		}
 
+		if attempt == 0 {
+			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
+		}
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -2403,6 +2452,13 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
+		}
+		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
+		if useWebsocket && wsSizeRouterAdvisoryAllowed && globalWSSizeRouter.PreferHTTP(len(codexBody)) {
+			useWebsocket = false
+			if attempt == 0 {
+				log.Printf("[WS] 请求体 %dKB 达到已学习的 1009 体积阈值，直接走 HTTP 上游 (endpoint=/v1/responses)", len(codexBody)/1024)
+			}
 		}
 
 		// 提取 API Key 用于设备指纹稳定化
@@ -3159,6 +3215,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					UpstreamErrorKind:    localContentionKind,
 				}, reqErr, false)
 				wsElapsed := time.Since(start)
+				if kind == upstreamErrorKindMessageTooBig {
+					globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+				}
 				fallbackSource := websocketMessageTooBigSource(reqErr.Error())
 				if fallbackLocalContention {
 					fallbackSource = websocketLocalContentionSource(reqErr)
@@ -3754,6 +3813,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}, outcome)
 			wsElapsed := time.Since(start)
 			resp.Body.Close()
+			globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
 			wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage), circuitAttempt, selectedDecision)
 			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue
@@ -4923,6 +4983,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, baseCodexBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, baseCodexBody), apiKeyID)
+	wsSizeRouterAdvisoryAllowed := websocketSizeRouterAdvisoryAllowed(c, c.Request.Header, baseCodexBody)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -5038,6 +5099,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
 			useWebsocket = false
+		}
+		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
+		if useWebsocket && wsSizeRouterAdvisoryAllowed && globalWSSizeRouter.PreferHTTP(len(codexBody)) {
+			useWebsocket = false
+			if attempt == 0 {
+				log.Printf("[WS] 请求体 %dKB 达到已学习的 1009 体积阈值，直接走 HTTP 上游 (endpoint=/v1/chat/completions)", len(codexBody)/1024)
+			}
 		}
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
@@ -5175,6 +5243,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					UpstreamErrorKind:    localContentionKind,
 				}, reqErr, false)
 				wsElapsed := time.Since(start)
+				if kind == upstreamErrorKindMessageTooBig {
+					globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+				}
 				fallbackSource := websocketMessageTooBigSource(reqErr.Error())
 				if fallbackLocalContention {
 					fallbackSource = websocketLocalContentionSource(reqErr)
@@ -5650,6 +5721,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}, outcome)
 			wsElapsed := time.Since(start)
 			resp.Body.Close()
+			globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
 			wsHTTPFallback.RetainRouted(account, proxyURL, wsElapsed, websocketMessageTooBigSource(outcome.failureMessage), circuitAttempt, selectedDecision)
 			log.Printf("上游 WebSocket 1009，首包前保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), outcome.failureMessage)
 			continue

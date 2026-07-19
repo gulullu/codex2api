@@ -6286,6 +6286,7 @@ type settingsResponse struct {
 	CodexWSHideUpstreamErrors                  bool                           `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled                  bool                           `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries                    int                            `json:"codex_ws_silent_max_retries"`
+	CodexWSSizeRouterEnabled                   bool                           `json:"codex_ws_size_router_enabled"`
 	CodexContinueThinkingEnabled               bool                           `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds                     int                            `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled                 bool                           `json:"codex_cli_version_sync_enabled"`
@@ -6416,6 +6417,7 @@ type updateSettingsReq struct {
 	CodexWSHideUpstreamErrors                  *bool                           `json:"codex_ws_hide_upstream_errors"`
 	CodexWSSilentRetryEnabled                  *bool                           `json:"codex_ws_silent_retry_enabled"`
 	CodexWSSilentMaxRetries                    *int                            `json:"codex_ws_silent_max_retries"`
+	CodexWSSizeRouterEnabled                   *bool                           `json:"codex_ws_size_router_enabled"`
 	CodexContinueThinkingEnabled               *bool                           `json:"codex_continue_thinking_enabled"`
 	CodexContinueMaxRounds                     *int                            `json:"codex_continue_max_rounds"`
 	CodexCLIVersionSyncEnabled                 *bool                           `json:"codex_cli_version_sync_enabled"`
@@ -7318,6 +7320,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:                  h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:                  h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:                    h.store.CodexWSSilentMaxRetries(),
+		CodexWSSizeRouterEnabled:                   h.store.CodexWSSizeRouterEnabled(),
 		CodexContinueThinkingEnabled:               h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:                     h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:                 h.store.CodexCLIVersionSyncEnabled(),
@@ -7809,6 +7812,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexWSSilentRetryEnabled(*req.CodexWSSilentRetryEnabled)
 		runtimeCfg.CodexWSSilentRetry = *req.CodexWSSilentRetryEnabled
 		log.Printf("设置已更新: codex_ws_silent_retry_enabled = %t", *req.CodexWSSilentRetryEnabled)
+	}
+
+	if req.CodexWSSizeRouterEnabled != nil {
+		h.store.SetCodexWSSizeRouterEnabled(*req.CodexWSSizeRouterEnabled)
+		runtimeCfg.CodexWSSizeRouter = *req.CodexWSSizeRouterEnabled
+		log.Printf("设置已更新: codex_ws_size_router_enabled = %t", *req.CodexWSSizeRouterEnabled)
 	}
 
 	if req.CodexWSSilentMaxRetries != nil {
@@ -8451,6 +8460,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:                  h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:                  h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:                    h.store.CodexWSSilentMaxRetries(),
+		CodexWSSizeRouterEnabled:                   h.store.CodexWSSizeRouterEnabled(),
 		CodexContinueThinkingEnabled:               h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:                     h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:                 h.store.CodexCLIVersionSyncEnabled(),
@@ -8627,6 +8637,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSHideUpstreamErrors:                  h.store.CodexWSHideUpstreamErrors(),
 		CodexWSSilentRetryEnabled:                  h.store.CodexWSSilentRetryEnabled(),
 		CodexWSSilentMaxRetries:                    h.store.CodexWSSilentMaxRetries(),
+		CodexWSSizeRouterEnabled:                   h.store.CodexWSSizeRouterEnabled(),
 		CodexContinueThinkingEnabled:               h.store.CodexContinueThinkingEnabled(),
 		CodexContinueMaxRounds:                     h.store.CodexContinueMaxRounds(),
 		CodexCLIVersionSyncEnabled:                 h.store.CodexCLIVersionSyncEnabled(),

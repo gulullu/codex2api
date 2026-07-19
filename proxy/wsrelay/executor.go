@@ -280,6 +280,10 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
+	// Record the attempted handshake UA immediately so failed handshakes are
+	// still auditable. A reused connection replaces this below with the UA that
+	// was actually sent when that connection was established.
+	proxy.RecordUpstreamUserAgent(ctx, headers.Get("User-Agent"))
 
 	// Resin 反代：注入账号身份头
 	if proxy.IsResinEnabled() {
@@ -500,6 +504,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			return nil, fmt.Errorf("%w: safe websocket generation or policy changed before request write", proxy.ErrWebsocketSafePoolFallback)
 		}
 	}
+	if wc.upstreamUserAgentKnown {
+		proxy.RecordUpstreamUserAgent(ctx, wc.upstreamUserAgent)
+	}
 
 	// 发送请求，失败时最多重试 2 次（重建连接）。
 	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
@@ -534,6 +541,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
 		if err2 != nil {
 			return nil, err2
+		}
+		if wc.upstreamUserAgentKnown {
+			proxy.RecordUpstreamUserAgent(ctx, wc.upstreamUserAgent)
 		}
 		markTerminalProofPolicy(wc)
 		sendErr = sendCurrentRequest(wc, wsBody, pr.RequestID)
@@ -646,6 +656,10 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		if version != "" {
 			headers.Set("Version", version)
 		}
+	} else {
+		// Keep an explicit empty header entry so net/http Request.Write suppresses
+		// its implicit Go-http-client/1.1 fallback during the WS handshake.
+		headers["User-Agent"] = []string{""}
 	}
 	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
 		headers.Set("X-Codex-Beta-Features", betaFeatures)

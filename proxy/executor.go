@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -369,8 +370,10 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 
 // Codex 上游常量
 const (
-	CodexBaseURL = "https://chatgpt.com/backend-api/codex"
-	Originator   = "codex-tui"
+	CodexBaseURL                     = "https://chatgpt.com/backend-api/codex"
+	Originator                       = "codex-tui"
+	codexResponsesLiteHeader         = "X-OpenAI-Internal-Codex-Responses-Lite"
+	codexResponsesLiteWSMetadataPath = "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite"
 )
 
 var codexAllowedForwardHeaders = []string{
@@ -378,11 +381,96 @@ var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
 	"X-Codex-Beta-Features",
+	codexResponsesLiteHeader,
 	// DeviceCheck 设备认证头（上游 openai/codex#20619）。仅在下游真实 Codex
 	// 客户端携带时原样透传——本代理无法（也不该）伪造：token 是 Apple 硬件
 	// 背书、服务端向 Apple 验证，假值必然验证失败、比"不携带"更暴露特征。
 	// 缺失是合法状态（纯 CLI / 非 macOS 客户端本就不发）。
 	"X-Oai-Attestation",
+}
+
+func codexResponsesLiteRequested(requestBody []byte, headers http.Header) bool {
+	if headers != nil && strings.EqualFold(strings.TrimSpace(headers.Get(codexResponsesLiteHeader)), "true") {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(requestBody, codexResponsesLiteWSMetadataPath).String()), "true")
+}
+
+// prepareCodexResponsesLiteTransport keeps the request-scoped Responses Lite
+// signal intact when codex2api changes the upstream transport. HTTP carries the
+// signal in a header; WebSocket carries it on each response.create frame so a
+// pooled connection can safely serve both Lite and non-Lite requests.
+func prepareCodexResponsesLiteTransport(requestBody []byte, headers http.Header, useWebsocket, enabled bool) ([]byte, http.Header) {
+	forwardHeaders := headers
+	headersCloned := false
+	if headers != nil && headers.Get(codexResponsesLiteHeader) != "" {
+		forwardHeaders = headers.Clone()
+		headersCloned = true
+		forwardHeaders.Del(codexResponsesLiteHeader)
+	}
+	if useWebsocket {
+		if enabled {
+			updated, err := sjson.SetBytes(requestBody, codexResponsesLiteWSMetadataPath, "true")
+			if err == nil {
+				requestBody = updated
+			}
+		}
+		return requestBody, forwardHeaders
+	}
+
+	if updated, err := sjson.DeleteBytes(requestBody, codexResponsesLiteWSMetadataPath); err == nil {
+		requestBody = updated
+	}
+	if enabled {
+		if !headersCloned {
+			forwardHeaders = headers.Clone()
+		}
+		if forwardHeaders == nil {
+			forwardHeaders = make(http.Header)
+		}
+		forwardHeaders.Set(codexResponsesLiteHeader, "true")
+	}
+	return requestBody, forwardHeaders
+}
+
+// normalizeCodexResponsesLiteBody 按上游对 Responses Lite 请求的强制约束净化请求体：
+// reasoning.context 必须为 all_turns、parallel_tool_calls 必须为 false，否则上游
+// 400 unsupported_value（WS/HTTP 均校验）。HTTP 上游还要求 tools 仅含 function/
+// custom/客户端执行的 tool search——网关自动注入的 hosted image_generation 工具
+// （及其桥接 instructions）会让整个请求被拒，须在发出前剥除；WS 上游接受该工具、
+// 生图桥接可用，不剥除以免功能回退。
+func normalizeCodexResponsesLiteBody(requestBody []byte, stripHostedTools bool) []byte {
+	requestBody, _ = sjson.SetBytes(requestBody, "parallel_tool_calls", false)
+	requestBody, _ = sjson.SetBytes(requestBody, "reasoning.context", "all_turns")
+	if !stripHostedTools {
+		return requestBody
+	}
+
+	if tools := gjson.GetBytes(requestBody, "tools"); tools.IsArray() {
+		kept := make([]json.RawMessage, 0, len(tools.Array()))
+		removed := false
+		for _, tool := range tools.Array() {
+			if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+				removed = true
+				continue
+			}
+			kept = append(kept, json.RawMessage(tool.Raw))
+		}
+		if removed {
+			if len(kept) == 0 {
+				requestBody, _ = sjson.DeleteBytes(requestBody, "tools")
+			} else if raw, err := json.Marshal(kept); err == nil {
+				requestBody, _ = sjson.SetRawBytes(requestBody, "tools", raw)
+			}
+			if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(requestBody, "tool_choice.type").String()), "image_generation") {
+				requestBody, _ = sjson.DeleteBytes(requestBody, "tool_choice")
+			}
+		}
+	}
+	if instructions := gjson.GetBytes(requestBody, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		requestBody, _ = sjson.SetBytes(requestBody, "instructions", removeCodexImageGenerationBridgeText(instructions))
+	}
+	return requestBody
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
@@ -425,11 +513,21 @@ func resolveUpstreamSessionID(apiKeyID int64, upstreamSeed, explicitSessionID st
 // useWebsocket 可选：未传时遵循全局强制 WS；传 true/false 时由调用方显式控制。
 // headers 下游请求头，用于设备指纹学习
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resetUpstreamUserAgentAudit(ctx)
+	responsesLite := codexResponsesLiteRequested(requestBody, headers)
+
 	// Payload 规则改写：在 WS/HTTP 分叉前统一应用，两条上游路径共享改写结果。
 	// 生图请求跳过——其 instructions/工具由网关自行构造，改写会破坏桥接协议。
 	if !responsesBodyRequestsImageGeneration(requestBody) {
 		RecordObservedInstructions(requestBody, headers)
 		requestBody = applyPayloadRulesForExecute(ctx, requestBody, gjson.GetBytes(requestBody, "model").String(), headers)
+		// 规则改写发生在各 handler 的 service_tier 净化之后，规则注入的 flex/auto 等
+		// 上游不接受的层级会原样发出并触发 400，这里补一次净化兜底。用量日志的
+		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
+		requestBody = sanitizeServiceTierForUpstream(requestBody)
 	}
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {
@@ -465,6 +563,10 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
+		requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, true, responsesLite)
+		if responsesLite {
+			requestBody = normalizeCodexResponsesLiteBody(requestBody, false)
+		}
 		observeUpstreamTransport(ctx, true, "", 0, 0)
 		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
@@ -476,9 +578,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if !wantWebsocket {
 		observeDefaultUpstreamTransport(ctx, false)
 	}
-
-	if ctx == nil {
-		ctx = context.Background()
+	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
+	if responsesLite {
+		requestBody = normalizeCodexResponsesLiteBody(requestBody, true)
 	}
 
 	account.Mu().RLock()
@@ -559,6 +661,9 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	resetUpstreamUserAgentAudit(ctx)
+	responsesLite := codexResponsesLiteRequested(requestBody, headers)
+	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
 	baseURL, apiKey := account.OpenAIResponsesCredentials()
 	account.Mu().RLock()
@@ -695,6 +800,9 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	resetUpstreamUserAgentAudit(ctx)
+	responsesLite := codexResponsesLiteRequested(requestBody, headers)
+	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
 	baseURL, apiKey := account.OpenAIResponsesCredentials()
 	account.Mu().RLock()
@@ -729,6 +837,8 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	resetUpstreamUserAgentAudit(ctx)
+	responsesLite := codexResponsesLiteRequested(requestBody, headers)
 
 	account.Mu().RLock()
 	accessToken := account.AccessToken
@@ -752,6 +862,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
 	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
+	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
@@ -967,6 +1078,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Del("Conversation_id")
 	}
 	applyAccountCustomHeaders(req, account)
+	RecordUpstreamUserAgent(req.Context(), req.Header.Get("User-Agent"))
 }
 
 func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account, apiKey string, headers http.Header) {
@@ -982,13 +1094,14 @@ func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account
 		req.Header.Set("Version", version)
 	}
 	if headers != nil {
-		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
+		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key", codexResponsesLiteHeader} {
 			if value := firstNonEmptyHeader(headers, key, ""); value != "" {
 				req.Header.Set(key, value)
 			}
 		}
 	}
 	applyAccountCustomHeaders(req, account)
+	RecordUpstreamUserAgent(req.Context(), req.Header.Get("User-Agent"))
 }
 
 const downstreamAffinityHeader = "X-Codex2API-Affinity-Key"

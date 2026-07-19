@@ -150,11 +150,11 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "free", AccountID: "acc"}
 
 	now := time.Now()
+	subscriptionExpiresAt := now.Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
 	reset5h := now.Add(3 * time.Hour).Unix()
 	reset7d := now.Add(5 * 24 * time.Hour).Unix()
-	wantSubscriptionExpiresAt := now.Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
 	usage := &WhamUsage{PlanType: "plus"}
-	usage.SubscriptionExpiresAtRaw = whamTimeRaw(wantSubscriptionExpiresAt.Format(time.RFC3339))
+	usage.SubscriptionExpiresAtRaw = whamTimeRaw(subscriptionExpiresAt.Format(time.RFC3339))
 	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 83, LimitWindowSeconds: 18000, ResetAt: reset5h}
 	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 30, LimitWindowSeconds: 604800, ResetAt: reset7d}
 
@@ -180,6 +180,7 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	if got := row.GetCredential("plan_type"); got != "plus" {
 		t.Errorf("persisted plan_type = %q, want plus", got)
 	}
+	wantSubscriptionExpiresAt := subscriptionExpiresAt
 	if !account.SubscriptionExpiresAt.Equal(wantSubscriptionExpiresAt) {
 		t.Errorf("account SubscriptionExpiresAt = %s, want %s", account.SubscriptionExpiresAt.Format(time.RFC3339), wantSubscriptionExpiresAt.Format(time.RFC3339))
 	}

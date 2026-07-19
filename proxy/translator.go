@@ -635,6 +635,34 @@ func applyResponsesImageGenerationBridgeInstructions(body map[string]any) bool {
 	return true
 }
 
+// removeCodexImageGenerationBridgeText 移除 instructions 中的生图桥接标记块，
+// 是 applyResponsesImageGenerationBridgeInstructions 的逆操作。剥除随注入工具
+// 一同追加的桥接文案时使用；标记块不在场则原样返回。
+func removeCodexImageGenerationBridgeText(instructions string) string {
+	const bridgeEndTag = "</codex2api-codex-image-generation>"
+	for {
+		start := strings.Index(instructions, codexImageGenerationBridgeMarker)
+		if start < 0 {
+			return instructions
+		}
+		rest := instructions[start:]
+		end := strings.Index(rest, bridgeEndTag)
+		head := strings.TrimRight(instructions[:start], " \t\r\n")
+		if end < 0 {
+			return head
+		}
+		tail := strings.TrimLeft(rest[end+len(bridgeEndTag):], " \t\r\n")
+		switch {
+		case head == "":
+			instructions = tail
+		case tail == "":
+			instructions = head
+		default:
+			instructions = head + "\n\n" + tail
+		}
+	}
+}
+
 func hasTopLevelResponsesImageOptions(body map[string]any) bool {
 	if len(body) == 0 {
 		return false

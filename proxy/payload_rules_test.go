@@ -85,6 +85,19 @@ func TestPayloadRulesServiceTierOverride(t *testing.T) {
 	}
 }
 
+func TestPayloadRulesServiceTierSanitizedAfterRewrite(t *testing.T) {
+	// 规则注入的 flex/auto 等上游不接受的层级须在发出前被净化剔除（issue #395），
+	// 否则会绕过 handler 层的净化直达上游触发 400。fast 则应映射为 priority。
+	for tier, want := range map[string]string{"flex": "", "auto": "", "scale": "", "default": "", "fast": "priority", "priority": "priority"} {
+		withPayloadRules(t, `{"override":[{"params":{"service_tier":"`+tier+`"}}]}`)
+		out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, nil)
+		out = sanitizeServiceTierForUpstream(out)
+		if got := gjson.GetBytes(out, "service_tier").String(); got != want {
+			t.Fatalf("tier %s: service_tier = %q, want %q", tier, got, want)
+		}
+	}
+}
+
 func TestPayloadRulesDefaultOnlyWhenMissing(t *testing.T) {
 	withPayloadRules(t, `{"default":[{"params":{"text.verbosity":"low","instructions":"default prompt"}}]}`)
 	out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, nil)

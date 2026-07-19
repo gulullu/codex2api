@@ -389,6 +389,161 @@ func TestApplyCodexRequestHeadersForwardsAttestationOnlyWhenPresent(t *testing.T
 	}
 }
 
+func TestApplyCodexRequestHeadersForwardsResponsesLiteOnlyWhenPresent(t *testing.T) {
+	const headerName = codexResponsesLiteHeader
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	downstreamHeaders := make(http.Header)
+	downstreamHeaders.Set(headerName, "true")
+
+	withLite, _ := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	applyCodexRequestHeaders(withLite, acc, "token-123", "cache-key-1", "api-key-1", nil, downstreamHeaders)
+	if got := withLite.Header.Get(headerName); got != "true" {
+		t.Fatalf("%s = %q, want true", headerName, got)
+	}
+
+	withoutLite, _ := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	applyCodexRequestHeaders(withoutLite, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{})
+	if got := withoutLite.Header.Get(headerName); got != "" {
+		t.Fatalf("%s = %q, want empty when downstream omitted the signal", headerName, got)
+	}
+}
+
+func TestCodexResponsesLiteRequestedRequiresExplicitTrue(t *testing.T) {
+	headerTrue := make(http.Header)
+	headerTrue.Set(codexResponsesLiteHeader, " TRUE ")
+	headerFalse := make(http.Header)
+	headerFalse.Set(codexResponsesLiteHeader, "false")
+
+	tests := []struct {
+		name    string
+		body    []byte
+		headers http.Header
+		want    bool
+	}{
+		{name: "http header", body: []byte(`{"model":"gpt-5.4"}`), headers: headerTrue, want: true},
+		{name: "websocket metadata", body: []byte(`{"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`), want: true},
+		{name: "false values", body: []byte(`{"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`), headers: headerFalse, want: false},
+		{name: "model name alone", body: []byte(`{"model":"gpt-5.6-sol"}`), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := codexResponsesLiteRequested(tt.body, tt.headers); got != tt.want {
+				t.Fatalf("codexResponsesLiteRequested() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareCodexResponsesLiteTransportBridgesRequestScopedSignal(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[{"type":"function_call","name":"run","namespace":"code_tools","arguments":"{}"}],
+		"client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"true"}
+	}`)
+	headers := make(http.Header)
+	headers.Set(codexResponsesLiteHeader, "true")
+
+	wsBody, wsHeaders := prepareCodexResponsesLiteTransport(body, headers, true, true)
+	if got := gjson.GetBytes(wsBody, codexResponsesLiteWSMetadataPath).String(); got != "true" {
+		t.Fatalf("WS Lite metadata = %q, want true; body=%s", got, wsBody)
+	}
+	if got := wsHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("WS handshake Lite header = %q, want empty", got)
+	}
+
+	httpBody, httpHeaders := prepareCodexResponsesLiteTransport(body, headers, false, true)
+	if got := httpHeaders.Get(codexResponsesLiteHeader); got != "true" {
+		t.Fatalf("HTTP Lite header = %q, want true", got)
+	}
+	if marker := gjson.GetBytes(httpBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("HTTP body retained WS-only Lite metadata: %s", httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "client_metadata.other").String(); got != "kept" {
+		t.Fatalf("unrelated client metadata = %q, want kept; body=%s", got, httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "input.0.namespace").String(); got != "code_tools" {
+		t.Fatalf("tool namespace = %q, want code_tools; body=%s", got, httpBody)
+	}
+	if got := headers.Get(codexResponsesLiteHeader); got != "true" {
+		t.Fatalf("caller headers were mutated: Lite header = %q", got)
+	}
+
+	nextWSBody, nextWSHeaders := prepareCodexResponsesLiteTransport([]byte(`{"model":"gpt-5.6-sol"}`), nil, true, false)
+	if marker := gjson.GetBytes(nextWSBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("non-Lite request inherited pooled WS metadata: %s", nextWSBody)
+	}
+	if got := nextWSHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("non-Lite request inherited pooled WS header: %q", got)
+	}
+
+	nonLiteHeaders := make(http.Header)
+	nonLiteHeaders.Set(codexResponsesLiteHeader, "false")
+	nonLiteBody := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`)
+	nonLiteBody, nonLiteHeaders = prepareCodexResponsesLiteTransport(nonLiteBody, nonLiteHeaders, false, false)
+	if got := nonLiteHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("false Lite header was forwarded as %q", got)
+	}
+	if marker := gjson.GetBytes(nonLiteBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("HTTP body retained false WS-only Lite metadata: %s", nonLiteBody)
+	}
+}
+
+func TestNormalizeCodexResponsesLiteBodyEnforcesUpstreamConstraints(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"parallel_tool_calls":true,
+		"reasoning":{"effort":"low"},
+		"tools":[{"type":"function","name":"run"},{"type":"image_generation","model":"gpt-image-2"}],
+		"instructions":"Base prompt.\n\n` + "<codex2api-codex-image-generation>\\nbridge text\\n</codex2api-codex-image-generation>" + `"
+	}`)
+
+	wsBody := normalizeCodexResponsesLiteBody(body, false)
+	if got := gjson.GetBytes(wsBody, "parallel_tool_calls").Bool(); got {
+		t.Fatalf("WS parallel_tool_calls = %v, want false", got)
+	}
+	if got := gjson.GetBytes(wsBody, "reasoning.context").String(); got != "all_turns" {
+		t.Fatalf("WS reasoning.context = %q, want all_turns", got)
+	}
+	if got := gjson.GetBytes(wsBody, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("WS reasoning.effort = %q, want low (preserved)", got)
+	}
+	if got := gjson.GetBytes(wsBody, "tools.#").Int(); got != 2 {
+		t.Fatalf("WS tools count = %d, want 2 (image tool kept on WS)", got)
+	}
+
+	httpBody := normalizeCodexResponsesLiteBody(body, true)
+	if got := gjson.GetBytes(httpBody, "tools.#").Int(); got != 1 {
+		t.Fatalf("HTTP tools count = %d, want 1; body=%s", got, httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "tools.0.type").String(); got != "function" {
+		t.Fatalf("HTTP surviving tool type = %q, want function", got)
+	}
+	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "Base prompt." {
+		t.Fatalf("HTTP instructions = %q, want bridge text removed", instructions)
+	}
+}
+
+func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"tools":[{"type":"image_generation","model":"gpt-image-2"}],
+		"tool_choice":{"type":"image_generation"},
+		"instructions":"` + "<codex2api-codex-image-generation>\\nbridge text\\n</codex2api-codex-image-generation>" + `"
+	}`)
+
+	httpBody := normalizeCodexResponsesLiteBody(body, true)
+	if tools := gjson.GetBytes(httpBody, "tools"); tools.Exists() {
+		t.Fatalf("HTTP tools should be removed entirely, got %s", tools.Raw)
+	}
+	if choice := gjson.GetBytes(httpBody, "tool_choice"); choice.Exists() {
+		t.Fatalf("HTTP tool_choice should be removed, got %s", choice.Raw)
+	}
+	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "" {
+		t.Fatalf("HTTP instructions = %q, want empty after bridge removal", instructions)
+	}
+}
+
 func TestApplyOpenAIResponsesRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {
@@ -720,6 +875,7 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 		version string
 		auth    string
 		accept  string
+		lite    string
 		body    []byte
 	}
 	results := make(chan result, 2)
@@ -732,6 +888,7 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 			version: r.Header.Get("Version"),
 			auth:    r.Header.Get("Authorization"),
 			accept:  r.Header.Get("Accept"),
+			lite:    r.Header.Get(codexResponsesLiteHeader),
 			body:    body,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -746,13 +903,17 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 		APIKey:       "relay-token",
 	}
 
-	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", http.Header{"User-Agent": []string{"curl/8.0"}})
+	downstreamHeaders := make(http.Header)
+	downstreamHeaders.Set("User-Agent", "curl/8.0")
+	downstreamHeaders.Set(codexResponsesLiteHeader, "true")
+
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
 	}
 	resp.Body.Close()
 
-	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", nil)
+	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesCompactRequest() error = %v", err)
 	}
@@ -775,6 +936,9 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 			}
 			if got.accept != "application/json, text/event-stream" {
 				t.Fatalf("%s Accept = %q", wantPath, got.accept)
+			}
+			if got.lite != "true" {
+				t.Fatalf("%s %s = %q, want true", wantPath, codexResponsesLiteHeader, got.lite)
 			}
 			if len(got.body) == 0 {
 				t.Fatalf("%s request body was empty", wantPath)

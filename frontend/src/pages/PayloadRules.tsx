@@ -215,6 +215,9 @@ const TEMPLATES: Array<{ key: TemplateKey; icon: typeof Wand2; titleKey: string;
 
 const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'].map((v) => ({ label: v, value: v }))
 
+// 上游实际只接受 priority（fast 会映射为 priority），其余值会在发往上游前被剔除
+const SERVICE_TIER_OPTIONS = ['priority', 'fast', 'auto', 'default', 'flex', 'scale'].map((v) => ({ label: v, value: v }))
+
 interface KVRow {
   path: string
   value: string
@@ -235,7 +238,11 @@ interface RuleFormState {
   apiKeyNames: string[]
   groupIds: string[]
   groupNames: string[]
+  /** 编辑时透传表单未暴露的条件字段，避免保存后静默丢失 */
+  carry: Pick<RuleEntry, 'headers' | 'notMatch' | 'exist' | 'notExist'>
 }
+
+const EMPTY_CARRY: RuleFormState['carry'] = { headers: {}, notMatch: {}, exist: [], notExist: [] }
 
 function emptyFormState(template: TemplateKey): RuleFormState {
   return {
@@ -254,16 +261,46 @@ function emptyFormState(template: TemplateKey): RuleFormState {
     groupIds: [],
     // fastGroup 模板默认对名为 fast 的分组生效
     groupNames: template === 'fastGroup' ? ['fast'] : [],
+    carry: EMPTY_CARRY,
   }
 }
 
+/** 编辑时反推规则最贴合的模板：无附加条件的单字段规则回到语义化表单，其余走 custom。 */
+function detectTemplate(entry: RuleEntry): TemplateKey {
+  if (Array.isArray(entry.params)) return 'custom'
+  const params = entry.params
+  const hasConditions =
+    Object.keys(entry.match).length > 0 ||
+    Object.keys(entry.notMatch).length > 0 ||
+    Object.keys(entry.headers).length > 0 ||
+    entry.exist.length > 0 ||
+    entry.notExist.length > 0
+  if (hasConditions) return 'custom'
+  const keys = Object.keys(params)
+  if (keys.length === 1 && keys[0] === 'instructions' && typeof params.instructions === 'string') {
+    if (entry.group === 'append') return 'appendPrompt'
+    if (entry.group === 'override') return 'overridePrompt'
+  }
+  if (
+    keys.length === 1 &&
+    keys[0] === 'service_tier' &&
+    entry.group === 'override' &&
+    SERVICE_TIER_OPTIONS.some((opt) => opt.value === params.service_tier)
+  ) {
+    return 'serviceTier'
+  }
+  return 'custom'
+}
+
 function formStateFromEntry(entry: RuleEntry): RuleFormState {
+  const template = detectTemplate(entry)
+  const params = Array.isArray(entry.params) ? {} : entry.params
   return {
-    template: 'custom',
+    template,
     group: entry.group,
     models: entry.models,
-    promptText: '',
-    tierValue: 'priority',
+    promptText: typeof params.instructions === 'string' ? params.instructions : '',
+    tierValue: typeof params.service_tier === 'string' ? params.service_tier : 'priority',
     effortFrom: 'medium',
     effortTo: 'high',
     paramRows: Array.isArray(entry.params)
@@ -275,6 +312,7 @@ function formStateFromEntry(entry: RuleEntry): RuleFormState {
     apiKeyNames: entry.apiKeyNames,
     groupIds: entry.groupIds,
     groupNames: entry.groupNames,
+    carry: { headers: entry.headers, notMatch: entry.notMatch, exist: entry.exist, notExist: entry.notExist },
   }
 }
 
@@ -294,11 +332,11 @@ function formStateToEntry(form: RuleFormState): RuleEntry | null {
   const base: RuleEntry = {
     group: form.group,
     models,
-    headers: {},
+    headers: form.carry.headers,
     match: {},
-    notMatch: {},
-    exist: [],
-    notExist: [],
+    notMatch: form.carry.notMatch,
+    exist: form.carry.exist,
+    notExist: form.carry.notExist,
     apiKeyIds,
     apiKeyNames,
     groupIds,
@@ -820,7 +858,7 @@ export default function PayloadRules() {
                               <span className={cn('inline-flex items-center rounded-md px-2 py-0.5 text-[11px] font-semibold', meta.badge)}>
                                 {t(meta.labelKey)}
                               </span>
-                              <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                              <div className="flex items-center gap-1 transition-opacity focus-within:opacity-100 [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover:opacity-100">
                                 <button
                                   type="button"
                                   onClick={() => openEditDialog(index)}
@@ -991,16 +1029,17 @@ export default function PayloadRules() {
               ) : null}
 
               {form.template === 'serviceTier' ? (
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-foreground">{t('payloadRules.formTier')}</label>
-                    <Input
+                <div className="space-y-1.5">
+                  <label className="text-xs font-semibold text-foreground">{t('payloadRules.formTier')}</label>
+                  <div className="max-w-[220px]">
+                    <Select
+                      compact
                       value={form.tierValue}
-                      placeholder="priority"
-                      className="h-9 font-mono text-xs"
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setForm({ ...form, tierValue: e.target.value })}
+                      options={SERVICE_TIER_OPTIONS}
+                      onValueChange={(v) => setForm({ ...form, tierValue: v })}
                     />
                   </div>
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">{t('payloadRules.formTierHint')}</p>
                 </div>
               ) : null}
 
@@ -1031,12 +1070,44 @@ export default function PayloadRules() {
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-xs font-semibold text-foreground">{t('payloadRules.formTier')}</label>
-                    <Input
-                      value={form.tierValue}
-                      placeholder="priority"
-                      className="h-9 font-mono text-xs"
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setForm({ ...form, tierValue: e.target.value })}
-                    />
+                    <div className="max-w-[220px]">
+                      <Select
+                        compact
+                        value={form.tierValue}
+                        options={SERVICE_TIER_OPTIONS}
+                        onValueChange={(v) => setForm({ ...form, tierValue: v })}
+                      />
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">{t('payloadRules.formTierHint')}</p>
+                  </div>
+                </div>
+              ) : null}
+
+              {form.template !== 'custom' && form.template !== 'fastGroup' ? (
+                <div className="space-y-3 rounded-xl border border-border/70 bg-muted/20 p-3.5">
+                  <div className="space-y-0.5">
+                    <label className="text-xs font-semibold text-foreground">{t('payloadRules.identityGatesLabel')}</label>
+                    <p className="text-[11px] leading-relaxed text-muted-foreground">{t('payloadRules.identityGatesHint')}</p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-foreground">{t('payloadRules.groupNamesLabel')}</label>
+                      <ChipInput
+                        value={form.groupNames}
+                        onChange={(groupNames) => setForm({ ...form, groupNames })}
+                        options={groupNameOptions}
+                        placeholder={t('payloadRules.groupNamesPlaceholder')}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-foreground">{t('payloadRules.apiKeyNamesLabel')}</label>
+                      <ChipInput
+                        value={form.apiKeyNames}
+                        onChange={(apiKeyNames) => setForm({ ...form, apiKeyNames })}
+                        options={apiKeyNameOptions}
+                        placeholder={t('payloadRules.apiKeyNamesPlaceholder')}
+                      />
+                    </div>
                   </div>
                 </div>
               ) : null}
