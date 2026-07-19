@@ -462,7 +462,9 @@ export default function AccountDetailSheet({
             {(account.proxy_url ||
               account.at_only ||
               account.openai_responses_api ||
-              account.base_url) && (
+              account.base_url ||
+              (!account.openai_responses_api &&
+                (account.models?.length ?? 0) > 0)) && (
               <Section title={t("accounts.detailTechnical")}>
                 <div className="space-y-2 rounded-xl border border-border bg-card p-3 text-[12px]">
                   {account.at_only && (
@@ -515,6 +517,19 @@ export default function AccountDetailSheet({
                       </span>
                     </div>
                   )}
+                  {!account.openai_responses_api &&
+                    (account.models?.length ?? 0) > 0 && (
+                      <div className="flex justify-between gap-3">
+                        <span className="shrink-0 text-muted-foreground">
+                          {t("accounts.supportedModelsAction")}
+                        </span>
+                        <span className="font-medium tabular-nums text-foreground">
+                          {t("accounts.supportedModelsCount", {
+                            count: account.models?.length ?? 0,
+                          })}
+                        </span>
+                      </div>
+                    )}
                 </div>
               </Section>
             )}

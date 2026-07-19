@@ -892,6 +892,39 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 	return modified
 }
 
+// normalizeResponsesSystemRoleMessages 把 input[] 中 role=system 的消息项改写为
+// developer 角色。上游 Codex /responses 不接受 system 角色（报 "System messages
+// are not allowed"），而 chat 与 Anthropic 两条翻译链路均已把 system 落到
+// developer（buildInput / buildCodexInput）；原生 Responses 直通路径在此补齐
+// 同样的语义（issue #409）。内容保持原样，content part 类型交由后续
+// normalizeResponsesContentPartTypes 按角色归一。
+func normalizeResponsesSystemRoleMessages(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if !isResponsesMessageInputItem(itemMap) {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(itemMap["role"])) != "system" {
+			continue
+		}
+		itemMap["role"] = "developer"
+		modified = true
+	}
+	return modified
+}
+
 // normalizeResponsesToolCallArgumentTypes 修正 input[] 中工具调用项 arguments 的
 // JSON 类型。上游对不同 item 类型的要求不对称：function_call.arguments 必须是
 // string（JSON 编码），tool_search_call.arguments 必须是 object。客户端与缓存
@@ -1976,6 +2009,8 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
 	normalizeResponsesCompactionItems(body)
+	// system 角色消息 → developer（上游不接受 system 角色，issue #409）
+	normalizeResponsesSystemRoleMessages(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	normalizeResponsesToolCallArgumentTypes(body)

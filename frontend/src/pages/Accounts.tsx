@@ -923,6 +923,15 @@ export default function Accounts() {
   );
   const [quickGroupIds, setQuickGroupIds] = useState<number[]>([]);
   const [quickGroupSubmitting, setQuickGroupSubmitting] = useState(false);
+  // OAuth 账号“支持模型”白名单编辑器状态;空白名单表示该账号可调度所有模型。
+  const [modelsAccount, setModelsAccount] = useState<AccountRow | null>(null);
+  const [modelsDraft, setModelsDraft] = useState<string[]>([]);
+  const [modelsInputDraft, setModelsInputDraft] = useState("");
+  const [modelsSyncing, setModelsSyncing] = useState(false);
+  const [modelsProbing, setModelsProbing] = useState(false);
+  const [modelsSaving, setModelsSaving] = useState(false);
+  // 探测看板：逐模型的实时测试状态（pending→testing→结果）。
+  const [probeBoard, setProbeBoard] = useState<ModelProbeItem[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
   const [domainFilter, setDomainFilter] = useState<string>("");
   const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
@@ -3255,6 +3264,171 @@ export default function Accounts() {
     }
   };
 
+  const openModelsEditor = (account: AccountRow) => {
+    setModelsAccount(account);
+    setModelsDraft([...(account.models ?? [])]);
+    setModelsInputDraft("");
+    setProbeBoard([]);
+  };
+
+  const closeModelsEditor = () => {
+    if (modelsSaving || modelsSyncing || modelsProbing) return;
+    setModelsAccount(null);
+    setModelsDraft([]);
+    setModelsInputDraft("");
+    setProbeBoard([]);
+  };
+
+  const addModelsDraftValues = (raw: string) => {
+    const next = parseModelTokens(raw);
+    if (next.length === 0) return;
+    setModelsDraft((current) => mergeModelLists(current, next));
+    setModelsInputDraft("");
+  };
+
+  const removeModelsDraftValue = (model: string) => {
+    setModelsDraft((current) => current.filter((item) => item !== model));
+  };
+
+  const clearModelsDraft = () => {
+    setModelsDraft([]);
+  };
+
+  const handleSyncModelsUpstream = async () => {
+    if (!modelsAccount) return;
+    setModelsSyncing(true);
+    try {
+      const result = await api.syncAccountModelsUpstream(modelsAccount.id);
+      const fetched = result.models ?? [];
+      setModelsDraft((current) => mergeModelLists(current, fetched));
+      showToast(
+        t("accounts.supportedModelsSyncDone", { count: fetched.length }),
+      );
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsSyncFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsSyncing(false);
+    }
+  };
+
+  const handleProbeModels = async () => {
+    if (!modelsAccount) return;
+    setModelsProbing(true);
+    setProbeBoard([]);
+    let available: string[] = [];
+    try {
+      const res = await fetch(
+        `/api/admin/accounts/${modelsAccount.id}/models/probe?stream=true`,
+        {
+          method: "POST",
+          headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
+        },
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("no stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const ev = JSON.parse(line.slice(6)) as {
+              type: string;
+              models?: string[];
+              model?: string;
+              outcome?: string;
+              detail?: string;
+              available?: string[];
+            };
+            if (ev.type === "start") {
+              setProbeBoard(
+                (ev.models ?? []).map((m) => ({
+                  model: m,
+                  status: "pending" as ModelProbeStatus,
+                })),
+              );
+            } else if (ev.type === "testing") {
+              setProbeBoard((board) =>
+                board.map((it) =>
+                  it.model === ev.model ? { ...it, status: "testing" } : it,
+                ),
+              );
+            } else if (ev.type === "result") {
+              setProbeBoard((board) =>
+                board.map((it) =>
+                  it.model === ev.model
+                    ? {
+                        ...it,
+                        status: (ev.outcome as ModelProbeStatus) ?? "error",
+                        detail: ev.detail,
+                      }
+                    : it,
+                ),
+              );
+            } else if (ev.type === "done") {
+              available = ev.available ?? [];
+            }
+          } catch {
+            /* 忽略解析异常 */
+          }
+        }
+      }
+      if (available.length === 0) {
+        showToast(t("accounts.supportedModelsProbeNone"), "error");
+      } else {
+        setModelsDraft((current) => mergeModelLists(current, available));
+        showToast(
+          t("accounts.supportedModelsProbeDone", { count: available.length }),
+        );
+      }
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsProbeFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsProbing(false);
+    }
+  };
+
+  const handleSaveModels = async () => {
+    if (!modelsAccount) return;
+    setModelsSaving(true);
+    try {
+      await api.updateAccountModels(modelsAccount.id, modelsDraft);
+      showToast(t("accounts.supportedModelsSaveDone"));
+      void reloadSilently();
+      setModelsAccount(null);
+      setModelsDraft([]);
+      setModelsInputDraft("");
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsSaveFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsSaving(false);
+    }
+  };
+
   const batchScoreBiasTrimmed = batchScoreBiasInput.trim();
   const batchScoreBiasValue = batchScoreBiasTrimmed
     ? parseIntegerInput(batchScoreBiasTrimmed)
@@ -4865,6 +5039,7 @@ export default function Accounts() {
                           onResetCredits={() =>
                             void handleResetCredits(account)
                           }
+                          onEditModels={() => openModelsEditor(account)}
                           onDelete={() => void handleDelete(account)}
                           onUsageRefreshed={() => void reloadSilently()}
                         />
@@ -5398,6 +5573,7 @@ export default function Accounts() {
                                     onResetCredits={() =>
                                       void handleResetCredits(account)
                                     }
+                                    onEditModels={() => openModelsEditor(account)}
                                     onDelete={() => void handleDelete(account)}
                                   />
                                 </div>
@@ -7372,6 +7548,150 @@ export default function Accounts() {
           </Modal>
 
           <Modal
+            show={Boolean(modelsAccount)}
+            title={t("accounts.supportedModelsTitle")}
+            contentClassName="sm:max-w-[560px]"
+            onClose={closeModelsEditor}
+            footer={
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={modelsSaving || modelsSyncing || modelsProbing}
+                  onClick={closeModelsEditor}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  disabled={modelsSaving || modelsSyncing || modelsProbing}
+                  onClick={() => void handleSaveModels()}
+                >
+                  {modelsSaving
+                    ? t("common.saving")
+                    : modelsDraft.length === 0
+                      ? t("accounts.supportedModelsClearSave")
+                      : t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">
+                  {modelsAccount ? formatAccountName(modelsAccount) : ""}
+                </div>
+                <div className="mt-1">{t("accounts.supportedModelsDesc")}</div>
+              </div>
+
+              {/* 自动获取：探测/同步按钮 + 说明，成一体 */}
+              <div className="rounded-lg border border-border bg-muted/10 p-3">
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={modelsSyncing || modelsSaving || modelsProbing}
+                    onClick={() => void handleProbeModels()}
+                  >
+                    <Zap
+                      className={`size-3.5 ${modelsProbing ? "animate-pulse" : ""}`}
+                    />
+                    {modelsProbing
+                      ? t("accounts.supportedModelsProbing")
+                      : t("accounts.supportedModelsProbe")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={modelsSyncing || modelsSaving || modelsProbing}
+                    onClick={() => void handleSyncModelsUpstream()}
+                  >
+                    <RefreshCw
+                      className={`size-3.5 ${modelsSyncing ? "animate-spin" : ""}`}
+                    />
+                    {modelsSyncing
+                      ? t("accounts.supportedModelsSyncing")
+                      : t("accounts.supportedModelsSync")}
+                  </Button>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t("accounts.supportedModelsProbeHint")}
+                </p>
+                {probeBoard.length > 0 && (
+                  <div className="mt-3">
+                    <ModelProbeBoard items={probeBoard} t={t} />
+                  </div>
+                )}
+              </div>
+
+              {/* 手动添加 */}
+              <div className="flex gap-2">
+                <Input
+                  placeholder={t("accounts.openaiModelsPlaceholder")}
+                  value={modelsInputDraft}
+                  disabled={modelsSaving}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setModelsInputDraft(event.target.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addModelsDraftValues(modelsInputDraft);
+                    }
+                  }}
+                  onPaste={(event) => {
+                    const pasted = event.clipboardData.getData("text");
+                    if (parseModelTokens(pasted).length > 1) {
+                      event.preventDefault();
+                      addModelsDraftValues(pasted);
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => addModelsDraftValues(modelsInputDraft)}
+                  disabled={!modelsInputDraft.trim() || modelsSaving}
+                >
+                  <Plus className="size-3.5" />
+                  {t("accounts.openaiModelsAdd")}
+                </Button>
+              </div>
+
+              {/* 白名单列表：计数 + 清空 在上，紧凑 pills 在下 */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {modelsDraft.length === 0
+                      ? t("accounts.supportedModelsHintAll")
+                      : t("accounts.supportedModelsHintCount", {
+                          count: modelsDraft.length,
+                        })}
+                  </span>
+                  {modelsDraft.length > 0 && (
+                    <button
+                      type="button"
+                      className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                      disabled={modelsSaving}
+                      onClick={clearModelsDraft}
+                    >
+                      {t("accounts.supportedModelsClearAll")}
+                    </button>
+                  )}
+                </div>
+                <ModelChipGrid
+                  variant="pills"
+                  models={modelsDraft}
+                  onRemove={removeModelsDraftValue}
+                  emptyLabel={t("accounts.supportedModelsEmpty")}
+                />
+              </div>
+            </div>
+          </Modal>
+
+          <Modal
             show={showBatchMetaEditor}
             title={t(
               batchMetaMode === "groups"
@@ -9186,19 +9506,153 @@ function APIKeyMultiSelect({
   );
 }
 
+type ModelProbeStatus =
+  | "pending"
+  | "testing"
+  | "available"
+  | "unsupported"
+  | "throttled"
+  | "error";
+
+type ModelProbeItem = {
+  model: string;
+  status: ModelProbeStatus;
+  detail?: string;
+};
+
+// ModelProbeBoard 逐模型实时探测看板：每个模型显示 等待/测试中/结果 的动画状态。
+function ModelProbeBoard({
+  items,
+  t,
+}: {
+  items: ModelProbeItem[];
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const tested = items.filter(
+    (it) => it.status !== "pending" && it.status !== "testing",
+  ).length;
+  const availableCount = items.filter(
+    (it) => it.status === "available",
+  ).length;
+
+  const statusMeta: Record<
+    ModelProbeStatus,
+    { icon: ReactNode; ring: string; text: string; label: string }
+  > = {
+    pending: {
+      icon: <Hourglass className="size-3.5" />,
+      ring: "border-border bg-muted/20",
+      text: "text-muted-foreground/70",
+      label: t("accounts.probeStatePending"),
+    },
+    testing: {
+      icon: <RefreshCw className="size-3.5 animate-spin" />,
+      ring: "border-primary/40 bg-primary/5",
+      text: "text-primary",
+      label: t("accounts.probeStateTesting"),
+    },
+    available: {
+      icon: <Check className="size-3.5" />,
+      ring: "border-emerald-500/30 bg-emerald-500/5",
+      text: "text-emerald-600 dark:text-emerald-400",
+      label: t("accounts.probeStateAvailable"),
+    },
+    unsupported: {
+      icon: <Ban className="size-3.5" />,
+      ring: "border-rose-500/30 bg-rose-500/5",
+      text: "text-rose-600 dark:text-rose-400",
+      label: t("accounts.probeStateUnsupported"),
+    },
+    throttled: {
+      icon: <Timer className="size-3.5" />,
+      ring: "border-amber-500/30 bg-amber-500/5",
+      text: "text-amber-600 dark:text-amber-400",
+      label: t("accounts.probeStateThrottled"),
+    },
+    error: {
+      icon: <AlertTriangle className="size-3.5" />,
+      ring: "border-border bg-muted/30",
+      text: "text-muted-foreground",
+      label: t("accounts.probeStateError"),
+    },
+  };
+
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-card p-3">
+      <div className="flex items-center justify-between text-xs">
+        <span className="font-medium text-foreground">
+          {t("accounts.probeBoardTitle")}
+        </span>
+        <span className="tabular-nums text-muted-foreground">
+          {t("accounts.probeBoardProgress", {
+            tested,
+            total: items.length,
+            available: availableCount,
+          })}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+        {items.map((it) => {
+          const meta = statusMeta[it.status];
+          return (
+            <div
+              key={it.model}
+              className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 transition-colors duration-300 ${meta.ring}`}
+              title={it.detail || meta.label}
+            >
+              <span className={`shrink-0 ${meta.text}`}>{meta.icon}</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                {it.model}
+              </span>
+              <span className={`shrink-0 text-[11px] ${meta.text}`}>
+                {meta.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ModelChipGrid({
   models,
   onRemove,
   emptyLabel,
+  variant = "grid",
 }: {
   models: string[];
   onRemove: (model: string) => void;
   emptyLabel: string;
+  variant?: "grid" | "pills";
 }) {
   if (models.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-3 text-sm text-muted-foreground">
         {emptyLabel}
+      </div>
+    );
+  }
+  if (variant === "pills") {
+    return (
+      <div className="flex flex-wrap gap-1.5 rounded-lg border border-border bg-muted/10 p-2.5">
+        {models.map((model) => (
+          <span
+            key={model}
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-background py-1 pl-2 pr-1 text-[12px]"
+            title={model}
+          >
+            <span className="font-mono text-foreground">{model}</span>
+            <button
+              type="button"
+              className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              onClick={() => onRemove(model)}
+              aria-label={`Remove ${model}`}
+            >
+              <X className="size-3" />
+            </button>
+          </span>
+        ))}
       </div>
     );
   }
@@ -10238,6 +10692,7 @@ function AccountRowActionsMenu({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onEditModels,
   onDelete,
 }: {
   t: ReturnType<typeof useTranslation>["t"];
@@ -10254,6 +10709,7 @@ function AccountRowActionsMenu({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onEditModels?: () => void;
   onDelete: () => void;
 }) {
   const refreshDisabled =
@@ -10348,6 +10804,17 @@ function AccountRowActionsMenu({
       disabled: resetCredits <= 0,
       onSelect: onResetCredits,
     },
+    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay(openai_responses_api)账号不显示。
+    ...(onEditModels && !account.openai_responses_api
+      ? [
+          {
+            key: "edit-models",
+            label: t("accounts.supportedModelsAction"),
+            icon: <SlidersHorizontal className="size-3.5" />,
+            onSelect: onEditModels,
+          },
+        ]
+      : []),
     ...(includeDelete
       ? [
           {
@@ -10606,6 +11073,7 @@ function AccountMobileCard({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onEditModels,
   onDelete,
   onUsageRefreshed,
 }: {
@@ -10634,6 +11102,7 @@ function AccountMobileCard({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onEditModels?: () => void;
   onDelete: () => void;
   onUsageRefreshed?: () => void;
 }) {
@@ -10946,6 +11415,7 @@ function AccountMobileCard({
               onToggleLock={onToggleLock}
               onResetStatus={onResetStatus}
               onResetCredits={onResetCredits}
+              onEditModels={onEditModels}
               onDelete={onDelete}
             />
           </div>
@@ -11174,6 +11644,7 @@ function AccountMobileCard({
           onToggleLock={onToggleLock}
           onResetStatus={onResetStatus}
           onResetCredits={onResetCredits}
+          onEditModels={onEditModels}
           onDelete={onDelete}
         />
       </div>

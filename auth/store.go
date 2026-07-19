@@ -424,6 +424,39 @@ func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
 	return false
 }
 
+// SupportsCodexModel 判断 Codex OAuth 账号能否服务指定模型。
+// Models 为空表示未配置白名单，放行全部模型；非空时按大小写不敏感精确匹配。
+func (a *Account) SupportsCodexModel(model string) bool {
+	if a == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return true
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.Models) == 0 {
+		return true
+	}
+	for _, candidate := range a.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
+}
+
+// CodexModels 返回 Codex OAuth 账号配置的支持模型白名单（空表示放行全部）。
+func (a *Account) CodexModels() []string {
+	if a == nil {
+		return []string{}
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneStringSlice(a.Models)
+}
+
 func (a *Account) OpenAIResponsesModels() []string {
 	if a == nil {
 		return []string{}
@@ -1915,6 +1948,14 @@ func (a *Account) GetPlanType() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.PlanType
+}
+
+// GroupIDSnapshot 返回账号当前所属组 ID 的副本。GroupIDs 写入受 a.mu 保护
+// （ApplyAccountGroups / ApplyAccountGroupMemberships），跨 goroutine 读取须走此快照。
+func (a *Account) GroupIDSnapshot() []int64 {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneInt64Slice(a.GroupIDs)
 }
 
 // applyRefreshedPlanTypeLocked applies a plan parsed from refreshed tokens.
@@ -5846,6 +5887,23 @@ func (s *Store) ApplyAccountName(dbID int64, name string) bool {
 	}
 	acc.mu.Lock()
 	acc.Name = strings.TrimSpace(name)
+	acc.mu.Unlock()
+	return true
+}
+
+// NormalizeAccountModels 归一化账号支持模型列表（去重、去空白、按字典序排序）。
+func NormalizeAccountModels(values []string) []string {
+	return normalizeModelList(values)
+}
+
+// ApplyAccountModels 更新运行时账号的支持模型白名单（空列表 = 清空白名单，放行全部模型）。
+func (s *Store) ApplyAccountModels(dbID int64, models []string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	acc.Models = normalizeModelList(models)
 	acc.mu.Unlock()
 	return true
 }

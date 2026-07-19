@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -804,7 +805,9 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 
 	db := newTestAdminDB(t)
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	probed := make(chan int64, 1)
+	probed := make(chan int64, 2)
+	probeHookDone := make(chan struct{})
+	var probeCalls atomic.Int32
 	handler := &Handler{
 		db:    db,
 		store: store,
@@ -819,7 +822,16 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 			return nil
 		},
 		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			call := probeCalls.Add(1)
 			probed <- acc.DBID
+			if call == 2 {
+				// The second call is the import-specific probe. Return a sentinel
+				// after observing it so its wrapper exits before the separate
+				// post-probe duplicate-merge DB phase; that phase is covered
+				// elsewhere and has no completion hook for this test.
+				close(probeHookDone)
+				return fmt.Errorf("test import probe observation complete")
+			}
 			return nil
 		},
 	}
@@ -830,13 +842,54 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 
 	handler.importAccountsCommon(ctx, []importToken{{refreshToken: "rt-import-refresh-probe"}}, "", false)
 
-	select {
-	case id := <-probed:
-		if id == 0 {
-			t.Fatal("probed account id is zero")
+	// refreshAccountByID performs its own post-refresh probe, and the RT import
+	// wrapper then performs the import-specific probe. Wait for both observed
+	// hooks to return their sentinel errors so neither wrapper can continue into
+	// a later DB phase while TempDir cleanup starts.
+	for i := 0; i < 2; i++ {
+		select {
+		case id := <-probed:
+			if id == 0 {
+				t.Fatal("probed account id is zero")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("usage probe %d/2 was not triggered after RT-only import refresh", i+1)
 		}
+	}
+	select {
+	case <-probeHookDone:
 	case <-time.After(2 * time.Second):
-		t.Fatal("usage probe was not triggered after RT-only import refresh")
+		t.Fatal("import-specific usage probe hook did not finish")
+	}
+	if got := probeCalls.Load(); got != 2 {
+		t.Fatalf("usage probe calls = %d, want 2", got)
+	}
+
+	// The import records account_events asynchronously. Wait for the durable
+	// write before TempDir cleanup closes and removes the SQLite database;
+	// otherwise the event goroutine can recreate WAL files during RemoveAll.
+	eventDeadline := time.Now().Add(2 * time.Second)
+	for {
+		points, err := db.GetAccountEventTrend(
+			context.Background(),
+			time.Now().Add(-time.Hour),
+			time.Now().Add(time.Hour),
+			60,
+		)
+		if err != nil {
+			t.Fatalf("GetAccountEventTrend: %v", err)
+		}
+		added := 0
+		for _, point := range points {
+			added += point.Added
+		}
+		if added == 1 {
+			break
+		}
+		if time.Now().After(eventDeadline) {
+			t.Fatalf("durable added account events = %d, want 1", added)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -1292,7 +1345,8 @@ func TestProbeImportedAccountUsageMergesAfterIdentityLearned(t *testing.T) {
 }
 
 // 勾选"允许重复添加"导入的 RT 账号刷新后不得被合并。
-func TestMergeRefreshedDuplicateSkipsAllowDuplicate(t *testing.T) {	gin.SetMode(gin.TestMode)
+func TestMergeRefreshedDuplicateSkipsAllowDuplicate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
 	db := newTestAdminDB(t)
 	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})

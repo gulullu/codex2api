@@ -1541,6 +1541,8 @@ export interface APIKeyLimits {
   token_limit_7d?: number
   token_limit_30d?: number
   disable_image_generation?: boolean
+  /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
+  image_generation_policy?: "allow" | "strip" | "block"
 }
 
 export interface APIKeyWindowUsage {

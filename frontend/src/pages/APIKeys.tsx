@@ -31,7 +31,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, type SelectOption } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -110,8 +109,10 @@ interface LimitsFormState {
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
-  disableImageGeneration: boolean;
+  imageGenerationPolicy: ImageGenerationPolicy;
 }
+
+type ImageGenerationPolicy = "allow" | "strip" | "block";
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
@@ -138,7 +139,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
-  disableImageGeneration: false,
+  imageGenerationPolicy: "allow",
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -2150,8 +2151,24 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
-    disableImageGeneration: limits.disable_image_generation === true,
+    imageGenerationPolicy: resolveImageGenerationPolicy(limits),
   };
+}
+
+// resolveImageGenerationPolicy 统一新旧两种后端配置：显式 image_generation_policy 优先，
+// 未设时旧的 disable_image_generation=true 视为 block，其余为 allow。
+function resolveImageGenerationPolicy(
+  limits: APIKeyLimits,
+): ImageGenerationPolicy {
+  switch (limits.image_generation_policy) {
+    case "strip":
+      return "strip";
+    case "block":
+      return "block";
+    case "allow":
+      return "allow";
+  }
+  return limits.disable_image_generation === true ? "block" : "allow";
 }
 
 function formatTokenLimitForForm(value?: number): {
@@ -2206,7 +2223,13 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
-    disable_image_generation: form.disableImageGeneration || undefined,
+    image_generation_policy:
+      form.imageGenerationPolicy === "allow"
+        ? undefined
+        : form.imageGenerationPolicy,
+    // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
+    disable_image_generation:
+      form.imageGenerationPolicy === "block" || undefined,
   };
 }
 
@@ -2528,7 +2551,7 @@ function LimitsEditor({
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "" ||
     value.tokenLimit30d !== "" ||
-    value.disableImageGeneration;
+    value.imageGenerationPolicy !== "allow";
   const [open, setOpen] = useState(hasAny || !!expanded);
   const tokenUnitOptions = useMemo(
     () =>
@@ -2601,19 +2624,37 @@ function LimitsEditor({
               {t("apiKeys.limits.planAllowHint")}
             </p>
           </div>
-          <div className="flex items-start justify-between gap-3 rounded-md border border-border/60 px-3 py-2">
-            <div className="space-y-0.5">
-              <label className="text-xs font-medium text-foreground">
-                {t("apiKeys.limits.disableImageGeneration")}
-              </label>
-              <p className="text-[10px] text-muted-foreground">
-                {t("apiKeys.limits.disableImageGenerationHint")}
-              </p>
-            </div>
-            <Switch
-              checked={value.disableImageGeneration}
-              onCheckedChange={(disableImageGeneration) => patch({ disableImageGeneration })}
+          <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
+            <label className="text-xs font-medium text-foreground">
+              {t("apiKeys.limits.imageGenerationPolicy")}
+            </label>
+            <Select
+              value={value.imageGenerationPolicy}
+              onValueChange={(policy) =>
+                patch({
+                  imageGenerationPolicy: policy as ImageGenerationPolicy,
+                })
+              }
+              options={[
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyAllow"),
+                  value: "allow",
+                },
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyStrip"),
+                  value: "strip",
+                },
+                {
+                  label: t("apiKeys.limits.imageGenerationPolicyBlock"),
+                  value: "block",
+                },
+              ]}
             />
+            <p className="text-[10px] text-muted-foreground">
+              {t(
+                `apiKeys.limits.imageGenerationPolicyHint.${value.imageGenerationPolicy}`,
+              )}
+            </p>
           </div>
         </div>
       </LimitSection>

@@ -561,6 +561,7 @@ func TestShouldRetryImageHTTPStatusForRequestUsesAccountAwareForbiddenPolicy(t *
 	for _, test := range []struct {
 		name          string
 		statusCode    int
+		body          []byte
 		account       *auth.Account
 		bound         bool
 		wantRetry     bool
@@ -577,12 +578,30 @@ func TestShouldRetryImageHTTPStatusForRequestUsesAccountAwareForbiddenPolicy(t *
 		{name: "Relay 504 remains non-retryable", statusCode: http.StatusGatewayTimeout, account: relay},
 		{name: "existing 503 policy is preserved", statusCode: http.StatusServiceUnavailable, account: oauth, wantRetry: true, wantGeneral: 1},
 		{name: "existing 429 policy is preserved", statusCode: http.StatusTooManyRequests, account: oauth, wantRetry: true, wantRateLimit: 1},
+		{name: "bound OAuth 401 stays on owner", statusCode: http.StatusUnauthorized, account: oauth, bound: true},
+		{name: "bound OAuth 429 stays on owner", statusCode: http.StatusTooManyRequests, account: oauth, bound: true},
+		{name: "bound OAuth 500 stays on owner", statusCode: http.StatusInternalServerError, account: oauth, bound: true},
+		{name: "bound OAuth 503 stays on owner", statusCode: http.StatusServiceUnavailable, account: oauth, bound: true},
+		{
+			name: "fresh OAuth model unsupported switches account", statusCode: http.StatusBadRequest, account: oauth,
+			body:      []byte(`{"error":{"message":"The model is not supported when using Codex with a ChatGPT account."}}`),
+			wantRetry: true, wantGeneral: 1,
+		},
+		{
+			name: "bound OAuth model unsupported stays on owner", statusCode: http.StatusBadRequest, account: oauth, bound: true,
+			body: []byte(`{"error":{"message":"The model is not supported when using Codex with a ChatGPT account."}}`),
+		},
+		{
+			name: "Relay model unsupported text is not OAuth entitlement", statusCode: http.StatusBadRequest, account: relay,
+			body: []byte(`{"error":{"message":"The model is not supported when using Codex with a ChatGPT account."}}`),
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			generalRetries := 0
 			rateLimitRetries := 0
 			got := shouldRetryImageHTTPStatusForRequest(
 				test.statusCode,
+				test.body,
 				test.account,
 				test.bound,
 				&generalRetries,

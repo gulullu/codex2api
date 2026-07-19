@@ -1153,7 +1153,39 @@ type APIKeyLimits struct {
 	TokenLimit30d  int64    `json:"token_limit_30d,omitempty"`
 	// DisableImageGeneration 为 true 时，该 Key 禁止访问生图模型(gpt-image-*)与
 	// 生图工具链路(image_generation 工具 / /v1/images 端点)，命中一律 403。
+	// 保留为向后兼容字段：新配置改用 ImageGenerationPolicy；未设 policy 时该 bool=true
+	// 等价于 policy=block（见 ResolveImageGenerationPolicy）。
 	DisableImageGeneration bool `json:"disable_image_generation,omitempty"`
+	// ImageGenerationPolicy 控制该 Key 遇到 Codex 图片工具能力时的处理策略：
+	//   - ""/allow: 正常放行(默认行为)
+	//   - strip:    剥离图片工具声明后作为普通文本请求继续转发上游(不返回 403)
+	//   - block:    命中生图能力一律 403(等价旧 DisableImageGeneration=true)
+	ImageGenerationPolicy string `json:"image_generation_policy,omitempty"`
+}
+
+// 图片工具策略取值。
+const (
+	ImageGenerationPolicyAllow = "allow"
+	ImageGenerationPolicyStrip = "strip"
+	ImageGenerationPolicyBlock = "block"
+)
+
+// ResolveImageGenerationPolicy 归一 Key 的图片工具策略，统一新旧两种配置来源：
+// 显式 ImageGenerationPolicy 优先；未设时旧 DisableImageGeneration=true 映射为 block；
+// 其余一律 allow。返回值恒为 allow/strip/block 之一。
+func (l APIKeyLimits) ResolveImageGenerationPolicy() string {
+	switch strings.ToLower(strings.TrimSpace(l.ImageGenerationPolicy)) {
+	case ImageGenerationPolicyStrip:
+		return ImageGenerationPolicyStrip
+	case ImageGenerationPolicyBlock:
+		return ImageGenerationPolicyBlock
+	case ImageGenerationPolicyAllow:
+		return ImageGenerationPolicyAllow
+	}
+	if l.DisableImageGeneration {
+		return ImageGenerationPolicyBlock
+	}
+	return ImageGenerationPolicyAllow
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
@@ -1162,7 +1194,8 @@ func (l APIKeyLimits) IsZero() bool {
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0 &&
-		!l.DisableImageGeneration
+		!l.DisableImageGeneration &&
+		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow
 }
 
 type APIKeyInput struct {

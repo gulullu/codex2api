@@ -186,8 +186,8 @@ func (h *Handler) Messages(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	baseCodexBody := codexBody
-	codexBody, payloadRulesPreApplied := h.prepareCodexPayloadRules(c, baseCodexBody, effectiveModel, accountFilter)
-	if h.inspectPromptFilterCanonicalResponses(c, baseCodexBody, codexBody, originalInboundBody, "/v1/messages", model) {
+	initialCodexBody, _ := h.prepareCodexPayloadRules(c, baseCodexBody, effectiveModel, accountFilter)
+	if h.inspectPromptFilterCanonicalResponses(c, baseCodexBody, initialCodexBody, originalInboundBody, "/v1/messages", model) {
 		return
 	}
 	promptDecision, _ := promptRiskDecisionFromContext(c)
@@ -195,7 +195,6 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(baseCodexBody)
 	serviceTier := extractServiceTier(baseCodexBody)
-	ruleIdentity := h.freezePayloadRuleIdentity(c)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, baseCodexBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, baseCodexBody), apiKeyID)
@@ -306,6 +305,23 @@ func (h *Handler) Messages(c *gin.Context) {
 		lastFailureWasRelay = false
 		lastStatusCode = 0
 		lastBody = nil
+		isRelayAccount := account.IsOpenAIResponsesAPI()
+		codexBody, attemptIdentity, payloadRulesPreApplied := h.prepareCodexPayloadRulesForAttempt(c, baseCodexBody, effectiveModel, account)
+		if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
+			circuitAttempt.Release(h.store, account)
+			sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		if !isRelayAccount {
+			lateDecision, upgraded := h.inspectPromptFilterSelectedOAuthAttempt(c, baseCodexBody, codexBody, originalInboundBody, "/v1/messages", model)
+			if upgraded {
+				circuitAttempt.Release(h.store, account)
+				promptDecision = lateDecision
+				routeRequirement = lateDecision
+				attempt--
+				continue
+			}
+		}
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
@@ -316,7 +332,6 @@ func (h *Handler) Messages(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket → HTTP 降级尝试启动 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
-		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
 		upstreamEndpoint := "/v1/responses"
@@ -348,7 +363,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		upstreamCtx = withPayloadRuleSnapshot(upstreamCtx, freezePayloadRuleSnapshot(c))
 		if payloadRulesPreApplied {
 			upstreamCtx = withPayloadRulesPreApplied(upstreamCtx)
@@ -363,8 +378,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			return
 		}
 		if isRelayAccount {
-			serviceTier = extractServiceTier(baseCodexBody)
-			upstreamBody := baseCodexBody
+			serviceTier = extractServiceTier(codexBody)
+			upstreamBody := codexBody
 			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBody(upstreamBody, account); ok {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
@@ -375,7 +390,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if payloadRulesPreApplied {
 				serviceTier = extractServiceTier(codexBody)
 			} else {
-				serviceTier = EffectiveRequestedServiceTierWithSnapshot(freezePayloadRuleSnapshot(c), codexBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
+				serviceTier = EffectiveRequestedServiceTierWithSnapshot(freezePayloadRuleSnapshot(c), codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 			}
 			httpSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
 			upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
@@ -598,7 +613,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryTextHTTPStatusForRequest(resp.StatusCode, account, requestRequiresBoundUpstreamAccount(c, rawBody), &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryTextHTTPStatusForRequest(resp.StatusCode, errBody, account, requestRequiresBoundUpstreamAccount(c, rawBody), &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			relayFailure := selectedDecision.routesToCybRelay() && account.IsOpenAIResponsesAPI()
 			failureKind := upstreamErrorKind(resp.StatusCode, errBody, decision)

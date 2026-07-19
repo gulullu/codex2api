@@ -1291,7 +1291,7 @@ func TestRelayGatewayRetryPolicyDoesNotChangeSharedImagePolicy(t *testing.T) {
 	relay := relayFailoverAccount(1, "https://relay.example", "sk-relay", 0)
 	for _, statusCode := range []int{http.StatusBadGateway, http.StatusGatewayTimeout, 524, 530} {
 		general := 0
-		if !shouldRetryTextHTTPStatus(statusCode, relay, &general, nil, 1, 0) {
+		if !shouldRetryTextHTTPStatus(statusCode, nil, relay, &general, nil, 1, 0) {
 			t.Fatalf("Relay text status %d should retry", statusCode)
 		}
 		if general != 1 {
@@ -1299,7 +1299,7 @@ func TestRelayGatewayRetryPolicyDoesNotChangeSharedImagePolicy(t *testing.T) {
 		}
 
 		general = 0
-		if shouldRetryHTTPStatus(statusCode, &general, nil, 1, 0) {
+		if shouldRetryHTTPStatus(statusCode, nil, &general, nil, 1, 0) {
 			t.Fatalf("shared/image policy unexpectedly retries status %d", statusCode)
 		}
 	}

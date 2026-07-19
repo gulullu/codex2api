@@ -2555,6 +2555,155 @@ func TestAppendMissingResponseImageOutputsAnnotatesExistingOutput(t *testing.T) 
 	}
 }
 
+func TestAccountFilterForModelRespectsAccountModelWhitelist(t *testing.T) {
+	filter := accountFilterForModel("gpt-5.6-sol")
+	if !filter(&auth.Account{PlanType: "plus"}) {
+		t.Fatal("空白名单账号应放行任意模型")
+	}
+	if !filter(&auth.Account{PlanType: "pro", Models: []string{"GPT-5.6-SOL", "gpt-5.3-codex"}}) {
+		t.Fatal("白名单命中（大小写不敏感）应放行")
+	}
+	restricted := &auth.Account{PlanType: "plus", Models: []string{"gpt-5.3-codex"}}
+	if filter(restricted) {
+		t.Fatal("白名单未包含请求模型时应拒绝")
+	}
+	if !accountFilterForModel("gpt-5.3-codex")(restricted) {
+		t.Fatal("白名单内模型应放行")
+	}
+	if !accountFilterForModel("")(restricted) {
+		t.Fatal("无模型信息的请求不应被白名单拦截")
+	}
+}
+
+func TestIsCodexModelUnsupportedError(t *testing.T) {
+	unsupported := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.","type":"invalid_request_error"}}`)
+	if !isCodexModelUnsupportedError(unsupported) {
+		t.Fatal("应识别模型不支持错误")
+	}
+	if isCodexModelUnsupportedError([]byte(`{"error":{"message":"Invalid value for 'temperature'","type":"invalid_request_error"}}`)) {
+		t.Fatal("普通 invalid_request 不应命中")
+	}
+	if isCodexModelUnsupportedError(nil) {
+		t.Fatal("空 body 不应命中")
+	}
+
+	general, rate := 0, 0
+	if !shouldRetryHTTPStatus(http.StatusBadRequest, unsupported, &general, &rate, 2, 1) {
+		t.Fatal("模型不支持的 400 应可换号重试")
+	}
+	general, rate = 0, 0
+	if shouldRetryHTTPStatus(http.StatusBadRequest, []byte(`{"error":{"message":"bad request"}}`), &general, &rate, 2, 1) {
+		t.Fatal("普通 400 不应重试")
+	}
+}
+
+func TestShouldRetryTextHTTPStatusModelUnsupportedRespectsAccountBoundary(t *testing.T) {
+	body := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+	oauth := &auth.Account{DBID: 1}
+	relay := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example", APIKey: "test-key"}
+
+	for _, tc := range []struct {
+		name    string
+		account *auth.Account
+		bound   bool
+		want    bool
+	}{
+		{name: "fresh oauth", account: oauth, want: true},
+		{name: "bound oauth enters protected retry pipeline", account: oauth, bound: true, want: true},
+		{name: "relay front door", account: relay, want: false},
+		{name: "unknown account", account: nil, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			general, rate := 0, 0
+			got := shouldRetryTextHTTPStatusForRequest(http.StatusBadRequest, body, tc.account, tc.bound, &general, &rate, 1, 1)
+			if got != tc.want {
+				t.Fatalf("retry = %v, want %v", got, tc.want)
+			}
+			wantGeneral := 0
+			if tc.want {
+				wantGeneral = 1
+			}
+			if general != wantGeneral || rate != 0 {
+				t.Fatalf("budgets = %d/%d, want %d/0", general, rate, wantGeneral)
+			}
+		})
+	}
+}
+
+func TestPrepareOpenAIResponsesBodyKeepsSystemRoleForRelay(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"relay system"}]}]}`)
+	got := PrepareOpenAIResponsesBody(raw)
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "system" {
+		t.Fatalf("Relay system role = %q, want system; body=%s", role, got)
+	}
+}
+
+func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
+	if !responseFailedRetryable(payload) {
+		t.Fatal("模型不支持的 response.failed 应视为可换号重试")
+	}
+	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
+	if responseFailedRetryable(plain) {
+		t.Fatal("普通 invalid_request 的 response.failed 不应重试")
+	}
+}
+
+func TestClassifyResponseFailedModelUnsupportedRespectsAccountBoundary(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
+	oauth := &auth.Account{DBID: 1}
+	relay := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: "https://relay.example", APIKey: "test-key"}
+
+	if policy := classifyResponseFailedRequest(oauth, false, payload); !policy.retryable {
+		t.Fatal("fresh OAuth model entitlement failure should rotate accounts")
+	}
+	if policy := classifyResponseFailedRequest(oauth, true, payload); !policy.retryable {
+		t.Fatal("owner-bound OAuth model entitlement failure must enter the protected retry pipeline")
+	}
+	if policy := classifyResponseFailedRequest(relay, false, payload); policy.retryable || policy.outcome.penalize {
+		t.Fatalf("Relay model text must stay neutral: %+v", policy)
+	}
+}
+
+func TestInspectPromptFilterSelectedOAuthAttemptUpgradesOnlyLateCYB(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewHandler(newPromptFilterRoutingStore("http://127.0.0.1:1"), nil, nil, nil)
+	base := []byte(`{"model":"gpt-5.4","input":"safe request"}`)
+	original := append([]byte(nil), base...)
+
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	setPromptRiskDecisionContext(ctx, defaultPromptRiskDecision(), handler.cybRelayConfig().GroupID)
+	ctx.Set(contextUpstreamAccountID, int64(99))
+	ctx.Set(contextUpstreamAccountType, "oauth")
+	attempt := []byte(`{"model":"gpt-5.4","instructions":"trigger cyb route","input":"safe request"}`)
+	decision, upgraded := handler.inspectPromptFilterSelectedOAuthAttempt(ctx, base, attempt, original, "/v1/responses", "gpt-5.4")
+	if !upgraded || !decision.routesToCybRelay() || decision.RouteSource != cybRelayRouteSourceDirect {
+		t.Fatalf("late decision = %+v, upgraded=%v; want direct Relay upgrade", decision, upgraded)
+	}
+	foundSelectedAccountSignal := false
+	for _, signal := range decision.Signals {
+		if signal == "payload_rules_selected_account" {
+			foundSelectedAccountSignal = true
+			break
+		}
+	}
+	if !foundSelectedAccountSignal {
+		t.Fatalf("late decision signals = %v, missing selected-account evidence", decision.Signals)
+	}
+	if accountID, _ := ctx.Get(contextUpstreamAccountID); accountID != int64(0) {
+		t.Fatalf("late pre-write audit retained stale account id: %v", accountID)
+	}
+
+	safeCtx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	safeCtx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	setPromptRiskDecisionContext(safeCtx, defaultPromptRiskDecision(), handler.cybRelayConfig().GroupID)
+	safeDecision, safeUpgraded := handler.inspectPromptFilterSelectedOAuthAttempt(safeCtx, base, base, original, "/v1/responses", "gpt-5.4")
+	if safeUpgraded || safeDecision.routesToCybRelay() {
+		t.Fatalf("safe late decision = %+v, upgraded=%v", safeDecision, safeUpgraded)
+	}
+}
+
 func TestAccountFilterForSparkAllowsNonFreeOrUnknownPlans(t *testing.T) {
 	filter := accountFilterForModel("gpt-5.3-codex-spark")
 	if filter == nil {
@@ -2664,13 +2813,13 @@ func TestClassify429Header7dUsesAccountCooldown(t *testing.T) {
 func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 	generalRetries := 0
 	rateLimitRetries := 0
-	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("first 429 should consume rate-limit retry budget")
 	}
-	if shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("second 429 should be blocked by rate-limit retry budget")
 	}
-	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("503 should still use general retry budget")
 	}
 	if generalRetries != 1 || rateLimitRetries != 1 {
@@ -2930,6 +3079,7 @@ func TestShouldRetryHTTPStatus403RequiresSafeOAuthAccountSwitch(t *testing.T) {
 			rateLimitRetries := 0
 			got := shouldRetryTextHTTPStatusForRequest(
 				http.StatusForbidden,
+				nil,
 				tc.account,
 				tc.boundContext,
 				&generalRetries,
@@ -3115,14 +3265,14 @@ func TestRelayForbiddenHealthEvidenceIsNeutralWhileOAuthRemainsAccountScoped(t *
 	}
 	generalRetries, rateLimitRetries := 0, 0
 	if !shouldRetryTextHTTPStatusForRequest(
-		http.StatusForbidden, oauth, false,
+		http.StatusForbidden, nil, oauth, false,
 		&generalRetries, &rateLimitRetries, 1, 1,
 	) {
 		t.Fatal("fresh OAuth 403 should still switch accounts")
 	}
 	generalRetries = 0
 	if shouldRetryTextHTTPStatusForRequest(
-		http.StatusForbidden, oauth, true,
+		http.StatusForbidden, nil, oauth, true,
 		&generalRetries, &rateLimitRetries, 1, 1,
 	) {
 		t.Fatal("bound OAuth 403 must not switch accounts")
@@ -4057,6 +4207,62 @@ func TestResponsesWebSocketStripsInjectedImageTool(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for upstream request")
+	}
+}
+
+func TestResponsesWebSocketStripPrecedesImageSizeValidation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	bodyCh := make(chan []byte, 1)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		bodyCh <- append([]byte(nil), requestBody...)
+		sse := `data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(sse))}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(contextAPIKeyRow, &database.APIKeyRow{
+			ID: 1,
+			Limits: database.APIKeyLimits{
+				ImageGenerationPolicy: database.ImageGenerationPolicyStrip,
+			},
+		})
+		c.Next()
+	})
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	// The size is invalid only for the capability that this API key removes.
+	// Validation must therefore observe the final stripped body, not this raw
+	// pre-policy payload.
+	request := `{"model":"gpt-5.4","input":"hello","tools":[{"type":"image_generation","model":"gpt-image-2","size":"5000x5000"}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(request)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case gotBody := <-bodyCh:
+		if strings.Contains(string(gotBody), "image_generation") || strings.Contains(string(gotBody), "5000x5000") {
+			t.Fatalf("final WebSocket upstream body retained stripped invalid image capability: %s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("strip request was rejected before final-body validation")
 	}
 }
 

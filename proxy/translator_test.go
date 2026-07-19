@@ -565,6 +565,59 @@ func TestPrepareResponsesBody_NormalizesUserOutputTextToInputText(t *testing.T) 
 	}
 }
 
+// 上游 Codex 不接受 role=system（"System messages are not allowed"），原生
+// Responses 直通路径须与 chat/Anthropic 链路一致改写为 developer（issue #409）。
+func TestPrepareResponsesBody_RewritesSystemRoleToDeveloper(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{
+				"type":"message",
+				"role":"system",
+				"content":[
+					{"type":"input_text","text":"you are a helpful assistant"}
+				]
+			},
+			{"role":"system","content":"bare system without type"},
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"function_call","call_id":"c1","name":"foo","arguments":"{}"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("typed system message should become developer, got %q; body=%s", role, got)
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); text != "you are a helpful assistant" {
+		t.Fatalf("system content should be preserved, got %q; body=%s", text, got)
+	}
+	if role := gjson.GetBytes(got, "input.1.role").String(); role != "developer" {
+		t.Fatalf("bare system message should become developer, got %q; body=%s", role, got)
+	}
+	if role := gjson.GetBytes(got, "input.2.role").String(); role != "user" {
+		t.Fatalf("user message must stay untouched, got %q; body=%s", role, got)
+	}
+	if name := gjson.GetBytes(got, "input.3.name").String(); name != "foo" {
+		t.Fatalf("non-message item must stay untouched; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_RewritesSystemRoleToDeveloper(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"system","content":"system prompt"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("WS path should also rewrite system to developer, got %q; body=%s", role, got)
+	}
+}
+
 func TestPrepareResponsesBody_NormalizesLegacyTopLevelFileInput(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

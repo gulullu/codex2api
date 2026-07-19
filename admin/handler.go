@@ -430,6 +430,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
 	api.POST("/accounts/sub2api/import", h.ImportFromSub2API)
+	api.PATCH("/accounts/:id/models", h.UpdateAccountModels)
+	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
+	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
@@ -3061,6 +3064,89 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 		return nil, fmt.Errorf("/v1/models 未返回可用模型")
 	}
 	return models, nil
+}
+
+type updateAccountModelsRequest struct {
+	Models []string `json:"models"`
+}
+
+// UpdateAccountModels 设置 Codex OAuth 账号的支持模型白名单。
+// 空数组 = 清空白名单，放行全部模型；非空时调度器只会把白名单内模型的请求派给该账号。
+func (h *Handler) UpdateAccountModels(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	var req updateAccountModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	models := auth.NormalizeAccountModels(req.Models)
+	if len(models) > 200 {
+		writeError(c, http.StatusBadRequest, "模型数量不能超过 200")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+	if account.IsOpenAIResponsesAPI() {
+		writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号请在账号设置中编辑模型列表")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.db.UpdateCredentials(ctx, id, map[string]interface{}{"models": models}); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.store.ApplyAccountModels(id, models)
+	h.db.InsertAccountEventAsync(id, "updated", "account_models")
+	c.JSON(http.StatusOK, gin.H{"models": models})
+}
+
+// SyncAccountUpstreamModels 用账号自身凭据实时拉取上游模型清单，
+// 返回该账号真实可用的模型 slug 列表。只读不落库，由管理端确认后再保存为白名单。
+func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+	if account.IsOpenAIResponsesAPI() {
+		writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号请使用账号设置中的模型同步")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
+	if err != nil {
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取上游模型清单失败: %s", err.Error()))
+		return
+	}
+	models := auth.NormalizeAccountModels(proxy.ExtractManifestModelSlugs(manifest.Body))
+	if len(models) == 0 {
+		writeError(c, http.StatusBadGateway, "上游模型清单未返回可用模型")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"models": models})
 }
 
 // importToken 导入时的统一 token 载体
@@ -6083,8 +6169,31 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit7d:           maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
 		DisableImageGeneration: in.DisableImageGeneration,
+		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
+	}
+	// 归一后旧 bool 与新 policy 保持一致，避免两处配置漂移。
+	out.DisableImageGeneration = out.ImageGenerationPolicy == database.ImageGenerationPolicyBlock
+	if out.ImageGenerationPolicy == database.ImageGenerationPolicyAllow {
+		out.ImageGenerationPolicy = ""
 	}
 	return out
+}
+
+// sanitizeImageGenerationPolicy 归一图片工具策略取值（allow/strip/block），并兼容旧的
+// DisableImageGeneration bool：显式 policy 优先，未设时 bool=true 视为 block。
+func sanitizeImageGenerationPolicy(in database.APIKeyLimits) string {
+	switch strings.ToLower(strings.TrimSpace(in.ImageGenerationPolicy)) {
+	case database.ImageGenerationPolicyStrip:
+		return database.ImageGenerationPolicyStrip
+	case database.ImageGenerationPolicyBlock:
+		return database.ImageGenerationPolicyBlock
+	case database.ImageGenerationPolicyAllow:
+		return database.ImageGenerationPolicyAllow
+	}
+	if in.DisableImageGeneration {
+		return database.ImageGenerationPolicyBlock
+	}
+	return database.ImageGenerationPolicyAllow
 }
 
 // knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的

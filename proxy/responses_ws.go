@@ -387,7 +387,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	h.loadEncryptedContextAffinity(c, rawBody)
 	affinityKey := sessionAffinityKey(resolveSchedulerAffinityID(c.Request.Header, rawBody), apiKeyID)
 	respCacheOwner := responseCacheOwner(apiKeyID)
-	ruleIdentity := h.freezePayloadRuleIdentity(c)
 	// 上下文压缩轮豁免首字超时看门狗（issue #381）：压缩首帧天然慢，超时换号无益。
 	bodySignalCompact := requestBodyHasCompactionTrigger(rawBody)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -398,11 +397,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	baseCodexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
 	codexBody := baseCodexBody
-	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
-		apiErr = api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest)
-		_ = writeResponsesWSError(conn, apiErr)
-		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
-	}
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
@@ -556,6 +550,26 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			expandedInputRaw = preparedResponsesInputRaw(baseCodexBody)
 			log.Printf("encrypted context owner unavailable or conflicted; downgraded before WebSocket routing (dropped=%d converted=%d)", repair.Dropped, repair.Converted)
 		}
+		var attemptIdentity *PayloadRuleIdentity
+		codexBody, attemptIdentity, payloadRulesPreApplied = h.prepareCodexPayloadRulesForAttempt(c, baseCodexBody, effectiveModel, account)
+		if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
+			circuitAttempt.Release(h.store, account)
+			apiErr = api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest)
+			if writeErr := writeResponsesWSError(conn, apiErr); writeErr != nil {
+				return errResponsesWSClientGone
+			}
+			return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
+		}
+		if !account.IsOpenAIResponsesAPI() {
+			lateDecision, upgraded := h.inspectPromptFilterSelectedOAuthAttempt(c, baseCodexBody, codexBody, originalInboundBody, "/v1/responses", model)
+			if upgraded {
+				circuitAttempt.Release(h.store, account)
+				promptDecision = lateDecision
+				routeRequirement = lateDecision
+				attempt--
+				continue
+			}
+		}
 
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
@@ -580,7 +594,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		upstreamCtx = withPayloadRuleSnapshot(upstreamCtx, freezePayloadRuleSnapshot(c))
 		if payloadRulesPreApplied {
 			upstreamCtx = withPayloadRulesPreApplied(upstreamCtx)
@@ -602,6 +616,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			} else {
 				upstreamBody = PrepareOpenAIResponsesBody(rawBody)
 			}
+			upstreamBody = applyImageGenerationStripPolicy(c, upstreamBody)
 			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
@@ -611,14 +626,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
 		// Relay 不套 Payload Rules，记账也必须保留原始值。OAuth
-		// 路径复用选号前已经扫描过的同一规则快照。
+		// 路径复用本次实际选中账号匹配后的同一规则快照。
 		if account.IsOpenAIResponsesAPI() {
 			serviceTier = extractServiceTier(upstreamBody)
 		} else {
 			if payloadRulesPreApplied {
 				serviceTier = extractServiceTier(upstreamBody)
 			} else {
-				serviceTier = EffectiveRequestedServiceTierWithSnapshot(freezePayloadRuleSnapshot(c), upstreamBody, effectiveModel, downstreamHeaders, ruleIdentity)
+				serviceTier = EffectiveRequestedServiceTierWithSnapshot(freezePayloadRuleSnapshot(c), upstreamBody, effectiveModel, downstreamHeaders, attemptIdentity)
 			}
 		}
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
@@ -927,9 +942,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				// display preference. A fresh request may rotate within the
 				// configured retry budget even when generic silent retry is
 				// disabled; bound continuation/encrypted requests never rotate.
-				shouldRetry = shouldRetryTextHTTPStatusForRequest(resp.StatusCode, account, false, &generalRetries, &rateLimitRetries, oauthForbiddenMaxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryTextHTTPStatusForRequest(resp.StatusCode, errBody, account, false, &generalRetries, &rateLimitRetries, oauthForbiddenMaxRetries, maxRateLimitRetries)
 			} else if silentRetryEnabled && attempt < maxRetries {
-				shouldRetry = shouldRetryTextHTTPStatusForRequest(resp.StatusCode, account, requiresBoundAccount, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryTextHTTPStatusForRequest(resp.StatusCode, errBody, account, requiresBoundAccount, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			visibleStatusCode := resp.StatusCode
 			if !shouldRetry {
