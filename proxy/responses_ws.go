@@ -466,6 +466,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}()
 
 	for attempt := 0; ; attempt++ {
+		resetWebsocketTransportAuditSignal(c)
 		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
 		if !retainedHTTPFallback {
 			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSessionWithStickyFallback(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement, &requestStickyRetry)
@@ -655,7 +656,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			var actualWebsocket bool
 			resp, reqErr, actualWebsocket = executeRequestWithWebsocketFramePreflight(
 				upstreamCtx, account, upstreamBody, codexBody, upstreamSessionID, httpSessionID,
-				proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+				proxyURL, apiKey, deviceCfg, downstreamHeaders, websocketFramePreflightStrict, useWebsocket,
 			)
 			useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		}

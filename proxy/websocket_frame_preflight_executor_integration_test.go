@@ -74,7 +74,7 @@ func TestExecuteRequestLargeUnboundWebsocketFrameUsesNativeHTTPBodyOnce(t *testi
 
 	resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
 		upstreamCtx, account, wsBody, preparedBody, "", "stable-http-session",
-		"", "sk-local", nil, http.Header{}, true,
+		"", "sk-local", nil, http.Header{}, websocketFramePreflightAllowSameAccountHTTP, true,
 	)
 	if err != nil {
 		t.Fatalf("preflight HTTP fallback error = %v", err)
@@ -132,6 +132,124 @@ func TestExecuteRequestLargeUnboundWebsocketFrameUsesNativeHTTPBodyOnce(t *testi
 	}
 }
 
+func TestExecuteRequestLargeContextBoundFrameAllowedUsesSameAccountHTTPOnce(t *testing.T) {
+	t.Setenv(websocketContextBoundHTTPPreflightEnv, "")
+	previousWS := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousWS
+		resinCfg.Store(previousResin)
+	})
+
+	account := &auth.Account{DBID: 74, AccessToken: "oauth-token", AccountID: "acct-74", PlanType: "pro", Status: auth.StatusReady}
+	var wsCalls int
+	WebsocketExecuteFunc = func(_ context.Context, gotAccount *auth.Account, body []byte, sessionID, proxyOverride, _ string, _ *DeviceProfileConfig, _ http.Header, _ string) (*http.Response, error) {
+		wsCalls++
+		if gotAccount != account {
+			t.Fatalf("WS preflight account changed: got=%p want=%p", gotAccount, account)
+		}
+		if sessionID != "explicit-ws-session" || proxyOverride != "sticky-proxy" {
+			t.Fatalf("WS preflight identity session=%q proxy=%q", sessionID, proxyOverride)
+		}
+		if got := gjson.GetBytes(body, "input").String(); got != "large screenshot" {
+			t.Fatalf("WS preflight body input=%q", got)
+		}
+		return nil, &WebsocketFramePreflightError{
+			FrameBytes:   17 * 1024 * 1024,
+			LimitBytes:   16 * 1024 * 1024,
+			ContextBound: true,
+		}
+	}
+
+	var httpCalls int
+	var httpAccount string
+	var httpBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		httpAccount = r.Header.Get("X-Resin-Account")
+		httpBody, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_same_account"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	ctx, observation := withUpstreamTransportObservation(context.Background())
+	wsBody := []byte(`{"model":"gpt-5.4","input":"large screenshot"}`)
+	httpBodyCandidate := append([]byte(nil), wsBody...)
+	resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+		ctx, account, wsBody, httpBodyCandidate,
+		"explicit-ws-session", "explicit-http-session", "sticky-proxy", "sk-local", nil, http.Header{},
+		websocketFramePreflightAllowSameAccountHTTP, true,
+	)
+	if err != nil {
+		t.Fatalf("same-account HTTP preflight error = %v", err)
+	}
+	if resp == nil {
+		t.Fatal("same-account HTTP preflight response = nil")
+	}
+	_ = resp.Body.Close()
+	if actualWebsocket || wsCalls != 1 || httpCalls != 1 {
+		t.Fatalf("actualWebsocket=%t wsCalls=%d httpCalls=%d, want false/1/1", actualWebsocket, wsCalls, httpCalls)
+	}
+	if httpAccount != "74" {
+		t.Fatalf("HTTP account=%q want selected account 74", httpAccount)
+	}
+	if got := gjson.GetBytes(httpBody, "prompt_cache_key").String(); got != "explicit-http-session" {
+		t.Fatalf("HTTP prompt_cache_key=%q want explicit-http-session body=%s", got, httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "input").String(); got != "large screenshot" {
+		t.Fatalf("HTTP body input=%q body=%s", got, httpBody)
+	}
+	reason, frameBytes, limitBytes := observation.Snapshot()
+	if reason != websocketLargeFrameSameAccountHTTPReason || frameBytes != 17*1024*1024 || limitBytes != 16*1024*1024 {
+		t.Fatalf("observation=(%q,%d,%d), want same-account HTTP reason and exact limits", reason, frameBytes, limitBytes)
+	}
+}
+
+func TestExecuteRequestLargeContextBoundFrameEnvOffRestoresStrict(t *testing.T) {
+	t.Setenv(websocketContextBoundHTTPPreflightEnv, "off")
+	previousWS := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousWS
+		resinCfg.Store(previousResin)
+	})
+
+	var wsCalls int
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		wsCalls++
+		return nil, &WebsocketFramePreflightError{FrameBytes: 17 * 1024 * 1024, LimitBytes: 16 * 1024 * 1024, ContextBound: true}
+	}
+	var httpCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpCalls++
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	ctx, observation := withUpstreamTransportObservation(context.Background())
+	body := []byte(`{"model":"gpt-5.4","input":"large"}`)
+	resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+		ctx, &auth.Account{DBID: 75, AccessToken: "must-not-be-used"}, body, body,
+		"explicit-session", "explicit-session", "", "sk-local", nil, http.Header{},
+		websocketFramePreflightAllowSameAccountHTTP, true,
+	)
+	frameErr, ok := websocketContextBoundFrameError(err)
+	if !ok || frameErr == nil {
+		t.Fatalf("env-off error=%v, want context-bound typed error", err)
+	}
+	if resp != nil || actualWebsocket || wsCalls != 1 || httpCalls != 0 {
+		t.Fatalf("resp=%v actualWS=%t wsCalls=%d httpCalls=%d, want nil/false/1/0", resp, actualWebsocket, wsCalls, httpCalls)
+	}
+	reason, _, _ := observation.Snapshot()
+	if reason != websocketLargeFrameContextBoundKind {
+		t.Fatalf("env-off reason=%q want=%q", reason, websocketLargeFrameContextBoundKind)
+	}
+}
+
 func TestExecuteRequestLargeUnboundWebsocketFrameSharedBodyFallbackDoesNotMutateCompatibilityPayload(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -181,7 +299,7 @@ func TestExecuteRequestLargeUnboundWebsocketFrameSharedBodyFallbackDoesNotMutate
 
 			resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
 				withPayloadRulesPreApplied(context.Background()), account,
-				sharedBody, sharedBody, "", "compat-http-session", "", "sk-local", nil, http.Header{}, true,
+				sharedBody, sharedBody, "", "compat-http-session", "", "sk-local", nil, http.Header{}, websocketFramePreflightAllowSameAccountHTTP, true,
 			)
 			if err != nil {
 				t.Fatalf("compatibility fallback error = %v", err)

@@ -1469,7 +1469,7 @@ func TestExecuteRequestLargeUnboundWebsocketFrameFallsBackBeforeHTTPWithoutLosin
 	ctx, observation := withUpstreamTransportObservation(context.Background())
 	body := []byte(`{"model":"gpt-5.4","input":"large"}`)
 	_, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
-		ctx, &auth.Account{DBID: 71}, body, body, "", "http-session", "", "sk-local", nil, http.Header{}, true,
+		ctx, &auth.Account{DBID: 71}, body, body, "", "http-session", "", "sk-local", nil, http.Header{}, websocketFramePreflightAllowSameAccountHTTP, true,
 	)
 	if err == nil {
 		t.Fatal("ExecuteRequest() error = nil, want the HTTP path's missing-account error")
@@ -1499,7 +1499,7 @@ func TestExecuteRequestLargeContextBoundWebsocketFrameReturnsLocal413(t *testing
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_owner","input":"large"}`)
 	resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
 		ctx, &auth.Account{DBID: 72, AccessToken: "must-not-be-used"}, body, body,
-		"explicit-session", "explicit-session", "", "sk-local", nil, http.Header{}, true,
+		"explicit-session", "explicit-session", "", "sk-local", nil, http.Header{}, websocketFramePreflightStrict, true,
 	)
 	frameErr, ok := websocketContextBoundFrameError(err)
 	if !ok || frameErr == nil {

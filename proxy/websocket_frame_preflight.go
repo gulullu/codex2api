@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -14,12 +15,42 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 const (
-	websocketLargeFrameHTTPPreflightReason = "ws_large_payload_http_preflight"
-	websocketLargeFrameContextBoundKind    = "websocket_large_frame_context_bound"
+	websocketLargeFrameHTTPPreflightReason   = "ws_large_payload_http_preflight"
+	websocketLargeFrameSameAccountHTTPReason = "ws_large_context_same_account_http_preflight"
+	websocketLargeFrameContextBoundKind      = "websocket_large_frame_context_bound"
+	websocketContextBoundHTTPPreflightEnv    = "CODEX_WS_CONTEXT_BOUND_HTTP_PREFLIGHT"
 )
+
+type websocketFramePreflightPolicy uint8
+
+const (
+	websocketFramePreflightStrict websocketFramePreflightPolicy = iota
+	websocketFramePreflightAllowSameAccountHTTP
+)
+
+func websocketContextBoundHTTPPreflightEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(websocketContextBoundHTTPPreflightEnv))) {
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// websocketFramePreflightPolicyForHTTP keeps true upstream continuations
+// fail-closed. Ordinary HTTP ingress may still carry a stable cache/session ID;
+// that identity is safe to retain while switching only the transport on the
+// already-selected account.
+func websocketFramePreflightPolicyForHTTP(rawBody []byte) websocketFramePreflightPolicy {
+	if strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != "" {
+		return websocketFramePreflightStrict
+	}
+	return websocketFramePreflightAllowSameAccountHTTP
+}
 
 // WebsocketFramePreflightError is returned by the registered WS executor only
 // after it has built the final response.create frame, but before it acquires a
@@ -127,6 +158,16 @@ func applyUpstreamTransportObservation(c *gin.Context, observation *upstreamTran
 	return actual
 }
 
+// resetWebsocketTransportAuditSignal starts every scheduler attempt with an
+// empty transport decision. Relay attempts bypass the Codex WS wrapper, so
+// without this reset a retry could inherit the prior OAuth attempt's preflight
+// reason and publish it on the final canonical row.
+func resetWebsocketTransportAuditSignal(c *gin.Context) {
+	if c != nil {
+		c.Set(contextWebsocketTransportReason, "")
+	}
+}
+
 func appendWebsocketTransportAuditSignal(c *gin.Context, input *database.UsageLogInput) {
 	if c == nil || input == nil {
 		return
@@ -136,7 +177,9 @@ func appendWebsocketTransportAuditSignal(c *gin.Context, input *database.UsageLo
 		return
 	}
 	reason, _ := value.(string)
-	if reason != websocketLargeFrameHTTPPreflightReason && reason != websocketLargeFrameContextBoundKind {
+	if reason != websocketLargeFrameHTTPPreflightReason &&
+		reason != websocketLargeFrameSameAccountHTTPReason &&
+		reason != websocketLargeFrameContextBoundKind {
 		return
 	}
 	signals := make([]string, 0, 4)
@@ -166,7 +209,7 @@ func websocketLargeFrameContextBoundMessage(frameErr *WebsocketFramePreflightErr
 	if frameErr != nil {
 		frameBytes, limitBytes = frameErr.FrameBytes, frameErr.LimitBytes
 	}
-	return fmt.Sprintf("WebSocket request frame (%d bytes) exceeds the configured safe limit (%d bytes). This request is bound to an existing upstream context and cannot be switched to HTTP safely. Shorten the request or start a new conversation.", frameBytes, limitBytes)
+	return fmt.Sprintf("WebSocket request frame (%d bytes) exceeds the configured safe limit (%d bytes). This request cannot be switched to HTTP under the current context or ingress policy. Shorten the request, start a new conversation, or review the large-frame preflight setting.", frameBytes, limitBytes)
 }
 
 func websocketLargeFrameContextBoundAPIError(frameErr *WebsocketFramePreflightError) *api.APIError {
@@ -189,8 +232,10 @@ func websocketContextBoundFrameError(err error) (*WebsocketFramePreflightError, 
 // account and caller-owned scheduler lease while choosing the transport. The
 // WS executor returns its typed decision before any connection/slot/write. An
 // unbound request then uses the caller-provided normal HTTP body and HTTP
-// session identity in this same handler attempt. Context-bound requests remain
-// local errors for the handler to publish without account/circuit penalties.
+// session identity in this same handler attempt. Context-bound requests obey
+// the caller's ingress policy: ordinary HTTP ingress may retain the selected
+// account and switch transport, while real inbound WS/continuations fail local
+// without account or circuit penalties.
 func executeRequestWithWebsocketFramePreflight(
 	ctx context.Context,
 	account *auth.Account,
@@ -198,6 +243,7 @@ func executeRequestWithWebsocketFramePreflight(
 	websocketSessionID, httpSessionID, proxyURL, apiKey string,
 	deviceCfg *DeviceProfileConfig,
 	headers http.Header,
+	policy websocketFramePreflightPolicy,
 	useWebsocket bool,
 ) (*http.Response, error, bool) {
 	if !useWebsocket {
@@ -210,14 +256,34 @@ func executeRequestWithWebsocketFramePreflight(
 	if !errors.As(err, &frameErr) {
 		return resp, err, true
 	}
-	if frameErr.ContextBound {
+	executorContextBound := frameErr.ContextBound
+	strictIngress := policy == websocketFramePreflightStrict
+	allowSameAccountHTTP := executorContextBound &&
+		policy == websocketFramePreflightAllowSameAccountHTTP &&
+		websocketContextBoundHTTPPreflightEnabled()
+	if strictIngress || (executorContextBound && !allowSameAccountHTTP) {
+		// The HTTP handler derives strictness from the original downstream body.
+		// A previous_response_id may already have been expanded into local history
+		// before the WS executor builds its frame, so the executor can legitimately
+		// report ContextBound=false. Preserve the ingress fail-closed decision by
+		// returning a handler-recognizable local preflight error in that case.
+		localFrameErr := frameErr
+		if !localFrameErr.ContextBound {
+			cloned := *localFrameErr
+			cloned.ContextBound = true
+			localFrameErr = &cloned
+		}
 		observeUpstreamTransport(ctx, false, websocketLargeFrameContextBoundKind, frameErr.FrameBytes, frameErr.LimitBytes)
-		log.Printf("[WS Preflight] transport=none reason=%s account=%d frame_bytes=%d limit_bytes=%d context_bound=true", websocketLargeFrameContextBoundKind, account.ID(), frameErr.FrameBytes, frameErr.LimitBytes)
-		return nil, frameErr, false
+		log.Printf("[WS Preflight] transport=none reason=%s account=%d frame_bytes=%d limit_bytes=%d context_bound=%t strict_ingress=%t", websocketLargeFrameContextBoundKind, account.ID(), frameErr.FrameBytes, frameErr.LimitBytes, executorContextBound, strictIngress)
+		return nil, localFrameErr, false
 	}
 
-	observeUpstreamTransport(ctx, false, websocketLargeFrameHTTPPreflightReason, frameErr.FrameBytes, frameErr.LimitBytes)
-	log.Printf("[WS Preflight] transport=http reason=%s account=%d frame_bytes=%d limit_bytes=%d context_bound=false", websocketLargeFrameHTTPPreflightReason, account.ID(), frameErr.FrameBytes, frameErr.LimitBytes)
+	reason := websocketLargeFrameHTTPPreflightReason
+	if allowSameAccountHTTP {
+		reason = websocketLargeFrameSameAccountHTTPReason
+	}
+	observeUpstreamTransport(ctx, false, reason, frameErr.FrameBytes, frameErr.LimitBytes)
+	log.Printf("[WS Preflight] transport=http reason=%s account=%d frame_bytes=%d limit_bytes=%d context_bound=%t same_account=true", reason, account.ID(), frameErr.FrameBytes, frameErr.LimitBytes, frameErr.ContextBound)
 	resp, err = ExecuteRequest(ctx, account, httpBody, httpSessionID, proxyURL, apiKey, deviceCfg, headers, false)
 	return resp, err, false
 }

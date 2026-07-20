@@ -2373,6 +2373,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
+		resetWebsocketTransportAuditSignal(c)
 		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
 		if !retainedHTTPFallback {
 			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSessionWithStickyFallback(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement, &requestStickyRetry)
@@ -3243,7 +3244,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
 		resp, reqErr, actualWebsocket := executeRequestWithWebsocketFramePreflight(
 			upstreamCtx, account, upstreamBody, codexBody, upstreamSessionID, httpSessionID,
-			proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+			proxyURL, apiKey, deviceCfg, downstreamHeaders, websocketFramePreflightPolicyForHTTP(rawBody), useWebsocket,
 		)
 		useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
@@ -4210,6 +4211,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	invalidEncryptedContentRetried := false
 
 	for attempt := 0; ; attempt++ {
+		resetWebsocketTransportAuditSignal(c)
 		account, stickyProxyURL, selectedDecision, circuitAttempt := h.nextCircuitPermittedRoutedAccountForSession(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement)
 		promptDecision = selectedDecision
 		if account == nil {
@@ -5100,6 +5102,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
+		resetWebsocketTransportAuditSignal(c)
 		account, stickyProxyURL, circuitAttempt, selectedDecision, retainedHTTPFallback := wsHTTPFallback.TakeRouted()
 		if !retainedHTTPFallback {
 			account, stickyProxyURL, selectedDecision, circuitAttempt = h.nextCircuitPermittedRoutedAccountForSessionWithStickyFallback(c, affinityKey, apiKeyID, retryExclusions, accountFilter, routeRequirement, &requestStickyRetry)
@@ -5288,7 +5291,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			var actualWebsocket bool
 			resp, reqErr, actualWebsocket = executeRequestWithWebsocketFramePreflight(
 				upstreamCtx, account, upstreamBody, codexBody, upstreamSessionID, httpSessionID,
-				proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket,
+				proxyURL, apiKey, deviceCfg, downstreamHeaders, websocketFramePreflightPolicyForHTTP(rawBody), useWebsocket,
 			)
 			useWebsocket = applyUpstreamTransportObservation(c, transportObservation, actualWebsocket)
 		}

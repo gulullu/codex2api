@@ -44,9 +44,26 @@ func TestAppendWebsocketTransportAuditSignalPreservesAndDeduplicates(t *testing.
 		t.Fatalf("route signals = %s, want %s", got, want)
 	}
 
+	c.Set(contextWebsocketTransportReason, websocketLargeFrameSameAccountHTTPReason)
+	sameAccountInput := &database.UsageLogInput{RouteSignals: `["encrypted_owner_hit"]`}
+	appendWebsocketTransportAuditSignal(c, sameAccountInput)
+	appendWebsocketTransportAuditSignal(c, sameAccountInput)
+	if got, want := sameAccountInput.RouteSignals, `["encrypted_owner_hit","ws_large_context_same_account_http_preflight"]`; got != want {
+		t.Fatalf("same-account route signals = %s, want %s", got, want)
+	}
+
 	malformed := &database.UsageLogInput{RouteSignals: `legacy-not-json`}
 	appendWebsocketTransportAuditSignal(c, malformed)
 	if malformed.RouteSignals != `legacy-not-json` {
 		t.Fatalf("malformed route signals replaced: %q", malformed.RouteSignals)
+	}
+}
+
+func TestWebsocketFramePreflightPolicyForHTTPKeepsPreviousResponseStrict(t *testing.T) {
+	if got := websocketFramePreflightPolicyForHTTP([]byte(`{"model":"gpt-5.4","previous_response_id":"resp_owner","input":"continue"}`)); got != websocketFramePreflightStrict {
+		t.Fatalf("previous_response_id policy = %v, want strict", got)
+	}
+	if got := websocketFramePreflightPolicyForHTTP([]byte(`{"model":"gpt-5.4","input":"full context"}`)); got != websocketFramePreflightAllowSameAccountHTTP {
+		t.Fatalf("full-context HTTP policy = %v, want same-account HTTP", got)
 	}
 }

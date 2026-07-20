@@ -139,9 +139,13 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: 'WS 大帧预检改走 HTTP',
     description: '最终上游 WebSocket 请求帧达到安全上限，系统在写入前保留同一账号并直接改走 HTTP；没有发生失败重试。',
   },
+  ws_large_context_same_account_http_preflight: {
+    label: '上下文大帧同账号改走 HTTP',
+    description: 'HTTP 入站的大截图、大文本或工具说明在写入前保留已选账号、代理和租约，直接改走 HTTP；16 MiB 是传输切换阈值，不是拒绝上限。',
+  },
   websocket_large_frame_context_bound: {
-    label: '上下文绑定大帧已拒绝',
-    description: '请求依赖上一响应或显式上游会话，无法安全切换到 HTTP；系统在写入前返回 413，避免上下文迁移或重复执行。',
+    label: '上下文或 WS 大帧已拒绝',
+    description: '带 previous_response_id 的上游续链和真实入站 WebSocket 无法安全改走 HTTP，因此在写入前返回 413；关闭同账号 HTTP 预检开关时，显式会话大帧也会恢复旧版 413。',
   },
   upstream_cyb_feedback_hash: {
     label: '上游 CYB 反馈指纹',
