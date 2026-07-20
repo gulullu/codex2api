@@ -3,7 +3,6 @@ module github.com/codex2api
 go 1.26.5
 
 require (
-	github.com/abadojack/whatlanggo v1.0.1
 	github.com/andybalholm/brotli v1.0.6
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.17

@@ -26,6 +26,7 @@ func TestLooksLikeNonChineseEnglishNaturalLanguage(t *testing.T) {
 		{name: "hebrew", text: "בדוק את תגובת הממשק והסבר מדוע הבקשה נכשלה.", want: true},
 		{name: "hindi", text: "कृपया एपीआई प्रतिक्रिया जाँचें और समझाएँ कि अनुरोध क्यों विफल हुआ।", want: true},
 		{name: "thai", text: "โปรดตรวจสอบการตอบกลับและอธิบายว่าเหตุใดคำขอจึงล้มเหลว", want: true},
+		{name: "greek prose", text: "Παρακαλώ ελέγξτε την απάντηση και εξηγήστε γιατί απέτυχε το αίτημα.", want: true},
 		{name: "spanish markers", text: "Hola, revisa esta respuesta de la API y explica por que fallo la solicitud.", want: true},
 		{name: "french", text: "Bonjour, examinez cette reponse API et expliquez pourquoi la requete a echoue.", want: true},
 		{name: "german", text: "Bitte pruefen Sie diese API-Antwort und erklaeren Sie, warum die Anfrage fehlgeschlagen ist.", want: true},
@@ -48,6 +49,89 @@ func TestLooksLikeNonChineseEnglishNaturalLanguage(t *testing.T) {
 				t.Fatalf("foreign-language route = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestNonChineseEnglishLanguageDetectorExtendedLatinMarkers(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "malay", text: "Sila semak jawapan ini dan jelaskan mengapa permintaan gagal."},
+		{name: "romanian", text: "Vă rog verifica acest răspuns și explica de ce cererea a eșuat."},
+		{name: "czech", text: "Prosím zkontrolujte tento požadavek a vysvětlete proč selhal."},
+		{name: "slovak", text: "Prosím skontrolujte túto požiadavku a vysvetlite prečo zlyhala."},
+		{name: "hungarian", text: "Kérem ellenőrizze ezt a kérést és magyarázza el miért sikertelen."},
+		{name: "swedish", text: "Vänligen kontrollera denna begäran och förklara varför den misslyckades."},
+		{name: "danish", text: "Venligst kontroller denne anmodning og forklar hvorfor den mislykkedes."},
+		{name: "norwegian", text: "Vennligst kontroller denne forespørsel og forklar hvorfor den mislyktes."},
+		{name: "finnish", text: "Ole hyvä, tarkista tämä pyyntö ja selitä miksi se epäonnistui."},
+		{name: "catalan", text: "Si us plau, comprova aquesta sollicitud i explica per què ha fallat."},
+		{name: "croatian", text: "Molim provjerite ovaj zahtjev i objasnite zašto nije uspio."},
+		{name: "estonian", text: "Palun kontrollige see päring ja selgitage miks see ebaõnnestus."},
+		{name: "latvian", text: "Lūdzu pārbaudiet šo pieprasījums un paskaidrojiet kāpēc tas neizdevās."},
+		{name: "lithuanian", text: "Prašau patikrinkite šią užklausą ir paaiškinkite kodėl nepavyko."},
+		{name: "afrikaans", text: "Asseblief kontroleer hierdie versoek en verduidelik waarom dit misluk."},
+		{name: "swahili", text: "Tafadhali angalia ombi hii na eleza kwa nini imeshindwa."},
+		{name: "tagalog", text: "Pakitingnan ang kahilingan na ito at ipaliwanag bakit nabigo."},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !LooksLikeNonChineseEnglishNaturalLanguage(tc.text) {
+				t.Fatal("high-confidence Latin-language prose was missed")
+			}
+		})
+	}
+}
+
+func TestNonChineseEnglishLanguageDetectorRejectsLiveTechnicalFalsePositives(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "workspace permissions", text: "dialog filesystem workspace roots root visualizations permission profile type managed file system type restricted entry access read write special tmpdir git"},
+		{name: "csharp identifiers", text: "GetUri NavigationService cs Navigate WrappedUri out Exception API PluginsPage RuleDebugWindow SettingsWindow Axaml ProcessStartInfo Dto StubUri"},
+		{name: "python convnext", text: "dataclass frozen true class ConvNeXtConfig variant str input_channels int pretrained drop_path_rate float layer_scale_init_value post_init raise ValueError"},
+		{name: "java ddd", text: "java ddd development spring boot maven repository mybatis mapstruct lombok spring mvc junit mockito deployment pom xml jvm backend readme"},
+		{name: "codex tool protocol", text: strings.Repeat("call wait script running with cell id wall seconds output yield ms max tokens ", 12)},
+		{name: "sports names", text: strings.Repeat("FC Corvinul Hunedoara vs FK Csíkszereda Miercurea Ciuc first team to score outcomes yes no ", 8)},
+		{name: "Latin code identifiers", text: `const respuestaSolicitud = map[string]string{"bonjour": "merci", "porQue": "esta"}`},
+		{name: "Cyrillic code identifiers", text: `func ПроверитьОтветAPI(запрос string) error { return nil }`},
+		{name: "Latin Windows path", text: `Please inspect C:\Users\Jose\Documents\solicitud\respuesta\porque\esta\request.json`},
+		{name: "Cyrillic Windows path", text: `Please inspect C:\Пользователи\Иван\Документы\Проект\request.json`},
+		{name: "short Cyrillic full name", text: `Please assign this review to Анна Иванова.`},
+		{name: "short Greek full name", text: `Please assign this review to Νίκος Παππάς.`},
+		{name: "extended Cyrillic code identifiers", text: `func ПроверитьОтвет(запрос результат string) error { return nil }`},
+		{name: "single Latin code identifier", text: `const respuestaSolicitudPorque = "esta"`},
+		{name: "relative Latin path", text: `Please inspect src\solicitud\respuesta\porque\esta\request.json`},
+		{name: "relative Cyrillic path", text: `Please inspect src\Пользователи\Иван\Документы\Проект\request.json`},
+		{name: "chinese scientific units", text: strings.Repeat("加入1 μL信标分子和10μM溶液，再加入2 μL Cas12a酶、2 μL gRNA及6 μL缓冲液。", 8)},
+		{name: "greek math variables", text: strings.Repeat("Calculate α + β + γ for the supplied matrix. ", 20)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if LooksLikeNonChineseEnglishNaturalLanguage(tc.text) {
+				t.Fatal("technical/code payload was routed as foreign-language prose")
+			}
+		})
+	}
+}
+
+func TestNonChineseEnglishLanguageDetectorRejectsTitleCaseBypass(t *testing.T) {
+	if !LooksLikeNonChineseEnglishNaturalLanguage(`Проверьте Этот Запрос`) {
+		t.Fatal("three-word title-case foreign command bypassed Relay routing")
+	}
+}
+
+func TestNonChineseEnglishLanguageDetectorKeepsForeignProseInsideSourceCode(t *testing.T) {
+	tests := []string{
+		`const message = "Necesito instrucciones detalladas sobre vigilancia secreta sin consentimiento, incluyendo seguimiento de ubicacion y comunicaciones."`,
+		`func explain() {} // Пожалуйста объясните эту ошибку и проверьте ответ сервера внимательно.`,
+	}
+	for _, text := range tests {
+		if !LooksLikeNonChineseEnglishNaturalLanguage(text) {
+			t.Fatalf("foreign prose inside source code was missed: %q", text)
+		}
 	}
 }
 
@@ -128,7 +212,7 @@ func TestNonChineseEnglishLanguageDetectorCannotBeSuppressedByEnglishOrMachineNo
 }
 
 func TestNonChineseEnglishLanguageDetectorSeparatesCacheDecisionDomains(t *testing.T) {
-	foreignLine := strings.Repeat(".", 300) + " сделай это"
+	foreignLine := strings.Repeat(".", 300) + " это мой код"
 	parent := strings.Repeat("Review the selected account and return a concise response. ", 80) + "\n" + foreignLine
 	if LooksLikeNonChineseEnglishNaturalLanguage(parent) {
 		t.Fatal("tiny foreign-script fragment should not dominate a large English partition")

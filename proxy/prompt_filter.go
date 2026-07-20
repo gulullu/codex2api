@@ -27,6 +27,7 @@ const promptFilterUserTextRescueSignal = "user_text_rescue"
 const promptFilterSQLCredentialExfiltrationSignal = "local_sql_credential_exfiltration"
 const promptFilterTargetedCovertSurveillanceSignal = "local_targeted_covert_surveillance"
 const promptFilterNonZhEnLanguageSignal = "local_non_zh_en_language"
+const promptFilterOperationalRansomwareAuthoringSignal = "local_operational_ransomware_authoring"
 const promptFilterMLModelBackdoorTrainingSignal = "local_ml_model_backdoor_training"
 const promptFilterRemoteCommandControlPlatformSignal = "local_remote_command_control_platform"
 const promptFilterSecurityCodeAuditSignal = "local_security_code_audit"
@@ -106,7 +107,23 @@ var promptFilterTargetedCovertSurveillancePatterns = []*regexp.Regexp{
 
 var promptFilterTargetedCovertSurveillanceDefensivePattern = regexp.MustCompile(`(?i)\b(?:detect|identify|stop|block|remove|report)\b[^.!?\n]{0,60}\b(?:stalking|tracking|surveillance|interception|wiretapping|eavesdropping|spyware)\b|\bprotect\b[^.!?\n]{0,50}\bfrom\b[^.!?\n]{0,50}\b(?:stalking|tracking|surveillance|interception|wiretapping|eavesdropping|spyware)\b|(?:检测|识别|举报|清除)[^。！？\n]{0,50}(?:跟踪|监控|监听|窃听|拦截|间谍软件)|(?:制止|阻止)(?:非法|秘密|隐蔽)?(?:跟踪|监控|监听|窃听|拦截)`)
 
-// These rules fill three production-observed OAuth CYB routing gaps. Every
+// This rule covers a production-observed wording gap where an operational
+// ransomware authoring request used "building functional" and "deployable"
+// instead of the existing exact build/deploy verbs. It deliberately requires
+// an authoring-quality request plus all four observed implementation
+// capability families. Merely discussing ransomware, detection, or one
+// technique is not enough. The signal only chooses Relay and never blocks
+// locally.
+var promptFilterOperationalRansomwareAuthoringRequestPattern = regexp.MustCompile(`(?i)\b(?:build(?:ing)?|creat(?:e|ing)|develop(?:ing)?|implement(?:ing)?|writ(?:e|ing)|generat(?:e|ing)|produc(?:e|ing)|cod(?:e|ing))\b[^.!?\n]{0,100}\b(?:technically\s+complete|complete|deployable|functional|working|runnable|production[- ]ready)\s+ransomware(?:\s*[,.;:]|\s+(?:that|which|with|using|including|capable|project|program|payload|implementation|source|code)\b|$)`)
+
+var promptFilterOperationalRansomwareCapabilityPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:aes[- ]?(?:128|192|256)|chacha20|file\s+encryption|encrypt(?:s|ed|ing|ion)?\s+(?:user\s+|victim\s+)?files?|encrypt(?:s|ed|ing|ion)?\s+(?:local\s+)?drives?)\b`),
+	regexp.MustCompile(`(?i)\b(?:delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|eras(?:e|es|ed|ing)|destroy(?:s|ed|ing)?|disabl(?:e|es|ed|ing)|inhibit(?:s|ed|ing)?)\b[^.!?\n]{0,80}\b(?:volume\s+)?shadow\s+cop(?:y|ies)\b|\b(?:vssadmin|wmic\s+shadowcopy|inhibit\s+system\s+recovery|disable\s+(?:system\s+)?recovery|delete\s+backups?)\b`),
+	regexp.MustCompile(`(?i)\b(?:tor(?:[- ]hosted)?|onion)\b[^.!?\n]{0,100}\b(?:payment|portal|site|service)\b|\b(?:cryptocurrency|crypto|bitcoin|monero)\b[^.!?\n]{0,80}\b(?:payment|wallet|address)\b|\b(?:ransom\s+note|payment\s+portal)\b`),
+	regexp.MustCompile(`(?i)\b(?:working|complete|runnable|full|deployable|functional)\b[^.!?\n]{0,40}\b(?:source\s+code|code|implementation|payload|executable|binary)\b|\bsource\s+code\b`),
+}
+
+// These rules fill production-observed OAuth CYB routing gaps. Every
 // witness must coexist inside one independently scanned payload partition.
 // They only choose the Relay account pool; they never block a request locally.
 var promptFilterMLModelBackdoorTrainingPatterns = []*regexp.Regexp{
@@ -517,8 +534,25 @@ func promptFilterPersonalMediaCacheDecodeVerdict(text string) bool {
 	return false
 }
 
+func promptFilterOperationalRansomwareAuthoringVerdict(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || !promptFilterOperationalRansomwareAuthoringRequestPattern.MatchString(text) {
+		return false
+	}
+	capabilities := 0
+	for _, pattern := range promptFilterOperationalRansomwareCapabilityPatterns {
+		if pattern != nil && pattern.MatchString(text) {
+			capabilities++
+		}
+	}
+	return capabilities == len(promptFilterOperationalRansomwareCapabilityPatterns)
+}
+
 func promptFilterObservedGapSignals(text string) []string {
-	signals := make([]string, 0, 5)
+	signals := make([]string, 0, 6)
+	if promptFilterOperationalRansomwareAuthoringVerdict(text) {
+		signals = append(signals, promptFilterOperationalRansomwareAuthoringSignal)
+	}
 	if promptFilterMLModelBackdoorTrainingVerdict(text) {
 		signals = append(signals, promptFilterMLModelBackdoorTrainingSignal)
 	}
@@ -819,12 +853,13 @@ func promptFilterPartitionsUsable(partitioned promptfilter.RoutingPayloadPartiti
 func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promptfilter.Config, fallbackReason string) promptFilterRouteScan {
 	fullText := promptfilter.ExtractRoutingText(rawBody, endpoint, cfg.MaxTextLength)
 	fullScan := inspectPromptFilterText(fullText, endpoint, cfg)
-	// Never trust the concatenated legacy text for this five-witness rule.
-	// Re-add it only after an independent bounded partition extraction proves
-	// all witnesses coexist in one real payload compartment.
+	// Never trust concatenated legacy text for partition-scoped route rules.
+	// Re-add them only after an independent bounded partition extraction proves
+	// every rule's witnesses coexist in one real payload compartment.
 	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
 	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterNonZhEnLanguageSignal)
 	for _, signal := range []string{
+		promptFilterOperationalRansomwareAuthoringSignal,
 		promptFilterMLModelBackdoorTrainingSignal,
 		promptFilterRemoteCommandControlPlatformSignal,
 		promptFilterSecurityCodeAuditSignal,

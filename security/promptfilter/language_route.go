@@ -6,18 +6,11 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
-
-	whatlanggo "github.com/abadojack/whatlanggo"
 )
 
 const (
 	nonZhEnMinimumForeignScriptLetters = 4
 	nonZhEnStrongForeignScriptLetters  = 12
-	nonZhEnMinimumLatinWords           = 10
-	nonZhEnMinimumLatinLetters         = 48
-	nonZhEnMaxSamples                  = 3
-	nonZhEnMaxSampleBytes              = 768
-	nonZhEnMaxTotalSampleBytes         = 4 * 1024
 	nonZhEnLatinWindowBytes            = 1024
 	nonZhEnLatinWindowOverlapBytes     = 256
 	nonZhEnLanguageCacheMinBytes       = 256
@@ -53,30 +46,51 @@ var (
 	nonZhEnLanguageHashSeedSecond = maphash.MakeSeed()
 )
 
-// nonEnglishLatinMarkerGroups are deliberately high-precision function-word
-// and prose-marker groups. They cover complete but statistically short Latin
-// sentences that whatlanggo cannot classify reliably. A single loanword,
-// product name, or identifier is never enough to satisfy a group.
-var nonEnglishLatinMarkerGroups = [][]string{
-	{"hola", "gracias", "revisa", "respuesta", "explica", "solicitud", "porque", "para", "esta", "este"},
-	{"bonjour", "merci", "avec", "pour", "dans", "cette", "pourquoi", "requete", "réponse", "expliquez"},
-	{"bitte", "warum", "nicht", "antwort", "anfrage", "prüfen", "erklaeren", "erklären", "diese", "dieser"},
-	{"obrigado", "resposta", "solicitacao", "solicitação", "porque", "para", "esta", "explique", "revise", "você"},
-	{"ciao", "grazie", "questa", "questo", "perche", "perché", "spiega", "richiesta", "risposta", "controlla"},
-	{"alstublieft", "waarom", "antwoord", "verzoek", "controleer", "uitleggen", "deze", "voor", "niet", "met"},
-	{"proszę", "dlaczego", "odpowiedz", "żądanie", "sprawdź", "wyjaśnij", "jest", "oraz", "nie", "dla"},
-	{"lütfen", "lutfen", "neden", "istek", "istegin", "yanıt", "yanitini", "kontrol", "açıkla", "aciklayin", "icin", "için", "degil", "değil"},
-	{"tolong", "mengapa", "permintaan", "jawaban", "periksa", "jelaskan", "dengan", "untuk", "yang", "tidak"},
-	{"vui", "long", "kiem", "tra", "phan", "hoi", "giai", "thich", "tai", "sao", "yeu", "cau", "khong"},
-	{"va rog", "de ce", "raspuns", "răspuns", "cerere", "verifica", "explica", "pentru", "acest", "aceasta"},
-	{"por favor", "respuesta", "solicitud", "revisar", "explicar", "porque", "para", "esta", "como", "gracias"},
+type latinLanguageMarkerGroup struct {
+	strong []string
+	weak   []string
+}
+
+// nonEnglishLatinMarkerGroups are deliberately high-precision prose marker
+// groups. Statistical language detectors are intentionally not used here:
+// code, paths, identifiers, tool schemas, and sports names can receive
+// confidently wrong language labels. Generic short words, accents, product
+// names, and identifiers cannot decide routing by themselves.
+var nonEnglishLatinMarkerGroups = []latinLanguageMarkerGroup{
+	{strong: []string{"hola", "gracias", "revisa", "respuesta", "explica", "solicitud", "porque", "necesito", "instrucciones", "detalladas", "vigilancia", "secreta", "consentimiento", "incluyendo", "seguimiento", "ubicacion", "comunicaciones"}, weak: []string{"para", "esta", "este", "una", "sin", "sobre", "con", "que"}},
+	{strong: []string{"bonjour", "merci", "pourquoi", "requete", "requête", "reponse", "réponse", "expliquez", "verifiez", "vérifiez", "demande", "echoue", "échoué"}, weak: []string{"avec", "pour", "dans", "cette", "une", "sans", "sur", "que"}},
+	{strong: []string{"bitte", "warum", "antwort", "anfrage", "prüfen", "pruefen", "erklären", "erklaeren", "fehlgeschlagen"}, weak: []string{"nicht", "diese", "dieser", "eine", "ohne", "und", "ist"}},
+	{strong: []string{"obrigado", "resposta", "solicitacao", "solicitação", "explique", "revise", "verifique", "falhou"}, weak: []string{"porque", "para", "esta", "uma", "sem", "sobre", "voce", "você", "nao", "não"}},
+	{strong: []string{"ciao", "grazie", "spiega", "richiesta", "risposta", "controlla", "perche", "perché", "riuscita"}, weak: []string{"questa", "questo", "una", "senza", "non", "che", "per"}},
+	{strong: []string{"alstublieft", "waarom", "antwoord", "verzoek", "controleer", "uitleggen", "mislukt"}, weak: []string{"deze", "voor", "niet", "met", "een", "zonder", "het", "dat"}},
+	{strong: []string{"proszę", "prosze", "dlaczego", "odpowiedz", "odpowiedź", "żądanie", "zadanie", "sprawdź", "sprawdz", "wyjaśnij", "wyjasnij"}, weak: []string{"jest", "oraz", "nie", "dla", "bez"}},
+	{strong: []string{"lütfen", "lutfen", "neden", "istek", "istegin", "yanıt", "yanit", "yanitini", "kontrol", "açıkla", "acikla", "aciklayin", "basarisiz", "başarısız"}, weak: []string{"için", "icin", "değil", "degil", "bir", "ve", "bu"}},
+	{strong: []string{"tolong", "mengapa", "permintaan", "jawaban", "periksa", "jelaskan", "gagal"}, weak: []string{"dengan", "untuk", "yang", "tidak", "ini", "dan", "tanpa"}},
+	{strong: []string{"sila", "mengapa", "permintaan", "jawapan", "semak", "jelaskan", "gagal"}, weak: []string{"dengan", "untuk", "yang", "tidak", "ini", "dan", "tanpa"}},
+	{strong: []string{"vui long", "vui lòng", "kiem tra", "kiểm tra", "phan hoi", "phản hồi", "giai thich", "giải thích", "tai sao", "tại sao", "yeu cau", "yêu cầu", "that bai", "thất bại"}, weak: []string{"khong", "không", "mot", "một", "va", "và", "nay", "này"}},
+	{strong: []string{"va rog", "vă rog", "de ce", "raspuns", "răspuns", "cerere", "verifica", "explica", "esuat", "eșuat"}, weak: []string{"pentru", "acest", "aceasta", "fara", "fără", "este"}},
+	{strong: []string{"prosím", "prosim", "proč", "proc", "odpověď", "odpoved", "požadavek", "pozadavek", "zkontrolujte", "vysvětlete", "vysvetlete", "selhal"}, weak: []string{"tento", "tato", "bez", "není", "neni", "pro"}},
+	{strong: []string{"prosím", "prosim", "prečo", "preco", "odpoveď", "odpoved", "požiadavka", "poziadavka", "skontrolujte", "vysvetlite", "zlyhala"}, weak: []string{"tento", "tato", "bez", "nie", "pre"}},
+	{strong: []string{"kérem", "kerem", "miért", "miert", "válasz", "valasz", "kérés", "keres", "ellenőrizze", "ellenorizze", "magyarázza", "magyarazza", "sikertelen"}, weak: []string{"ezt", "nem", "és", "es", "nélkül", "nelkul", "egy"}},
+	{strong: []string{"vänligen", "vanligen", "varför", "varfor", "svar", "begäran", "begaran", "kontrollera", "förklara", "forklara", "misslyckades"}, weak: []string{"denna", "inte", "med", "för", "for", "utan", "och"}},
+	{strong: []string{"venligst", "hvorfor", "svar", "anmodning", "kontrollér", "kontroller", "forklar", "mislykkedes"}, weak: []string{"denne", "ikke", "med", "for", "uden", "og"}},
+	{strong: []string{"vennligst", "hvorfor", "svar", "forespørsel", "foresporsel", "kontroller", "forklar", "mislyktes"}, weak: []string{"denne", "ikke", "med", "for", "uten", "og"}},
+	{strong: []string{"ole hyvä", "ole hyva", "miksi", "vastaus", "pyyntö", "pyynto", "tarkista", "selitä", "selita", "epäonnistui", "epaonnistui"}, weak: []string{"tämä", "tama", "ei", "kanssa", "varten", "ilman", "ja"}},
+	{strong: []string{"si us plau", "per què", "per que", "resposta", "sol·licitud", "sollicitud", "comprova", "explica", "fallat"}, weak: []string{"aquesta", "sense", "amb", "no"}},
+	{strong: []string{"molim", "zašto", "zasto", "odgovor", "zahtjev", "provjerite", "objasnite", "nije uspio"}, weak: []string{"ovaj", "ova", "bez", "nije", "za"}},
+	{strong: []string{"palun", "miks", "vastus", "päring", "paring", "kontrollige", "selgitage", "ebaõnnestus", "ebaonnestus"}, weak: []string{"see", "ei", "koos", "jaoks", "ilma"}},
+	{strong: []string{"lūdzu", "ludzu", "kāpēc", "kapec", "atbilde", "pieprasījums", "pieprasijums", "pārbaudiet", "parbaudiet", "paskaidrojiet", "neizdevās", "neizdevas"}, weak: []string{"šis", "sis", "šī", "si", "bez", "nav", "par"}},
+	{strong: []string{"prašau", "prasau", "kodėl", "kodel", "atsakymas", "užklausa", "uzklausa", "patikrinkite", "paaiškinkite", "paaiskinkite", "nepavyko"}, weak: []string{"šis", "sis", "ši", "si", "be", "nėra", "nera", "dėl", "del"}},
+	{strong: []string{"asseblief", "waarom", "antwoord", "versoek", "kontroleer", "verduidelik", "misluk"}, weak: []string{"hierdie", "nie", "met", "vir", "sonder"}},
+	{strong: []string{"tafadhali", "kwa nini", "jibu", "ombi", "angalia", "eleza", "imeshindwa"}, weak: []string{"hii", "bila", "na", "kwa"}},
+	{strong: []string{"pakitingnan", "bakit", "sagot", "kahilingan", "suriin", "ipaliwanag", "nabigo"}, weak: []string{"ito", "hindi", "para", "nang", "na"}},
 }
 
 // LooksLikeNonChineseEnglishNaturalLanguage reports whether bounded readable
 // prompt text contains enough evidence of a natural language other than
 // Chinese or English. It is a routing hint only: callers must never use it to
-// block a request. URL/path/hash/code noise is excluded before the statistical
-// Latin-language pass; all Unicode letters remain covered by the script pass.
+// block a request. URL/path/hash/code noise is excluded before the Latin marker
+// pass; recognized non-Latin Unicode scripts are covered independently.
 func LooksLikeNonChineseEnglishNaturalLanguage(text string) bool {
 	if strings.TrimSpace(text) == "" {
 		return false
@@ -126,94 +140,196 @@ func (cache *nonZhEnLanguageDecisionCache) put(key nonZhEnLanguageCacheKey, resu
 }
 
 func containsForeignNaturalScript(text string) bool {
-	var scriptCounts [25]int
-	var scriptWords [25]int
+	type scriptEvidence struct {
+		meaningfulLetters int
+		meaningfulWords   int
+		longestWord       int
+	}
+	var evidence [foreignScriptCount]scriptEvidence
 	totalLetters := 0
-	lastScript := -1
-	for _, r := range text {
-		if !unicode.IsLetter(r) {
-			lastScript = -1
-			continue
+	activeScript := -1
+	activeWordLetters := 0
+	flushWord := func() {
+		if activeScript < 0 || activeWordLetters < 2 {
+			activeScript = -1
+			activeWordLetters = 0
+			return
 		}
-		totalLetters++
-		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Latin, r) || unicode.Is(unicode.Bopomofo, r) {
-			lastScript = -1
-			continue
+		current := &evidence[activeScript]
+		current.meaningfulLetters += activeWordLetters
+		current.meaningfulWords++
+		if activeWordLetters > current.longestWord {
+			current.longestWord = activeWordLetters
 		}
-		bucket := foreignScriptBucket(r)
-		scriptCounts[bucket]++
-		if lastScript != bucket {
-			scriptWords[bucket]++
+		activeScript = -1
+		activeWordLetters = 0
+	}
+	for _, line := range strings.Split(text, "\n") {
+		for _, segment := range naturalLanguageSegmentsFromLine(line) {
+			for _, field := range strings.Fields(segment) {
+				if machineLikeLanguageToken(field) {
+					flushWord()
+					continue
+				}
+				for _, r := range field {
+					if unicode.Is(unicode.Mn, r) && activeScript >= 0 {
+						continue
+					}
+					if !unicode.IsLetter(r) {
+						flushWord()
+						continue
+					}
+					totalLetters++
+					if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Latin, r) || unicode.Is(unicode.Bopomofo, r) {
+						flushWord()
+						continue
+					}
+					bucket := foreignScriptBucket(r)
+					if activeScript != bucket {
+						flushWord()
+						activeScript = bucket
+					}
+					activeWordLetters++
+				}
+				flushWord()
+			}
 		}
-		lastScript = bucket
 	}
 	if totalLetters == 0 {
 		return false
 	}
-	for index, count := range scriptCounts {
-		if count < nonZhEnMinimumForeignScriptLetters {
+	for bucket, current := range evidence {
+		if current.meaningfulLetters < nonZhEnMinimumForeignScriptLetters {
 			continue
 		}
-		// A short coherent foreign-script phrase is decisive. In a much larger
-		// English/Chinese partition, require at least twelve letters so a lone
-		// personal name or mathematical variable cannot redirect the request.
-		if count >= 20 || (scriptWords[index] >= 2 && (count >= nonZhEnStrongForeignScriptLetters || count*8 >= totalLetters)) {
-			return true
+		strongInPartition := current.meaningfulLetters >= nonZhEnStrongForeignScriptLetters || current.meaningfulLetters*8 >= totalLetters
+		switch bucket {
+		case foreignScriptGreek:
+			// Greek math variables and repeated scientific units such as μL/μM
+			// are isolated one-letter runs and therefore never qualify here.
+			if current.meaningfulWords >= 3 && current.meaningfulLetters >= 8 && strongInPartition {
+				return true
+			}
+		case foreignScriptKana, foreignScriptThai, foreignScriptLao, foreignScriptKhmer, foreignScriptMyanmar:
+			// These scripts commonly omit spaces or are split by allowed Han
+			// characters, so coherent script volume is the safer boundary.
+			if current.meaningfulLetters >= nonZhEnStrongForeignScriptLetters ||
+				(current.meaningfulLetters >= 8 && current.meaningfulLetters*8 >= totalLetters) {
+				return true
+			}
+		case foreignScriptHangul:
+			if current.meaningfulLetters >= 8 && (current.meaningfulWords >= 2 || current.meaningfulLetters >= nonZhEnStrongForeignScriptLetters) {
+				return true
+			}
+		default:
+			// Spaced scripts require at least three real words. This excludes
+			// one- and two-part personal names and code identifiers while retaining
+			// prose. Three title-cased words remain decisive: suppressing them
+			// globally would create a trivial Title Case bypass for short commands.
+			if current.meaningfulWords >= 3 && current.meaningfulLetters >= 8 && strongInPartition {
+				return true
+			}
 		}
 	}
 	return false
 }
 
+const (
+	foreignScriptCyrillic = iota
+	foreignScriptArabic
+	foreignScriptDevanagari
+	foreignScriptHebrew
+	foreignScriptGreek
+	foreignScriptKana
+	foreignScriptHangul
+	foreignScriptThai
+	foreignScriptBengali
+	foreignScriptGeorgian
+	foreignScriptArmenian
+	foreignScriptEthiopic
+	foreignScriptGujarati
+	foreignScriptGurmukhi
+	foreignScriptKannada
+	foreignScriptTamil
+	foreignScriptTelugu
+	foreignScriptMalayalam
+	foreignScriptOriya
+	foreignScriptMyanmar
+	foreignScriptSinhala
+	foreignScriptKhmer
+	foreignScriptLao
+	foreignScriptTibetan
+	foreignScriptSyriac
+	foreignScriptThaana
+	foreignScriptCherokee
+	foreignScriptCanadianAboriginal
+	foreignScriptMongolian
+	foreignScriptCount
+)
+
 func foreignScriptBucket(r rune) int {
 	switch {
 	case unicode.Is(unicode.Cyrillic, r):
-		return 0
+		return foreignScriptCyrillic
 	case unicode.Is(unicode.Arabic, r):
-		return 1
+		return foreignScriptArabic
 	case unicode.Is(unicode.Devanagari, r):
-		return 2
+		return foreignScriptDevanagari
 	case unicode.Is(unicode.Hebrew, r):
-		return 3
+		return foreignScriptHebrew
 	case unicode.Is(unicode.Greek, r):
-		return 4
-	case unicode.Is(unicode.Hiragana, r):
-		return 5
-	case unicode.Is(unicode.Katakana, r):
-		return 6
+		return foreignScriptGreek
+	case unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r):
+		return foreignScriptKana
 	case unicode.Is(unicode.Hangul, r):
-		return 7
+		return foreignScriptHangul
 	case unicode.Is(unicode.Thai, r):
-		return 8
+		return foreignScriptThai
 	case unicode.Is(unicode.Bengali, r):
-		return 9
+		return foreignScriptBengali
 	case unicode.Is(unicode.Georgian, r):
-		return 10
+		return foreignScriptGeorgian
 	case unicode.Is(unicode.Armenian, r):
-		return 11
+		return foreignScriptArmenian
 	case unicode.Is(unicode.Ethiopic, r):
-		return 12
+		return foreignScriptEthiopic
 	case unicode.Is(unicode.Gujarati, r):
-		return 13
+		return foreignScriptGujarati
 	case unicode.Is(unicode.Gurmukhi, r):
-		return 14
+		return foreignScriptGurmukhi
 	case unicode.Is(unicode.Kannada, r):
-		return 15
+		return foreignScriptKannada
 	case unicode.Is(unicode.Tamil, r):
-		return 16
+		return foreignScriptTamil
 	case unicode.Is(unicode.Telugu, r):
-		return 17
+		return foreignScriptTelugu
 	case unicode.Is(unicode.Malayalam, r):
-		return 18
+		return foreignScriptMalayalam
 	case unicode.Is(unicode.Oriya, r):
-		return 19
+		return foreignScriptOriya
 	case unicode.Is(unicode.Myanmar, r):
-		return 20
+		return foreignScriptMyanmar
 	case unicode.Is(unicode.Sinhala, r):
-		return 21
+		return foreignScriptSinhala
 	case unicode.Is(unicode.Khmer, r):
-		return 22
+		return foreignScriptKhmer
+	case unicode.Is(unicode.Lao, r):
+		return foreignScriptLao
+	case unicode.Is(unicode.Tibetan, r):
+		return foreignScriptTibetan
+	case unicode.Is(unicode.Syriac, r):
+		return foreignScriptSyriac
+	case unicode.Is(unicode.Thaana, r):
+		return foreignScriptThaana
+	case unicode.Is(unicode.Cherokee, r):
+		return foreignScriptCherokee
+	case unicode.Is(unicode.Canadian_Aboriginal, r):
+		return foreignScriptCanadianAboriginal
+	case unicode.Is(unicode.Mongolian, r):
+		return foreignScriptMongolian
 	default:
-		return 24
+		// Never merge unrelated unknown scripts into one evidence bucket.
+		return -1
 	}
 }
 
@@ -282,98 +398,178 @@ func containsForeignLatinWindow(text string) bool {
 }
 
 func inspectForeignLatinWindow(text string) bool {
-	samples, allWords, latinLetters, nonASCII := latinNaturalLanguageSamples(text)
+	allWords := latinNaturalLanguageWords(text)
 	if len(allWords) == 0 {
 		return false
 	}
-	if hasNonEnglishLatinMarkers(allWords) {
-		return true
-	}
-	// Several accented Latin letters in a real prose fragment are enough to
-	// establish non-English language evidence even when the statistical model
-	// considers a short sentence ambiguous.
-	if nonASCII >= 4 && latinLetters >= 20 && nonASCII*20 >= latinLetters {
-		return true
-	}
-	for _, sample := range samples {
-		info := whatlanggo.Detect(sample)
-		if info.IsReliable() && info.Lang != whatlanggo.Eng && info.Lang != whatlanggo.Cmn {
-			return true
-		}
-	}
-	return false
+	return hasNonEnglishLatinMarkers(allWords)
 }
 
-func latinNaturalLanguageSamples(text string) (samples []string, allWords []string, latinLetters int, nonASCII int) {
-	lines := strings.Split(text, "\n")
-	totalSampleBytes := 0
-	for _, line := range lines {
-		words, letters, accented := latinWordsFromLine(line)
-		if len(words) == 0 {
-			continue
-		}
-		latinLetters += letters
-		nonASCII += accented
-		allWords = append(allWords, words...)
-		if len(samples) >= nonZhEnMaxSamples-1 || len(words) < nonZhEnMinimumLatinWords || letters < nonZhEnMinimumLatinLetters {
-			continue
-		}
-		sample := boundedWordSample(words, nonZhEnMaxSampleBytes)
-		if sample == "" || totalSampleBytes+len(sample) > nonZhEnMaxTotalSampleBytes {
-			continue
-		}
-		samples = append(samples, sample)
-		totalSampleBytes += len(sample)
+func latinNaturalLanguageWords(text string) []string {
+	var allWords []string
+	for _, line := range strings.Split(text, "\n") {
+		allWords = append(allWords, latinWordsFromLine(line)...)
 	}
-
-	if len(allWords) >= nonZhEnMinimumLatinWords && latinLetters >= nonZhEnMinimumLatinLetters && len(samples) < nonZhEnMaxSamples {
-		remaining := nonZhEnMaxTotalSampleBytes - totalSampleBytes
-		if remaining > nonZhEnMaxSampleBytes {
-			remaining = nonZhEnMaxSampleBytes
-		}
-		if aggregate := boundedWordSample(allWords, remaining); aggregate != "" {
-			samples = append(samples, aggregate)
-		}
-	}
-	return samples, allWords, latinLetters, nonASCII
+	return allWords
 }
 
-func latinWordsFromLine(line string) ([]string, int, int) {
+func latinWordsFromLine(line string) []string {
 	if strings.TrimSpace(line) == "" {
-		return nil, 0, 0
+		return nil
 	}
 	words := make([]string, 0, 16)
-	latinLetters, nonASCII := 0, 0
-	for _, field := range strings.Fields(line) {
-		if machineLikeLanguageToken(field) {
-			continue
-		}
-		for _, word := range latinWords(field) {
-			if machineLikeLanguageWord(word) {
+	for _, segment := range naturalLanguageSegmentsFromLine(line) {
+		for _, field := range strings.Fields(segment) {
+			if machineLikeLanguageToken(field) {
 				continue
 			}
-			wordRunes := utf8.RuneCountInString(word)
-			if wordRunes < 2 || wordRunes > 30 {
-				continue
-			}
-			words = append(words, word)
-			for _, r := range word {
-				if unicode.Is(unicode.Latin, r) {
-					latinLetters++
-					if r > unicode.MaxASCII {
-						nonASCII++
-					}
+			for _, word := range latinWords(field) {
+				if machineLikeLanguageWord(word) {
+					continue
 				}
+				wordRunes := utf8.RuneCountInString(word)
+				if wordRunes < 2 || wordRunes > 30 {
+					continue
+				}
+				words = append(words, word)
 			}
 		}
 	}
-	return words, latinLetters, nonASCII
+	return words
+}
+
+// naturalLanguageSegmentsFromLine removes source-code identifiers from the
+// language decision while retaining quoted strings and comments, where prose
+// can legitimately live. The check is intentionally narrow: arbitrary JSON,
+// Markdown, and slash-separated adversarial prose must not become a bypass.
+func naturalLanguageSegmentsFromLine(line string) []string {
+	if !looksLikeSourceCodeLine(line) {
+		return []string{line}
+	}
+	return sourceCodeProseSegments(line)
+}
+
+func looksLikeSourceCodeLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	prefixes := []string{
+		"const ", "var ", "let ", "func ", "function ", "def ", "class ",
+		"type ", "package ", "import ", "from ", "public ", "private ",
+		"protected ", "interface ", "struct ", "enum ",
+	}
+	matchedPrefix := false
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(lower, prefix) {
+			matchedPrefix = true
+			break
+		}
+	}
+	return matchedPrefix && strings.ContainsAny(trimmed, "={}();`")
+}
+
+func sourceCodeProseSegments(line string) []string {
+	segments := make([]string, 0, 3)
+	var quoted strings.Builder
+	var quote rune
+	escaped := false
+	for _, r := range line {
+		if quote == 0 {
+			if r == '\'' || r == '"' || r == '`' {
+				quote = r
+				quoted.Reset()
+			}
+			continue
+		}
+		if escaped {
+			quoted.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if r == quote {
+			if value := strings.TrimSpace(quoted.String()); value != "" {
+				segments = append(segments, value)
+			}
+			quote = 0
+			continue
+		}
+		quoted.WriteRune(r)
+	}
+	if comment := sourceCodeLineComment(line); comment != "" {
+		segments = append(segments, comment)
+	}
+	return segments
+}
+
+func sourceCodeLineComment(line string) string {
+	var quote byte
+	escaped := false
+	for index := 0; index < len(line); index++ {
+		current := line[index]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if current == '\\' {
+				escaped = true
+				continue
+			}
+			if current == quote {
+				quote = 0
+			}
+			continue
+		}
+		if current == '\'' || current == '"' || current == '`' {
+			quote = current
+			continue
+		}
+		if current == '/' && index+1 < len(line) && line[index+1] == '/' {
+			return strings.TrimSpace(line[index+2:])
+		}
+		if current == '#' && (index == 0 || line[index-1] == ' ' || line[index-1] == '\t') {
+			return strings.TrimSpace(line[index+1:])
+		}
+	}
+	return ""
 }
 
 func machineLikeLanguageToken(token string) bool {
 	trimmed := strings.Trim(token, "\"'.,!?，。！？:：()")
 	lower := strings.ToLower(trimmed)
-	return lower == "" || strings.Contains(lower, "://") || strings.HasPrefix(lower, "www.")
+	if lower == "" || strings.Contains(lower, "://") || strings.HasPrefix(lower, "www.") {
+		return true
+	}
+	if len(lower) >= 3 && ((lower[0] >= 'a' && lower[0] <= 'z') && lower[1] == ':' && (lower[2] == '\\' || lower[2] == '/')) {
+		return true
+	}
+	separatorCount := strings.Count(lower, "/") + strings.Count(lower, `\`)
+	if separatorCount >= 2 && relativeFilePathToken(lower) {
+		return true
+	}
+	return strings.HasPrefix(lower, "/") || strings.HasPrefix(lower, "./") ||
+		strings.HasPrefix(lower, "../") || strings.HasPrefix(lower, "~/") || strings.HasPrefix(lower, `\\`)
+}
+
+func relativeFilePathToken(token string) bool {
+	normalized := strings.ReplaceAll(token, `\`, "/")
+	leaf := strings.Trim(normalized[strings.LastIndex(normalized, "/")+1:], `"'.,!?;:()[]{}`)
+	dot := strings.LastIndexByte(leaf, '.')
+	if dot <= 0 || len(leaf)-dot-1 < 1 || len(leaf)-dot-1 > 12 {
+		return false
+	}
+	for _, r := range leaf[dot+1:] {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func machineLikeLanguageWord(word string) bool {
@@ -419,27 +615,6 @@ func latinWords(value string) []string {
 	return words
 }
 
-func boundedWordSample(words []string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	var sample strings.Builder
-	for _, word := range words {
-		extra := len(word)
-		if sample.Len() > 0 {
-			extra++
-		}
-		if sample.Len()+extra > maxBytes {
-			break
-		}
-		if sample.Len() > 0 {
-			sample.WriteByte(' ')
-		}
-		sample.WriteString(word)
-	}
-	return sample.String()
-}
-
 func hasNonEnglishLatinMarkers(words []string) bool {
 	seenWords := make(map[string]struct{}, len(words))
 	for _, word := range words {
@@ -447,21 +622,35 @@ func hasNonEnglishLatinMarkers(words []string) bool {
 	}
 	joined := " " + strings.Join(words, " ") + " "
 	for _, group := range nonEnglishLatinMarkerGroups {
-		seenMarkers := make(map[string]struct{}, 4)
-		for _, marker := range group {
-			matched := false
-			if strings.Contains(marker, " ") {
-				matched = strings.Contains(joined, " "+marker+" ")
-			} else {
-				_, matched = seenWords[marker]
+		seenMarkers := make(map[string]struct{}, 6)
+		strongCount, phraseCount := 0, 0
+		for _, marker := range group.strong {
+			if !latinMarkerMatches(marker, seenWords, joined) {
+				continue
 			}
-			if matched {
+			seenMarkers[marker] = struct{}{}
+			strongCount++
+			if strings.Contains(marker, " ") {
+				phraseCount++
+			}
+		}
+		for _, marker := range group.weak {
+			if latinMarkerMatches(marker, seenWords, joined) {
 				seenMarkers[marker] = struct{}{}
 			}
 		}
-		if len(seenMarkers) >= 3 {
+		if (len(seenMarkers) >= 4 && strongCount >= 3) ||
+			(len(seenMarkers) >= 3 && strongCount >= 2 && phraseCount >= 1) {
 			return true
 		}
 	}
 	return false
+}
+
+func latinMarkerMatches(marker string, seenWords map[string]struct{}, joined string) bool {
+	if strings.Contains(marker, " ") {
+		return strings.Contains(joined, " "+marker+" ")
+	}
+	_, matched := seenWords[marker]
+	return matched
 }

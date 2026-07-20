@@ -119,6 +119,10 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: '非中英语种内容',
     description: '完整请求的某个独立文本分区检测到中文、英文以外的自然语言，因此统一交由 Relay；不代表本地拦截。',
   },
+  local_operational_ransomware_authoring: {
+    label: '可运行勒索软件编写组合',
+    description: '同一请求分区同时要求构建可部署勒索软件，并出现多项具体实现能力，因此改走 Relay；不代表本地拦截。',
+  },
   local_ml_model_backdoor_training: {
     label: '模型后门训练组合',
     description: '同一请求分区同时出现模型后门、训练动作与触发器/损失目标，因此改走 Relay；不代表本地拦截。',
