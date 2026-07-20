@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -25,12 +26,22 @@ const promptCyberPolicyMessage = "This request was blocked by the content policy
 const promptFilterUserTextRescueSignal = "user_text_rescue"
 const promptFilterSQLCredentialExfiltrationSignal = "local_sql_credential_exfiltration"
 const promptFilterTargetedCovertSurveillanceSignal = "local_targeted_covert_surveillance"
+const promptFilterNonZhEnLanguageSignal = "local_non_zh_en_language"
 const promptFilterMLModelBackdoorTrainingSignal = "local_ml_model_backdoor_training"
 const promptFilterRemoteCommandControlPlatformSignal = "local_remote_command_control_platform"
 const promptFilterSecurityCodeAuditSignal = "local_security_code_audit"
 const promptFilterLoginProtectionReverseEngineeringSignal = "local_login_protection_reverse_engineering"
 const promptFilterPersonalMediaCacheDecodeSignal = "local_personal_media_cache_decode"
 const contextPromptFilterScanMeta = "promptFilterScanMeta"
+
+var promptFilterNonZhEnRelayEnabled = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_NON_ZH_EN_RELAY_ENABLED"))) {
+	case "0", "false", "off", "no", "disabled":
+		return false
+	default:
+		return true
+	}
+}()
 
 type promptFilterRouteScan struct {
 	Verdict       promptfilter.Verdict
@@ -567,6 +578,22 @@ func promptFilterTargetedCovertSurveillancePayloadVerdict(rawBody []byte, endpoi
 	return false
 }
 
+func promptFilterNonZhEnLanguagePayloadVerdict(rawBody []byte, endpoint string) bool {
+	if !promptFilterNonZhEnRelayEnabled || !cybRelayTextEndpoint(endpoint) {
+		return false
+	}
+	partitioned := promptfilter.ExtractRoutingPartitions(rawBody, endpoint)
+	if !promptFilterPartitionsUsable(partitioned) {
+		return false
+	}
+	for _, partition := range partitioned.Partitions {
+		if promptfilter.LooksLikeNonChineseEnglishNaturalLanguage(partition.Text) {
+			return true
+		}
+	}
+	return false
+}
+
 func withoutPromptFilterRouteSignal(signals []string, excluded string) []string {
 	filtered := make([]string, 0, len(signals))
 	for _, signal := range signals {
@@ -612,6 +639,9 @@ func promptFilterCYBSignal(verdict promptfilter.Verdict, text string, cfg prompt
 	}
 	if promptFilterTargetedCovertSurveillanceVerdict(text) {
 		signals = append(signals, promptFilterTargetedCovertSurveillanceSignal)
+	}
+	if promptFilterNonZhEnRelayEnabled && promptfilter.LooksLikeNonChineseEnglishNaturalLanguage(text) {
+		signals = append(signals, promptFilterNonZhEnLanguageSignal)
 	}
 	for _, signal := range promptFilterObservedGapSignals(text) {
 		signals = appendUniqueRouteSignal(signals, signal)
@@ -793,6 +823,7 @@ func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promp
 	// Re-add it only after an independent bounded partition extraction proves
 	// all witnesses coexist in one real payload compartment.
 	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
+	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterNonZhEnLanguageSignal)
 	for _, signal := range []string{
 		promptFilterMLModelBackdoorTrainingSignal,
 		promptFilterRemoteCommandControlPlatformSignal,
@@ -804,6 +835,9 @@ func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promp
 	}
 	if cfg.Enabled && promptFilterTargetedCovertSurveillancePayloadVerdict(rawBody, endpoint) {
 		fullScan.Signals = appendUniqueRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
+	}
+	if cfg.Enabled && promptFilterNonZhEnLanguagePayloadVerdict(rawBody, endpoint) {
+		fullScan.Signals = appendUniqueRouteSignal(fullScan.Signals, promptFilterNonZhEnLanguageSignal)
 	}
 	if cfg.Enabled {
 		for _, signal := range promptFilterObservedGapPayloadSignals(rawBody, endpoint) {

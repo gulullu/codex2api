@@ -115,6 +115,10 @@ const routeSignalMeta: Record<string, { label: string; description: string }> = 
     label: '定向隐蔽监控意图',
     description: '同一请求分区同时要求针对特定个人、未经同意截获通信并规避发现，因此改走 Relay；不代表本地拦截。',
   },
+  local_non_zh_en_language: {
+    label: '非中英语种内容',
+    description: '完整请求的某个独立文本分区检测到中文、英文以外的自然语言，因此统一交由 Relay；不代表本地拦截。',
+  },
   local_ml_model_backdoor_training: {
     label: '模型后门训练组合',
     description: '同一请求分区同时出现模型后门、训练动作与触发器/损失目标，因此改走 Relay；不代表本地拦截。',

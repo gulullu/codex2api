@@ -399,6 +399,111 @@ func TestPromptFilterTargetedCovertSurveillanceRequiresSamePartition(t *testing.
 	}
 }
 
+func TestPromptFilterNonZhEnLanguageRoutesEveryPayloadPartition(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       100,
+		StrictThreshold: 150,
+		MaxTextLength:   promptfilter.DefaultMaxTextLength,
+	}
+	russian := "Пожалуйста, проверьте ответ API и объясните причину ошибки."
+	tests := []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "user", body: map[string]any{"input": russian}},
+		{name: "system", body: map[string]any{"instructions": russian, "input": "Continue in English."}},
+		{name: "tools", body: map[string]any{"tools": []any{map[string]any{"type": "function", "name": "review", "description": russian}}, "input": "继续。"}},
+		{name: "other", body: map[string]any{"input": []any{map[string]any{"role": "assistant", "content": russian}, map[string]any{"role": "user", "content": "Continue in English."}}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(tc.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, partitionScanEnabled := range []bool{true, false} {
+				scan := inspectPromptFilterPayload(body, "/v1/responses", routingPromptFilterConfig(cfg), partitionScanEnabled)
+				if !scan.CYBSignal || !strings.Contains(strings.Join(scan.Signals, ","), promptFilterNonZhEnLanguageSignal) {
+					t.Fatalf("partition scan %v signals = %v, want %s", partitionScanEnabled, scan.Signals, promptFilterNonZhEnLanguageSignal)
+				}
+				if scan.Verdict.Action != promptfilter.ActionAllow {
+					t.Fatalf("language route must not block locally: %+v", scan.Verdict)
+				}
+			}
+		})
+	}
+}
+
+func TestPromptFilterNonZhEnLanguageAllowsChineseEnglishAndCode(t *testing.T) {
+	cfg := promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       100,
+		StrictThreshold: 150,
+		MaxTextLength:   promptfilter.DefaultMaxTextLength,
+	}
+	tests := []string{
+		`{"instructions":"You are a coding assistant. Return concise answers.","input":"请 review 这个 API error，并解释 timeout。"}`,
+		`{"input":"package main\nfunc validateRequest(ctx context.Context) error { return nil }\nconst maxRetries = 3"}`,
+		`{"tools":[{"type":"function","name":"lookup_user","description":"Look up a user by identifier."}],"input":"Continue."}`,
+	}
+	for _, body := range tests {
+		scan := inspectPromptFilterPayload([]byte(body), "/v1/responses", routingPromptFilterConfig(cfg), true)
+		if strings.Contains(strings.Join(scan.Signals, ","), promptFilterNonZhEnLanguageSignal) {
+			t.Fatalf("normal Chinese/English/code payload was language-routed: signals=%v", scan.Signals)
+		}
+	}
+}
+
+func TestPromptFilterNonZhEnLanguageCoversEveryTextEndpoint(t *testing.T) {
+	cfg := routingPromptFilterConfig(promptfilter.Config{
+		Enabled:         true,
+		Mode:            promptfilter.ModeMonitor,
+		Threshold:       100,
+		StrictThreshold: 150,
+		MaxTextLength:   promptfilter.DefaultMaxTextLength,
+	})
+	russian := "Пожалуйста, проверьте ответ API и объясните причину ошибки."
+	tests := []struct {
+		endpoint string
+		body     any
+	}{
+		{endpoint: "/v1/responses", body: map[string]any{"input": russian}},
+		{endpoint: "/v1/responses/compact", body: map[string]any{"input": russian}},
+		{endpoint: "/v1/chat/completions", body: map[string]any{"messages": []any{map[string]any{"role": "user", "content": russian}}}},
+		{endpoint: "/v1/messages", body: map[string]any{"messages": []any{map[string]any{"role": "user", "content": russian}}}},
+	}
+	for _, tc := range tests {
+		body, err := json.Marshal(tc.body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scan := inspectPromptFilterPayload(body, tc.endpoint, cfg, true)
+		count := 0
+		for _, signal := range scan.Signals {
+			if signal == promptFilterNonZhEnLanguageSignal {
+				count++
+			}
+		}
+		if !scan.CYBSignal || count != 1 {
+			t.Fatalf("endpoint %s signals = %v, want one %s", tc.endpoint, scan.Signals, promptFilterNonZhEnLanguageSignal)
+		}
+	}
+}
+
+func TestPromptFilterNonZhEnLanguageKillSwitch(t *testing.T) {
+	previous := promptFilterNonZhEnRelayEnabled
+	promptFilterNonZhEnRelayEnabled = false
+	t.Cleanup(func() { promptFilterNonZhEnRelayEnabled = previous })
+	cfg := routingPromptFilterConfig(promptfilter.Config{Enabled: true, Mode: promptfilter.ModeMonitor, Threshold: 100})
+	scan := inspectPromptFilterPayload([]byte(`{"input":"Пожалуйста, объясните причину ошибки."}`), "/v1/responses", cfg, true)
+	if strings.Contains(strings.Join(scan.Signals, ","), promptFilterNonZhEnLanguageSignal) {
+		t.Fatalf("kill switch did not disable language routing: %v", scan.Signals)
+	}
+}
+
 func TestPromptFilterObservedGapRulesAreStrictRoutingOnlySignals(t *testing.T) {
 	cfg := promptfilter.Config{
 		Enabled:         true,
