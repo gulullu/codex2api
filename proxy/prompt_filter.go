@@ -27,6 +27,8 @@ const promptFilterUserTextRescueSignal = "user_text_rescue"
 const promptFilterSQLCredentialExfiltrationSignal = "local_sql_credential_exfiltration"
 const promptFilterTargetedCovertSurveillanceSignal = "local_targeted_covert_surveillance"
 const promptFilterNonZhEnLanguageSignal = "local_non_zh_en_language"
+const promptFilterCTFFlagExploitationSignal = "local_ctf_flag_exploitation"
+const promptFilterOperationalSecurityTestingPlatformSignal = "local_operational_security_testing_platform"
 const promptFilterOperationalRansomwareAuthoringSignal = "local_operational_ransomware_authoring"
 const promptFilterMLModelBackdoorTrainingSignal = "local_ml_model_backdoor_training"
 const promptFilterRemoteCommandControlPlatformSignal = "local_remote_command_control_platform"
@@ -121,6 +123,35 @@ var promptFilterOperationalRansomwareCapabilityPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(?:delet(?:e|es|ed|ing)|remov(?:e|es|ed|ing)|eras(?:e|es|ed|ing)|destroy(?:s|ed|ing)?|disabl(?:e|es|ed|ing)|inhibit(?:s|ed|ing)?)\b[^.!?\n]{0,80}\b(?:volume\s+)?shadow\s+cop(?:y|ies)\b|\b(?:vssadmin|wmic\s+shadowcopy|inhibit\s+system\s+recovery|disable\s+(?:system\s+)?recovery|delete\s+backups?)\b`),
 	regexp.MustCompile(`(?i)\b(?:tor(?:[- ]hosted)?|onion)\b[^.!?\n]{0,100}\b(?:payment|portal|site|service)\b|\b(?:cryptocurrency|crypto|bitcoin|monero)\b[^.!?\n]{0,80}\b(?:payment|wallet|address)\b|\b(?:ransom\s+note|payment\s+portal)\b`),
 	regexp.MustCompile(`(?i)\b(?:working|complete|runnable|full|deployable|functional)\b[^.!?\n]{0,40}\b(?:source\s+code|code|implementation|payload|executable|binary)\b|\bsource\s+code\b`),
+}
+
+// This rule covers an observed OAuth CYB family where an autonomous agent is
+// given a concrete CTF service and told to keep exploiting it until a flag is
+// obtained. CTF terminology or flag-format documentation alone is not enough:
+// all four witnesses must coexist in one independently scanned partition.
+var promptFilterCTFFlagExploitationPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:ctf|capture[- ]the[- ]flag)\b|(?:ctf|夺旗)(?:题|挑战|靶场|比赛)`),
+	regexp.MustCompile(`(?i)\b(?:host|origin|target)\s*[:=]\s*(?:https?://)?[a-z0-9._-]+(?:(?:\s+|[,;]\s*)port\s*[:=]\s*\d{2,5}|:\d{2,5})|https?://[a-z0-9._-]+(?::\d{2,5})?(?:[/\s]|$)|\b(?:\d{1,3}\.){3}\d{1,3}\s+(?:port\s*[:=]\s*)\d{2,5}\b`),
+	regexp.MustCompile(`(?i)\b(?:get|obtain|retrieve|capture|find|recover|submit)\s+(?:the\s+)?flags?\b|(?:目标|任务|目的)[^。！？\n]{0,24}(?:获取|拿到|找到|夺取|提交)\s*(?:到)?\s*flag|(?:获取|拿到|找到|夺取|提交)\s*(?:到)?\s*flag`),
+	regexp.MustCompile(`(?i)\b(?:keep\s+working|do\s+not\s+stop|don't\s+stop|continue\s+(?:working|executing|exploiting)|until\s+(?:the\s+)?(?:goal|flag)|solve\s+the\s+challenge|execute\s+(?:the\s+)?(?:exploit|commands?|tools?))\b|(?:持续|继续)(?:执行|推进|工作|利用|完成)|不要停止|直到[^。！？\n]{0,24}(?:完成|获取|拿到)\s*(?:flag)?`),
+}
+
+// This rule covers an observed OAuth CYB family where a pentest product is
+// not merely discussed: the request asks the agent to implement an active
+// verification platform spanning multiple offensive testing families. The
+// capability-family count prevents generic security product development or a
+// single vulnerability mention from becoming a route signal.
+var promptFilterOperationalSecurityTestingPlatformPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:pentest|penetration[- ]testing|security[- ]testing|vulnerability[- ]testing|attack[- ]surface)\b[^.!?\n]{0,80}\b(?:platform|engine|system|product|framework|scanner)\b|(?:渗透测试|安全测试|漏洞测试|漏洞扫描|攻击面)[^。！？\n]{0,50}(?:平台|引擎|系统|产品|框架|扫描器)`),
+	regexp.MustCompile(`(?i)\b(?:implement|develop|build|code|integrate|ship|complete|continue|finish|push|merge)\b[^.!?\n]{0,120}\b(?:platform|engine|module|capabilit(?:y|ies)|feature|code|implementation|prs?)\b|(?:实现|开发|构建|编码|集成|完成|继续|持续|推送|合并)[^。！？\n]{0,100}(?:平台|引擎|模块|能力|功能|代码|实现|PR)`),
+	regexp.MustCompile(`(?i)\b(?:active\s+verification|exploit\s+verification|poc\s+replay|verification\s+(?:recipe|executor|engine)|evidence\s+engine|proof\s+contract|executed\s+requests?|positive\s+assertion)\b|(?:主动验证|漏洞验证|利用验证|攻击复现|PoC\s*(?:复现|回放)|验证执行器|验证引擎|证据引擎|确定性断言)`),
+}
+
+var promptFilterOperationalSecurityTestingCapabilityPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:idor|cross[- ]user|cross[- ]tenant|auth(?:entication|orization)?\s+bypass|workflow\s+bypass|privilege\s+escalation)\b|(?:越权|跨用户|跨租户|认证绕过|授权绕过|权限绕过|工作流绕过|提权)`),
+	regexp.MustCompile(`(?i)\b(?:sqli|sql\s+injection|command\s+injection|ssti|rce|remote\s+code\s+execution)\b|(?:sql\s*注入|命令注入|模板注入|远程代码执行)`),
+	regexp.MustCompile(`(?i)\b(?:ssrf|xss|file\s+upload|graphql\s+mutation|race\s+condition|toctou|secret\s+exposure|config\s+exposure)\b|(?:服务端请求伪造|跨站脚本|文件上传|竞态|重复提交|密钥泄露|配置泄露)`),
+	regexp.MustCompile(`(?i)\b(?:stateful\s+authorization|business\s+logic|refund\s+manipulation|approval\s+manipulation|price\s+manipulation|multi[- ]tenant\s+saas)\b|(?:状态化授权|业务逻辑|退款操纵|审批操纵|价格操纵|多租户)`),
 }
 
 // These rules fill production-observed OAuth CYB routing gaps. Every
@@ -548,8 +579,31 @@ func promptFilterOperationalRansomwareAuthoringVerdict(text string) bool {
 	return capabilities == len(promptFilterOperationalRansomwareCapabilityPatterns)
 }
 
+func promptFilterCTFFlagExploitationVerdict(text string) bool {
+	return promptFilterAllWitnessesMatch(text, promptFilterCTFFlagExploitationPatterns)
+}
+
+func promptFilterOperationalSecurityTestingPlatformVerdict(text string) bool {
+	if !promptFilterAllWitnessesMatch(text, promptFilterOperationalSecurityTestingPlatformPatterns) {
+		return false
+	}
+	capabilityFamilies := 0
+	for _, pattern := range promptFilterOperationalSecurityTestingCapabilityPatterns {
+		if pattern != nil && pattern.MatchString(text) {
+			capabilityFamilies++
+		}
+	}
+	return capabilityFamilies >= 2
+}
+
 func promptFilterObservedGapSignals(text string) []string {
-	signals := make([]string, 0, 6)
+	signals := make([]string, 0, 8)
+	if promptFilterCTFFlagExploitationVerdict(text) {
+		signals = append(signals, promptFilterCTFFlagExploitationSignal)
+	}
+	if promptFilterOperationalSecurityTestingPlatformVerdict(text) {
+		signals = append(signals, promptFilterOperationalSecurityTestingPlatformSignal)
+	}
 	if promptFilterOperationalRansomwareAuthoringVerdict(text) {
 		signals = append(signals, promptFilterOperationalRansomwareAuthoringSignal)
 	}
@@ -859,6 +913,8 @@ func inspectPromptFilterPayloadLegacy(rawBody []byte, endpoint string, cfg promp
 	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterTargetedCovertSurveillanceSignal)
 	fullScan.Signals = withoutPromptFilterRouteSignal(fullScan.Signals, promptFilterNonZhEnLanguageSignal)
 	for _, signal := range []string{
+		promptFilterCTFFlagExploitationSignal,
+		promptFilterOperationalSecurityTestingPlatformSignal,
 		promptFilterOperationalRansomwareAuthoringSignal,
 		promptFilterMLModelBackdoorTrainingSignal,
 		promptFilterRemoteCommandControlPlatformSignal,

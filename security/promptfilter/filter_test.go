@@ -469,6 +469,51 @@ func TestExtractRoutingUserTextDoesNotFallbackToFullPayload(t *testing.T) {
 	}
 }
 
+func TestExtractLatestRoutingUserTextReturnsOnlyNewestVisibleTurn(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "compatibility history"}},
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "older visible turn"}}},
+			map[string]any{"role": "assistant", "content": "assistant history"},
+			map[string]any{"type": "reasoning", "encrypted_content": strings.Repeat("CIPHER", 100)},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "input_image", "image_url": "https://private.invalid/image"},
+				map[string]any{"type": "input_text", "text": "latest visible turn"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	got := ExtractLatestRoutingUserText(body, "/v1/responses", len(body))
+	if got != "latest visible turn" {
+		t.Fatalf("latest routing user text = %q", got)
+	}
+}
+
+func TestExtractLatestRoutingUserTextSupportsDirectResponsesAndChat(t *testing.T) {
+	tests := []struct {
+		name, endpoint, body, want string
+	}{
+		{"responses direct", "/v1/responses", `{"input":"direct current user"}`, "direct current user"},
+		{"chat", "/v1/chat/completions", `{"messages":[{"role":"user","content":"older"},{"role":"assistant","content":"reply"},{"role":"user","content":"latest chat user"}]}`, "latest chat user"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ExtractLatestRoutingUserText([]byte(tc.body), tc.endpoint, len(tc.body)); got != tc.want {
+				t.Fatalf("latest routing user text = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractLatestRoutingUserTextDoesNotFallback(t *testing.T) {
+	body := []byte(`{"instructions":"SYSTEM","input":[{"type":"reasoning","encrypted_content":"OPAQUE"},{"type":"function_call_output","output":"TOOL"}]}`)
+	if got := ExtractLatestRoutingUserText(body, "/v1/responses", len(body)); got != "" {
+		t.Fatalf("latest routing user extractor leaked non-user payload: %q", got)
+	}
+}
+
 func TestLimitScanTextPreservesUTF8(t *testing.T) {
 	text := strings.Repeat("界", 40000) + strings.Repeat("🙂", 1000) + "tail关键字"
 	got := limitScanText(text, 80*1024)

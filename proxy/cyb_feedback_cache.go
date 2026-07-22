@@ -13,15 +13,21 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
 	upstreamCybFeedbackSignal         = "upstream_cyb_feedback_hash"
 	contextUpstreamCybFeedbackDigest  = "upstreamCybFeedbackDigest"
-	upstreamCybFeedbackHashDomain     = "codex2api-upstream-cyb-feedback-v1"
+	upstreamCybFeedbackHashDomain     = "codex2api-upstream-cyb-feedback-v2"
+	upstreamCybFeedbackTextMode       = "latest-visible-user-text"
+	upstreamCybFeedbackRawBodyMode    = "raw-body-fallback"
+	upstreamCybFeedbackMinimumRunes   = 16
 	upstreamCybFeedbackDefaultTTL     = 24 * time.Hour
 	upstreamCybFeedbackMaximumTTL     = 24 * time.Hour
 	upstreamCybFeedbackDefaultEntries = 1024
@@ -41,8 +47,10 @@ type upstreamCybFeedbackEntry struct {
 	ExpiresAt time.Time
 }
 
-// upstreamCybFeedbackCache remembers only a keyed digest of an exact request.
-// It deliberately stores neither prompt text nor a reusable session identity.
+// upstreamCybFeedbackCache remembers only a keyed digest of the normalized
+// latest visible user turn. Requests without at least 16 visible runes retain
+// exact raw-body semantics so short probes cannot expand across envelopes. It
+// deliberately stores neither prompt text nor a reusable session identity.
 // The process-random key also makes persisted/offline dictionary attacks
 // impossible because the whole cache disappears when the process exits.
 type upstreamCybFeedbackCache struct {
@@ -141,12 +149,29 @@ func (c *upstreamCybFeedbackCache) digest(endpoint string, rawBody []byte) (upst
 	if c == nil || !c.enabled || len(rawBody) == 0 || !cybRelayTextEndpoint(endpoint) {
 		return digest, false
 	}
+	mode := upstreamCybFeedbackRawBodyMode
+	material := rawBody
+	latestUserText := normalizeUpstreamCybFeedbackText(
+		promptfilter.ExtractLatestRoutingUserText(rawBody, endpoint, len(rawBody)),
+	)
+	if utf8.RuneCountInString(latestUserText) >= upstreamCybFeedbackMinimumRunes {
+		mode = upstreamCybFeedbackTextMode
+		material = []byte(latestUserText)
+	}
 	mac := hmac.New(sha256.New, c.key[:])
 	writeUpstreamCybFeedbackFrame(mac, []byte(upstreamCybFeedbackHashDomain))
 	writeUpstreamCybFeedbackFrame(mac, []byte(strings.ToLower(strings.TrimSpace(endpoint))))
-	writeUpstreamCybFeedbackFrame(mac, rawBody)
+	writeUpstreamCybFeedbackFrame(mac, []byte(mode))
+	writeUpstreamCybFeedbackFrame(mac, material)
 	copy(digest[:], mac.Sum(nil))
 	return digest, true
+}
+
+func normalizeUpstreamCybFeedbackText(text string) string {
+	text = norm.NFKC.String(text)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return strings.TrimSpace(text)
 }
 
 type upstreamCybFeedbackHashWriter interface {
@@ -220,9 +245,10 @@ func (c *upstreamCybFeedbackCache) removeElementLocked(element *list.Element) {
 	c.lru.Remove(element)
 }
 
-// captureUpstreamCybFeedbackRequest records a digest of the original inbound
-// bytes. HTTP handlers use overwrite=false so an internal /responses ->
-// /responses/compact hand-off keeps the real public endpoint and body. A
+// captureUpstreamCybFeedbackRequest records a digest of the normalized latest
+// visible user turn, falling back to the original inbound bytes for short or
+// missing text. HTTP handlers use overwrite=false so an internal /responses ->
+// /responses/compact hand-off keeps the real public endpoint and envelope. A
 // Responses WebSocket connection uses overwrite=true once per turn because a
 // gin.Context is shared across turns.
 func (h *Handler) captureUpstreamCybFeedbackRequest(c *gin.Context, endpoint string, rawBody []byte, overwrite bool) {
@@ -268,7 +294,7 @@ func (h *Handler) applyUpstreamCybFeedbackRoute(c *gin.Context, rawBody []byte, 
 	}
 	return promptRiskDecision{
 		Disposition:        promptRiskDispositionRelay,
-		Reason:             "Exact request previously received OAuth cyber_policy",
+		Reason:             "Exact current user text previously received OAuth cyber_policy",
 		Signals:            []string{upstreamCybFeedbackSignal},
 		RouteSource:        cybRelayRouteSourceDirect,
 		SkipPinPersistence: true,

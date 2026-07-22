@@ -50,7 +50,31 @@ func newUpstreamCybFeedbackTestContext(endpoint string) *gin.Context {
 	return ctx
 }
 
-func TestUpstreamCybFeedbackDigestIsExactAndKeyed(t *testing.T) {
+func TestUpstreamCybFeedbackDigestUsesNormalizedLatestVisibleUserText(t *testing.T) {
+	var firstKey [sha256.Size]byte
+	firstKey[0] = 1
+	cfg := upstreamCybFeedbackConfig{Enabled: true, TTL: time.Hour, MaxEntries: 8}
+	cache := newUpstreamCybFeedbackCacheForTest(cfg, firstKey, time.Now)
+	firstBody := []byte(`{"model":"gpt-5.6-sol","input":"Please build the security verifier.\nReturn reproducible evidence.","stream":false}`)
+	secondBody := []byte(`{"metadata":{"trace":"different-envelope"},"instructions":"A different system shell.","model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"older user turn that must not own the digest"}]},{"role":"assistant","content":[{"type":"output_text","text":"older answer"}]},{"role":"user","content":[{"type":"input_text","text":"  Ｐlease build the security verifier.\r\nReturn reproducible evidence.  "}]}],"stream":true}`)
+
+	digest, ok := cache.digest("/v1/responses", firstBody)
+	if !ok {
+		t.Fatal("eligible request did not produce a digest")
+	}
+	sameText, ok := cache.digest("/v1/responses", secondBody)
+	if !ok {
+		t.Fatal("same user text in a different envelope did not produce a digest")
+	}
+	if digest != sameText {
+		t.Fatal("NFKC/newline/trim-equivalent latest user text must share a digest across envelopes")
+	}
+	if got := normalizeUpstreamCybFeedbackText("  Ｐlease\r\ncontinue\r  "); got != "Please\ncontinue" {
+		t.Fatalf("normalized text = %q, want %q", got, "Please\ncontinue")
+	}
+}
+
+func TestUpstreamCybFeedbackDigestSeparatesDifferentUserTextEndpointAndKey(t *testing.T) {
 	var firstKey [sha256.Size]byte
 	var secondKey [sha256.Size]byte
 	firstKey[0] = 1
@@ -58,30 +82,50 @@ func TestUpstreamCybFeedbackDigestIsExactAndKeyed(t *testing.T) {
 	cfg := upstreamCybFeedbackConfig{Enabled: true, TTL: time.Hour, MaxEntries: 8}
 	first := newUpstreamCybFeedbackCacheForTest(cfg, firstKey, time.Now)
 	second := newUpstreamCybFeedbackCacheForTest(cfg, secondKey, time.Now)
-	body := []byte(`{"model":"gpt-5.6-sol","input":"same exact bytes"}`)
+	body := []byte(`{"model":"gpt-5.6-sol","input":"Please build the security verifier with reproducible evidence."}`)
 
 	digest, ok := first.digest("/v1/responses", body)
 	if !ok {
 		t.Fatal("eligible request did not produce a digest")
 	}
-	same, _ := first.digest("/v1/responses", append([]byte(nil), body...))
-	if digest != same {
-		t.Fatal("same endpoint and exact body produced different digests")
+	differentTextBody := []byte(`{"model":"gpt-5.6-sol","input":"Please build a different security verifier with other evidence."}`)
+	differentText, _ := first.digest("/v1/responses", differentTextBody)
+	if digest == differentText {
+		t.Fatal("different latest visible user text must miss")
 	}
-	differentBody, _ := first.digest("/v1/responses", append(body, ' '))
-	if digest == differentBody {
-		t.Fatal("one-byte body change must miss")
-	}
-	differentEndpoint, _ := first.digest("/v1/chat/completions", body)
+	chatBody := []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"Please build the security verifier with reproducible evidence."}]}`)
+	differentEndpoint, _ := first.digest("/v1/chat/completions", chatBody)
 	if digest == differentEndpoint {
 		t.Fatal("different endpoint must miss")
 	}
-	differentKey, _ := second.digest("/v1/responses", body)
+	differentKey, _ := second.digest("/v1/responses", append([]byte(nil), body...))
 	if digest == differentKey {
 		t.Fatal("different process HMAC keys must isolate digests")
 	}
 	if _, ok := first.digest("/v1/images/generations", body); ok {
 		t.Fatal("non-text endpoint must not be captured")
+	}
+}
+
+func TestUpstreamCybFeedbackDigestShortTextFallsBackToRawBody(t *testing.T) {
+	var key [sha256.Size]byte
+	cache := newUpstreamCybFeedbackCacheForTest(upstreamCybFeedbackConfig{
+		Enabled: true, TTL: time.Hour, MaxEntries: 8,
+	}, key, time.Now)
+	firstBody := []byte(`{"model":"gpt-5.6-sol","input":"short","stream":false}`)
+	secondBody := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":" short "}]}],"stream":true}`)
+
+	first, ok := cache.digest("/v1/responses", firstBody)
+	if !ok {
+		t.Fatal("short request did not produce its raw-body fallback digest")
+	}
+	sameRawBody, _ := cache.digest("/v1/responses", append([]byte(nil), firstBody...))
+	if first != sameRawBody {
+		t.Fatal("identical short raw bodies must share a fallback digest")
+	}
+	differentEnvelope, _ := cache.digest("/v1/responses", secondBody)
+	if first == differentEnvelope {
+		t.Fatal("short equivalent text in a different envelope must retain exact raw-body semantics")
 	}
 }
 
@@ -268,7 +312,7 @@ func TestLogUsageForRequestMarksAndLearnsCanonicalCyberPolicy(t *testing.T) {
 	}
 }
 
-func TestUpstreamCybFeedbackHTTPFlowRoutesOnlyExactRepeatAfterCanonicalOAuthCyberPolicy(t *testing.T) {
+func TestUpstreamCybFeedbackHTTPFlowRoutesSameLatestTextAfterCanonicalOAuthCyberPolicy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("CODEX_TRANSPORT_MODE", "standard")
 	previousWebsocketExecute := WebsocketExecuteFunc
@@ -353,13 +397,20 @@ func TestUpstreamCybFeedbackHTTPFlowRoutesOnlyExactRepeatAfterCanonicalOAuthCybe
 		t.Fatalf("exact repeat decision = %+v present=%v", decision, ok)
 	}
 
-	changed, _ := run(append(body, ' '))
-	if changed.Code != http.StatusBadRequest || oauthCalls.Load() != 2 || relayCalls.Load() != 1 {
-		t.Fatalf("one-byte change status=%d oauth=%d relay=%d body=%s", changed.Code, oauthCalls.Load(), relayCalls.Load(), changed.Body.String())
+	differentEnvelope := []byte(`{"metadata":{"trace":"new-envelope"},"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"  benign exact feedback lifecycle  "}]}],"stream":false}`)
+	envelopeRepeat, _ := run(differentEnvelope)
+	if envelopeRepeat.Code != http.StatusOK || oauthCalls.Load() != 1 || relayCalls.Load() != 2 {
+		t.Fatalf("same-text envelope repeat status=%d oauth=%d relay=%d body=%s", envelopeRepeat.Code, oauthCalls.Load(), relayCalls.Load(), envelopeRepeat.Body.String())
+	}
+
+	changedText := []byte(`{"model":"gpt-5.4","input":"benign different feedback lifecycle","stream":false}`)
+	changed, _ := run(changedText)
+	if changed.Code != http.StatusBadRequest || oauthCalls.Load() != 2 || relayCalls.Load() != 2 {
+		t.Fatalf("changed text status=%d oauth=%d relay=%d body=%s", changed.Code, oauthCalls.Load(), relayCalls.Load(), changed.Body.String())
 	}
 }
 
-func TestUpstreamCybFeedbackWebSocketTurnDoesNotLeakDigestOrPinIntoNextTurn(t *testing.T) {
+func TestUpstreamCybFeedbackWebSocketLearnsThenRoutesSameTextDifferentEnvelope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("CODEX_TRANSPORT_MODE", "standard")
 	previousWebsocketExecute := WebsocketExecuteFunc
@@ -371,12 +422,12 @@ func TestUpstreamCybFeedbackWebSocketTurnDoesNotLeakDigestOrPinIntoNextTurn(t *t
 			t.Errorf("OAuth hook account = %d, want 54", account.ID())
 		}
 		oauthCalls.Add(1)
-		sse := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"oauth\"}\n\n" +
-			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_oauth\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
 		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-			Body:       io.NopCloser(bytes.NewBufferString(sse)),
+			StatusCode: http.StatusBadRequest,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(bytes.NewBufferString(
+				`{"error":{"code":"cyber_policy","type":"invalid_request_error","message":"This content was flagged for possible cybersecurity risk."}}`,
+			)),
 		}, nil
 	}
 
@@ -430,25 +481,27 @@ func TestUpstreamCybFeedbackWebSocketTurnDoesNotLeakDigestOrPinIntoNextTurn(t *t
 	}, key, time.Now)
 
 	firstPayload := []byte(`{"type":"response.create","model":"gpt-5.4","input":"benign exact feedback lifecycle"}`)
-	firstDigest, _ := handler.upstreamCybFeedback.digest("/v1/responses", firstPayload)
-	handler.upstreamCybFeedback.learnDigest(firstDigest)
-	secondPayload := []byte(`{"type":"response.create","model":"gpt-5.4","input":"benign different feedback lifecycle"}`)
+	secondPayload := []byte(`{"type":"response.create","metadata":{"trace":"different-envelope"},"model":"gpt-5.4","input":[{"role":"user","content":[{"type":"input_text","text":"  benign exact feedback lifecycle  "}]}]}`)
+	thirdPayload := []byte(`{"type":"response.create","model":"gpt-5.4","input":"benign different feedback lifecycle"}`)
 
 	router := gin.New()
 	handler.RegisterRoutes(router)
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
-	connection, response, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):]+"/v1/responses", nil)
-	if err != nil {
-		if response != nil {
-			t.Fatalf("dial websocket: %v status=%d", err, response.StatusCode)
-		}
-		t.Fatalf("dial websocket: %v", err)
-	}
-	t.Cleanup(func() { _ = connection.Close() })
 
-	readCompleted := func(label string) {
+	runTurn := func(label string, payload []byte, wantType string) []byte {
 		t.Helper()
+		connection, response, err := websocket.DefaultDialer.Dial("ws"+server.URL[len("http"):]+"/v1/responses", nil)
+		if err != nil {
+			if response != nil {
+				t.Fatalf("%s dial websocket: %v status=%d", label, err, response.StatusCode)
+			}
+			t.Fatalf("%s dial websocket: %v", label, err)
+		}
+		defer connection.Close()
+		if err := connection.WriteMessage(websocket.TextMessage, payload); err != nil {
+			t.Fatalf("%s write turn: %v", label, err)
+		}
 		_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
 		for eventIndex := 0; eventIndex < 8; eventIndex++ {
 			_, event, readErr := connection.ReadMessage()
@@ -456,29 +509,30 @@ func TestUpstreamCybFeedbackWebSocketTurnDoesNotLeakDigestOrPinIntoNextTurn(t *t
 				t.Fatalf("%s read event: %v", label, readErr)
 			}
 			switch eventType := gjson.GetBytes(event, "type").String(); eventType {
-			case "response.completed":
-				return
-			case "error":
-				t.Fatalf("%s returned error event: %s", label, event)
+			case "response.completed", "error":
+				if eventType != wantType {
+					t.Fatalf("%s terminal type=%q want=%q event=%s", label, eventType, wantType, event)
+				}
+				return event
 			}
 		}
-		t.Fatalf("%s did not complete", label)
+		t.Fatalf("%s did not return a terminal event", label)
+		return nil
 	}
 
-	if err := connection.WriteMessage(websocket.TextMessage, firstPayload); err != nil {
-		t.Fatalf("write first turn: %v", err)
-	}
-	readCompleted("feedback turn")
-	if relayCalls.Load() != 1 || oauthCalls.Load() != 0 {
-		t.Fatalf("feedback turn relay=%d oauth=%d, want relay only", relayCalls.Load(), oauthCalls.Load())
+	runTurn("learning turn", firstPayload, "error")
+	if relayCalls.Load() != 0 || oauthCalls.Load() != 1 {
+		t.Fatalf("learning turn relay=%d oauth=%d, want first OAuth miss", relayCalls.Load(), oauthCalls.Load())
 	}
 
-	if err := connection.WriteMessage(websocket.TextMessage, secondPayload); err != nil {
-		t.Fatalf("write second turn: %v", err)
-	}
-	readCompleted("different turn")
+	runTurn("same-text envelope turn", secondPayload, "response.completed")
 	if relayCalls.Load() != 1 || oauthCalls.Load() != 1 {
-		t.Fatalf("different turn relay=%d oauth=%d, stale digest or pin leaked across turns", relayCalls.Load(), oauthCalls.Load())
+		t.Fatalf("same-text envelope turn relay=%d oauth=%d, want learned Relay route", relayCalls.Load(), oauthCalls.Load())
+	}
+
+	runTurn("different-text turn", thirdPayload, "error")
+	if relayCalls.Load() != 1 || oauthCalls.Load() != 2 {
+		t.Fatalf("different-text turn relay=%d oauth=%d, stale digest or pin leaked across turns", relayCalls.Load(), oauthCalls.Load())
 	}
 }
 

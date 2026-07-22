@@ -1214,8 +1214,27 @@ func ExtractUserText(body []byte, endpoint string, maxLen int) string {
 // user text exists it returns an empty string; it never falls back to the full
 // payload.
 func ExtractRoutingUserText(body []byte, endpoint string, maxLen int) string {
+	return latestFirstRoutingText(routingUserSegments(body, endpoint), maxLen)
+}
+
+// ExtractLatestRoutingUserText returns only the newest non-empty visible user
+// turn. It shares the strict, text-only extraction boundary used by
+// ExtractRoutingUserText and never falls back to system, tool, reasoning,
+// image/file or other opaque payload fields.
+func ExtractLatestRoutingUserText(body []byte, endpoint string, maxLen int) string {
+	segments := routingUserSegments(body, endpoint)
+	for index := len(segments) - 1; index >= 0; index-- {
+		segment := strings.TrimSpace(segments[index])
+		if segment != "" {
+			return limitScanText(segment, maxLen)
+		}
+	}
+	return ""
+}
+
+func routingUserSegments(body []byte, endpoint string) []string {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
-		return ""
+		return nil
 	}
 
 	var segments []string
@@ -1225,12 +1244,11 @@ func ExtractRoutingUserText(body []byte, endpoint string, maxLen int) string {
 		collectRoutingMessageSegments(gjson.GetBytes(body, "messages"), &segments)
 	default:
 		// Some Responses-compatible clients send both fields. Treat input as
-		// authoritative/current by collecting it last; latest-first assembly
-		// below therefore preserves it ahead of compatibility messages.
+		// authoritative/current by collecting it last.
 		collectRoutingMessageSegments(gjson.GetBytes(body, "messages"), &segments)
 		collectRoutingInputSegments(gjson.GetBytes(body, "input"), &segments)
 	}
-	return latestFirstRoutingText(segments, maxLen)
+	return segments
 }
 
 func collectRoutingMessageSegments(result gjson.Result, segments *[]string) {
