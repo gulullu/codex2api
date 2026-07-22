@@ -21,6 +21,8 @@ import {
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountHealthBar from "./AccountHealthBar";
+import ChannelLogo from "./ChannelLogo";
+import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -220,7 +222,17 @@ export default function AccountDetailSheet({
         >
           <SheetHeader>
             <div className="flex items-start justify-between gap-3 pr-2">
-              <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-1 items-start gap-3">
+                <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-card ring-1 ring-border shadow-sm">
+                  {account.grok_api ? (
+                    <ChannelLogo channel="grok" size={22} />
+                  ) : account.openai_responses_api ? (
+                    <ModelLogo model="openai" variant="plain" size={22} />
+                  ) : (
+                    <ChannelLogo channel="codex" size={40} className="rounded-xl" />
+                  )}
+                </span>
+                <div className="min-w-0 flex-1">
                 <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                   {sequence != null && (
                     <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] font-semibold text-muted-foreground">
@@ -248,6 +260,7 @@ export default function AccountDetailSheet({
                     {t("accounts.detailSubtitle")}
                   </SheetDescription>
                 )}
+                </div>
               </div>
               <div className="flex shrink-0 items-center gap-0.5">
                 <Button

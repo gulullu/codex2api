@@ -38,9 +38,9 @@ func (h *Handler) CodexAlphaSearchHandler(c *gin.Context) {
 	}
 
 	apiKeyID := requestAPIKeyID(c)
-	// 搜索端点只存在于 ChatGPT 后端，relay API-key 账号无从代答。
+	// 搜索端点只存在于 ChatGPT 后端，relay/Grok 账号无从代答。
 	account := h.store.NextExcludingWithFilter(apiKeyID, nil, func(a *auth.Account) bool {
-		return !a.IsOpenAIResponsesAPI()
+		return !a.IsRelayStyle()
 	})
 	if account == nil {
 		api.SendError(c, api.ErrServiceUnavailable)

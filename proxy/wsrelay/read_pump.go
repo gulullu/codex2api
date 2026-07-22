@@ -132,10 +132,9 @@ func (wc *WsConnection) handleControlPong(appData string) {
 	if wc.session != nil {
 		wc.session.HandlePong()
 	}
-	// Preserve the official keepalive semantics: a successful Pong refreshes
-	// socket liveness. Continuation binding TTL is tracked independently and a
-	// bound-idle socket remains constrained by the separate socket budgets.
-	wc.Touch()
+	// Preserve official socket-liveness semantics without refreshing the
+	// separate business-idle clock used by the opt-in idle reclaimer.
+	wc.touchTransport()
 	wc.touchInbound()
 	wc.notifyProbePong(appData)
 }

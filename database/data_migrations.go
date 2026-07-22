@@ -16,7 +16,10 @@ const (
 	// 去重，AT 轮换后产生的重复账号 v1 清不掉；v2 把 email+user_id 也纳入别名
 	// 后重跑一次合并。
 	dataMigrationOAuthIdentityDedupeV2 = "20260702_oauth_identity_dedupe_v2"
-	dataMigrationTimeout               = 5 * time.Minute
+	// usage_logs.channel 迁移：PostgreSQL 的存量 Codex 行由列的 fast default
+	// 提供 codex 语义，不做全表 UPDATE；SQLite 仍修复旧库中的空值。
+	dataMigrationUsageLogChannelV1 = "20260721_usage_log_channel_backfill_v1"
+	dataMigrationTimeout           = 5 * time.Minute
 )
 
 type oauthIdentityDedupeAccount struct {
@@ -35,7 +38,64 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV1, db.dedupeOAuthIdentityAccounts); err != nil {
 		return err
 	}
-	return db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts)
+	if err := db.runDataMigrationOnce(ctx, dataMigrationOAuthIdentityDedupeV2, db.dedupeOAuthIdentityAccounts); err != nil {
+		return err
+	}
+	return db.runDataMigrationOnce(ctx, dataMigrationUsageLogChannelV1, db.backfillUsageLogChannel)
+}
+
+// backfillUsageLogChannel 只修复确定属于 Grok 的历史行。PostgreSQL 不得在
+// 启动迁移中把整张 usage_logs 更新为 codex：新列以常量 fast default
+// 暴露存量行，旧版写入遗漏 channel 时也由默认值补齐。SQLite 数据量
+// 小且不支持 PostgreSQL 的在线迁移设施，所以仍将真正的空值修复为 codex。
+func (db *DB) backfillUsageLogChannel(ctx context.Context, tx *sql.Tx) error {
+	if db.isSQLite() {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE usage_logs SET channel = 'grok'
+			WHERE COALESCE(channel, '') <> 'grok'
+			  AND account_id IN (SELECT id FROM accounts WHERE platform = 'xai')`); err != nil {
+			return fmt.Errorf("回填 grok 渠道: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE usage_logs SET channel = 'codex'
+			WHERE COALESCE(channel, '') = ''`); err != nil {
+			return fmt.Errorf("回填 codex 渠道: %w", err)
+		}
+		return nil
+	}
+
+	// 先读取极少量的 xai 账号 ID，再按 usage_logs(account_id) 索引定点修复。
+	// 这避免 UPDATE ... FROM 在统计信息不准时选择全表 Hash Join。
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM accounts WHERE platform = 'xai'`)
+	if err != nil {
+		return fmt.Errorf("查询 xai 账号: %w", err)
+	}
+	var xaiAccountIDs []int64
+	for rows.Next() {
+		var accountID int64
+		if err := rows.Scan(&accountID); err != nil {
+			rows.Close()
+			return fmt.Errorf("读取 xai 账号: %w", err)
+		}
+		xaiAccountIDs = append(xaiAccountIDs, accountID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("遍历 xai 账号: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭 xai 账号结果集: %w", err)
+	}
+
+	for _, accountID := range xaiAccountIDs {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE usage_logs SET channel = 'grok'
+			WHERE account_id = $1
+			  AND channel IS DISTINCT FROM 'grok'`, accountID); err != nil {
+			return fmt.Errorf("回填 xai 账号 %d 的 grok 渠道: %w", accountID, err)
+		}
+	}
+	return nil
 }
 
 func (db *DB) runDataMigrationsWithTimeout() error {

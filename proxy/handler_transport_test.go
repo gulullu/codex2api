@@ -13,6 +13,10 @@ func TestResponsesAttemptUsesWebsocketTracksActualAccountTransport(t *testing.T)
 		BaseURL:      "https://relay.example.test/v1",
 		APIKey:       "relay-key",
 	}
+	grokAccount := &auth.Account{
+		UpstreamType: auth.UpstreamGrok,
+		APIKey:       "xai-test-key",
+	}
 
 	tests := []struct {
 		name      string
@@ -23,6 +27,7 @@ func TestResponsesAttemptUsesWebsocketTracksActualAccountTransport(t *testing.T)
 		{name: "oauth websocket selected", account: oauthAccount, requested: true, want: true},
 		{name: "oauth http selected", account: oauthAccount, requested: false, want: false},
 		{name: "relay always uses http", account: relayAccount, requested: true, want: false},
+		{name: "grok always uses http", account: grokAccount, requested: true, want: false},
 		{name: "nil account cannot use websocket", requested: true, want: false},
 	}
 

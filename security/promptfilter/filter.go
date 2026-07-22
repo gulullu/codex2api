@@ -505,8 +505,30 @@ func Inspect(body []byte, endpoint string, cfg Config) Verdict {
 	return InspectText(text, cfg)
 }
 
+// RequiresRequestText 判断当前配置下是否真的需要从请求正文提取文本。
+// 本地 filter 关闭时 InspectText 直接判定为放行；review 仅在本地 filter 产出
+// warn/block 后才触发，risk 只读取聚合分数与身份、不消费正文，newapi 只塑形
+// 已拦截响应——因此这些能力都无法在本地 filter 关闭时独立需要正文。唯一的例外
+// 是 sidecar：当 MinScore<=0 时它可能在零分下仍被调用，故一并纳入判定。
+//
+// 全部相关能力关闭时返回 false，调用方应在提取正文前直接放行，避免对大请求体
+// (曾达 16MB) 做无效的 JSON 遍历/UTF-8 解码 (issue #417)。
+func RequiresRequestText(cfg Config) bool {
+	return cfg.Enabled || cfg.Advanced.Sidecar.Enabled
+}
+
 func InspectText(text string, cfg Config) Verdict {
 	cfg = NormalizeConfig(cfg)
+	// 关闭或空文本时提前返回，避开 Preview 与全量 UTF-8 计数——大文本上这两步
+	// 本身也可观测 (issue #417)。
+	if !cfg.Enabled || strings.TrimSpace(text) == "" {
+		return Verdict{
+			Enabled:   cfg.Enabled,
+			Mode:      cfg.Mode,
+			Action:    ActionAllow,
+			Threshold: cfg.Threshold,
+		}
+	}
 	preview := Preview(text, 500)
 	verdict := Verdict{
 		Enabled:        cfg.Enabled,
@@ -515,9 +537,6 @@ func InspectText(text string, cfg Config) Verdict {
 		Threshold:      cfg.Threshold,
 		TextPreview:    preview,
 		ExtractedChars: utf8.RuneCountInString(text),
-	}
-	if !cfg.Enabled || strings.TrimSpace(text) == "" {
-		return verdict
 	}
 
 	engine, err := engineForConfig(cfg)

@@ -1,8 +1,13 @@
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { createPortal } from "react-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
 import Modal from "../components/Modal";
+import ChannelLogo from "../components/ChannelLogo";
+import ModelLogo from "../components/ModelLogo";
+import { cn } from "@/lib/utils";
+import GrokAccounts from "./GrokAccounts";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
@@ -31,6 +36,7 @@ import type {
   SystemSettings,
   RecycleBinAccountRow,
   RelayGuardianStatusResponse,
+  AgentIdentityImportItem,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -94,6 +100,9 @@ import {
   RotateCcw,
   Pencil,
   Check,
+  CheckCircle,
+  XCircle,
+  Loader2,
   ChevronDown,
   Copy,
   Cookie,
@@ -112,6 +121,7 @@ import {
   ToggleLeft,
   ToggleRight,
   MoreHorizontal,
+  Sparkles,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
@@ -304,6 +314,14 @@ function formatAccountListEmail(account: AccountRow): string {
 
 function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
+}
+
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+function getCreditBalanceDisplay(account: AccountRow): string | null {
+  if (!account.credits_has_credits) return null;
+  if (account.credits_unlimited) return "∞";
+  const balance = (account.credits_balance ?? "").trim();
+  return balance ? balance : null;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -511,7 +529,7 @@ function mergeModelLists(current: string[], incoming: string[]): string[] {
 }
 
 function formatAccountName(account: AccountRow): string {
-  if (account.openai_responses_api) {
+  if (account.openai_responses_api || account.grok_api) {
     return account.name?.trim() || `ID ${account.id}`;
   }
   return account.email || account.name || `ID ${account.id}`;
@@ -720,6 +738,19 @@ export default function Accounts() {
   const { t, i18n } = useTranslation();
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
+  // providerView 决定账号管理页顶部展示哪一套上游：codex(现有页) 或 grok(独立黑白视图)。
+  // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
+  const location = useLocation();
+  const navigate = useNavigate();
+  const providerView: "codex" | "grok" = location.pathname.replace(/\/+$/, "").endsWith("/accounts/grok")
+    ? "grok"
+    : "codex";
+  const setProviderView = useCallback(
+    (view: "codex" | "grok") => {
+      navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    },
+    [navigate],
+  );
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = usePersistedPageSize(
     "accounts",
@@ -873,8 +904,19 @@ export default function Accounts() {
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "session" | "openai" | "oauth"
+    "rt" | "st" | "at" | "session" | "openai" | "oauth" | "agentIdentity"
   >("oauth");
+  const [agentIdentityJson, setAgentIdentityJson] = useState("");
+  const [agentIdentityProxyUrl, setAgentIdentityProxyUrl] = useState("");
+  const agentIdentityFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [agentIdentityFilesImporting, setAgentIdentityFilesImporting] =
+    useState(false);
+  const [agentIdentityFilesResult, setAgentIdentityFilesResult] = useState<{
+    total: number;
+    imported: number;
+    failed: number;
+    items: AgentIdentityImportItem[];
+  } | null>(null);
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -1489,7 +1531,13 @@ export default function Accounts() {
     },
     load: loadAccounts,
   });
-  const accounts = data.accounts;
+  // Codex 视图的统计卡/额度分布/列表/批量操作一律排除 Grok 账号
+  // （Grok 账号由顶部切换后的 Grok 页单独统计与管理）。
+  const allAccounts = data.accounts;
+  const accounts = useMemo(
+    () => allAccounts.filter((account) => !account.grok_api),
+    [allAccounts],
+  );
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
   const lazyMode = data.lazyMode;
@@ -2060,6 +2108,67 @@ export default function Accounts() {
       setSubmitting(false);
     }
   };
+  const handleAddAgentIdentity = async () => {
+    if (!agentIdentityJson.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      const res = await api.importCodexAgentIdentity({
+        auth_json: agentIdentityJson,
+        proxy_url: agentIdentityProxyUrl.trim() || undefined,
+      });
+      showToast(
+        res.email
+          ? t("accounts.agentIdentitySuccess", { email: res.email })
+          : t("accounts.addSuccess"),
+      );
+      setShowAdd(false);
+      setAgentIdentityJson("");
+      setAgentIdentityProxyUrl("");
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleImportAgentIdentityFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    setAgentIdentityFilesImporting(true);
+    setAgentIdentityFilesResult(null);
+    try {
+      const files = await Promise.all(
+        Array.from(fileList).map((file) => file.text()),
+      );
+      const res = await api.batchImportCodexAgentIdentity({
+        files,
+        proxy_url: agentIdentityProxyUrl.trim() || undefined,
+      });
+      setAgentIdentityFilesResult(res);
+      if (res.imported > 0) {
+        showToast(
+          t("accounts.agentIdentityFileImportDone", {
+            imported: res.imported,
+            total: res.total,
+          }),
+        );
+        void reload();
+      }
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setAgentIdentityFilesImporting(false);
+      if (agentIdentityFileInputRef.current)
+        agentIdentityFileInputRef.current.value = "";
+    }
+  };
+
   const handleAddOpenAIResponses = async () => {
     const models = openAIForm.models;
     if (!openAIForm.api_key.trim() || models.length === 0) return;
@@ -4058,9 +4167,54 @@ export default function Accounts() {
     }
   };
 
+  // Codex/Grok 顶部段控切换：两套账号视图共用同一切换器（Grok 通过 headerSlot 注入）。
+  // 滑块动画 + 品牌 logo，与仪表盘渠道过滤器视觉一致。
+  // 不复用 Codex 侧的导入/导出/邀请/回收站等入口，Grok 页只保留账号本身的增删启停。
+  const providerSwitcher = (
+    <div className="relative grid grid-cols-2 items-center rounded-lg border border-border bg-muted/40 p-0.5">
+      <span
+        aria-hidden
+        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/2)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
+        style={{ transform: `translateX(${providerView === "grok" ? 100 : 0}%)` }}
+      />
+      {(
+        [
+          ["codex", t("accounts.providerViewCodex")],
+          ["grok", t("accounts.providerViewGrok")],
+        ] as const
+      ).map(([key, label]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => setProviderView(key)}
+          aria-pressed={providerView === key}
+          className={cn(
+            "relative z-10 inline-flex items-center justify-center gap-2 rounded-md px-5 py-2 text-base font-semibold transition-all duration-200 active:scale-[0.97]",
+            providerView === key
+              ? "text-foreground"
+              : "text-muted-foreground opacity-75 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
+          )}
+        >
+          <ChannelLogo channel={key} size={20} />
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (providerView === "grok") {
+    // key 触发渠道切换时整块内容淡入过渡，切换器由 headerSlot 常驻不闪。
+    return (
+      <div key="provider-grok" className="animate-channel-switch-in">
+        <GrokAccounts headerSlot={providerSwitcher} />
+      </div>
+    );
+  }
+
   return (
     <div
-      className="relative @container/accounts"
+      key="provider-codex"
+      className="relative @container/accounts animate-channel-switch-in"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -4112,23 +4266,27 @@ export default function Accounts() {
             title={t("accounts.title")}
             description={t("accounts.description")}
             onRefresh={() => void reload()}
+            hideTitle
             titleAdornment={
-              <Select
-                className="w-32"
-                compact
-                value={pageMode}
-                onValueChange={(value) => {
-                  const mode = value === "personal" ? "personal" : "pool";
-                  // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
-                  pageModeUserSetRef.current = true;
-                  persistAccountPageMode(mode);
-                  setPageMode(mode);
-                }}
-                options={[
-                  { value: "pool", label: t("accounts.pageModePool") },
-                  { value: "personal", label: t("accounts.pageModePersonal") },
-                ]}
-              />
+              <div className="flex items-center gap-2">
+                {providerSwitcher}
+                <Select
+                  className="w-32"
+                  compact
+                  value={pageMode}
+                  onValueChange={(value) => {
+                    const mode = value === "personal" ? "personal" : "pool";
+                    // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
+                    pageModeUserSetRef.current = true;
+                    persistAccountPageMode(mode);
+                    setPageMode(mode);
+                  }}
+                  options={[
+                    { value: "pool", label: t("accounts.pageModePool") },
+                    { value: "personal", label: t("accounts.pageModePersonal") },
+                  ]}
+                />
+              </div>
             }
             actions={
               <>
@@ -5251,6 +5409,14 @@ export default function Accounts() {
                             )}
                             {visibleColumns.email && (
                               <TableCell className="min-w-[220px] whitespace-normal text-[14px] text-muted-foreground">
+                                <div className="flex min-w-0 items-center gap-2.5">
+                                <span className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-card ring-1 ring-border shadow-sm">
+                                  {account.openai_responses_api ? (
+                                    <ModelLogo model="openai" variant="plain" size={17} />
+                                  ) : (
+                                    <ChannelLogo channel="codex" size={32} className="rounded-lg" />
+                                  )}
+                                </span>
                                 <div className="flex min-w-0 flex-col items-start gap-1">
                                   <button
                                     type="button"
@@ -5261,7 +5427,7 @@ export default function Accounts() {
                                       openAccountDetail(account);
                                     }}
                                   >
-                                    {account.openai_responses_api
+                                    {account.openai_responses_api || account.grok_api
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </button>
@@ -5282,19 +5448,35 @@ export default function Accounts() {
                                   )}
                                   {(account.at_only ||
                                     account.openai_responses_api ||
+                                    account.grok_api ||
+                                    account.agent_identity ||
                                     account.enabled === false ||
                                     account.locked ||
                                     (account.rate_limit_reset_credits ?? 0) >
-                                      0) && (
+                                      0 ||
+                                    getCreditBalanceDisplay(account) !==
+                                      null) && (
                                     <div className="flex flex-wrap gap-1">
                                       {account.at_only && (
                                         <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                                           {formatAccessTokenBadge(account)}
                                         </span>
                                       )}
+                                      {account.agent_identity && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                                          <Fingerprint className="size-2.5" />
+                                          Agent Identity
+                                        </span>
+                                      )}
                                       {account.openai_responses_api && (
                                         <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                                           Responses API
+                                        </span>
+                                      )}
+                                      {account.grok_api && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                                          <Sparkles className="size-2.5" />
+                                          Grok
                                         </span>
                                       )}
                                       {account.enabled === false && (
@@ -5328,8 +5510,38 @@ export default function Accounts() {
                                           {account.rate_limit_reset_credits ?? 0}
                                         </button>
                                       )}
+                                      {getCreditBalanceDisplay(account) !==
+                                        null && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setUsageAccount(account);
+                                          }}
+                                          className="inline-flex items-center rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-400 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                                          title={
+                                            account.credits_unlimited
+                                              ? t(
+                                                  "accounts.creditsBalanceUnlimited",
+                                                )
+                                              : t(
+                                                  "accounts.creditsBalanceBadge",
+                                                  {
+                                                    balance:
+                                                      getCreditBalanceDisplay(
+                                                        account,
+                                                      ),
+                                                  },
+                                                )
+                                          }
+                                        >
+                                          <Coins className="mr-0.5 size-2.5" />
+                                          {getCreditBalanceDisplay(account)}
+                                        </button>
+                                      )}
                                     </div>
                                   )}
+                                </div>
                                 </div>
                               </TableCell>
                             )}
@@ -5712,6 +5924,15 @@ export default function Accounts() {
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
+                ) : addMethod === "agentIdentity" ? (
+                  <Button
+                    onClick={() => void handleAddAgentIdentity()}
+                    disabled={submitting || !agentIdentityJson.trim()}
+                  >
+                    {submitting
+                      ? t("accounts.adding")
+                      : t("accounts.agentIdentityImportBtn")}
+                  </Button>
                 ) : oauthStep === "generate" ? (
                   <Button
                     onClick={() => void handleOAuthGenerate()}
@@ -5735,7 +5956,7 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => {
                   setAddMethod("oauth");
@@ -5806,6 +6027,17 @@ export default function Accounts() {
               >
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
+              </button>
+              <button
+                onClick={() => setAddMethod("agentIdentity")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "agentIdentity"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Fingerprint className="size-3.5" />
+                {t("accounts.addMethodAgentIdentity")}
               </button>
             </div>
 
@@ -6117,6 +6349,110 @@ export default function Accounts() {
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
+                })}
+              </div>
+            ) : addMethod === "agentIdentity" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
+                  {t("accounts.agentIdentityHint")}
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.agentIdentityJsonLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[240px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.agentIdentityJsonPlaceholder")}
+                    value={agentIdentityJson}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setAgentIdentityJson(event.target.value)
+                    }
+                    rows={10}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.agentIdentityNote")}
+                  </p>
+                </div>
+
+                {/* 多文件批量导入 */}
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("accounts.agentIdentityFileImportTitle")}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {t("accounts.agentIdentityFileImportDesc")}
+                      </p>
+                    </div>
+                    <input
+                      ref={agentIdentityFileInputRef}
+                      type="file"
+                      accept=".json,application/json"
+                      multiple
+                      className="hidden"
+                      onChange={(e) =>
+                        void handleImportAgentIdentityFiles(e.target.files)
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={agentIdentityFilesImporting}
+                      onClick={() => agentIdentityFileInputRef.current?.click()}
+                    >
+                      {agentIdentityFilesImporting ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          {t("accounts.agentIdentityFileImporting")}
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="size-3.5" />
+                          {t("accounts.agentIdentityFileImportBtn")}
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  {agentIdentityFilesResult ? (
+                    <div className="mt-3 space-y-2 border-t border-border pt-3">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("accounts.agentIdentityFileImportSummary", {
+                          imported: agentIdentityFilesResult.imported,
+                          total: agentIdentityFilesResult.total,
+                        })}
+                      </p>
+                      <div className="max-h-40 space-y-1 overflow-y-auto">
+                        {agentIdentityFilesResult.items.map((item, index) => (
+                          <div
+                            key={index}
+                            className="flex items-start gap-1.5 text-xs"
+                          >
+                            {item.ok ? (
+                              <CheckCircle className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                            ) : (
+                              <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+                            )}
+                            <span className="min-w-0 flex-1 break-all text-muted-foreground">
+                              {item.email || `#${index + 1}`}
+                              {item.ok
+                                ? null
+                                : item.error
+                                  ? ` — ${item.error}`
+                                  : ""}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                {renderProxyInput({
+                  value: agentIdentityProxyUrl,
+                  testKey: "add-agent-identity",
+                  onChange: setAgentIdentityProxyUrl,
                 })}
               </div>
             ) : (
@@ -9901,7 +10237,7 @@ function isRateLimitedAccount(account: AccountRow): boolean {
 
 function isUnsampledQuotaAccount(account: AccountRow): boolean {
   const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api) {
+  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
     return false;
   }
   // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
@@ -10715,7 +11051,11 @@ function AccountRowActionsMenu({
   const refreshDisabled =
     refreshing || account.at_only || account.openai_responses_api;
   const authJsonDisabled =
-    authJsonExporting || account.at_only || account.openai_responses_api;
+    authJsonExporting ||
+    account.at_only ||
+    account.openai_responses_api ||
+    account.grok_api ||
+    account.agent_identity;
   const resetCredits = account.rate_limit_reset_credits ?? 0;
 
   const items: HeaderActionMenuItem[] = [
@@ -10760,7 +11100,10 @@ function AccountRowActionsMenu({
       icon: <FileJson className="size-3.5" />,
       disabled: authJsonDisabled,
       title:
-        account.at_only || account.openai_responses_api
+        account.at_only ||
+        account.openai_responses_api ||
+        account.grok_api ||
+        account.agent_identity
           ? t("accounts.authJsonDisabled")
           : undefined,
       onSelect: onGenerateAuthJson,
@@ -10804,8 +11147,8 @@ function AccountRowActionsMenu({
       disabled: resetCredits <= 0,
       onSelect: onResetCredits,
     },
-    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay(openai_responses_api)账号不显示。
-    ...(onEditModels && !account.openai_responses_api
+    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay/Grok 账号不显示。
+    ...(onEditModels && !account.openai_responses_api && !account.grok_api
       ? [
           {
             key: "edit-models",
@@ -11119,6 +11462,7 @@ function AccountMobileCard({
   const hasStateBadges =
     account.at_only ||
     account.openai_responses_api ||
+    account.grok_api ||
     account.enabled === false ||
     account.locked;
   const modelCooldownCount = account.model_cooldowns?.length ?? 0;
@@ -11162,6 +11506,26 @@ function AccountMobileCard({
               >
                 <RotateCcw className="size-2.5" />
                 {resetCredits}
+              </button>
+            )}
+            {getCreditBalanceDisplay(account) !== null && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUsage();
+                }}
+                className="inline-flex items-center gap-1 rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                title={
+                  account.credits_unlimited
+                    ? t("accounts.creditsBalanceUnlimited")
+                    : t("accounts.creditsBalanceBadge", {
+                        balance: getCreditBalanceDisplay(account),
+                      })
+                }
+              >
+                <Coins className="size-2.5" />
+                {getCreditBalanceDisplay(account)}
               </button>
             )}
           </div>
@@ -11231,6 +11595,13 @@ function AccountMobileCard({
                   </span>
                 )}
                 <AccountGuardianBadge account={account} />
+                {account.grok_api && (
+                  <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                    <Sparkles className="size-2.5" />
+                    Grok
+                    {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
+                  </span>
+                )}
                 {account.enabled === false && (
                   <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
                     <PowerOff className="mr-0.5 size-2.5" />
@@ -11501,6 +11872,13 @@ function AccountMobileCard({
               </span>
             )}
             <AccountGuardianBadge account={account} />
+            {account.grok_api && (
+              <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                <Sparkles className="size-2.5" />
+                Grok
+                {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
+              </span>
+            )}
             {account.enabled === false && (
               <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
                 <PowerOff className="mr-0.5 size-2.5" />
@@ -11918,7 +12296,11 @@ function TestConnectionModal({
     onSettledRef.current();
   }, []);
 
-  const isOpenAIResponsesAccount = Boolean(account.openai_responses_api);
+  // Grok 与 openai_responses 同属"账号自带模型清单"的 relay 风格账号，
+  // 测试模型选择逻辑一致（用 account.models 而非上游 /v1/models 全量）。
+  const isOpenAIResponsesAccount = Boolean(
+    account.openai_responses_api || account.grok_api,
+  );
 
   const modelSelectOptions = useMemo(
     () =>
@@ -12161,12 +12543,19 @@ function TestConnectionModal({
     outputEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [output]);
 
-  const statusLabel = {
-    connecting: `⏳ ${t("accounts.connecting")}`,
-    streaming: `🔄 ${t("accounts.receivingResponse")}`,
-    success: `✅ ${t("accounts.testSuccess")}`,
-    error: `❌ ${t("accounts.testFailed")}`,
+  const statusText = {
+    connecting: t("accounts.connecting"),
+    streaming: t("accounts.receivingResponse"),
+    success: t("accounts.testSuccess"),
+    error: t("accounts.testFailed"),
   }[status];
+  const StatusIcon = {
+    connecting: Loader2,
+    streaming: Loader2,
+    success: CheckCircle,
+    error: XCircle,
+  }[status];
+  const statusIconSpin = status === "connecting" || status === "streaming";
 
   const statusColor = {
     connecting: "text-muted-foreground",
@@ -12204,7 +12593,10 @@ function TestConnectionModal({
           <span
             className={`flex items-center gap-1.5 text-sm font-semibold ${statusColor}`}
           >
-            {statusLabel}
+            <StatusIcon
+              className={cn("size-4", statusIconSpin && "animate-spin")}
+            />
+            {statusText}
           </span>
           <Select
             className="w-52 max-w-full"

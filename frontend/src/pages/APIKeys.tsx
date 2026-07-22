@@ -11,6 +11,7 @@ import { api } from "../api";
 import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
 import ChipInput from "../components/ChipInput";
 import Modal from "../components/Modal";
+import ChannelLogo from "../components/ChannelLogo";
 import PageHeader from "../components/PageHeader";
 import StateShell from "../components/StateShell";
 import StatCard from "../components/StatCard";
@@ -61,6 +62,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Waypoints,
   Trash2,
   XCircle,
 } from "lucide-react";
@@ -110,9 +112,20 @@ interface LimitsFormState {
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
+  upstreamChannel: UpstreamChannel;
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
+type UpstreamChannel = "auto" | "codex" | "grok";
+
+// Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
+const DEFAULT_GROK_MODEL_OPTIONS = [
+  "grok-4.5",
+  "grok-4",
+  "grok-3-fast",
+  "grok-3",
+  "grok-2",
+];
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
   token: 1,
@@ -140,6 +153,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
   imageGenerationPolicy: "allow",
+  upstreamChannel: "auto",
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -211,6 +225,7 @@ export default function APIKeys() {
         .getModels()
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
+        grok_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
     ]);
@@ -218,6 +233,7 @@ export default function APIKeys() {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
+      grokModelOptions: modelsResponse.grok_models ?? [],
       settings: settingsResponse,
     };
   }, []);
@@ -226,14 +242,39 @@ export default function APIKeys() {
     keys: APIKeyRow[];
     groups: AccountGroup[];
     modelOptions: string[];
+    grokModelOptions: string[];
     settings: SystemSettings | null;
   }>({
-    initialData: { keys: [], groups: [], modelOptions: [], settings: null },
+    initialData: {
+      keys: [],
+      groups: [],
+      modelOptions: [],
+      grokModelOptions: [],
+      settings: null,
+    },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+  // 模型下拉跟随渠道选择:grok 只列 Grok 模型(账号未声明时用常见兜底),
+  // codex 只列 Codex 目录,auto 合并两者。
+  const grokModelOptions =
+    data.grokModelOptions.length > 0
+      ? data.grokModelOptions
+      : DEFAULT_GROK_MODEL_OPTIONS;
+  const modelOptionsForChannel = useCallback(
+    (channel: UpstreamChannel): string[] => {
+      if (channel === "grok") return grokModelOptions;
+      if (channel === "codex") return modelOptions;
+      const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
+      return [
+        ...modelOptions,
+        ...grokModelOptions.filter((m) => !seen.has(m.toLowerCase())),
+      ];
+    },
+    [modelOptions, grokModelOptions],
+  );
   const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
   const publicImageStudioPageEnabled =
     data.settings?.public_image_studio_page_enabled ?? false;
@@ -1116,6 +1157,7 @@ export default function APIKeys() {
                                     status={getAPIKeyStatus(keyRow)}
                                     t={t}
                                   />
+                                  <KeyChannelBadge keyRow={keyRow} t={t} />
                                   {isBusy ? (
                                     <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                                   ) : null}
@@ -1296,10 +1338,13 @@ export default function APIKeys() {
                                         <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                                       ) : null}
                                     </div>
-                                    <KeyStatusBadge
-                                      status={getAPIKeyStatus(keyRow)}
-                                      t={t}
-                                    />
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <KeyStatusBadge
+                                        status={getAPIKeyStatus(keyRow)}
+                                        t={t}
+                                      />
+                                      <KeyChannelBadge keyRow={keyRow} t={t} />
+                                    </div>
                                   </div>
                                 </TableCell>
                                 <TableCell>
@@ -1752,6 +1797,21 @@ export default function APIKeys() {
               </FormField>
             </div>
 
+            <FormField
+              label={t("apiKeys.limits.upstreamChannel")}
+              icon={<Waypoints className="size-3.5" />}
+              as="div"
+            >
+              <UpstreamChannelPicker
+                value={createForm.limits.upstreamChannel}
+                onChange={(upstreamChannel) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, upstreamChannel },
+                  })
+                }
+              />
+            </FormField>
+
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
                 label={t("apiKeys.quotaLimitLabel")}
@@ -1819,7 +1879,9 @@ export default function APIKeys() {
             <LimitsEditor
               value={createForm.limits}
               onChange={(limits) => updateCreateForm({ limits })}
-              modelOptions={modelOptions}
+              modelOptions={modelOptionsForChannel(
+                createForm.limits.upstreamChannel,
+              )}
             />
           </form>
         </Modal>
@@ -1928,6 +1990,21 @@ export default function APIKeys() {
                     </FormField>
                   </div>
 
+                  <FormField
+                    label={t("apiKeys.limits.upstreamChannel")}
+                    icon={<Waypoints className="size-3.5" />}
+                    as="div"
+                  >
+                    <UpstreamChannelPicker
+                      value={editForm.limits.upstreamChannel}
+                      onChange={(upstreamChannel) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, upstreamChannel },
+                        })
+                      }
+                    />
+                  </FormField>
+
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
                       label={t("apiKeys.expireModeLabel")}
@@ -1989,7 +2066,9 @@ export default function APIKeys() {
                 <LimitsEditor
                   value={editForm.limits}
                   onChange={(limits) => updateEditForm({ limits })}
-                  modelOptions={modelOptions}
+                  modelOptions={modelOptionsForChannel(
+                    editForm.limits.upstreamChannel,
+                  )}
                   expanded
                 />
               )}
@@ -2152,7 +2231,70 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
+    upstreamChannel:
+      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+        ? limits.upstream_channel
+        : "auto",
   };
+}
+
+// UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
+// 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
+function UpstreamChannelPicker({
+  value,
+  onChange,
+}: {
+  value: UpstreamChannel;
+  onChange: (next: UpstreamChannel) => void;
+}) {
+  const { t } = useTranslation();
+  const options: Array<{
+    key: UpstreamChannel;
+    label: string;
+    icon: ReactNode;
+  }> = [
+    {
+      key: "auto",
+      label: t("apiKeys.limits.upstreamChannelAutoTab"),
+      icon: <Waypoints className="size-4 shrink-0" />,
+    },
+    {
+      key: "codex",
+      label: t("apiKeys.limits.upstreamChannelCodex"),
+      icon: <ChannelLogo channel="codex" size={18} />,
+    },
+    {
+      key: "grok",
+      label: t("apiKeys.limits.upstreamChannelGrok"),
+      icon: <ChannelLogo channel="grok" size={18} />,
+    },
+  ];
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+        {options.map(({ key, label, icon }) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => onChange(key)}
+            aria-pressed={value === key}
+            className={cn(
+              "inline-flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold transition-all",
+              value === key
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground opacity-70 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
+            )}
+          >
+            {icon}
+            <span className="truncate">{label}</span>
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        {t(`apiKeys.limits.upstreamChannelHint.${value}`)}
+      </p>
+    </div>
+  );
 }
 
 // resolveImageGenerationPolicy 统一新旧两种后端配置：显式 image_generation_policy 优先，
@@ -2230,6 +2372,8 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
     disable_image_generation:
       form.imageGenerationPolicy === "block" || undefined,
+    upstream_channel:
+      form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
   };
 }
 
@@ -2323,6 +2467,52 @@ function KeyStatusBadge({
     >
       <span className={cn("size-1.5 rounded-full", config.dot)} />
       {t(`apiKeys.status.${status}`)}
+    </Badge>
+  );
+}
+
+// KeyChannelBadge 展示该 Key 的上游渠道限定（auto/codex/grok），一眼区分 Key 用途。
+function KeyChannelBadge({
+  keyRow,
+  t,
+}: {
+  keyRow: APIKeyRow;
+  t: Translator;
+}) {
+  const channel = keyRow.limits?.upstream_channel;
+  if (channel === "grok") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelGrok")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="grok" size={12} />
+        Grok
+      </Badge>
+    );
+  }
+  if (channel === "codex") {
+    return (
+      <Badge
+        variant="outline"
+        title={t("apiKeys.limits.upstreamChannelCodex")}
+        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
+      >
+        <ChannelLogo channel="codex" size={12} />
+        Codex
+      </Badge>
+    );
+  }
+  // auto：路由图标表示"不限渠道，按模型自动路由"
+  return (
+    <Badge
+      variant="outline"
+      title={t("apiKeys.limits.upstreamChannelHint.auto")}
+      className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-muted-foreground"
+    >
+      <Waypoints className="size-3" />
+      {t("apiKeys.limits.upstreamChannelAutoTab")}
     </Badge>
   );
 }

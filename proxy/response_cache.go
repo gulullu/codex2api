@@ -255,16 +255,31 @@ func inputHasToolCallContext(input gjson.Result) bool {
 func inputHasFunctionCallOutput(input gjson.Result) bool {
 	found := false
 	input.ForEach(func(_, v gjson.Result) bool {
-		switch v.Get("type").String() {
-		case "function_call_output", "tool_call_output", "local_shell_call_output",
-			"shell_call_output", "apply_patch_call_output",
-			"tool_search_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+		if isCodexToolCallOutputType(v.Get("type").String()) {
 			found = true
 			return false
 		}
 		return true
 	})
 	return found
+}
+
+// isCodexToolCallOutputType 判断 item 类型是否属于工具调用输出项（*_call_output），
+// 与 isCodexToolCallContextType 的调用项集合一一对应。
+func isCodexToolCallOutputType(typ string) bool {
+	switch typ {
+	case "function_call_output",
+		"tool_call_output",
+		"local_shell_call_output",
+		"shell_call_output",
+		"apply_patch_call_output",
+		"tool_search_call_output",
+		"custom_tool_call_output",
+		"mcp_tool_call_output":
+		return true
+	default:
+		return false
+	}
 }
 
 // cacheCompletedResponse 从 response.completed 事件中提取 response.id 和 response.output，

@@ -73,8 +73,14 @@ type WsConnection struct {
 	// 连接状态
 	state atomic.Int32
 
-	// 最后使用时间
+	// Legacy socket activity used by the existing five-minute expiry path.
+	// Business traffic and successful heartbeat Pong both refresh this value so
+	// disabling the opt-in business-idle reclaimer preserves rb28/v2.5.9.
 	lastUsed atomic.Int64
+
+	// lastBusinessUsed is refreshed only by request/response business traffic.
+	// Heartbeat/Pong transport liveness must never extend this deadline.
+	lastBusinessUsed atomic.Int64
 
 	// 最近入站活动时间（数据帧/对端 Ping/Pong 回执，UnixNano）。仅供 probe
 	// 免往返判断：近期有入站即 TCP 双向可证活。0 表示尚无入站，probe 走完整
@@ -177,20 +183,48 @@ func effectiveProxyURL(account *auth.Account, proxyOverride string) string {
 
 // NewWsConnection 创建 WebSocket 连接
 func NewWsConnection(conn *websocket.Conn, session *Session, wsURL string) *WsConnection {
+	now := time.Now().UnixNano()
 	wc := &WsConnection{
 		conn:      conn,
 		session:   session,
 		URL:       wsURL,
-		createdAt: time.Now().UnixNano(),
+		createdAt: now,
 	}
-	wc.lastUsed.Store(time.Now().UnixNano())
+	wc.lastUsed.Store(now)
+	wc.lastBusinessUsed.Store(now)
 	wc.state.Store(int32(StateConnected))
 	return wc
 }
 
-// Touch 更新最后使用时间
+// Touch records business activity while retaining the legacy socket activity
+// timestamp used when the opt-in reclaimer is disabled.
 func (wc *WsConnection) Touch() {
+	now := time.Now().UnixNano()
+	wc.lastUsed.Store(now)
+	wc.lastBusinessUsed.Store(now)
+}
+
+// touchTransport records transport liveness only. In particular, a heartbeat
+// Pong must not make a business-idle connection appear recently used.
+func (wc *WsConnection) touchTransport() {
 	wc.lastUsed.Store(time.Now().UnixNano())
+}
+
+func (wc *WsConnection) businessIdleFor(now time.Time) time.Duration {
+	if wc == nil {
+		return 0
+	}
+	last := wc.lastBusinessUsed.Load()
+	if last <= 0 {
+		// Literal test/legacy connections without a business timestamp fail
+		// closed and are never reclaimed by the opt-in policy.
+		return 0
+	}
+	idle := now.Sub(time.Unix(0, last))
+	if idle < 0 {
+		return 0
+	}
+	return idle
 }
 
 // touchInbound 记录一次入站活动（数据帧/对端 Ping/我方 Ping 的 Pong 回执）。
@@ -465,35 +499,35 @@ type Manager struct {
 	// safePoolAccounts tracks account-level safe-pool lifecycle presence for the
 	// read-only runtime snapshot. Admission publishes it before any cold dial so
 	// a tag retirement cannot miss an owner that has not created a socket yet.
-	safePoolAccounts               sync.Map
-	safePoolDialAttempts           atomic.Uint64
-	safePoolDialSuccess            atomic.Uint64
-	safePoolDialFailures           atomic.Uint64
-	safePoolReuseHits              atomic.Uint64
-	safePoolSaturations            atomic.Uint64
-	safePoolFuseTrips              atomic.Uint64
-	safePoolCompatibilityDrops     atomic.Uint64
-	safePoolCompatibilityFallbacks atomic.Uint64
-	safePoolOwnerEligible          atomic.Uint64
-	safePoolOwnerMissing           atomic.Uint64
-	safePoolOwnerRejected          atomic.Uint64
-	safePoolRequestIneligible      atomic.Uint64
-	safePoolOwnerAdmittedNew       atomic.Uint64
-	safePoolOwnerAdmittedExisting  atomic.Uint64
-	safePoolOwnerSampleRejected    atomic.Uint64
-	safePoolOwnerBudgetRejected    atomic.Uint64
-	safePoolOwnerOneShotFallbacks  atomic.Uint64
-	safePoolOwnerConfigErrors      atomic.Uint64
-	safePoolOwnerHandshakeRejected atomic.Uint64
-	safePoolFrameMetadataRejected  atomic.Uint64
+	safePoolAccounts                sync.Map
+	safePoolDialAttempts            atomic.Uint64
+	safePoolDialSuccess             atomic.Uint64
+	safePoolDialFailures            atomic.Uint64
+	safePoolReuseHits               atomic.Uint64
+	safePoolSaturations             atomic.Uint64
+	safePoolFuseTrips               atomic.Uint64
+	safePoolCompatibilityDrops      atomic.Uint64
+	safePoolCompatibilityFallbacks  atomic.Uint64
+	safePoolOwnerEligible           atomic.Uint64
+	safePoolOwnerMissing            atomic.Uint64
+	safePoolOwnerRejected           atomic.Uint64
+	safePoolRequestIneligible       atomic.Uint64
+	safePoolOwnerAdmittedNew        atomic.Uint64
+	safePoolOwnerAdmittedExisting   atomic.Uint64
+	safePoolOwnerSampleRejected     atomic.Uint64
+	safePoolOwnerBudgetRejected     atomic.Uint64
+	safePoolOwnerOneShotFallbacks   atomic.Uint64
+	safePoolOwnerConfigErrors       atomic.Uint64
+	safePoolOwnerHandshakeRejected  atomic.Uint64
+	safePoolFrameMetadataRejected   atomic.Uint64
 	safePoolGenerationInvalidations atomic.Uint64
 	safePoolRetiredOwners           atomic.Uint64
-	continuationBudgetEvictions    atomic.Uint64
-	ownerAdmissionMu               sync.Mutex
-	safePoolAdmittedOwners         map[int64]map[string]uint64
-	safePoolAccountGenerations     map[int64]uint64
-	ownerAdmissionSalt             [32]byte
-	ownerAdmissionSaltValid        bool
+	continuationBudgetEvictions     atomic.Uint64
+	ownerAdmissionMu                sync.Mutex
+	safePoolAdmittedOwners          map[int64]map[string]uint64
+	safePoolAccountGenerations      map[int64]uint64
+	ownerAdmissionSalt              [32]byte
+	ownerAdmissionSaltValid         bool
 
 	// response_id -> 连接 绑定（续链亲和）。上游 chatgpt backend 无服务端存储时，
 	// previous_response_id 的上下文只存活在产生该响应的那条 WS 连接里；带续链 ID
@@ -527,6 +561,19 @@ type Manager struct {
 
 	// 可选的保活 Ping 函数（用于测试替换），nil 时使用默认 SendHeartbeat
 	keepalivePingFunc func(wc *WsConnection) error
+
+	// Business-idle reclaim metrics and bounded reconnect attribution. These do
+	// not participate in routing and remain inert while the feature is disabled.
+	idleReclaimEligible       atomic.Uint64
+	idleReclaimReclaimed      atomic.Uint64
+	idleReclaimSkippedBusy    atomic.Uint64
+	idleReclaimSkippedContext atomic.Uint64
+	idleReclaimReconnect      atomic.Uint64
+	idleReclaimPendingKeys    atomic.Int64
+	idleReclaimMu             sync.Mutex
+	idleReclaimedKeys         map[string]time.Time
+	idleReclaimNextLog        atomic.Int64
+	idleReclaimLastLogged     atomic.Uint64
 
 	// 测试钩子：连接写入池后、首个 pending/read lease 建立前触发。
 	afterConnectionStored          func(wc *WsConnection)
@@ -717,6 +764,9 @@ func (m *Manager) evictExpired() {
 		m.trimIdleAccountConnections(accountID, accountConnectionLimit(account), nil)
 		accountLock.Unlock()
 	}
+	// This second pass is a runtime-gated extension. When disabled it returns
+	// immediately and the cleanup behavior above remains byte-for-byte intact.
+	m.reclaimBusinessIdleConnections(time.Now())
 	// Cross-account continuation convergence is a top-level phase. Never call
 	// it while an account lock from ordinary capacity is held.
 	m.enforceContinuationSocketBudgets()
@@ -1802,6 +1852,7 @@ func (m *Manager) acquireConnection(
 	wait := AcquireInitialBackoff
 	var waited time.Duration
 	var createLeaseFailures int
+	var busyOverflowAttempted bool
 
 	for {
 		if replacementOwner {
@@ -1826,8 +1877,8 @@ func (m *Manager) acquireConnection(
 					if !m.ensureConnectionActivationCapacity(account.ID(), accountConnectionLimit(account), wc) {
 						accountLock.Unlock()
 						lock.Unlock()
-						if waited >= AcquireMaxWait {
-							return nil, nil, newLocalCapacityAcquireError(AcquireMaxWait)
+						if maxWait := busyAcquireMaxWait(); waited >= maxWait {
+							return nil, nil, newLocalCapacityAcquireError(maxWait)
 						}
 						select {
 						case <-ctx.Done():
@@ -1867,8 +1918,19 @@ func (m *Manager) acquireConnection(
 				// 连接被同 session 的前一个请求占用：指数退避轮询等待其空闲，
 				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
 				// 到龄连接也会走到这里等在途请求结束，结束后下一轮循环轮转重建。
-				if waited >= AcquireMaxWait {
-					return nil, nil, newSessionBusyAcquireError(AcquireMaxWait)
+				//
+				// 短等待(patience)后可溢出到同账号的兄弟槽位（issue #413，默认关闭）：
+				// 前一请求长时间流式输出时，同会话的并发请求不再等满整个上限。
+				// 只尝试一次；失败（容量满/拨号失败）回落到继续等待，最坏情况与关闭时一致。
+				if !busyOverflowAttempted && busyOverflowEnabled() && waited >= busyOverflowPatience() && !isBusyOverflowSessionKey(sessionKey) {
+					busyOverflowAttempted = true
+					if owc, opr, ok := m.tryAcquireBusyOverflow(ctx, account, wsURL, sessionKey, headers, proxyOverride); ok {
+						log.Printf("[WS] busy session 溢出到同账号兄弟连接 (account=%d, waited=%s)", account.ID(), waited.Round(time.Millisecond))
+						return owc, opr, nil
+					}
+				}
+				if maxWait := busyAcquireMaxWait(); waited >= maxWait {
+					return nil, nil, newSessionBusyAcquireError(maxWait)
 				}
 				select {
 				case <-ctx.Done():
@@ -1890,8 +1952,8 @@ func (m *Manager) acquireConnection(
 		if !m.reserveAccountConnectionCapacity(account, key) {
 			accountLock.Unlock()
 			lock.Unlock()
-			if waited >= AcquireMaxWait {
-				return nil, nil, newLocalCapacityAcquireError(AcquireMaxWait)
+			if maxWait := busyAcquireMaxWait(); waited >= maxWait {
+				return nil, nil, newLocalCapacityAcquireError(maxWait)
 			}
 			select {
 			case <-ctx.Done():
@@ -1952,6 +2014,105 @@ func (m *Manager) acquireConnection(
 
 		return wc, pr, nil
 	}
+}
+
+// tryAcquireBusyOverflow 在 busy session 等待超过 patience 后，尝试在同账号的有界
+// overflow 槽位（<sessionKey>#ovf-N）上复用空闲兄弟连接或新建一条（issue #413）。
+// 单遍、尽力而为：槽位也在忙则换下一个；账号容量满或拨号/租约失败即放弃，调用方
+// 回落到继续等待原连接——失败路径不会比不开启 overflow 更差。
+// 兄弟连接正常入池，由既有的 IdleTimeout/容量裁剪回收。
+func (m *Manager) tryAcquireBusyOverflow(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	baseSessionKey string,
+	headers http.Header,
+	proxyOverride string,
+) (*WsConnection, *PendingRequest, bool) {
+	proxyURL := effectiveProxyURL(account, proxyOverride)
+	accountLimit := accountConnectionLimit(account)
+	accountLock := m.accountLock(account.ID())
+	for i := 1; i <= BusyOverflowSlots; i++ {
+		slotSession := fmt.Sprintf("%s%s%d", baseSessionKey, busyOverflowKeyInfix, i)
+		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+		lock := m.keyLock(key)
+		lock.Lock()
+		if v, ok := m.connections.Load(key); ok {
+			wc := v.(*WsConnection)
+			if canReuseConnection(wc) {
+				if m.probe(wc) {
+					accountLock.Lock()
+					current, exists := m.connections.Load(key)
+					if exists && current == wc && canReuseConnection(wc) {
+						pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession)
+						if leaseErr == nil {
+							wc.account = account
+							wc.Touch()
+							m.trimIdleAccountConnections(account.ID(), accountLimit, wc)
+							accountLock.Unlock()
+							lock.Unlock()
+							return wc, pr, true
+						}
+						m.DiscardConnection(wc)
+					}
+					accountLock.Unlock()
+					lock.Unlock()
+					continue
+				}
+				m.DiscardConnection(wc)
+			} else if wc.IsConnected() && !wc.IsExpired() && wc.session != nil && wc.session.PendingCount() > 0 && !isRotatableOverAge(wc) {
+				// 兄弟槽位也在忙：换下一个槽位
+				lock.Unlock()
+				continue
+			} else {
+				// 死/到龄/过期连接：清掉腾出槽位，下方直接新建
+				m.DiscardConnection(wc)
+			}
+		}
+		accountLock.Lock()
+		if _, ok := m.connections.Load(key); ok {
+			accountLock.Unlock()
+			lock.Unlock()
+			continue
+		}
+		if !m.reserveAccountConnectionCapacity(account, key) {
+			// 账号连接容量已满：不为 overflow 挤占更多连接，放弃降级回到等待
+			accountLock.Unlock()
+			lock.Unlock()
+			return nil, nil, false
+		}
+		accountLock.Unlock()
+		wc, err := m.createConnection(ctx, account, wsURL, slotSession, headers, proxyOverride)
+		if err != nil {
+			m.releaseAccountConnectionCapacity(account.ID())
+			lock.Unlock()
+			log.Printf("[WS] busy overflow 新建连接失败，回落等待原连接 (account=%d): %v", account.ID(), err)
+			return nil, nil, false
+		}
+		m.connections.Store(key, wc)
+		if m.afterConnectionStored != nil {
+			m.afterConnectionStored(wc)
+		}
+		pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession)
+		if leaseErr == nil {
+			if earlyErr := wc.waitForEarlyReadFailure(ctx, newConnectionReadFailureGrace); earlyErr != nil {
+				wc.session.RemovePendingRequest(pr.RequestID)
+				leaseErr = earlyErr
+			}
+		}
+		m.releaseAccountConnectionCapacity(account.ID())
+		if leaseErr != nil {
+			m.DiscardConnection(wc)
+			lock.Unlock()
+			return nil, nil, false
+		}
+		lock.Unlock()
+		if fn := m.getOnConnected(); fn != nil {
+			fn(account.ID(), wc.session)
+		}
+		return wc, pr, true
+	}
+	return nil, nil, false
 }
 
 // StatelessConnectionSlots 无显式会话的请求在每个 (account, cacheKey) 维度下
@@ -2341,6 +2502,7 @@ func (m *Manager) createConnectionWithIdentity(
 	// 控制帧处理器必须在唯一永久 reader 启动前安装。
 	wc.installControlHandlers()
 	wc.StartReadPump()
+	m.noteIdleReclaimReconnect(poolKey, time.Now())
 
 	return wc, nil
 }

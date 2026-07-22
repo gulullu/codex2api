@@ -22,9 +22,9 @@ import (
 // 上游失败时 fast-fail 返回错误、不伪造列表——Codex 客户端自身会回落本地缓存。
 func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
-	// 清单端点只存在于 ChatGPT 后端,relay API-key 账号无从代答。
+	// 清单端点只存在于 ChatGPT 后端,relay/Grok 账号无从代答。
 	account := h.store.NextExcludingWithFilter(apiKeyID, nil, func(a *auth.Account) bool {
-		return !a.IsOpenAIResponsesAPI()
+		return !a.IsRelayStyle()
 	})
 	if account == nil {
 		api.SendError(c, api.ErrServiceUnavailable)

@@ -102,7 +102,7 @@ export interface RelayGuardianEventsResponse {
   end: ISODateString
 }
 
-export interface StatsResponse {
+export interface StatsChannelCounts {
   total: number
   available: number
   rate_limited: number
@@ -110,11 +110,51 @@ export interface StatsResponse {
   today_requests: number
 }
 
+export interface StatsResponse {
+  total: number
+  available: number
+  rate_limited: number
+  error: number
+  today_requests: number
+  // 按上游渠道(codex/grok)拆分的账号与今日请求计数
+  channels?: Record<string, StatsChannelCounts>
+}
+
 export interface AccountUsageWindow {
   requests: number
   tokens: number
   account_billed?: number
   user_billed?: number
+}
+
+export interface GrokProductUsage {
+  product: string
+  usage_percent?: number | null
+}
+
+// Grok billing 完整额度视图（后端 grok_billing_detail 凭据透出）。
+export interface GrokBillingDetail {
+  plan?: string
+  weekly_percent?: number | null
+  weekly_period_start?: string
+  weekly_period_end?: string
+  product_usage?: GrokProductUsage[]
+  on_demand_cap_cents?: number | null
+  on_demand_used_cents?: number | null
+  monthly_limit_cents?: number | null
+  monthly_used_cents?: number | null
+  monthly_percent?: number | null
+  monthly_period_start?: string
+  monthly_period_end?: string
+  updated_at?: string
+}
+
+export interface GrokRateLimitSnapshot {
+  limit_tokens?: number
+  remaining_tokens?: number
+  limit_requests?: number
+  remaining_requests?: number
+  updated_at?: string
 }
 
 export interface AccountRow {
@@ -131,6 +171,12 @@ export interface AccountRow {
   access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
+  grok_api?: boolean
+  agent_identity?: boolean
+  grok_auth_kind?: string
+  grok_billing?: GrokBillingDetail
+  // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
+  grok_rate_limit?: GrokRateLimitSnapshot
   base_url?: string
   models?: string[]
   model_mapping?: string
@@ -181,6 +227,11 @@ export interface AccountRow {
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
+  applicable_reset_credits?: number | null
+  credits_balance?: string | null
+  credits_has_credits?: boolean | null
+  credits_unlimited?: boolean | null
+  credits_overage_limit_reached?: boolean | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -313,6 +364,39 @@ export interface AddATAccountRequest {
   custom_headers?: Record<string, string> | null
 }
 
+// Codex Agent Identity auth.json 导入（auth_mode=agentIdentity，动态签名，不存 AT/RT）。
+export interface ImportAgentIdentityRequest {
+  name?: string
+  auth_json: string
+  proxy_url?: string
+}
+
+export interface ImportAgentIdentityResponse {
+  message: string
+  id: number
+  email?: string
+}
+
+// Agent Identity auth.json 文件批量导入(每项一个文件的原始 JSON 内容)。
+export interface AgentIdentityBatchImportRequest {
+  files: string[]
+  proxy_url?: string
+}
+
+export interface AgentIdentityImportItem {
+  email?: string
+  id?: number
+  ok: boolean
+  error?: string
+}
+
+export interface AgentIdentityBatchImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: AgentIdentityImportItem[]
+}
+
 export interface AddOpenAIResponsesAccountRequest {
   name?: string
   base_url: string
@@ -358,6 +442,99 @@ export interface FetchOpenAIResponsesModelsRequest {
 export interface FetchOpenAIResponsesModelsResponse {
   base_url: string
   models: string[]
+}
+
+export type GrokAuthKind = 'oauth' | 'api_key'
+
+export interface AddGrokAccountRequest {
+  name?: string
+  auth_kind: GrokAuthKind
+  auth_json?: string
+  api_key?: string
+  base_url?: string
+  models?: string[]
+  model_mapping?: string
+  proxy_url?: string
+}
+
+export type UpdateGrokAccountRequest = AddGrokAccountRequest
+
+export interface FetchGrokModelsResponse {
+  models: string[]
+}
+
+// Grok Device Code OAuth（与 CLIProxyAPI / Grok CLI 一致）。
+export interface GrokDeviceStartRequest {
+  proxy_url?: string
+  name?: string
+  base_url?: string
+  models?: string[]
+}
+
+export interface GrokDeviceStartResponse {
+  session_id: string
+  user_code: string
+  verification_uri?: string
+  verification_uri_complete?: string
+  verification_url: string
+  expires_in: number
+  interval: number
+}
+
+export interface GrokDevicePollRequest {
+  session_id: string
+  proxy_url?: string
+  name?: string
+}
+
+export interface GrokDevicePollResponse {
+  status: 'pending' | 'authorized' | string
+  slow_down?: boolean
+  interval?: number
+  user_code?: string
+  expires_at?: string
+  message?: string
+  id?: number
+  email?: string
+}
+
+// Grok Web SSO 批量导入：用 sso token 自动换成 Build(OAuth) 账号。
+export interface GrokSSOImportRequest {
+  tokens: string
+  base_url?: string
+  models?: string[]
+  proxy_url?: string
+}
+
+export interface GrokSSOImportItem {
+  name?: string
+  email?: string
+  id?: number
+  ok: boolean
+  error?: string
+}
+
+export interface GrokSSOImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: GrokSSOImportItem[]
+}
+
+// Grok 凭据文件批量导入（CPA.json / auth.json）：每项是一个文件的原始 JSON 内容。
+export interface GrokBatchImportRequest {
+  files: string[]
+  base_url?: string
+  models?: string[]
+  proxy_url?: string
+}
+
+// 结果结构与 SSO 导入一致，复用 GrokSSOImportItem。
+export interface GrokBatchImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: GrokSSOImportItem[]
 }
 
 export interface UpdateAccountSchedulerRequest {
@@ -753,7 +930,11 @@ export interface SystemSettings {
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
   codex_ws_size_router_enabled: boolean
+  codex_ws_busy_acquire_max_wait_sec: number
+  codex_ws_busy_overflow_enabled: boolean
+  codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
+  overflow_auto_compact_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
@@ -1288,6 +1469,8 @@ export interface ModelInfo {
 
 export interface ModelsResponse {
   models: string[]
+  // Grok 渠道账号声明模型的并集;渠道选 grok 时模型下拉用这份
+  grok_models?: string[]
   items?: ModelInfo[]
   last_synced_at?: string
   source_url: string
@@ -1407,6 +1590,8 @@ export interface APIKeyTokenStat {
 export interface UsageLog {
   id: number
   account_id: number
+  // 上游渠道(codex/grok),写入时固化;历史行回填,可能为空
+  channel?: string
   client_ip: string
   client_user_agent: string
   upstream_user_agent: string
@@ -1423,6 +1608,7 @@ export interface UsageLog {
   output_tokens: number
   reasoning_tokens: number
   first_token_ms: number
+  ws_acquire_ms?: number
   reasoning_effort: string
   inbound_endpoint: string
   upstream_endpoint: string
@@ -1543,6 +1729,7 @@ export interface APIKeyLimits {
   disable_image_generation?: boolean
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
+  upstream_channel?: "codex" | "grok"
 }
 
 export interface APIKeyWindowUsage {

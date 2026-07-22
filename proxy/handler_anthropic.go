@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ==================== Anthropic 错误格式 ====================
@@ -113,6 +114,16 @@ func anthropicResponseFailedCanonicalStatus(c *gin.Context, outcome streamOutcom
 	return anthropicFinalResponseStatusForContext(c, canonicalStreamStatus(outcome), responseFailedErrorBody(payload))
 }
 
+// applyMessagesModelMapping 对翻译后的 codexBody 套用全局模型映射与思考强度别名。
+// 别名注入会同时写入顶层 reasoning_effort（Chat 形态字段）与 reasoning.effort；
+// 本路径的 codexBody 已是 Responses 形态且不再经过 PrepareResponsesBody 净化，
+// 顶层字段原样发到上游会触发 400 Unsupported parameter（issue #412），在此剥离。
+func (h *Handler) applyMessagesModelMapping(codexBody []byte, supportedModels []string) []byte {
+	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, supportedModels)
+	codexBody, _ = sjson.DeleteBytes(codexBody, "reasoning_effort")
+	return codexBody
+}
+
 // ==================== /v1/messages Handler ====================
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
@@ -164,7 +175,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
-	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, h.supportedModelIDs(c.Request.Context()))
+	codexBody = h.applyMessagesModelMapping(codexBody, h.supportedModelIDs(c.Request.Context()))
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	if isImageOnlyModel(effectiveModel) {
 		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
@@ -185,6 +196,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	baseCodexBody := codexBody
 	initialCodexBody, _ := h.prepareCodexPayloadRules(c, baseCodexBody, effectiveModel, accountFilter)
 	if h.inspectPromptFilterCanonicalResponses(c, baseCodexBody, initialCodexBody, originalInboundBody, "/v1/messages", model) {
@@ -306,7 +318,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		lastFailureWasRelay = false
 		lastStatusCode = 0
 		lastBody = nil
-		isRelayAccount := account.IsOpenAIResponsesAPI()
+		isRelayAccount := account.IsRelayStyle()
 		codexBody, attemptIdentity, payloadRulesPreApplied := h.prepareCodexPayloadRulesForAttempt(c, baseCodexBody, effectiveModel, account)
 		if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 			circuitAttempt.Release(h.store, account)
@@ -334,11 +346,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			log.Printf("上游 WebSocket → HTTP 降级尝试启动 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
 		attemptEffectiveModel := effectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		useWebsocket := responsesAttemptUsesWebsocket(account, h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP())
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			relayBaseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(relayBaseURL, "/v1/responses")
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 		}
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -385,7 +396,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			if payloadRulesPreApplied {
@@ -787,6 +798,20 @@ func (h *Handler) Messages(c *gin.Context) {
 						wroteAnyBody = true
 						terminalDelivered = true
 					}
+					return false
+				}
+
+				// 首 token 前的 response.failed 不翻译进下游流（issue #412）：
+				// 可重试（5xx/429 等）时吞掉事件，交由循环外静默换号重试；
+				// 不可重试或重试耗尽时中止转发，循环外按真实错误码返回 JSON。
+				// 否则 handleFailed 会把失败翻译成 stop_reason=end_turn 的"正常空结束"，
+				// 下游网关会把它当成功计一条 0 token 请求且无从重试。
+				if shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+					pendingFirstTokenEvents.Reset()
+					return false
+				}
+				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, writeErr != nil) {
+					pendingFirstTokenEvents.Reset()
 					return false
 				}
 

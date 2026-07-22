@@ -26,6 +26,104 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteUsageLogChannelMigrationAndDefault(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "channel-migration.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	var defaultValue string
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT dflt_value FROM pragma_table_info('usage_logs') WHERE name = 'channel'
+	`).Scan(&defaultValue); err != nil {
+		t.Fatalf("查询 channel 默认值: %v", err)
+	}
+	if defaultValue != "'codex'" {
+		t.Fatalf("channel 默认值 = %q, want %q", defaultValue, "'codex'")
+	}
+
+	insertAccount := func(name, platform string) int64 {
+		t.Helper()
+		res, err := db.conn.ExecContext(ctx, `
+			INSERT INTO accounts (name, platform, type, credentials, status)
+			VALUES ($1, $2, 'oauth', '{}', 'active')
+		`, name, platform)
+		if err != nil {
+			t.Fatalf("插入 %s 账号: %v", platform, err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			t.Fatalf("读取 %s 账号 ID: %v", platform, err)
+		}
+		return id
+	}
+	xaiID := insertAccount("legacy-grok", "xai")
+	openaiID := insertAccount("legacy-codex", "openai")
+
+	for _, row := range []struct {
+		accountID int64
+		channel   interface{}
+	}{
+		{xaiID, ""},
+		{xaiID, "grok"},
+		{openaiID, ""},
+		{openaiID, nil},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (account_id, channel, status_code) VALUES ($1, $2, 200)
+		`, row.accountID, row.channel); err != nil {
+			t.Fatalf("插入旧 usage_log: %v", err)
+		}
+	}
+
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationUsageLogChannelV1); err != nil {
+		t.Fatalf("清理 channel migration 标记: %v", err)
+	}
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("执行 channel migration: %v", err)
+	}
+
+	assertCount := func(query string, want int) {
+		t.Helper()
+		var got int
+		if err := db.conn.QueryRowContext(ctx, query).Scan(&got); err != nil {
+			t.Fatalf("查询迁移结果: %v", err)
+		}
+		if got != want {
+			t.Fatalf("迁移结果 count = %d, want %d; query=%s", got, want, query)
+		}
+	}
+	assertCount(fmt.Sprintf(`SELECT COUNT(*) FROM usage_logs WHERE account_id = %d AND channel = 'grok'`, xaiID), 2)
+	assertCount(fmt.Sprintf(`SELECT COUNT(*) FROM usage_logs WHERE account_id = %d AND channel = 'codex'`, openaiID), 2)
+	assertCount(`SELECT COUNT(*) FROM usage_logs WHERE channel IS NULL OR channel = ''`, 0)
+	assertCount(fmt.Sprintf(`SELECT COUNT(*) FROM data_migrations WHERE version = '%s'`, dataMigrationUsageLogChannelV1), 1)
+
+	// 旧版回滚后 INSERT 不携 channel，仍必须依赖列默认值得到 codex。
+	res, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs (account_id, status_code) VALUES ($1, 200)`, openaiID)
+	if err != nil {
+		t.Fatalf("插入旧版形式 usage_log: %v", err)
+	}
+	logID, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("读取 usage_log ID: %v", err)
+	}
+	var channel string
+	if err := db.conn.QueryRowContext(ctx, `SELECT channel FROM usage_logs WHERE id = $1`, logID).Scan(&channel); err != nil {
+		t.Fatalf("读取旧版形式 usage_log: %v", err)
+	}
+	if channel != UpstreamChannelCodex {
+		t.Fatalf("旧版形式 usage_log channel = %q, want codex", channel)
+	}
+
+	// 幂等：重跑不应修改已经分类的行或增加第二个标记。
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("重跑 channel migration: %v", err)
+	}
+	assertCount(fmt.Sprintf(`SELECT COUNT(*) FROM data_migrations WHERE version = '%s'`, dataMigrationUsageLogChannelV1), 1)
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -974,7 +1072,7 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 		t.Fatalf("summary = %+v, want one 5xx/401/499/timeout/retry", summary)
 	}
 
-	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5)
+	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5, "")
 	if err != nil {
 		t.Fatalf("GetChartAggregation 返回错误: %v", err)
 	}
@@ -2074,7 +2172,7 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2173,7 +2271,7 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2405,7 +2503,7 @@ func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
 		t.Fatalf("更新旧日志时间失败: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2481,7 +2579,7 @@ func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.
 		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -3401,5 +3499,93 @@ func TestSQLiteSystemSettingsContinueThinkingRoundtrip(t *testing.T) {
 	}
 	if clamped.CodexContinueMaxRounds != 32 {
 		t.Errorf("越界轮数应归一到 32, got %d", clamped.CodexContinueMaxRounds)
+	}
+}
+
+func TestSQLiteSystemSettingsWSIdleReclaimRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	seed := &SystemSettings{
+		MaxConcurrency:  2,
+		TestConcurrency: 1,
+		TestModel:       "gpt-5.4",
+	}
+	if err := db.UpdateSystemSettings(ctx, seed); err != nil {
+		t.Fatalf("UpdateSystemSettings(seed): %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(default): %v", err)
+	}
+	if got.CodexWSIdleReclaimEnabled || got.CodexWSIdleReclaimPercent != 0 || got.CodexWSIdleReclaimIdleSec != 600 {
+		t.Fatalf("default idle reclaim = enabled:%v percent:%d idle:%d, want false/0/600", got.CodexWSIdleReclaimEnabled, got.CodexWSIdleReclaimPercent, got.CodexWSIdleReclaimIdleSec)
+	}
+
+	got.CodexWSIdleReclaimEnabled = true
+	got.CodexWSIdleReclaimPercent = 20
+	got.CodexWSIdleReclaimIdleSec = 900
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(valid): %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(valid): %v", err)
+	}
+	if !after.CodexWSIdleReclaimEnabled || after.CodexWSIdleReclaimPercent != 20 || after.CodexWSIdleReclaimIdleSec != 900 {
+		t.Fatalf("roundtrip idle reclaim = enabled:%v percent:%d idle:%d, want true/20/900", after.CodexWSIdleReclaimEnabled, after.CodexWSIdleReclaimPercent, after.CodexWSIdleReclaimIdleSec)
+	}
+
+	after.CodexWSIdleReclaimPercent = 17
+	after.CodexWSIdleReclaimIdleSec = 60
+	if err := db.UpdateSystemSettings(ctx, after); err != nil {
+		t.Fatalf("UpdateSystemSettings(invalid): %v", err)
+	}
+	normalized, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(invalid): %v", err)
+	}
+	if normalized.CodexWSIdleReclaimPercent != 0 || normalized.CodexWSIdleReclaimIdleSec != 600 {
+		t.Fatalf("invalid idle reclaim normalized to percent:%d idle:%d, want 0/600", normalized.CodexWSIdleReclaimPercent, normalized.CodexWSIdleReclaimIdleSec)
+	}
+
+	normalized.CodexWSIdleReclaimPercent = 100
+	normalized.CodexWSIdleReclaimIdleSec = 90000
+	if err := db.UpdateSystemSettings(ctx, normalized); err != nil {
+		t.Fatalf("UpdateSystemSettings(cap): %v", err)
+	}
+	capped, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(cap): %v", err)
+	}
+	if capped.CodexWSIdleReclaimPercent != 100 || capped.CodexWSIdleReclaimIdleSec != 86400 {
+		t.Fatalf("capped idle reclaim = percent:%d idle:%d, want 100/86400", capped.CodexWSIdleReclaimPercent, capped.CodexWSIdleReclaimIdleSec)
+	}
+}
+
+func TestNormalizeCodexWSIdleReclaimSettings(t *testing.T) {
+	for _, percent := range []int{0, 5, 20, 50, 100} {
+		if got := NormalizeCodexWSIdleReclaimPercent(percent); got != percent {
+			t.Errorf("NormalizeCodexWSIdleReclaimPercent(%d) = %d", percent, got)
+		}
+	}
+	for _, percent := range []int{-1, 1, 4, 6, 17, 99, 101} {
+		if got := NormalizeCodexWSIdleReclaimPercent(percent); got != 0 {
+			t.Errorf("NormalizeCodexWSIdleReclaimPercent(%d) = %d, want 0", percent, got)
+		}
+	}
+
+	for input, want := range map[int]int{
+		-1: 600, 0: 600, 1: 600, 299: 600,
+		300: 300, 600: 600, 86400: 86400, 86401: 86400,
+	} {
+		if got := NormalizeCodexWSIdleReclaimIdleSec(input); got != want {
+			t.Errorf("NormalizeCodexWSIdleReclaimIdleSec(%d) = %d, want %d", input, got, want)
+		}
 	}
 }

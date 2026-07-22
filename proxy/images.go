@@ -1575,7 +1575,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				return
 			}
 			kind := classifyTransportFailure(reqErr)
-			if kind != "" {
+			if shouldPenalizeTransportFailure(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)

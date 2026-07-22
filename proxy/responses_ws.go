@@ -107,7 +107,7 @@ func classifyResponsesWSResponseFailedAction(
 	}
 
 	oauthForbidden := policy.outcome.logStatusCode == http.StatusForbidden &&
-		account != nil && !account.IsOpenAIResponsesAPI()
+		account != nil && !account.IsRelayStyle()
 	if oauthForbidden {
 		action.retry = policy.retryable && oauthForbiddenRetryAllowed
 		// Never publish an account-scoped OAuth 403 as a successful terminal
@@ -431,10 +431,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	accountFilter := accountFilterForModel(effectiveModel)
 	relayCfg := h.cybRelayConfig()
-	if promptDecision.routesToCybRelay() || (relayCfg.Enabled && relayCfg.GroupID > 0) {
+	if promptDecision.routesToCybRelay() || (relayCfg.Enabled && relayCfg.GroupID > 0) ||
+		requestUpstreamChannel(c) == database.UpstreamChannelGrok {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	wsRetrySettings := CurrentRuntimeSettings()
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
@@ -561,7 +563,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 			return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 		}
-		if !account.IsOpenAIResponsesAPI() {
+		if !account.IsRelayStyle() {
 			lateDecision, upgraded := h.inspectPromptFilterSelectedOAuthAttempt(c, baseCodexBody, codexBody, originalInboundBody, "/v1/responses", model)
 			if upgraded {
 				circuitAttempt.Release(h.store, account)
@@ -602,7 +604,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
-		useWebsocket := !wsHTTPFallback.ForceHTTP() && !account.IsOpenAIResponsesAPI()
+		useWebsocket := responsesAttemptUsesWebsocket(account, !wsHTTPFallback.ForceHTTP())
 		// 生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
 		// 图片数据会卡死（issue #220）；自然语言生图意图也需保留图片工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
@@ -610,7 +612,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
 		upstreamBody := codexBody
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			relayBody, deleteErr := sjson.DeleteBytes(rawBody, "type")
 			if deleteErr == nil {
 				upstreamBody = PrepareOpenAIResponsesBody(relayBody)
@@ -628,7 +630,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		// Relay 不套 Payload Rules，记账也必须保留原始值。OAuth
 		// 路径复用本次实际选中账号匹配后的同一规则快照。
-		if account.IsOpenAIResponsesAPI() {
+		if account.IsRelayStyle() {
 			serviceTier = extractServiceTier(upstreamBody)
 		} else {
 			if payloadRulesPreApplied {
@@ -648,8 +650,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			upstreamCancel()
 			return errResponsesWSClientGone
 		}
-		if account.IsOpenAIResponsesAPI() {
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+		if account.IsRelayStyle() {
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			httpSessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
 			upstreamCtx, transportObservation := withUpstreamTransportObservation(upstreamCtx)
@@ -938,7 +940,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 			requiresBoundAccount := requestRequiresBoundUpstreamAccount(c, rawBody)
 			shouldRetry := false
-			if resp.StatusCode == http.StatusForbidden && account != nil && !account.IsOpenAIResponsesAPI() && !requiresBoundAccount && attempt < oauthForbiddenMaxRetries {
+			if resp.StatusCode == http.StatusForbidden && account != nil && !account.IsRelayStyle() && !requiresBoundAccount && attempt < oauthForbiddenMaxRetries {
 				// OAuth 403 is account-scoped health evidence rather than a
 				// display preference. A fresh request may rotate within the
 				// configured retry budget even when generic silent retry is
@@ -1073,7 +1075,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					retryExclusions.MarkHard(account.ID())
 				}
 				retryBudget := maxRetries
-				if retryErr.outcome.logStatusCode == http.StatusForbidden && account != nil && !account.IsOpenAIResponsesAPI() {
+				if retryErr.outcome.logStatusCode == http.StatusForbidden && account != nil && !account.IsRelayStyle() {
 					retryBudget = oauthForbiddenMaxRetries
 				}
 				log.Printf("Responses WebSocket upstream stream ended before first token, retrying (attempt %d/%d, account %d): %s", attempt+1, retryBudget+1, account.ID(), retryErr.outcome.failureMessage)
@@ -1699,7 +1701,7 @@ func responsesWSUpstreamAPIError(statusCode int, body []byte) *api.APIError {
 }
 
 func responsesWSFinalHTTPStatusForAccount(account *auth.Account, statusCode int) int {
-	if statusCode == http.StatusForbidden && account != nil && !account.IsOpenAIResponsesAPI() {
+	if statusCode == http.StatusForbidden && account != nil && !account.IsRelayStyle() {
 		return http.StatusServiceUnavailable
 	}
 	return statusCode

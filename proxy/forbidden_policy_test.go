@@ -34,6 +34,11 @@ func TestResponseFailedForbiddenPolicyByAccountOwnership(t *testing.T) {
 		BaseURL:      "https://relay.example/v1",
 		APIKey:       "relay-key",
 	}
+	grok := &auth.Account{
+		DBID:         3,
+		UpstreamType: auth.UpstreamGrok,
+		APIKey:       "xai-test-key",
+	}
 
 	tests := []struct {
 		name          string
@@ -61,6 +66,13 @@ func TestResponseFailedForbiddenPolicyByAccountOwnership(t *testing.T) {
 		{
 			name:          "relay front door is neutral and transparent",
 			account:       relay,
+			wantPenalize:  false,
+			wantRetry:     false,
+			wantCanonical: http.StatusForbidden,
+		},
+		{
+			name:          "grok is an external RelayStyle account",
+			account:       grok,
 			wantPenalize:  false,
 			wantRetry:     false,
 			wantCanonical: http.StatusForbidden,
@@ -101,6 +113,11 @@ func TestResponsesWSOAuthForbiddenUsesPoolLevelStatus(t *testing.T) {
 		BaseURL:      "https://relay.example/v1",
 		APIKey:       "relay-key",
 	}
+	grok := &auth.Account{
+		DBID:         3,
+		UpstreamType: auth.UpstreamGrok,
+		APIKey:       "xai-test-key",
+	}
 	body := []byte(`{"error":{"code":"codex_access_restricted","message":"account forbidden"}}`)
 
 	if got := responsesWSFinalHTTPStatusForAccount(oauth, http.StatusForbidden); got != http.StatusServiceUnavailable {
@@ -116,6 +133,9 @@ func TestResponsesWSOAuthForbiddenUsesPoolLevelStatus(t *testing.T) {
 
 	if got := responsesWSFinalHTTPStatusForAccount(relay, http.StatusForbidden); got != http.StatusForbidden {
 		t.Fatalf("Relay 403 visible status = %d, want 403", got)
+	}
+	if got := responsesWSFinalHTTPStatusForAccount(grok, http.StatusForbidden); got != http.StatusForbidden {
+		t.Fatalf("Grok 403 visible status = %d, want 403", got)
 	}
 	relayErr := responsesWSUpstreamAPIError(
 		responsesWSFinalHTTPStatusForAccount(relay, http.StatusForbidden),
@@ -143,6 +163,11 @@ func TestResponsesWSResponseFailedForbiddenPublicationPolicy(t *testing.T) {
 		UpstreamType: auth.UpstreamOpenAIResponses,
 		BaseURL:      "https://relay.example/v1",
 		APIKey:       "relay-key",
+	}
+	grok := &auth.Account{
+		DBID:         3,
+		UpstreamType: auth.UpstreamGrok,
+		APIKey:       "xai-test-key",
 	}
 
 	for _, silentRetry := range []bool{false, true} {
@@ -189,6 +214,16 @@ func TestResponsesWSResponseFailedForbiddenPublicationPolicy(t *testing.T) {
 		}
 		if action.policy.outcome.penalize {
 			t.Fatal("Relay embedded 403 must not penalize account health")
+		}
+		if action.policy.canonicalStatus != http.StatusForbidden {
+			t.Fatalf("canonical status = %d, want 403", action.policy.canonicalStatus)
+		}
+	})
+
+	t.Run("Grok does not enter OAuth 403 rotation", func(t *testing.T) {
+		action := classifyResponsesWSResponseFailedAction(grok, false, payload, true, true, true, true, true)
+		if !action.suppressRaw || action.retry {
+			t.Fatalf("Grok action = %+v, want one canonical non-OAuth error", action)
 		}
 		if action.policy.canonicalStatus != http.StatusForbidden {
 			t.Fatalf("canonical status = %d, want 403", action.policy.canonicalStatus)

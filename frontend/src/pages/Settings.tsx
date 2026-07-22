@@ -1147,7 +1147,11 @@ export default function Settings() {
     codex_ws_silent_retry_enabled: true,
     codex_ws_silent_max_retries: 2,
     codex_ws_size_router_enabled: true,
+    codex_ws_busy_acquire_max_wait_sec: 30,
+    codex_ws_busy_overflow_enabled: false,
+    codex_ws_busy_patience_sec: 2,
     codex_continue_thinking_enabled: false,
+    overflow_auto_compact_enabled: false,
     codex_continue_max_rounds: 8,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
@@ -2301,6 +2305,12 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_size_router_enabled', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.codexWSBusyOverflowEnabled')} description={t('settings.codexWSBusyOverflowEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_busy_overflow_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_busy_overflow_enabled', checked)}
+                  />
+                </SettingField>
               </div>
 
               <div className={cn(SETTINGS_FIELD_GRID, 'border-t border-border/80 pt-4')}>
@@ -2345,6 +2355,44 @@ export default function Settings() {
                     }}
                   />
                 </SettingField>
+                <SettingField
+                  label={t('settings.codexWSBusyAcquireMaxWait')}
+                  description={t('settings.codexWSBusyAcquireMaxWaitDesc')}
+                  suffix={t('settings.unit.sec')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={300}
+                    value={settingsForm.codex_ws_busy_acquire_max_wait_sec}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_acquire_max_wait_sec: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({
+                        codex_ws_busy_acquire_max_wait_sec: value,
+                      })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSBusyPatience')}
+                  description={t('settings.codexWSBusyPatienceDesc')}
+                  suffix={t('settings.unit.sec')}
+                  className={cn(!settingsForm.codex_ws_busy_overflow_enabled && 'opacity-60')}
+                >
+                  <DraftNumberInput
+                    min={0}
+                    max={300}
+                    disabled={!settingsForm.codex_ws_busy_overflow_enabled}
+                    value={settingsForm.codex_ws_busy_patience_sec}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_patience_sec: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_busy_overflow_enabled) return
+                      void autoSaveSettingsPatch({
+                        codex_ws_busy_patience_sec: value,
+                      })
+                    }}
+                  />
+                </SettingField>
               </div>
             </div>
           </SettingsCard>
@@ -2380,6 +2428,17 @@ export default function Settings() {
                   />
                 </SettingField>
               </div>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.overflowAutoCompact')} description={t('settings.overflowAutoCompactDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.overflowAutoCompactEnabled')} description={t('settings.overflowAutoCompactEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.overflow_auto_compact_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('overflow_auto_compact_enabled', checked)}
+                />
+              </SettingField>
             </div>
           </SettingsCard>
 

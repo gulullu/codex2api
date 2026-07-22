@@ -47,6 +47,12 @@ const (
 	defaultCodexWSSilentRetries   = 2
 	defaultCodexWSSizeRouter      = true
 	maxCodexWSSilentRetries       = 10
+	defaultCodexWSBusyMaxWaitSec  = 30
+	defaultCodexWSBusyPatienceSec = 2
+	maxCodexWSBusyWaitSec         = 300
+	defaultCodexWSIdleReclaimSec  = 10 * 60
+	minCodexWSIdleReclaimSec      = 5 * 60
+	maxCodexWSIdleReclaimSec      = 24 * 60 * 60
 
 	defaultCodexContinueMaxRounds = 8
 	minCodexContinueMaxRounds     = 1
@@ -54,19 +60,33 @@ const (
 )
 
 type RuntimeSettings struct {
-	ClientCompatMode      string
-	CodexMinCLIVersion    string
-	CodexUserAgentConfig  string
-	StreamFlushPolicy     string
-	StreamFlushIntervalMS int
-	FirstTokenMode        string
-	FirstTokenTimeoutSec  int
-	BillingTierPolicy     string
-	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
-	CodexWSHideErrors     bool // 隐藏 Codex WS 上游原始错误（默认 true）
-	CodexWSSilentRetry    bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
-	CodexWSSilentRetries  int  // Codex WS 静默换号最大重试次数（默认 2）
-	CodexWSSizeRouter     bool // 1009 自学习体积路由：超大请求直接首发 HTTP（默认 true）
+	ClientCompatMode       string
+	CodexMinCLIVersion     string
+	CodexUserAgentConfig   string
+	StreamFlushPolicy      string
+	StreamFlushIntervalMS  int
+	FirstTokenMode         string
+	FirstTokenTimeoutSec   int
+	BillingTierPolicy      string
+	CodexForceWebsocket    bool // 强制 Codex 上游走 WebSocket（默认 false）
+	CodexWSHideErrors      bool // 隐藏 Codex WS 上游原始错误（默认 true）
+	CodexWSSilentRetry     bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
+	CodexWSSilentRetries   int  // Codex WS 静默换号最大重试次数（默认 2）
+	CodexWSSizeRouter      bool // 1009 自学习体积路由：超大请求直接首发 HTTP（默认 true）
+	CodexWSBusyMaxWaitSec  int  // busy session/容量等待的累计上限秒数（默认 30，issue #413）
+	CodexWSBusyOverflow    bool // busy session 溢出到同账号兄弟连接（默认 false）
+	CodexWSBusyPatienceSec int  // 触发溢出前的短等待秒数（默认 2）
+	// CodexWSIdleReclaimEnabled 开启后仅回收无在途请求、无读写 lease、且没有
+	// live previous_response_id 绑定的业务空闲连接。默认关闭，关闭时保持旧行为。
+	CodexWSIdleReclaimEnabled bool
+	// CodexWSIdleReclaimPercent 是按动态账号 ID 稳定采样的灰度比例，仅接受
+	// 0/5/20/50/100；非法值 fail closed 为 0。
+	CodexWSIdleReclaimPercent int
+	// CodexWSIdleReclaimIdleSec 是业务帧空闲阈值，默认 10 分钟，安全下限 5 分钟。
+	CodexWSIdleReclaimIdleSec int
+	// OverflowAutoCompact 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）。
+	// 全局开关与 per-key limits.auto_compact_overflow 为「或」关系。
+	OverflowAutoCompact bool
 	// CodexContinueThinking 检测到上游按 518n-2 指纹截断思考时自动续想并折叠成单响应（默认 false）。
 	CodexContinueThinking  bool
 	CodexContinueMaxRounds int // 单次请求最大续想轮数，含首轮（默认 8，范围 1-32）
@@ -114,6 +134,9 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSilentRetry:               defaultCodexWSSilentRetry,
 		CodexWSSilentRetries:             defaultCodexWSSilentRetries,
 		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
+		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
+		CodexWSBusyPatienceSec:           defaultCodexWSBusyPatienceSec,
+		CodexWSIdleReclaimIdleSec:        defaultCodexWSIdleReclaimSec,
 		CodexContinueMaxRounds:           defaultCodexContinueMaxRounds,
 		RequestIsolationMode:             defaultRequestIsolationMode(),
 		CodexCLIVersionSyncEnabled:       true,
@@ -220,6 +243,25 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSSilentRetries > maxCodexWSSilentRetries {
 		settings.CodexWSSilentRetries = maxCodexWSSilentRetries
 	}
+	if settings.CodexWSBusyMaxWaitSec <= 0 {
+		settings.CodexWSBusyMaxWaitSec = defaultCodexWSBusyMaxWaitSec
+	}
+	if settings.CodexWSBusyMaxWaitSec > maxCodexWSBusyWaitSec {
+		settings.CodexWSBusyMaxWaitSec = maxCodexWSBusyWaitSec
+	}
+	if settings.CodexWSBusyPatienceSec < 0 {
+		settings.CodexWSBusyPatienceSec = defaultCodexWSBusyPatienceSec
+	}
+	if settings.CodexWSBusyPatienceSec > maxCodexWSBusyWaitSec {
+		settings.CodexWSBusyPatienceSec = maxCodexWSBusyWaitSec
+	}
+	settings.CodexWSIdleReclaimPercent = NormalizeCodexWSIdleReclaimPercent(settings.CodexWSIdleReclaimPercent)
+	if settings.CodexWSIdleReclaimIdleSec < minCodexWSIdleReclaimSec {
+		settings.CodexWSIdleReclaimIdleSec = defaultCodexWSIdleReclaimSec
+	}
+	if settings.CodexWSIdleReclaimIdleSec > maxCodexWSIdleReclaimSec {
+		settings.CodexWSIdleReclaimIdleSec = maxCodexWSIdleReclaimSec
+	}
 	if settings.CodexContinueMaxRounds < minCodexContinueMaxRounds {
 		settings.CodexContinueMaxRounds = defaults.CodexContinueMaxRounds
 	}
@@ -228,6 +270,17 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	}
 	settings.AutoResetCreditsBeforeExpiryMin = database.NormalizeAutoResetCreditsBeforeExpiryMinutes(settings.AutoResetCreditsBeforeExpiryMin)
 	return settings
+}
+
+// NormalizeCodexWSIdleReclaimPercent keeps rollout changes explicit and
+// reversible. Unknown values never widen the canary.
+func NormalizeCodexWSIdleReclaimPercent(percent int) int {
+	switch percent {
+	case 0, 5, 20, 50, 100:
+		return percent
+	default:
+		return 0
+	}
 }
 
 func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSettings {
@@ -249,6 +302,13 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
 		next.CodexWSSizeRouter = settings.CodexWSSizeRouterEnabled
+		next.CodexWSBusyMaxWaitSec = settings.CodexWSBusyAcquireMaxWaitSec
+		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
+		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
+		next.CodexWSIdleReclaimEnabled = settings.CodexWSIdleReclaimEnabled
+		next.CodexWSIdleReclaimPercent = settings.CodexWSIdleReclaimPercent
+		next.CodexWSIdleReclaimIdleSec = settings.CodexWSIdleReclaimIdleSec
+		next.OverflowAutoCompact = settings.OverflowAutoCompactEnabled
 		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled
 		next.CodexContinueMaxRounds = settings.CodexContinueMaxRounds
 		next.CodexSyncedCLIVersion = settings.CodexSyncedCLIVersion

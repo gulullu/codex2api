@@ -706,9 +706,32 @@ function ResetCreditsSection({
     }
   }
 
+  const balanceDisplay = account.credits_has_credits
+    ? account.credits_unlimited
+      ? t('accounts.creditsBalanceUnlimitedShort')
+      : (account.credits_balance ?? '').trim() || null
+    : null
+  const applicable =
+    typeof account.applicable_reset_credits === 'number'
+      ? account.applicable_reset_credits
+      : null
+
   return (
     <div className="mt-5 rounded-2xl border bg-card p-4">
       <h4 className="mb-3 text-base font-semibold">{t('accounts.resetCreditsTitle')}</h4>
+      {balanceDisplay !== null && (
+        <div className="mb-3 flex items-center justify-between gap-4 rounded-xl bg-muted/40 px-3 py-2">
+          <span className="text-sm font-medium">{t('accounts.creditsBalanceLabel')}</span>
+          <span className="flex items-center gap-2">
+            <span className="text-base font-semibold tabular-nums text-foreground">{balanceDisplay}</span>
+            {account.credits_overage_limit_reached && (
+              <span className="rounded-md bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 ring-1 ring-inset ring-red-500/20 dark:bg-red-950 dark:text-red-400 dark:ring-red-400/20">
+                {t('accounts.creditsOverageReached')}
+              </span>
+            )}
+          </span>
+        </div>
+      )}
       {error && <div className="mb-3 text-xs text-red-500">{error}</div>}
       {done && !error && (
         <div className="mb-3 text-xs text-emerald-600">{t('accounts.resetCreditsSuccess')}</div>
@@ -719,7 +742,14 @@ function ResetCreditsSection({
           <p className="text-xs text-muted-foreground">{t('accounts.resetCreditsHint')}</p>
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-2xl font-semibold tabular-nums text-foreground">{count}</span>
+          <div className="flex flex-col items-end">
+            <span className="text-2xl font-semibold tabular-nums text-foreground">{count}</span>
+            {count > 0 && applicable === 0 && (
+              <span className="text-[10px] text-muted-foreground">
+                {t('accounts.resetCreditsNotApplicable')}
+              </span>
+            )}
+          </div>
           {count > 0 &&
             (confirming ? (
               <div className="flex items-center gap-2">

@@ -278,7 +278,7 @@ func (h *Handler) applyAccountModelMappingToBody(rawBody []byte, account *auth.A
 
 func (h *Handler) applyAccountModelMappingToBodyForModels(rawBody []byte, account *auth.Account, modelCandidates ...string) ([]byte, string, bool) {
 	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
-	if model == "" || !gjson.ValidBytes(rawBody) || account == nil || !account.IsOpenAIResponsesAPI() {
+	if model == "" || !gjson.ValidBytes(rawBody) || account == nil || !account.IsRelayStyle() {
 		return rawBody, model, false
 	}
 	modelCandidates = append(modelCandidates, model)
@@ -461,7 +461,7 @@ func resolveAccountCompactModelMappingForCandidates(account *auth.Account, candi
 // 标记且映射目标不允许携带 -openai-compact 后缀进入上游请求体。
 func (h *Handler) applyAccountCompactModelMappingToBody(rawBody []byte, account *auth.Account, modelCandidates ...string) ([]byte, string, bool) {
 	model := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
-	if model == "" || !gjson.ValidBytes(rawBody) || account == nil || !account.IsOpenAIResponsesAPI() {
+	if model == "" || !gjson.ValidBytes(rawBody) || account == nil || !account.IsRelayStyle() {
 		return rawBody, model, false
 	}
 	candidates := compactMappingCandidates(append(modelCandidates, model)...)

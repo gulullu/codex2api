@@ -113,7 +113,7 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
 	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
 
-	got := summarizeDashboardAccounts(rows, []*auth.Account{
+	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
 		unauthorized,
 		disabled,

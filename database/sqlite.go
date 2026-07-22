@@ -126,6 +126,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			output_tokens INTEGER DEFAULT 0,
 			reasoning_tokens INTEGER DEFAULT 0,
 			first_token_ms INTEGER DEFAULT 0,
+			ws_acquire_ms INTEGER DEFAULT 0,
 			reasoning_effort TEXT DEFAULT '',
 			effective_model TEXT DEFAULT '',
 			inbound_endpoint TEXT DEFAULT '',
@@ -250,6 +251,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_ws_silent_retry_enabled INTEGER DEFAULT 1,
 					codex_ws_silent_max_retries INTEGER DEFAULT 2,
 					codex_ws_size_router_enabled INTEGER DEFAULT 1,
+					codex_ws_busy_acquire_max_wait_sec INTEGER DEFAULT 30,
+					codex_ws_busy_overflow_enabled INTEGER DEFAULT 0,
+					codex_ws_busy_patience_sec INTEGER DEFAULT 2,
+					codex_ws_idle_reclaim_enabled INTEGER DEFAULT 0,
+					codex_ws_idle_reclaim_percent INTEGER DEFAULT 0,
+					codex_ws_idle_reclaim_idle_sec INTEGER DEFAULT 600,
+					overflow_auto_compact_enabled INTEGER DEFAULT 0,
 					codex_continue_thinking_enabled INTEGER DEFAULT 0,
 					codex_continue_max_rounds INTEGER DEFAULT 8,
 					retry_interval_ms INTEGER DEFAULT 0,
@@ -419,10 +427,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "tags", "TEXT DEFAULT '[]'"},
 		{"accounts", "note", "TEXT DEFAULT ''"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
+		{"usage_logs", "channel", "TEXT DEFAULT 'codex'"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "reasoning_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "first_token_ms", "INTEGER DEFAULT 0"},
+		{"usage_logs", "ws_acquire_ms", "INTEGER DEFAULT 0"},
 		{"usage_logs", "reasoning_effort", "TEXT DEFAULT ''"},
 		{"usage_logs", "effective_model", "TEXT DEFAULT ''"},
 		{"usage_logs", "inbound_endpoint", "TEXT DEFAULT ''"},
@@ -505,6 +515,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_ws_silent_retry_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "codex_ws_size_router_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "codex_ws_busy_acquire_max_wait_sec", "INTEGER DEFAULT 30"},
+		{"system_settings", "codex_ws_busy_overflow_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_busy_patience_sec", "INTEGER DEFAULT 2"},
+		{"system_settings", "codex_ws_idle_reclaim_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_idle_reclaim_percent", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_ws_idle_reclaim_idle_sec", "INTEGER DEFAULT 600"},
+		{"system_settings", "overflow_auto_compact_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_continue_thinking_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_continue_max_rounds", "INTEGER DEFAULT 8"},
 		{"system_settings", "retry_interval_ms", "INTEGER DEFAULT 0"},
@@ -771,14 +788,20 @@ func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, e
 	return result, nil
 }
 
-func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
+func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Time, bucketMinutes int, channel string) (*ChartAggregation, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
-	rows, err := db.conn.QueryContext(ctx, `
+	query := `
 		SELECT created_at, duration_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, model, status_code
 		FROM usage_logs
 		WHERE created_at >= $1 AND created_at <= $2
 		  AND status_code <> 499
-	`, startArg, endArg)
+	`
+	args := []interface{}{startArg, endArg}
+	if channel != "" {
+		query += " AND " + usageLogChannelSQLPredicate("channel", "$3")
+		args = append(args, channel)
+	}
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -980,7 +1003,7 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 
 // getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）。
 // rangeStart 为零值时回落到"今日"(本地 0 点起);rangeEnd 为零值表示至今。
-func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time) (*UsageStats, error) {
+func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*UsageStats, error) {
 	now := time.Now()
 	if rangeStart.IsZero() {
 		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -995,8 +1018,13 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		`
 	args := []interface{}{db.timeArg(rangeStart)}
 	if !rangeEnd.IsZero() {
-		query += " AND created_at < $2"
+		query += fmt.Sprintf(" AND created_at < $%d", len(args)+1)
 		args = append(args, db.timeArg(rangeEnd))
+	}
+	if channel != "" {
+		placeholder := fmt.Sprintf("$%d", len(args)+1)
+		query += " AND " + usageLogChannelSQLPredicate("channel", placeholder)
+		args = append(args, channel)
 	}
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
@@ -1071,6 +1099,12 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 	var currentTokens, currentPrompt, currentCompletion, currentCached int64
 	var currentFirstTokenMsSum float64
 	var currentAccountBilled, currentUserBilled float64
+	totalWhere := "status_code <> 499"
+	totalArgs := []interface{}{}
+	if channel != "" {
+		totalWhere += " AND " + usageLogChannelSQLPredicate("channel", "$1")
+		totalArgs = append(totalArgs, channel)
+	}
 	_ = db.conn.QueryRowContext(ctx, `
 		SELECT
 			COUNT(*),
@@ -1084,17 +1118,18 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 			COALESCE(SUM(account_billed), 0),
 			COALESCE(SUM(user_billed), 0)
 		FROM usage_logs
-		WHERE status_code <> 499
-	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
+		WHERE `+totalWhere, totalArgs...).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
 
-	// 基线值
+	// 基线值；渠道过滤时 baseline 无渠道维度，跳过（口径与 Postgres 侧一致）。
 	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
 	var bFirstTokenMsSum float64
 	var bAccountBilled, bUserBilled float64
-	_ = db.conn.QueryRowContext(ctx, `
+	if channel == "" {
+		_ = db.conn.QueryRowContext(ctx, `
 		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 		FROM usage_stats_baseline WHERE id = 1
 	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bCacheHitRequests, &bFirstTokenMsSum, &bFirstTokenSamples, &bAccountBilled, &bUserBilled)
+	}
 
 	stats.TotalRequests = visibleTotal + bReq
 	stats.TotalTokens = currentTokens + bTok
@@ -1113,11 +1148,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
-	stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd)
+	stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd); err != nil {
+	if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel); err != nil {
 		return nil, err
 	}
 

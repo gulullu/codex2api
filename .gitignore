@@ -38,6 +38,10 @@ AGMENT.md
 CLIProxyAPI/
 sub2api/
 new-api/
+CPA-Manager-Plus/
+grok2api/
+grokcli2api-go/
 .gstack/
 .gocache/
 .gopath/
+CLAUDE.md

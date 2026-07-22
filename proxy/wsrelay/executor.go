@@ -346,6 +346,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
+	acquireStart := time.Now()
 	safePoolRequest := false
 	if continuationRequest {
 		if poolPolicy.mode == statelessPoolHTTPFallback {
@@ -486,6 +487,8 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 		}
 	}
+	// 取连耗时（busy 排队 + 探活 + 握手）计入本 attempt 的 ws_acquire_ms（issue #413）
+	proxy.AddWsAcquireDuration(ctx, time.Since(acquireStart))
 	if err2 != nil {
 		return nil, err2
 	}
@@ -538,7 +541,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		case <-time.After(time.Duration(retries+1) * 200 * time.Millisecond):
 		}
 
+		reacquireStart := time.Now()
 		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+		proxy.AddWsAcquireDuration(ctx, time.Since(reacquireStart))
 		if err2 != nil {
 			return nil, err2
 		}
