@@ -562,12 +562,18 @@ type Manager struct {
 	// 可选的保活 Ping 函数（用于测试替换），nil 时使用默认 SendHeartbeat
 	keepalivePingFunc func(wc *WsConnection) error
 
-	// Business-idle reclaim metrics and bounded reconnect attribution. These do
-	// not participate in routing and remain inert while the feature is disabled.
+	// Business-idle reclaim cumulative metrics and bounded reconnect attribution.
+	// With a non-zero rollout, disabled means observe-only: it scans and records
+	// safe candidates but never changes pool ownership or closes a connection.
+	idleReclaimSeen           atomic.Uint64
+	idleReclaimSampleHit      atomic.Uint64
+	idleReclaimIdleCandidate  atomic.Uint64
 	idleReclaimEligible       atomic.Uint64
+	idleReclaimWouldReclaim   atomic.Uint64
 	idleReclaimReclaimed      atomic.Uint64
 	idleReclaimSkippedBusy    atomic.Uint64
 	idleReclaimSkippedContext atomic.Uint64
+	idleReclaimSkippedRate    atomic.Uint64
 	idleReclaimReconnect      atomic.Uint64
 	idleReclaimPendingKeys    atomic.Int64
 	idleReclaimMu             sync.Mutex

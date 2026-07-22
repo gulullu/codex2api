@@ -1,6 +1,7 @@
 package wsrelay
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func TestControlPongDoesNotRefreshBusinessIdle(t *testing.T) {
 }
 
 func TestIdleReclaimDisabledPreservesConnection(t *testing.T) {
-	setIdleReclaimTestSettings(t, false, 100, 5*60)
+	setIdleReclaimTestSettings(t, false, 0, 5*60)
 	m := NewManager()
 	t.Cleanup(m.Stop)
 	now := time.Now()
@@ -56,6 +57,128 @@ func TestIdleReclaimDisabledPreservesConnection(t *testing.T) {
 	}
 	if snapshot := m.IdleReclaimRuntimeSnapshot(); snapshot.Enabled || snapshot.Eligible != 0 || snapshot.Reclaimed != 0 {
 		t.Fatalf("disabled snapshot = %+v, want inert", snapshot)
+	}
+}
+
+func TestIdleReclaimObserveOnlyCountsWithoutMutation(t *testing.T) {
+	setIdleReclaimTestSettings(t, false, 100, 5*60)
+	m := NewManager()
+	t.Cleanup(m.Stop)
+	now := time.Now()
+	wc := addConnectedConn(t, m, 108, "observe-only")
+	makeBusinessIdle(wc, now, 6*time.Minute)
+
+	m.reclaimBusinessIdleConnections(now)
+
+	if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc || !wc.IsConnected() {
+		t.Fatal("observe-only idle reclaimer changed the connection lifecycle")
+	}
+	if m.ConnectionCount() != 1 || m.SessionCount() != 1 {
+		t.Fatalf("observe-only changed pool sizes: connections=%d sessions=%d", m.ConnectionCount(), m.SessionCount())
+	}
+	snapshot := m.IdleReclaimRuntimeSnapshot()
+	if snapshot.Enabled || !snapshot.ObserveOnly || snapshot.Seen != 1 || snapshot.IdleCandidate != 1 ||
+		snapshot.SampleHit != 1 || snapshot.Eligible != 1 || snapshot.WouldReclaim != 1 ||
+		snapshot.Reclaimed != 0 || snapshot.SkippedRateLimit != 0 || snapshot.PendingReconnects != 0 || snapshot.Reconnect != 0 {
+		t.Fatalf("observe-only snapshot = %+v, want one safe dry-run candidate and no lifecycle metrics", snapshot)
+	}
+}
+
+func TestIdleReclaimObserveOnlyScansPastEnforceCap(t *testing.T) {
+	setIdleReclaimTestSettings(t, false, 100, 5*60)
+	m := NewManager()
+	t.Cleanup(m.Stop)
+	now := time.Now()
+	const candidates = idleReclaimMaxPerPass + 4
+	for i := 0; i < candidates; i++ {
+		wc := addConnectedConn(t, m, int64(120+i), fmt.Sprintf("observe-many-%d", i))
+		makeBusinessIdle(wc, now, 6*time.Minute)
+	}
+
+	m.reclaimBusinessIdleConnections(now)
+
+	snapshot := m.IdleReclaimRuntimeSnapshot()
+	if snapshot.WouldReclaim != candidates || snapshot.Reclaimed != 0 || snapshot.SkippedRateLimit != 0 {
+		t.Fatalf("observe-only snapshot = %+v, want all %d candidates observed without enforcing the cap", snapshot, candidates)
+	}
+	if got := m.ConnectionCount(); got != candidates {
+		t.Fatalf("observe-only connection count = %d, want %d", got, candidates)
+	}
+	if got := m.SessionCount(); got != candidates {
+		t.Fatalf("observe-only session count = %d, want %d", got, candidates)
+	}
+}
+
+func TestIdleReclaimObserveOnlyDoesNotWaitForWriter(t *testing.T) {
+	setIdleReclaimTestSettings(t, false, 100, 5*60)
+	m := NewManager()
+	t.Cleanup(m.Stop)
+	now := time.Now()
+	wc := addConnectedConn(t, m, 140, "observe-writer-busy")
+	makeBusinessIdle(wc, now, 6*time.Minute)
+	wc.writeMu.Lock()
+	started := time.Now()
+	m.reclaimBusinessIdleConnections(now)
+	elapsed := time.Since(started)
+	wc.writeMu.Unlock()
+
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("observe-only waited %s for writeMu, want non-blocking TryLock", elapsed)
+	}
+	if !wc.IsConnected() || m.ConnectionCount() != 1 || m.SessionCount() != 1 {
+		t.Fatal("observe-only changed a writer-busy connection")
+	}
+	if snapshot := m.IdleReclaimRuntimeSnapshot(); snapshot.SkippedBusy != 1 || snapshot.WouldReclaim != 0 || snapshot.Reclaimed != 0 {
+		t.Fatalf("writer-busy snapshot = %+v, want one non-blocking busy skip", snapshot)
+	}
+}
+
+func TestIdleReclaimObserveOnlyPreservesContinuationContext(t *testing.T) {
+	setIdleReclaimTestSettings(t, false, 100, 5*60)
+	m := NewManager()
+	t.Cleanup(m.Stop)
+	now := time.Now()
+	wc := addConnectedConn(t, m, 109, "observe-bound")
+	m.BindResponseConn("resp_observe_bound", wc, "observe-bound", 109, "key-A")
+	makeBusinessIdle(wc, now, 6*time.Minute)
+
+	m.reclaimBusinessIdleConnections(now)
+
+	if current, ok := m.connections.Load(wc.PoolKey); !ok || current != wc || !wc.IsConnected() {
+		t.Fatal("observe-only idle reclaimer closed continuation context")
+	}
+	if got, _ := m.lookupResponseConn("resp_observe_bound", 109, "key-A"); got != wc {
+		t.Fatal("observe-only idle reclaimer removed continuation binding")
+	}
+	if snapshot := m.IdleReclaimRuntimeSnapshot(); snapshot.SkippedContext != 1 || snapshot.WouldReclaim != 0 ||
+		snapshot.Reclaimed != 0 || snapshot.PendingReconnects != 0 || snapshot.Reconnect != 0 {
+		t.Fatalf("observe-only bound snapshot = %+v, want one protected context", snapshot)
+	}
+}
+
+func TestIdleReclaimObserveToEnforceHotSwitch(t *testing.T) {
+	setIdleReclaimTestSettings(t, false, 100, 5*60)
+	m := NewManager()
+	t.Cleanup(m.Stop)
+	now := time.Now()
+	wc := addConnectedConn(t, m, 110, "hot-switch")
+	makeBusinessIdle(wc, now, 6*time.Minute)
+
+	m.reclaimBusinessIdleConnections(now)
+	if !wc.IsConnected() {
+		t.Fatal("observe phase closed connection")
+	}
+	next := proxy.CurrentRuntimeSettings()
+	next.CodexWSIdleReclaimEnabled = true
+	proxy.ApplyRuntimeSettings(next)
+	m.reclaimBusinessIdleConnections(now.Add(30 * time.Second))
+
+	if _, ok := m.connections.Load(wc.PoolKey); ok || wc.IsConnected() {
+		t.Fatal("enforce phase did not reclaim the previously observed idle connection")
+	}
+	snapshot := m.IdleReclaimRuntimeSnapshot()
+	if !snapshot.Enabled || snapshot.ObserveOnly || snapshot.WouldReclaim != 2 || snapshot.Reclaimed != 1 || snapshot.PendingReconnects != 1 {
+		t.Fatalf("hot-switch snapshot = %+v, want observe then one enforced reclaim", snapshot)
 	}
 }
 
@@ -170,23 +293,76 @@ func TestIdleReclaimSerializesWithConcurrentLeaseActivation(t *testing.T) {
 	wc.session.RemovePendingRequest(pending.RequestID)
 }
 
-func TestIdleReclaimAccountSamplingIsStableAndMonotonic(t *testing.T) {
-	for accountID := int64(1); accountID <= 1000; accountID++ {
-		first := idleReclaimAccountSampled(accountID, 20)
-		if repeat := idleReclaimAccountSampled(accountID, 20); repeat != first {
-			t.Fatalf("account %d changed buckets between evaluations", accountID)
+func TestIdleReclaimPoolKeySamplingIsStableMonotonicAndDistributed(t *testing.T) {
+	counts := map[int]int{5: 0, 20: 0, 50: 0}
+	sameAccountHits := 0
+	sameAccountMisses := 0
+	for i := 0; i < 10000; i++ {
+		poolKey := fmt.Sprintf("%d|wss://example.test/responses|session-%d|proxy-%d", i%137+1, i, i%31)
+		first := idleReclaimPoolKeySampled(poolKey, 20)
+		if repeat := idleReclaimPoolKeySampled(poolKey, 20); repeat != first {
+			t.Fatalf("pool key %d changed buckets between evaluations", i)
 		}
-		if idleReclaimAccountSampled(accountID, 5) && !first {
-			t.Fatalf("account %d sampled at 5%% but not 20%%", accountID)
+		if idleReclaimPoolKeySampled(poolKey, 5) && !first {
+			t.Fatalf("pool key %d sampled at 5%% but not 20%%", i)
 		}
-		if first && !idleReclaimAccountSampled(accountID, 50) {
-			t.Fatalf("account %d sampled at 20%% but not 50%%", accountID)
+		if first && !idleReclaimPoolKeySampled(poolKey, 50) {
+			t.Fatalf("pool key %d sampled at 20%% but not 50%%", i)
 		}
-		if !idleReclaimAccountSampled(accountID, 100) {
-			t.Fatalf("account %d not sampled at 100%%", accountID)
+		if !idleReclaimPoolKeySampled(poolKey, 100) {
+			t.Fatalf("pool key %d not sampled at 100%%", i)
+		}
+		for _, percent := range []int{5, 20, 50} {
+			if idleReclaimPoolKeySampled(poolKey, percent) {
+				counts[percent]++
+			}
+		}
+		sameAccountKey := fmt.Sprintf("42|wss://example.test/responses|same-account-session-%d|", i)
+		if idleReclaimPoolKeySampled(sameAccountKey, 20) {
+			sameAccountHits++
+		} else {
+			sameAccountMisses++
 		}
 	}
-	if idleReclaimAccountSampled(1, 17) || idleReclaimAccountSampled(0, 100) {
-		t.Fatal("invalid rollout or invalid account widened the canary")
+	for percent, count := range counts {
+		want := percent * 100
+		if count < want-350 || count > want+350 {
+			t.Fatalf("%d%% distribution = %d/10000, outside conservative tolerance", percent, count)
+		}
+	}
+	if idleReclaimPoolKeySampled("1|wss://example.test|session", 17) || idleReclaimPoolKeySampled("", 100) {
+		t.Fatal("invalid rollout or empty PoolKey widened the canary")
+	}
+	if sameAccountHits == 0 || sameAccountMisses == 0 {
+		t.Fatalf("same dynamic account did not split across PoolKey buckets: hits=%d misses=%d", sameAccountHits, sameAccountMisses)
+	}
+}
+
+func TestIdleReclaimLimitsActualClosesPerPass(t *testing.T) {
+	setIdleReclaimTestSettings(t, true, 100, 5*60)
+	m := NewManager()
+	t.Cleanup(m.Stop)
+	now := time.Now()
+	for i := 0; i < idleReclaimMaxPerPass+4; i++ {
+		wc := addConnectedConn(t, m, int64(200+i), fmt.Sprintf("rate-%d", i))
+		makeBusinessIdle(wc, now, 6*time.Minute)
+	}
+
+	m.reclaimBusinessIdleConnections(now)
+	snapshot := m.IdleReclaimRuntimeSnapshot()
+	if snapshot.Reclaimed != idleReclaimMaxPerPass || snapshot.SkippedRateLimit != 1 || snapshot.WouldReclaim != idleReclaimMaxPerPass {
+		t.Fatalf("first limited pass snapshot = %+v, want reclaimed=8 cap_stops=1 would=8", snapshot)
+	}
+	if got := m.ConnectionCount(); got != 4 {
+		t.Fatalf("connections after first limited pass = %d, want 4", got)
+	}
+
+	m.reclaimBusinessIdleConnections(now.Add(30 * time.Second))
+	snapshot = m.IdleReclaimRuntimeSnapshot()
+	if snapshot.Reclaimed != idleReclaimMaxPerPass+4 || snapshot.SkippedRateLimit != 1 {
+		t.Fatalf("second limited pass snapshot = %+v, want all 12 reclaimed without another cap stop", snapshot)
+	}
+	if got := m.ConnectionCount(); got != 0 {
+		t.Fatalf("connections after second limited pass = %d, want 0", got)
 	}
 }

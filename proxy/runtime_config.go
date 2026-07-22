@@ -77,9 +77,10 @@ type RuntimeSettings struct {
 	CodexWSBusyOverflow    bool // busy session 溢出到同账号兄弟连接（默认 false）
 	CodexWSBusyPatienceSec int  // 触发溢出前的短等待秒数（默认 2）
 	// CodexWSIdleReclaimEnabled 开启后仅回收无在途请求、无读写 lease、且没有
-	// live previous_response_id 绑定的业务空闲连接。默认关闭，关闭时保持旧行为。
+	// live previous_response_id 绑定的业务空闲连接。关闭但灰度比例非零时仅观察
+	// 并累计安全候选，不关闭连接；关闭且比例为零时完全保持旧行为。
 	CodexWSIdleReclaimEnabled bool
-	// CodexWSIdleReclaimPercent 是按动态账号 ID 稳定采样的灰度比例，仅接受
+	// CodexWSIdleReclaimPercent 是按动态 PoolKey 稳定采样的灰度比例，仅接受
 	// 0/5/20/50/100；非法值 fail closed 为 0。
 	CodexWSIdleReclaimPercent int
 	// CodexWSIdleReclaimIdleSec 是业务帧空闲阈值，默认 10 分钟，安全下限 5 分钟。
