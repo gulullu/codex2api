@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2516,7 +2517,9 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 				if json.Unmarshal(raw, &toolMap) == nil &&
 					strings.TrimSpace(firstNonEmptyAnyString(toolMap["name"])) != "" {
 					toolMap["type"] = "function"
-					normalizeFunctionToolParameters(toolMap)
+					if !isReservedCodexTool(toolMap) {
+						normalizeFunctionToolParameters(toolMap)
+					}
 					tools = append(tools, toolMap)
 				}
 				continue
@@ -2554,9 +2557,11 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 				item["parameters"] = params
 			}
 		}
-		normalizeFunctionToolParameters(item)
 		if parsed.Function.Strict != nil {
 			item["strict"] = *parsed.Function.Strict
+		}
+		if !isReservedCodexTool(item) {
+			normalizeFunctionToolParameters(item)
 		}
 		tools = append(tools, item)
 	}
@@ -2730,8 +2735,12 @@ func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	ensureArrayItems(schema)
 }
 
-func sanitizeStructuredOutputSchemaForUpstream(schema map[string]interface{}) {
+func sanitizeStructuredOutputSchemaForUpstream(schema map[string]interface{}, strict bool) {
 	sanitizeSchemaForUpstream(schema)
+	filterStructuredOutputRequiredToProperties(schema)
+	if strict {
+		normalizeStrictSchemaRequiredFields(schema)
+	}
 	ensureObjectAdditionalPropertiesFalse(schema)
 }
 
@@ -2891,12 +2900,14 @@ func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[st
 func sanitizeStructuredOutputSchema(format map[string]any) bool {
 	modified := false
 	if schema, ok := format["schema"].(map[string]any); ok && schema != nil {
-		sanitizeStructuredOutputSchemaForUpstream(schema)
+		strict, _ := format["strict"].(bool)
+		sanitizeStructuredOutputSchemaForUpstream(schema, strict)
 		modified = true
 	}
 	if jsonSchema, ok := format["json_schema"].(map[string]any); ok && jsonSchema != nil {
 		if schema, ok := jsonSchema["schema"].(map[string]any); ok && schema != nil {
-			sanitizeStructuredOutputSchemaForUpstream(schema)
+			strict, _ := jsonSchema["strict"].(bool)
+			sanitizeStructuredOutputSchemaForUpstream(schema, strict)
 			modified = true
 		}
 	}
@@ -2942,11 +2953,16 @@ func isReservedCodexTool(tool map[string]any) bool {
 func normalizeFunctionToolParameters(tool map[string]any) {
 	params, ok := tool["parameters"].(map[string]any)
 	if !ok || params == nil {
-		tool["parameters"] = defaultFunctionParametersSchema()
-		return
+		params = defaultFunctionParametersSchema()
+		tool["parameters"] = params
 	}
 	sanitizeSchemaForUpstream(params)
 	ensureFunctionParametersRootObject(params)
+	strict, _ := tool["strict"].(bool)
+	if strict {
+		normalizeStrictSchemaRequiredFields(params)
+		ensureObjectAdditionalPropertiesFalse(params)
+	}
 }
 
 func defaultFunctionParametersSchema() map[string]any {
@@ -3010,6 +3026,110 @@ func normalizeSchemaRequiredFields(schema map[string]interface{}) {
 		for _, v := range defs {
 			if sub, ok := v.(map[string]interface{}); ok {
 				normalizeSchemaRequiredFields(sub)
+			}
+		}
+	}
+}
+
+// filterStructuredOutputRequiredToProperties removes stale required names that
+// are not declared by the same object. Structured outputs always disable
+// additionalProperties below, so such names are unsatisfiable even outside
+// strict mode. Existing required names and optional properties are preserved.
+func filterStructuredOutputRequiredToProperties(schema map[string]interface{}) {
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		if rawRequired, ok := schema["required"].([]interface{}); ok {
+			filtered := make([]interface{}, 0, len(rawRequired))
+			seen := make(map[string]struct{}, len(rawRequired))
+			for _, item := range rawRequired {
+				name, ok := item.(string)
+				if !ok {
+					continue
+				}
+				if _, exists := props[name]; !exists {
+					continue
+				}
+				if _, duplicate := seen[name]; duplicate {
+					continue
+				}
+				seen[name] = struct{}{}
+				filtered = append(filtered, name)
+			}
+			if len(filtered) == 0 {
+				delete(schema, "required")
+			} else {
+				schema["required"] = filtered
+			}
+		}
+		for _, value := range props {
+			if sub, ok := value.(map[string]interface{}); ok {
+				filterStructuredOutputRequiredToProperties(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		filterStructuredOutputRequiredToProperties(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					filterStructuredOutputRequiredToProperties(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		filterStructuredOutputRequiredToProperties(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, value := range defs {
+			if sub, ok := value.(map[string]interface{}); ok {
+				filterStructuredOutputRequiredToProperties(sub)
+			}
+		}
+	}
+}
+
+// normalizeStrictSchemaRequiredFields makes strict-mode schemas satisfy the
+// Responses API invariant that every declared object property is required and
+// no required name exists outside properties. Optional values remain
+// representable through nullable property schemas. Non-strict schemas never
+// call this helper, so their optional-field semantics are preserved.
+func normalizeStrictSchemaRequiredFields(schema map[string]interface{}) {
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		names := make([]string, 0, len(props))
+		for name, value := range props {
+			names = append(names, name)
+			if sub, ok := value.(map[string]interface{}); ok {
+				normalizeStrictSchemaRequiredFields(sub)
+			}
+		}
+		sort.Strings(names)
+		required := make([]interface{}, len(names))
+		for i, name := range names {
+			required[i] = name
+		}
+		schema["required"] = required
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		normalizeStrictSchemaRequiredFields(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					normalizeStrictSchemaRequiredFields(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		normalizeStrictSchemaRequiredFields(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, value := range defs {
+			if sub, ok := value.(map[string]interface{}); ok {
+				normalizeStrictSchemaRequiredFields(sub)
 			}
 		}
 	}

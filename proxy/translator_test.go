@@ -922,6 +922,217 @@ func TestPrepareResponsesBody_JSONSchemaDoesNotInjectImageBridge(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_StrictStructuredOutputRepairsRequiredSet(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":"review",
+		"text":{"format":{
+			"type":"json_schema",
+			"name":"ExternalCallReviewResult",
+			"strict":true,
+			"schema":{
+				"type":"object",
+				"properties":{
+					"approved":{"type":"boolean"},
+					"reason":{"type":"string"}
+				},
+				"required":["approved","calculation"]
+			}
+		}}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	required := gjson.GetBytes(got, "text.format.schema.required")
+	if required.Raw != `["approved","reason"]` {
+		t.Fatalf("strict response required set = %s, want exact property set; body=%s", required.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_StrictStructuredOutputRepairsNestedRequiredSet(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":"review",
+		"text":{"format":{
+			"type":"json_schema",
+			"name":"NestedReviewResult",
+			"strict":true,
+			"schema":{
+				"type":"object",
+				"properties":{
+					"result":{
+						"type":"object",
+						"properties":{
+							"score":{"type":"number"},
+							"summary":{"type":"string"}
+						},
+						"required":["score","obsolete"]
+					}
+				},
+				"required":[]
+			}
+		}}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if required := gjson.GetBytes(got, "text.format.schema.required"); required.Raw != `["result"]` {
+		t.Fatalf("strict root required set = %s, want result; body=%s", required.Raw, got)
+	}
+	if required := gjson.GetBytes(got, "text.format.schema.properties.result.required"); required.Raw != `["score","summary"]` {
+		t.Fatalf("strict nested required set = %s, want exact property set; body=%s", required.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_NonStrictStructuredOutputPreservesOptionalProperties(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":"review",
+		"text":{"format":{
+			"type":"json_schema",
+			"name":"OptionalReviewResult",
+			"strict":false,
+			"schema":{
+				"type":"object",
+				"properties":{
+					"approved":{"type":"boolean"},
+					"reason":{"type":"string"}
+				},
+				"required":["approved","calculation"]
+			}
+		}}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	required := gjson.GetBytes(got, "text.format.schema.required")
+	if required.Raw != `["approved"]` {
+		t.Fatalf("non-strict optional semantics or stale-key filtering failed: required=%s body=%s", required.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_StrictFunctionRepairsRequiredSet(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"hold this task",
+		"tools":[{
+			"type":"function",
+			"name":"hold",
+			"strict":true,
+			"parameters":{
+				"type":"object",
+				"properties":{
+					"confidence":{"type":"number"},
+					"reason":{"type":"string"}
+				},
+				"required":["reason","obsolete"]
+			}
+		}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	required := gjson.GetBytes(got, "tools.0.parameters.required")
+	if required.Raw != `["confidence","reason"]` {
+		t.Fatalf("strict function required set = %s, want exact property set; body=%s", required.Raw, got)
+	}
+	if additional := gjson.GetBytes(got, "tools.0.parameters.additionalProperties"); !additional.Exists() || additional.Bool() {
+		t.Fatalf("strict function must disable additional properties, got %s; body=%s", additional.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_StrictFunctionDefaultsNullParameters(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"hold this task",
+		"tools":[{
+			"type":"function",
+			"name":"hold",
+			"strict":true,
+			"parameters":null
+		}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	params := gjson.GetBytes(got, "tools.0.parameters")
+	if params.Get("type").String() != "object" || !params.Get("properties").IsObject() {
+		t.Fatalf("strict null parameters were not defaulted to an object: %s", got)
+	}
+	if required := params.Get("required"); !required.IsArray() || len(required.Array()) != 0 {
+		t.Fatalf("strict empty parameters required = %s, want []; body=%s", required.Raw, got)
+	}
+	if additional := params.Get("additionalProperties"); !additional.Exists() || additional.Bool() {
+		t.Fatalf("strict empty parameters must disable additional properties, got %s; body=%s", additional.Raw, got)
+	}
+}
+
+func TestTranslateRequest_StrictFunctionRepairsRequiredSet(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"messages":[{"role":"user","content":"hold this task"}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"hold",
+				"strict":true,
+				"parameters":{
+					"type":"object",
+					"properties":{
+						"confidence":{"type":"number"},
+						"reason":{"type":"string"}
+					},
+					"required":["reason","obsolete"]
+				}
+			}
+		}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	required := gjson.GetBytes(got, "tools.0.parameters.required")
+	if required.Raw != `["confidence","reason"]` {
+		t.Fatalf("chat strict function required set = %s, want exact property set; body=%s", required.Raw, got)
+	}
+	if additional := gjson.GetBytes(got, "tools.0.parameters.additionalProperties"); !additional.Exists() || additional.Bool() {
+		t.Fatalf("chat strict function must disable additional properties, got %s; body=%s", additional.Raw, got)
+	}
+}
+
+func TestTranslateRequest_ReservedStrictFunctionSchemaRemainsUntouched(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"messages":[{"role":"user","content":"delegate"}],
+		"tools":[{
+			"type":"function",
+			"function":{
+				"name":"collaboration.spawn_agent",
+				"strict":true,
+				"parameters":{
+					"type":"object",
+					"properties":{
+						"message":{"type":"string","minLength":1},
+						"optional":{"type":"string"}
+					},
+					"required":["message"]
+				}
+			}
+		}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	params := gjson.GetBytes(got, "tools.0.parameters")
+	if minLength := params.Get("properties.message.minLength"); !minLength.Exists() || minLength.Int() != 1 {
+		t.Fatalf("reserved tool schema was sanitized: %s", got)
+	}
+	if required := params.Get("required"); required.Raw != `["message"]` {
+		t.Fatalf("reserved tool required set changed: %s; body=%s", required.Raw, got)
+	}
+	if params.Get("additionalProperties").Exists() {
+		t.Fatalf("reserved tool additionalProperties was injected: %s", got)
+	}
+}
+
 func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -938,7 +1149,8 @@ func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testin
 							"minProperties":1,
 							"properties":{}
 						}
-					}
+					},
+					"required":["testEnvironmentContract","obsolete"]
 				},
 				"strict":true
 			}
@@ -965,6 +1177,9 @@ func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testin
 	if v := gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.additionalProperties"); !v.Exists() || v.Bool() {
 		t.Fatalf("nested object should get additionalProperties=false, got %s; body=%s", v.Raw, got)
 	}
+	if required := gjson.GetBytes(got, "text.format.schema.required"); required.Raw != `["testEnvironmentContract"]` {
+		t.Fatalf("strict legacy response_format required set = %s, want exact property set; body=%s", required.Raw, got)
+	}
 }
 
 func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
@@ -983,7 +1198,8 @@ func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
 							"minProperties":1,
 							"properties":{}
 						}
-					}
+					},
+					"required":["testEnvironmentContract","obsolete"]
 				}
 			}
 		}
@@ -1008,6 +1224,9 @@ func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
 	}
 	if v := gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.additionalProperties"); !v.Exists() || v.Bool() {
 		t.Fatalf("nested object should get additionalProperties=false, got %s; body=%s", v.Raw, got)
+	}
+	if required := gjson.GetBytes(got, "text.format.schema.required"); required.Raw != `["testEnvironmentContract"]` {
+		t.Fatalf("non-strict legacy response_format stale required filtering failed: %s; body=%s", required.Raw, got)
 	}
 }
 
