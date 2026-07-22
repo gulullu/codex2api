@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -979,6 +980,174 @@ func TestPrepareResponsesBody_StrictStructuredOutputRepairsNestedRequiredSet(t *
 	}
 	if required := gjson.GetBytes(got, "text.format.schema.properties.result.required"); required.Raw != `["score","summary"]` {
 		t.Fatalf("strict nested required set = %s, want exact property set; body=%s", required.Raw, got)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendDecodesAndRepairsNestedStringSchema(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"response_format":{
+			"type":"json_schema",
+			"strict":"true",
+			"name":"ExternalCallReviewResult",
+			"schema":"{\"type\":\"object\",\"properties\":{\"decision\":{\"type\":\"string\"}},\"required\":[\"calculation\"]}"
+		}
+	}`)
+
+	got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if stats.Formats != 1 || stats.Schemas != 1 || stats.DecodedJSON != 1 || stats.ModifiedSchemas != 1 {
+		t.Fatalf("unexpected guard stats: %+v; body=%s", stats, got)
+	}
+	if stats.StaleRequired != 1 || stats.StrictFormats != 1 {
+		t.Fatalf("expected stale strict schema evidence, got %+v", stats)
+	}
+	path := "response_format.schema"
+	if gjson.GetBytes(got, path).Type != gjson.JSON {
+		t.Fatalf("schema string was not decoded: %s", got)
+	}
+	if required := gjson.GetBytes(got, path+".required"); required.Raw != `["decision"]` {
+		t.Fatalf("required set = %s, want exact properties; body=%s", required.Raw, got)
+	}
+	if additional := gjson.GetBytes(got, path+".additionalProperties"); !additional.Exists() || additional.Bool() {
+		t.Fatalf("additionalProperties must be false; body=%s", got)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendRepairsWrappedJSONString(t *testing.T) {
+	raw := []byte(`{
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"json_schema":"{\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"},\"confidence\":{\"type\":\"number\"}},\"required\":[\"answer\",\"calculation\"]}}"
+			}
+		}
+	}`)
+
+	got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if stats.DecodedJSON != 1 || stats.StaleRequired != 1 || stats.ModifiedSchemas != 1 {
+		t.Fatalf("unexpected guard stats: %+v; body=%s", stats, got)
+	}
+	required := gjson.GetBytes(got, "text.format.json_schema.schema.required")
+	if required.Raw != `["answer","confidence"]` {
+		t.Fatalf("required set = %s, want exact properties; body=%s", required.Raw, got)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendRemovesRefSiblingRequired(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"text":{"format":{
+			"type":"json_schema",
+			"name":"ExternalCallReviewResult",
+			"strict":true,
+			"schema":{
+				"$ref":"#/$defs/result",
+				"required":["decision","calculation"],
+				"$defs":{"result":{
+					"type":"object",
+					"properties":{"decision":{"type":"string"}},
+					"required":["decision","calculation"]
+				}}
+			}
+		}}
+	}`)
+
+	got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if stats.StaleRequired != 3 || stats.ModifiedSchemas != 1 {
+		t.Fatalf("unexpected guard stats: %+v; body=%s", stats, got)
+	}
+	if rootRequired := gjson.GetBytes(got, "text.format.schema.required"); rootRequired.Exists() {
+		t.Fatalf("$ref sibling required must be removed; body=%s", got)
+	}
+	if required := gjson.GetBytes(got, "text.format.schema.$defs.result.required"); required.Raw != `["decision"]` {
+		t.Fatalf("referenced object required set = %s, want decision; body=%s", required.Raw, got)
+	}
+	if additional := gjson.GetBytes(got, "text.format.schema.$defs.result.additionalProperties"); !additional.Exists() || additional.Bool() {
+		t.Fatalf("referenced object additionalProperties must be false; body=%s", got)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendPreservesNonStrictOptionalProperties(t *testing.T) {
+	raw := []byte(`{
+		"response_format":{
+			"type":"json_schema",
+			"strict":false,
+			"schema":"{\"type\":\"object\",\"properties\":{\"decision\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}},\"required\":[\"decision\",\"calculation\"]}"
+		}
+	}`)
+
+	got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if stats.StaleRequired != 1 || stats.MissingRequired != 0 || stats.StrictFormats != 0 {
+		t.Fatalf("unexpected non-strict guard stats: %+v; body=%s", stats, got)
+	}
+	if required := gjson.GetBytes(got, "response_format.schema.required"); required.Raw != `["decision"]` {
+		t.Fatalf("non-strict required set = %s, want only decision; body=%s", required.Raw, got)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendIgnoresNestedPseudoFormats(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[{"type":"json_schema","schema":{"required":["do_not_touch"]}}],
+		"metadata":{"response_format":{"type":"json_schema","schema":{"required":["do_not_touch"]}}},
+		"tools":[{"type":"function","name":"example","parameters":{"type":"object","properties":{"payload":{"type":"json_schema","required":["do_not_touch"]}}}}]
+	}`)
+
+	got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("nested pseudo formats changed: got=%s want=%s", got, raw)
+	}
+	if stats.Candidates || stats.Formats != 0 || stats.Schemas != 0 || stats.ModifiedSchemas != 0 {
+		t.Fatalf("nested pseudo formats must be ignored: %+v", stats)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendPreservesEnumDataAndLargeNumbers(t *testing.T) {
+	raw := []byte(`{
+		"request_id":900719925474099312345,
+		"text":{"format":{
+			"type":"json_schema",
+			"strict":true,
+			"schema":{
+				"type":"object",
+				"properties":{"payload":{"type":"object","enum":[{"properties":{"x":1},"required":["calculation"]}]}},
+				"required":["payload","calculation"]
+			}
+		}}
+	}`)
+
+	got, _ := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if number := gjson.GetBytes(got, "request_id").Raw; number != "900719925474099312345" {
+		t.Fatalf("large number changed to %s; body=%s", number, got)
+	}
+	if enumRequired := gjson.GetBytes(got, "text.format.schema.properties.payload.enum.0.required"); enumRequired.Raw != `["calculation"]` {
+		t.Fatalf("enum data was rewritten: %s; body=%s", enumRequired.Raw, got)
+	}
+	if enumProperties := gjson.GetBytes(got, "text.format.schema.properties.payload.enum.0.properties.x"); enumProperties.Int() != 1 {
+		t.Fatalf("enum object data was rewritten; body=%s", got)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendIsIdempotent(t *testing.T) {
+	raw := []byte(`{"text":{"format":{"type":"json_schema","strict":true,"schema":{"$ref":"#/$defs/result","required":["calculation"],"$defs":{"result":{"type":"object","properties":{"decision":{"type":"string"}},"required":["calculation"]}}}}}}`)
+	first, firstStats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	second, secondStats := normalizeCodexStructuredOutputSchemasForSend(first)
+	if !bytes.Equal(first, second) {
+		t.Fatalf("guard is not idempotent: first=%s second=%s", first, second)
+	}
+	if firstStats.ModifiedSchemas != 1 || secondStats.ModifiedSchemas != 0 || secondStats.DecodedJSON != 0 {
+		t.Fatalf("unexpected idempotence stats: first=%+v second=%+v", firstStats, secondStats)
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendLeavesUnrelatedBodyUntouched(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.6-sol","input":"hello","schema":"not a response format"}`)
+	got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("unrelated body changed: got=%s want=%s", got, raw)
+	}
+	if stats.Candidates || stats.Formats != 0 || stats.ModifiedSchemas != 0 {
+		t.Fatalf("unexpected guard stats: %+v", stats)
 	}
 }
 

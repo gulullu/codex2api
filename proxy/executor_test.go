@@ -1424,6 +1424,74 @@ func TestExecuteRequestForcedWebsocketUsesStatelessSessionWithoutExplicitSession
 	}
 }
 
+func TestExecuteRequestWebsocketSendsNormalizedStructuredOutputSchema(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+	var sentBody []byte
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		sentBody = append([]byte(nil), requestBody...)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test"}`)),
+		}, nil
+	}
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"text":{"format":{"type":"json_schema","strict":true,"schema":{
+			"$ref":"#/$defs/result",
+			"required":["decision","calculation"],
+			"$defs":{"result":{"type":"object","properties":{"decision":{"type":"string"}},"required":["calculation"]}}
+		}}}
+	}`)
+
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, body, "", "", "sk-local", nil, http.Header{}, true)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+	if rootRequired := gjson.GetBytes(sentBody, "text.format.schema.required"); rootRequired.Exists() {
+		t.Fatalf("WS body retained $ref sibling required: %s", sentBody)
+	}
+	if required := gjson.GetBytes(sentBody, "text.format.schema.$defs.result.required"); required.Raw != `["decision"]` {
+		t.Fatalf("WS body required set = %s, want decision; body=%s", required.Raw, sentBody)
+	}
+}
+
+func TestExecuteRequestHTTPSendsNormalizedStructuredOutputSchema(t *testing.T) {
+	var sentBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sentBody, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+	previousResin := GetResinConfig()
+	SetResinConfig(&ResinConfig{BaseURL: server.URL, PlatformName: "schema-guard-test"})
+	t.Cleanup(func() { SetResinConfig(previousResin) })
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"response_format":{"type":"json_schema","json_schema":{"strict":true,"schema":{
+			"$ref":"#/$defs/result",
+			"required":["decision","calculation"],
+			"$defs":{"result":{"type":"object","properties":{"decision":{"type":"string"}},"required":["calculation"]}}
+		}}}
+	}`)
+
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, body, "", "", "sk-local", nil, http.Header{}, false)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+	if rootRequired := gjson.GetBytes(sentBody, "response_format.json_schema.schema.required"); rootRequired.Exists() {
+		t.Fatalf("HTTP body retained $ref sibling required: %s", sentBody)
+	}
+	if required := gjson.GetBytes(sentBody, "response_format.json_schema.schema.$defs.result.required"); required.Raw != `["decision"]` {
+		t.Fatalf("HTTP body required set = %s, want decision; body=%s", required.Raw, sentBody)
+	}
+}
+
 func TestExecuteRequestForcedWebsocketUsesExplicitSession(t *testing.T) {
 	previousSettings := CurrentRuntimeSettings()
 	t.Cleanup(func() { ApplyRuntimeSettings(previousSettings) })

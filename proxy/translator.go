@@ -2900,18 +2900,232 @@ func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[st
 func sanitizeStructuredOutputSchema(format map[string]any) bool {
 	modified := false
 	if schema, ok := format["schema"].(map[string]any); ok && schema != nil {
-		strict, _ := format["strict"].(bool)
+		strict := structuredOutputStrictEnabled(format["strict"])
 		sanitizeStructuredOutputSchemaForUpstream(schema, strict)
 		modified = true
 	}
 	if jsonSchema, ok := format["json_schema"].(map[string]any); ok && jsonSchema != nil {
 		if schema, ok := jsonSchema["schema"].(map[string]any); ok && schema != nil {
-			strict, _ := jsonSchema["strict"].(bool)
+			strict := structuredOutputStrictEnabled(jsonSchema["strict"]) || structuredOutputStrictEnabled(format["strict"])
 			sanitizeStructuredOutputSchemaForUpstream(schema, strict)
 			modified = true
 		}
 	}
 	return modified
+}
+
+func structuredOutputStrictEnabled(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		return err == nil && parsed
+	case json.Number:
+		parsed, err := strconv.ParseFloat(string(typed), 64)
+		return err == nil && parsed != 0
+	case float64:
+		return typed != 0
+	default:
+		return false
+	}
+}
+
+type codexStructuredOutputGuardStats struct {
+	Candidates      bool
+	Formats         int
+	Schemas         int
+	DecodedJSON     int
+	ModifiedSchemas int
+	StaleRequired   int
+	MissingRequired int
+	StrictFormats   int
+	Unrecognized    int
+}
+
+// normalizeCodexStructuredOutputSchemasForSend is the final OAuth/Codex
+// transport boundary guard. It deliberately inspects only the two API-owned
+// response format locations: top-level text.format (Responses) and top-level
+// response_format (legacy Chat Completions). Client input, metadata and tool
+// schemas may contain the same field names and must never be rewritten here.
+func normalizeCodexStructuredOutputSchemasForSend(rawBody []byte) ([]byte, codexStructuredOutputGuardStats) {
+	stats := codexStructuredOutputGuardStats{}
+	if !bytes.Contains(rawBody, []byte(`"json_schema"`)) {
+		return rawBody, stats
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(rawBody))
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil || body == nil {
+		return rawBody, stats
+	}
+	if textValue, ok := body["text"].(map[string]any); ok {
+		if format, ok := textValue["format"].(map[string]any); ok {
+			normalizeCodexStructuredOutputFormatForSend(format, &stats)
+		}
+	}
+	if responseFormat, ok := body["response_format"].(map[string]any); ok {
+		normalizeCodexStructuredOutputFormatForSend(responseFormat, &stats)
+	}
+	if stats.ModifiedSchemas == 0 && stats.DecodedJSON == 0 {
+		return rawBody, stats
+	}
+	result, err := json.Marshal(body)
+	if err != nil {
+		return rawBody, stats
+	}
+	return result, stats
+}
+
+func normalizeCodexStructuredOutputFormatForSend(format map[string]any, stats *codexStructuredOutputGuardStats) {
+	if strings.ToLower(strings.TrimSpace(firstNonEmptyAnyString(format["type"]))) != "json_schema" {
+		return
+	}
+	stats.Candidates = true
+	stats.Formats++
+	strict := structuredOutputStrictEnabled(format["strict"])
+	if strict {
+		stats.StrictFormats++
+	}
+	foundSchema := false
+	if schema, decoded, ok := structuredOutputObjectValue(format["schema"]); ok {
+		foundSchema = true
+		if decoded {
+			format["schema"] = schema
+			stats.DecodedJSON++
+		}
+		normalizeOneCodexStructuredOutputSchema(schema, strict, stats)
+	}
+	if wrapper, decoded, ok := structuredOutputObjectValue(format["json_schema"]); ok {
+		if decoded {
+			format["json_schema"] = wrapper
+			stats.DecodedJSON++
+		}
+		wrapperStrict := strict || structuredOutputStrictEnabled(wrapper["strict"])
+		if wrapperStrict && !strict {
+			stats.StrictFormats++
+		}
+		if schema, schemaDecoded, schemaOK := structuredOutputObjectValue(wrapper["schema"]); schemaOK {
+			foundSchema = true
+			if schemaDecoded {
+				wrapper["schema"] = schema
+				stats.DecodedJSON++
+			}
+			normalizeOneCodexStructuredOutputSchema(schema, wrapperStrict, stats)
+		}
+	}
+	if !foundSchema {
+		stats.Unrecognized++
+	}
+}
+
+func structuredOutputObjectValue(value any) (map[string]any, bool, bool) {
+	if object, ok := value.(map[string]any); ok && object != nil {
+		return object, false, true
+	}
+	encoded, ok := value.(string)
+	if !ok || !strings.HasPrefix(strings.TrimSpace(encoded), "{") {
+		return nil, false, false
+	}
+	var object map[string]any
+	decoder := json.NewDecoder(strings.NewReader(encoded))
+	decoder.UseNumber()
+	if err := decoder.Decode(&object); err != nil || object == nil {
+		return nil, false, false
+	}
+	return object, true, true
+}
+
+func normalizeOneCodexStructuredOutputSchema(schema map[string]any, strict bool, stats *codexStructuredOutputGuardStats) {
+	stats.Schemas++
+	stale, missing := structuredOutputRequiredMismatchCounts(schema, strict)
+	stats.StaleRequired += stale
+	stats.MissingRequired += missing
+	before, _ := json.Marshal(schema)
+	sanitizeStructuredOutputSchemaForUpstream(schema, strict)
+	after, _ := json.Marshal(schema)
+	if !bytes.Equal(before, after) {
+		stats.ModifiedSchemas++
+	}
+}
+
+func structuredOutputRequiredMismatchCounts(schema map[string]any, strict bool) (stale, missing int) {
+	properties, hasProperties := schema["properties"].(map[string]any)
+	required := make(map[string]struct{})
+	if rawRequired, exists := schema["required"]; exists {
+		if !hasProperties {
+			switch values := rawRequired.(type) {
+			case []any:
+				if len(values) == 0 {
+					stale++
+				} else {
+					stale += len(values)
+				}
+			default:
+				stale++
+			}
+		} else {
+			switch values := rawRequired.(type) {
+			case []any:
+				for _, rawName := range values {
+					name, ok := rawName.(string)
+					if !ok || strings.TrimSpace(name) == "" {
+						stale++
+						continue
+					}
+					if _, duplicate := required[name]; duplicate {
+						stale++
+						continue
+					}
+					required[name] = struct{}{}
+					if _, exists := properties[name]; !exists {
+						stale++
+					}
+				}
+			default:
+				stale++
+			}
+		}
+	}
+	if strict && hasProperties {
+		for name := range properties {
+			if _, exists := required[name]; !exists {
+				missing++
+			}
+		}
+	}
+	forEachStructuredOutputChildSchema(schema, func(child map[string]any) {
+		childStale, childMissing := structuredOutputRequiredMismatchCounts(child, strict)
+		stale += childStale
+		missing += childMissing
+	})
+	return stale, missing
+}
+
+func forEachStructuredOutputChildSchema(schema map[string]any, visit func(map[string]any)) {
+	for _, key := range []string{"properties", "patternProperties", "dependentSchemas", "$defs", "definitions"} {
+		if children, ok := schema[key].(map[string]any); ok {
+			for _, child := range children {
+				if childSchema, ok := child.(map[string]any); ok {
+					visit(childSchema)
+				}
+			}
+		}
+	}
+	for _, key := range []string{"items", "additionalProperties", "contains", "not", "if", "then", "else", "propertyNames", "unevaluatedProperties", "unevaluatedItems"} {
+		if child, ok := schema[key].(map[string]any); ok {
+			visit(child)
+		}
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf", "prefixItems"} {
+		if children, ok := schema[key].([]any); ok {
+			for _, child := range children {
+				if childSchema, ok := child.(map[string]any); ok {
+					visit(childSchema)
+				}
+			}
+		}
+	}
 }
 
 func isFunctionTool(tool map[string]any) bool {
@@ -3036,7 +3250,13 @@ func normalizeSchemaRequiredFields(schema map[string]interface{}) {
 // additionalProperties below, so such names are unsatisfiable even outside
 // strict mode. Existing required names and optional properties are preserved.
 func filterStructuredOutputRequiredToProperties(schema map[string]interface{}) {
-	if props, ok := schema["properties"].(map[string]interface{}); ok {
+	props, hasProperties := schema["properties"].(map[string]interface{})
+	if !hasProperties {
+		// Codex validates required against properties at the same schema
+		// context. A sibling required on $ref/allOf without local properties
+		// is rejected as an extra key after reference expansion.
+		delete(schema, "required")
+	} else {
 		if rawRequired, ok := schema["required"].([]interface{}); ok {
 			filtered := make([]interface{}, 0, len(rawRequired))
 			seen := make(map[string]struct{}, len(rawRequired))

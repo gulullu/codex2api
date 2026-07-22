@@ -535,6 +535,13 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
 	}
+	requestBody, schemaGuard := normalizeCodexStructuredOutputSchemasForSend(requestBody)
+	if schemaGuard.ModifiedSchemas > 0 || schemaGuard.DecodedJSON > 0 || schemaGuard.Unrecognized > 0 {
+		log.Printf("[Schema Guard] formats=%d schemas=%d decoded_json=%d modified=%d stale_required=%d missing_required=%d strict_formats=%d unrecognized=%d",
+			schemaGuard.Formats, schemaGuard.Schemas, schemaGuard.DecodedJSON, schemaGuard.ModifiedSchemas,
+			schemaGuard.StaleRequired, schemaGuard.MissingRequired, schemaGuard.StrictFormats,
+			schemaGuard.Unrecognized)
+	}
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]
