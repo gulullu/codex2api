@@ -1013,6 +1013,76 @@ func TestNormalizeCodexStructuredOutputSchemasForSendDecodesAndRepairsNestedStri
 	}
 }
 
+func TestNormalizeCodexStructuredOutputSchemasForSendDecodesAPIFormatString(t *testing.T) {
+	tests := []struct {
+		name         string
+		raw          string
+		formatPath   string
+		schemaPath   string
+		requiredPath string
+	}{
+		{
+			name:         "responses text format string",
+			raw:          `{"model":"gpt-5.6-sol","text":{"format":"{\"type\":\"json_schema\",\"name\":\"ExternalCallReviewResult\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"decision\":{\"type\":\"string\"}},\"required\":[\"calculation\"]}}"}}`,
+			formatPath:   "text.format",
+			schemaPath:   "text.format.schema",
+			requiredPath: "text.format.schema.required",
+		},
+		{
+			name:         "legacy response format string",
+			raw:          `{"model":"gpt-5.6-sol","response_format":"{\"type\":\"json_schema\",\"name\":\"ExternalCallReviewResult\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"decision\":{\"type\":\"string\"}},\"required\":[\"calculation\"]}}"}`,
+			formatPath:   "response_format",
+			schemaPath:   "response_format.schema",
+			requiredPath: "response_format.schema.required",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, stats := normalizeCodexStructuredOutputSchemasForSend([]byte(test.raw))
+			if stats.Formats != 1 || stats.Schemas != 1 || stats.DecodedJSON != 1 || stats.ModifiedSchemas != 1 || stats.StaleRequired != 1 {
+				t.Fatalf("unexpected guard stats: %+v; body=%s", stats, got)
+			}
+			if format := gjson.GetBytes(got, test.formatPath); !format.IsObject() {
+				t.Fatalf("format string was not decoded: %s", got)
+			}
+			if schema := gjson.GetBytes(got, test.schemaPath); !schema.IsObject() {
+				t.Fatalf("schema is not an object: %s", got)
+			}
+			if required := gjson.GetBytes(got, test.requiredPath); required.Raw != `["decision"]` {
+				t.Fatalf("required set = %s, want decision only; body=%s", required.Raw, got)
+			}
+		})
+	}
+}
+
+func TestNormalizeCodexStructuredOutputSchemasForSendRejectsInvalidFormatStringSuffix(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "trailing garbage",
+			raw:  `{"model":"gpt-5.6-sol","response_format":"{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}} trailing"}`,
+		},
+		{
+			name: "second JSON value",
+			raw:  `{"model":"gpt-5.6-sol","text":{"format":"{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}} {\"unexpected\":true}"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := []byte(test.raw)
+			got, stats := normalizeCodexStructuredOutputSchemasForSend(raw)
+			if !bytes.Equal(got, raw) {
+				t.Fatalf("invalid format string changed: got=%s want=%s", got, raw)
+			}
+			if stats.Candidates || stats.Formats != 0 || stats.Schemas != 0 || stats.DecodedJSON != 0 || stats.ModifiedSchemas != 0 {
+				t.Fatalf("invalid format string produced guard stats: %+v", stats)
+			}
+		})
+	}
+}
+
 func TestNormalizeCodexStructuredOutputSchemasForSendRepairsWrappedJSONString(t *testing.T) {
 	raw := []byte(`{
 		"text":{

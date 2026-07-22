@@ -52,6 +52,14 @@ func TestAppendWebsocketTransportAuditSignalPreservesAndDeduplicates(t *testing.
 		t.Fatalf("same-account route signals = %s, want %s", got, want)
 	}
 
+	c.Set(contextWebsocketTransportReason, websocketStructuredOutputHTTPReason)
+	structuredInput := &database.UsageLogInput{}
+	appendWebsocketTransportAuditSignal(c, structuredInput)
+	appendWebsocketTransportAuditSignal(c, structuredInput)
+	if got, want := structuredInput.RouteSignals, `["ws_structured_output_http_preflight"]`; got != want {
+		t.Fatalf("structured-output route signals = %s, want %s", got, want)
+	}
+
 	malformed := &database.UsageLogInput{RouteSignals: `legacy-not-json`}
 	appendWebsocketTransportAuditSignal(c, malformed)
 	if malformed.RouteSignals != `legacy-not-json` {

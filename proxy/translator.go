@@ -2950,7 +2950,10 @@ type codexStructuredOutputGuardStats struct {
 // schemas may contain the same field names and must never be rewritten here.
 func normalizeCodexStructuredOutputSchemasForSend(rawBody []byte) ([]byte, codexStructuredOutputGuardStats) {
 	stats := codexStructuredOutputGuardStats{}
-	if !bytes.Contains(rawBody, []byte(`"json_schema"`)) {
+	// Match both ordinary JSON objects ("json_schema") and API-owned format
+	// objects that a client has JSON-encoded into a string (\"json_schema\").
+	// Exact field ownership is still enforced below before anything is decoded.
+	if !bytes.Contains(rawBody, []byte(`json_schema`)) {
 		return rawBody, stats
 	}
 	var body map[string]any
@@ -2960,12 +2963,22 @@ func normalizeCodexStructuredOutputSchemasForSend(rawBody []byte) ([]byte, codex
 		return rawBody, stats
 	}
 	if textValue, ok := body["text"].(map[string]any); ok {
-		if format, ok := textValue["format"].(map[string]any); ok {
+		if format, decoded, ok := structuredOutputObjectValue(textValue["format"]); ok {
+			before := stats.Formats
 			normalizeCodexStructuredOutputFormatForSend(format, &stats)
+			if decoded && stats.Formats > before {
+				textValue["format"] = format
+				stats.DecodedJSON++
+			}
 		}
 	}
-	if responseFormat, ok := body["response_format"].(map[string]any); ok {
+	if responseFormat, decoded, ok := structuredOutputObjectValue(body["response_format"]); ok {
+		before := stats.Formats
 		normalizeCodexStructuredOutputFormatForSend(responseFormat, &stats)
+		if decoded && stats.Formats > before {
+			body["response_format"] = responseFormat
+			stats.DecodedJSON++
+		}
 	}
 	if stats.ModifiedSchemas == 0 && stats.DecodedJSON == 0 {
 		return rawBody, stats
@@ -3031,6 +3044,13 @@ func structuredOutputObjectValue(value any) (map[string]any, bool, bool) {
 	decoder := json.NewDecoder(strings.NewReader(encoded))
 	decoder.UseNumber()
 	if err := decoder.Decode(&object); err != nil || object == nil {
+		return nil, false, false
+	}
+	// Accept trailing whitespace only. Silently accepting a second JSON value or
+	// arbitrary suffix would turn an invalid client format into a different,
+	// apparently valid upstream request.
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil, false, false
 	}
 	return object, true, true

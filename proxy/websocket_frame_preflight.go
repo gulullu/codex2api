@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,9 @@ const (
 	websocketLargeFrameSameAccountHTTPReason = "ws_large_context_same_account_http_preflight"
 	websocketLargeFrameContextBoundKind      = "websocket_large_frame_context_bound"
 	websocketContextBoundHTTPPreflightEnv    = "CODEX_WS_CONTEXT_BOUND_HTTP_PREFLIGHT"
+	websocketStructuredOutputHTTPReason      = "ws_structured_output_http_preflight"
+	websocketStructuredOutputHTTPEnv         = "CODEX_WS_STRUCTURED_OUTPUT_HTTP_PREFLIGHT"
+	websocketStructuredOutputHTTPNamesEnv    = "CODEX_WS_STRUCTURED_OUTPUT_HTTP_NAMES"
 )
 
 type websocketFramePreflightPolicy uint8
@@ -39,6 +43,173 @@ func websocketContextBoundHTTPPreflightEnabled() bool {
 	default:
 		return true
 	}
+}
+
+// websocketStructuredOutputHTTPPreflightEnabled permits an operator-selected
+// JSON-schema name to use native HTTP instead of the Codex WebSocket beta
+// transport. The same request, selected account, scheduler lease and HTTP
+// session identity are retained; only the transport changes before any WS
+// connection is acquired or written. An empty name allowlist is inert.
+//
+// This is intentionally a kill-switch rather than an account/tag rule. Relay
+// account IDs are dynamic, and the incompatibility is a request-shape property.
+func websocketStructuredOutputHTTPPreflightEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(websocketStructuredOutputHTTPEnv))) {
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// websocketStructuredOutputFormatPath recognizes only API-owned, top-level
+// response-format locations. It must not scan input, metadata or function-tool
+// parameter schemas: those are ordinary request data and are valid on WS.
+type websocketStructuredOutputFormat struct {
+	path           string
+	name           string
+	schemaRaw      []byte
+	schemaEncoding string
+}
+
+func findWebsocketStructuredOutputFormat(rawBody []byte) websocketStructuredOutputFormat {
+	for _, path := range []string{"text.format", "response_format"} {
+		result := gjson.GetBytes(rawBody, path)
+		var object map[string]any
+		formatDecoded := false
+		switch {
+		case result.IsObject():
+			decoder := json.NewDecoder(strings.NewReader(result.Raw))
+			decoder.UseNumber()
+			if err := decoder.Decode(&object); err != nil || object == nil {
+				continue
+			}
+		case result.Type == gjson.String:
+			var ok bool
+			object, formatDecoded, ok = structuredOutputObjectValue(result.String())
+			if !ok {
+				continue
+			}
+		default:
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(firstNonEmptyAnyString(object["type"])), "json_schema") {
+			continue
+		}
+
+		format := websocketStructuredOutputFormat{
+			path: path,
+			name: strings.TrimSpace(firstNonEmptyAnyString(object["name"])),
+		}
+		if schema, decoded, ok := structuredOutputObjectValue(object["schema"]); ok {
+			format.schemaRaw, _ = json.Marshal(schema)
+			format.schemaEncoding = "object"
+			if formatDecoded || decoded {
+				format.schemaEncoding = "json_string"
+			}
+		}
+		if wrapper, wrapperDecoded, ok := structuredOutputObjectValue(object["json_schema"]); ok {
+			if format.name == "" {
+				format.name = strings.TrimSpace(firstNonEmptyAnyString(wrapper["name"]))
+			}
+			if len(format.schemaRaw) == 0 {
+				if schema, schemaDecoded, schemaOK := structuredOutputObjectValue(wrapper["schema"]); schemaOK {
+					format.schemaRaw, _ = json.Marshal(schema)
+					format.schemaEncoding = "object"
+					if formatDecoded || wrapperDecoded || schemaDecoded {
+						format.schemaEncoding = "json_string"
+					}
+				}
+			}
+		}
+		if format.schemaEncoding == "" {
+			format.schemaEncoding = "missing"
+		}
+		return format
+	}
+	return websocketStructuredOutputFormat{}
+}
+
+func websocketStructuredOutputFormatPath(rawBody []byte) string {
+	return findWebsocketStructuredOutputFormat(rawBody).path
+}
+
+func websocketStructuredOutputHTTPNameAllowed(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, configured := range strings.Split(os.Getenv(websocketStructuredOutputHTTPNamesEnv), ",") {
+		configured = strings.TrimSpace(configured)
+		if configured == "*" || strings.EqualFold(configured, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func websocketStructuredOutputJSONKind(value gjson.Result) string {
+	if !value.Exists() {
+		return "missing"
+	}
+	switch value.Type {
+	case gjson.Null:
+		return "null"
+	case gjson.False, gjson.True:
+		return "bool"
+	case gjson.Number:
+		return "number"
+	case gjson.String:
+		return "string"
+	case gjson.JSON:
+		if value.IsArray() {
+			return "array"
+		}
+		if value.IsObject() {
+			return "object"
+		}
+		return "json"
+	default:
+		return "unknown"
+	}
+}
+
+// websocketStructuredOutputSafeSummary records only structural metadata. It
+// never includes prompt text, schema descriptions, property values or the raw
+// schema. The short hashes let operators correlate repeated shapes safely.
+func websocketStructuredOutputSafeSummary(rawBody []byte, format websocketStructuredOutputFormat) string {
+	nameHash := sha256.Sum256([]byte(format.name))
+	schema := gjson.ParseBytes(format.schemaRaw)
+	schemaHash := "none"
+	if len(format.schemaRaw) > 0 {
+		sum := sha256.Sum256(format.schemaRaw)
+		schemaHash = fmt.Sprintf("%x", sum[:6])
+	}
+	properties := schema.Get("properties")
+	required := schema.Get("required")
+	propertyMap := properties.Map()
+	_, calculationProperty := propertyMap["calculation"]
+	calculationRequired := false
+	for _, item := range required.Array() {
+		if item.Type == gjson.String && item.String() == "calculation" {
+			calculationRequired = true
+			break
+		}
+	}
+	calculationKind := "missing"
+	if calculationProperty {
+		calculationKind = websocketStructuredOutputJSONKind(propertyMap["calculation"])
+	}
+	_, stats := normalizeCodexStructuredOutputSchemasForSend(rawBody)
+	return fmt.Sprintf(
+		"name_hash=%x schema_hash=%s schema_encoding=%s schema_kind=%s properties_kind=%s properties=%d required_kind=%s required=%d calculation_property=%t calculation_kind=%s calculation_required=%t formats=%d schemas=%d stale_required=%d missing_required=%d strict_formats=%d unrecognized=%d",
+		nameHash[:6], schemaHash, format.schemaEncoding, websocketStructuredOutputJSONKind(schema),
+		websocketStructuredOutputJSONKind(properties), len(propertyMap),
+		websocketStructuredOutputJSONKind(required), len(required.Array()),
+		calculationProperty, calculationKind, calculationRequired,
+		stats.Formats, stats.Schemas, stats.StaleRequired, stats.MissingRequired,
+		stats.StrictFormats, stats.Unrecognized,
+	)
 }
 
 // websocketFramePreflightPolicyForHTTP keeps true upstream continuations
@@ -179,6 +350,7 @@ func appendWebsocketTransportAuditSignal(c *gin.Context, input *database.UsageLo
 	reason, _ := value.(string)
 	if reason != websocketLargeFrameHTTPPreflightReason &&
 		reason != websocketLargeFrameSameAccountHTTPReason &&
+		reason != websocketStructuredOutputHTTPReason &&
 		reason != websocketLargeFrameContextBoundKind {
 		return
 	}
@@ -249,6 +421,21 @@ func executeRequestWithWebsocketFramePreflight(
 	if !useWebsocket {
 		resp, err := ExecuteRequest(ctx, account, httpBody, httpSessionID, proxyURL, apiKey, deviceCfg, headers, false)
 		return resp, err, false
+	}
+
+	// Route only explicitly allowlisted structured-output names through native
+	// HTTP on the already-selected account. This supports narrow compatibility
+	// diagnosis without changing unrelated JSON-schema traffic. True inbound WS
+	// and previous_response_id paths pass the strict policy and remain fail-closed
+	// so connection-local context is never moved across transports.
+	if policy == websocketFramePreflightAllowSameAccountHTTP && websocketStructuredOutputHTTPPreflightEnabled() {
+		format := findWebsocketStructuredOutputFormat(websocketBody)
+		if format.path != "" && websocketStructuredOutputHTTPNameAllowed(format.name) {
+			observeUpstreamTransport(ctx, false, websocketStructuredOutputHTTPReason, 0, 0)
+			log.Printf("[WS Preflight] transport=http reason=%s account=%d format_path=%s same_account=true %s", websocketStructuredOutputHTTPReason, account.ID(), format.path, websocketStructuredOutputSafeSummary(websocketBody, format))
+			resp, err := ExecuteRequest(ctx, account, httpBody, httpSessionID, proxyURL, apiKey, deviceCfg, headers, false)
+			return resp, err, false
+		}
 	}
 
 	resp, err := ExecuteRequest(ctx, account, websocketBody, websocketSessionID, proxyURL, apiKey, deviceCfg, headers, true)

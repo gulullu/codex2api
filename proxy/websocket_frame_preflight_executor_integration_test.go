@@ -15,6 +15,218 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestWebsocketStructuredOutputFormatPathOnlyMatchesAPIFields(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		wantPath     string
+		wantName     string
+		wantEncoding string
+	}{
+		{
+			name:         "responses text format",
+			body:         `{"model":"gpt-5.6-sol","text":{"format":{"type":"json_schema","name":"ExternalCallReviewResult","schema":{"type":"object"}}}}`,
+			wantPath:     "text.format",
+			wantName:     "ExternalCallReviewResult",
+			wantEncoding: "object",
+		},
+		{
+			name:         "legacy response format",
+			body:         `{"model":"gpt-5.6-sol","response_format":{"type":"json_schema","json_schema":{"name":"result","schema":{"type":"object"}}}}`,
+			wantPath:     "response_format",
+			wantName:     "result",
+			wantEncoding: "object",
+		},
+		{
+			name:         "legacy wrapper encoded as JSON string",
+			body:         `{"model":"gpt-5.6-sol","response_format":{"type":"json_schema","json_schema":"{\"name\":\"result\",\"schema\":{\"type\":\"object\"}}"}}`,
+			wantPath:     "response_format",
+			wantName:     "result",
+			wantEncoding: "json_string",
+		},
+		{
+			name:         "top level format encoded as JSON string",
+			body:         `{"model":"gpt-5.6-sol","response_format":"{\"type\":\"json_schema\",\"name\":\"result\",\"schema\":{\"type\":\"object\"}}"}`,
+			wantPath:     "response_format",
+			wantName:     "result",
+			wantEncoding: "json_string",
+		},
+		{
+			name: "nested input is data",
+			body: `{"model":"gpt-5.6-sol","input":{"text":{"format":{"type":"json_schema"}}}}`,
+		},
+		{
+			name: "function tool schema is not response format",
+			body: `{"model":"gpt-5.6-sol","tools":[{"type":"function","name":"review","parameters":{"type":"object","properties":{"type":{"const":"json_schema"}}}}]}`,
+		},
+		{
+			name: "json object remains websocket compatible",
+			body: `{"model":"gpt-5.6-sol","text":{"format":{"type":"json_object"}}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			format := findWebsocketStructuredOutputFormat([]byte(test.body))
+			if format.path != test.wantPath || format.name != test.wantName || format.schemaEncoding != test.wantEncoding {
+				t.Fatalf("format=%+v want path=%q name=%q encoding=%q", format, test.wantPath, test.wantName, test.wantEncoding)
+			}
+		})
+	}
+}
+
+func TestWebsocketStructuredOutputSafeSummaryDoesNotLogSchemaContent(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","text":{"format":{"type":"json_schema","name":"ExternalCallReviewResult","strict":true,"schema":{"type":"object","description":"DO_NOT_LOG_ME","properties":{"private_field":{"type":"string","enum":["PRIVATE_ENUM_VALUE"]},"calculation":{"type":"number"}},"required":["private_field","calculation"]}}}}`)
+	format := findWebsocketStructuredOutputFormat(body)
+	summary := websocketStructuredOutputSafeSummary(body, format)
+	for _, forbidden := range []string{"ExternalCallReviewResult", "DO_NOT_LOG_ME", "private_field", "PRIVATE_ENUM_VALUE"} {
+		if strings.Contains(summary, forbidden) {
+			t.Fatalf("safe summary leaked %q: %s", forbidden, summary)
+		}
+	}
+	for _, required := range []string{"name_hash=", "schema_hash=", "schema_encoding=object", "properties=2", "required=2", "calculation_property=true", "calculation_required=true"} {
+		if !strings.Contains(summary, required) {
+			t.Fatalf("safe summary missing %q: %s", required, summary)
+		}
+	}
+}
+
+func TestWebsocketStructuredOutputSafeSummaryMissingSchemaDoesNotHashRequest(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","input":"DO_NOT_LOG_OR_HASH_THIS_PROMPT","text":{"format":{"type":"json_schema","name":"ExternalCallReviewResult"}}}`)
+	format := findWebsocketStructuredOutputFormat(body)
+	summary := websocketStructuredOutputSafeSummary(body, format)
+	for _, forbidden := range []string{"ExternalCallReviewResult", "DO_NOT_LOG_OR_HASH_THIS_PROMPT"} {
+		if strings.Contains(summary, forbidden) {
+			t.Fatalf("safe summary leaked %q: %s", forbidden, summary)
+		}
+	}
+	for _, required := range []string{"schema_hash=none", "schema_encoding=missing", "schema_kind=missing"} {
+		if !strings.Contains(summary, required) {
+			t.Fatalf("safe summary missing %q: %s", required, summary)
+		}
+	}
+}
+
+func TestExecuteRequestStructuredOutputUsesSameAccountHTTPBeforeWebsocketWrite(t *testing.T) {
+	t.Setenv(websocketStructuredOutputHTTPEnv, "")
+	t.Setenv(websocketStructuredOutputHTTPNamesEnv, "ExternalCallReviewResult")
+	previousWS := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousWS
+		resinCfg.Store(previousResin)
+	})
+
+	var wsCalls int
+	WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+		wsCalls++
+		return nil, nil
+	}
+
+	var httpCalls int
+	var httpAccount string
+	var capturedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		httpAccount = r.Header.Get("X-Resin-Account")
+		capturedBody, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_structured_http"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	account := &auth.Account{DBID: 91, AccessToken: "oauth-token", AccountID: "acct-91", PlanType: "pro", Status: auth.StatusReady}
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"type":"reasoning","id":"reasoning-1","encrypted_content":"opaque-ciphertext"}],"text":{"format":{"type":"json_schema","name":"ExternalCallReviewResult","strict":true,"schema":{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"],"additionalProperties":false}}},"stream":false}`)
+	ctx, observation := withUpstreamTransportObservation(context.Background())
+	resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+		ctx, account, body, append([]byte(nil), body...), "stateless-ws", "stable-http-session",
+		"", "sk-local", nil, http.Header{}, websocketFramePreflightAllowSameAccountHTTP, true,
+	)
+	if err != nil {
+		t.Fatalf("structured-output HTTP preflight error=%v", err)
+	}
+	if resp == nil {
+		t.Fatal("structured-output HTTP response=nil")
+	}
+	_ = resp.Body.Close()
+	if actualWebsocket || wsCalls != 0 || httpCalls != 1 {
+		t.Fatalf("actualWebsocket=%t wsCalls=%d httpCalls=%d, want false/0/1", actualWebsocket, wsCalls, httpCalls)
+	}
+	if httpAccount != "91" {
+		t.Fatalf("HTTP account=%q want selected account 91", httpAccount)
+	}
+	if got := gjson.GetBytes(capturedBody, "prompt_cache_key").String(); got != "stable-http-session" {
+		t.Fatalf("HTTP prompt_cache_key=%q body=%s", got, capturedBody)
+	}
+	if got := gjson.GetBytes(capturedBody, "text.format.name").String(); got != "ExternalCallReviewResult" {
+		t.Fatalf("HTTP structured format name=%q body=%s", got, capturedBody)
+	}
+	if got := gjson.GetBytes(capturedBody, "input.0.encrypted_content").String(); got != "opaque-ciphertext" {
+		t.Fatalf("HTTP encrypted_content=%q body=%s", got, capturedBody)
+	}
+	reason, frameBytes, limitBytes := observation.Snapshot()
+	if reason != websocketStructuredOutputHTTPReason || frameBytes != 0 || limitBytes != 0 {
+		t.Fatalf("observation=(%q,%d,%d), want structured-output HTTP reason", reason, frameBytes, limitBytes)
+	}
+}
+
+func TestExecuteRequestStructuredOutputPreflightHonorsKillSwitchAndStrictPolicy(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+
+	tests := []struct {
+		name             string
+		env              string
+		names            string
+		previousResponse bool
+		inboundWS        bool
+	}{
+		{name: "kill switch off", env: "off", names: "result"},
+		{name: "empty allowlist is inert"},
+		{name: "previous response derives strict policy", names: "result", previousResponse: true},
+		{name: "inbound websocket strict policy", names: "result", inboundWS: true},
+		{name: "unlisted schema name", names: "different-result"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(websocketStructuredOutputHTTPEnv, test.env)
+			t.Setenv(websocketStructuredOutputHTTPNamesEnv, test.names)
+			wsCalls := 0
+			WebsocketExecuteFunc = func(context.Context, *auth.Account, []byte, string, string, string, *DeviceProfileConfig, http.Header, string) (*http.Response, error) {
+				wsCalls++
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"id":"resp_ws"}`)),
+				}, nil
+			}
+			body := []byte(`{"model":"gpt-5.6-sol","text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}}}`)
+			if test.previousResponse {
+				body = []byte(`{"model":"gpt-5.6-sol","previous_response_id":"resp_owner","text":{"format":{"type":"json_schema","name":"result","schema":{"type":"object"}}}}`)
+			}
+			policy := websocketFramePreflightPolicyForHTTP(body)
+			if test.inboundWS {
+				policy = websocketFramePreflightStrict
+			}
+			resp, err, actualWebsocket := executeRequestWithWebsocketFramePreflight(
+				context.Background(), &auth.Account{DBID: 92, AccessToken: "oauth-token"}, body, body,
+				"ws-session", "http-session", "", "sk-local", nil, http.Header{}, policy, true,
+			)
+			if err != nil {
+				t.Fatalf("websocket request error=%v", err)
+			}
+			if resp == nil {
+				t.Fatal("websocket response=nil")
+			}
+			_ = resp.Body.Close()
+			if !actualWebsocket || wsCalls != 1 {
+				t.Fatalf("actualWebsocket=%t wsCalls=%d, want true/1", actualWebsocket, wsCalls)
+			}
+		})
+	}
+}
+
 func TestExecuteRequestLargeUnboundWebsocketFrameUsesNativeHTTPBodyOnce(t *testing.T) {
 	const appendMarker = "rb23-preflight-append-once"
 	withPayloadRules(t, `{"append":[{"params":{"instructions":"`+appendMarker+`"}}]}`)
