@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1512,6 +1513,11 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
 		},
 		{
+			name:    "OAuth base concurrency above range",
+			body:    `{"base_concurrency_override":51}`,
+			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
+		},
+		{
 			name:    "5h auto pause threshold out of range",
 			body:    `{"auto_pause_5h_threshold":1.01}`,
 			message: "auto_pause_5h_threshold 超出范围，必须在 0..1 之间",
@@ -1539,6 +1545,50 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 			assertErrorMessage(t, recorder, tc.message)
 		})
 	}
+}
+
+func TestUpdateAccountSchedulerAllowsExtendedResponsesConcurrency(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertOpenAIResponsesAccount(context.Background(), "responses", map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      "https://api.openai.com",
+		"api_key":       "test-only-key",
+		"models":        []string{"gpt-5"},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(accountID, 10)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if recorder := patch(`{"base_concurrency_override":1000}`); recorder.Code != http.StatusOK {
+		t.Fatalf("1000 status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 1000 {
+		t.Fatalf("base_concurrency_override = %+v, want 1000", row.BaseConcurrencyOverride)
+	}
+
+	recorder := patch(`{"base_concurrency_override":1001}`)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("1001 status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	assertErrorMessage(t, recorder, "base_concurrency_override 超出范围，必须在 1..1000 之间")
 }
 
 func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
@@ -2154,6 +2204,73 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 		if priority := account.GetSchedulerPriority(); priority != 0 {
 			t.Fatalf("runtime account %d scheduler priority after reset = %d, want 0", account.ID(), priority)
 		}
+	}
+}
+
+func TestBatchUpdateAccountsExtendedConcurrencyRequiresAllResponsesAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	insertResponses := func(name, apiKey string) int64 {
+		t.Helper()
+		id, err := db.InsertOpenAIResponsesAccount(ctx, name, map[string]interface{}{
+			"upstream_type": auth.UpstreamOpenAIResponses,
+			"base_url":      "https://api.openai.com",
+			"api_key":       apiKey,
+			"models":        []string{"gpt-5"},
+		}, "")
+		if err != nil {
+			t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+		}
+		return id
+	}
+	responsesID1 := insertResponses("responses-1", "test-key-1")
+	responsesID2 := insertResponses("responses-2", "test-key-2")
+	oauthID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+
+	invoke := func(ids []int64, value int64) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(map[string]interface{}{
+			"ids":                       ids,
+			"base_concurrency_override": value,
+		})
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-update", bytes.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.BatchUpdateAccounts(ginCtx)
+		return recorder
+	}
+
+	if recorder := invoke([]int64{responsesID1, responsesID2}, 1000); recorder.Code != http.StatusOK {
+		t.Fatalf("all Responses status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	for _, id := range []int64{responsesID1, responsesID2} {
+		row, err := db.GetAccountByID(ctx, id)
+		if err != nil {
+			t.Fatalf("GetAccountByID(%d): %v", id, err)
+		}
+		if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 1000 {
+			t.Fatalf("account %d concurrency = %+v, want 1000", id, row.BaseConcurrencyOverride)
+		}
+	}
+
+	recorder := invoke([]int64{responsesID1, oauthID}, 51)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("mixed batch status = %d, want %d, body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	assertErrorMessage(t, recorder, "base_concurrency_override 超出范围，必须在 1..50 之间")
+	oauthRow, err := db.GetAccountByID(ctx, oauthID)
+	if err != nil {
+		t.Fatalf("GetAccountByID OAuth: %v", err)
+	}
+	if oauthRow.BaseConcurrencyOverride.Valid {
+		t.Fatalf("OAuth concurrency changed on rejected batch: %+v", oauthRow.BaseConcurrencyOverride)
 	}
 }
 

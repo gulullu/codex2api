@@ -573,6 +573,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/intelligence/run", h.RunPromptIntelligence)
 	api.GET("/prompt-filter/intelligence/history", h.ListPromptIntelligenceHistory)
 	api.POST("/prompt-filter/intelligence/rules", h.AddPromptIntelligenceCandidate)
+	api.GET("/relay-route/stats", h.GetRelayRouteStats)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
@@ -1289,12 +1290,17 @@ type accountSchedulerUpdate struct {
 	CredentialUpdates       map[string]interface{}
 }
 
-func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
+const (
+	defaultAccountBaseConcurrencyMax         int64 = 50
+	openAIResponsesAccountBaseConcurrencyMax int64 = 1000
+)
+
+func parseAccountSchedulerUpdate(req updateAccountSchedulerReq, baseConcurrencyMax int64) (accountSchedulerUpdate, error) {
 	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, 50)
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, baseConcurrencyMax)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1412,6 +1418,48 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	}, nil
 }
 
+func requestsExtendedBaseConcurrency(raw json.RawMessage) bool {
+	var value int64
+	return json.Unmarshal(raw, &value) == nil && value > defaultAccountBaseConcurrencyMax
+}
+
+func isOpenAIResponsesAccountRow(row *database.AccountRow) bool {
+	return row != nil && strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+}
+
+func (h *Handler) accountBaseConcurrencyMax(ctx context.Context, id int64, raw json.RawMessage) (int64, error) {
+	if !requestsExtendedBaseConcurrency(raw) {
+		return defaultAccountBaseConcurrencyMax, nil
+	}
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if isOpenAIResponsesAccountRow(row) {
+		return openAIResponsesAccountBaseConcurrencyMax, nil
+	}
+	return defaultAccountBaseConcurrencyMax, nil
+}
+
+func (h *Handler) batchBaseConcurrencyMax(ctx context.Context, ids []int64, raw json.RawMessage) (int64, error) {
+	if !requestsExtendedBaseConcurrency(raw) {
+		return defaultAccountBaseConcurrencyMax, nil
+	}
+	for _, id := range ids {
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return defaultAccountBaseConcurrencyMax, nil
+			}
+			return 0, err
+		}
+		if !isOpenAIResponsesAccountRow(row) {
+			return defaultAccountBaseConcurrencyMax, nil
+		}
+	}
+	return openAIResponsesAccountBaseConcurrencyMax, nil
+}
+
 func (u accountSchedulerUpdate) hasChanges() bool {
 	return u.ScoreBiasOverride.Set ||
 		u.BaseConcurrencyOverride.Set ||
@@ -1491,14 +1539,23 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 
-	update, err := parseAccountSchedulerUpdate(req)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	baseConcurrencyMax, err := h.accountBaseConcurrencyMax(ctx, id, req.BaseConcurrencyOverride)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	update, err := parseAccountSchedulerUpdate(req, baseConcurrencyMax)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
 
 	if update.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
@@ -4888,7 +4945,15 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		return
 	}
 
-	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	baseConcurrencyMax, err := h.batchBaseConcurrencyMax(ctx, ids, req.BaseConcurrencyOverride)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "校验账号类型失败: "+err.Error())
+		return
+	}
+	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq, baseConcurrencyMax)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -4899,9 +4964,6 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请提供要更新的字段")
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
 
 	if schedulerUpdate.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, schedulerUpdate.AllowedAPIKeyIDs.Values)

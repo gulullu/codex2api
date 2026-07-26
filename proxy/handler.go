@@ -732,6 +732,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateWsAcquireFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
+	h.observeRelayRouteUsage(c, input)
 	h.logUsage(input)
 }
 
@@ -1902,6 +1903,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	routePlan, ok := h.prepareRelayRoutePlanAndReply(c, rawBody, "/v1/responses")
+	if !ok {
+		return
+	}
 	bodyReadDone := time.Now()
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
@@ -1916,7 +1921,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// 非流式请求仍可提升到 compact 专用链路，保留只实现 /responses/compact 的
 	// 中转兼容性。
 	bodySignalCompact := requestBodyHasCompactionTrigger(rawBody)
-	pinBodySignalToCodexAccounts := bodySignalCompact && h.storeHasAvailableCodexAccount()
+	pinBodySignalToCodexAccounts := bodySignalCompact && !routePlan.Required() && h.storeHasAvailableCodexAccount()
 	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
 	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
 		h.ResponsesCompact(c)
@@ -2001,6 +2006,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
 	// strip 策略：剥离网关注入及客户端携带的图片工具能力声明，作为普通文本请求继续（issue #411）。
 	codexBody = applyImageGenerationStripPolicy(c, codexBody)
+	oauthRulePreview := ApplyPayloadRulesToBody(codexBody, gjson.GetBytes(codexBody, "model").String(), c.Request.Header, ruleIdentity)
+	h.upgradeRelayRoutePlanFromPayloadRules(routePlan, oauthRulePreview, "/v1/responses", model)
 	var openAIResponsesBody []byte
 	resetOpenAIResponsesBody := func() {
 		openAIResponsesBody = nil
@@ -2041,6 +2048,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	accountFilter = routePlan.composeFilter(accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -2072,6 +2080,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if routePlan.Required() {
+				h.logRelayGroupExhausted(c, routePlan)
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
@@ -2082,6 +2093,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			return
+		}
+		accountFilter, ok = h.applyRelayRouteSelection(c, routePlan, account, accountFilter, retainedHTTPFallback)
+		if !ok {
 			return
 		}
 
@@ -3130,6 +3145,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	routePlan, ok := h.relayRoutePlanForRequestAndReply(c, rawBody, "/v1/responses/compact")
+	if !ok {
+		return
+	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -3229,6 +3248,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	accountFilter = routePlan.composeFilter(accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -3250,6 +3270,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
+				if routePlan.Required() {
+					h.logRelayGroupExhausted(c, routePlan)
+				}
 				if (lastStatusCode == http.StatusTooManyRequests || lastStatusCode == http.StatusBadGateway) && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
@@ -3261,6 +3284,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
+		}
+		accountFilter, ok = h.applyRelayRouteSelection(c, routePlan, account, accountFilter, false)
+		if !ok {
+			return
 		}
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
@@ -3667,6 +3694,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	routePlan, ok := h.relayRoutePlanForRequestAndReply(c, rawBody, "/v1/chat/completions")
+	if !ok {
+		return
+	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -3736,6 +3767,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	oauthRulePreview := ApplyPayloadRulesToBody(codexBody, gjson.GetBytes(codexBody, "model").String(), c.Request.Header, ruleIdentity)
+	h.upgradeRelayRoutePlanFromPayloadRules(routePlan, oauthRulePreview, "/v1/responses", model)
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	logEffectiveModel := usageEffectiveModelForMapping(logModel, effectiveModel, mappingApplied)
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
@@ -3754,6 +3787,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	accountFilter = routePlan.composeFilter(accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
@@ -3786,6 +3820,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if routePlan.Required() {
+				h.logRelayGroupExhausted(c, routePlan)
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
@@ -3796,6 +3833,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			return
+		}
+		accountFilter, ok = h.applyRelayRouteSelection(c, routePlan, account, accountFilter, retainedHTTPFallback)
+		if !ok {
 			return
 		}
 

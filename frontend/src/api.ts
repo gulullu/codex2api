@@ -57,6 +57,7 @@ import type {
   PromptFilterRulePatternTestResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  RelayRouteStats,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
@@ -787,6 +788,8 @@ export const api = {
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
+  getRelayRouteStats: (windowHours = 24) =>
+    request<RelayRouteStats>(`/relay-route/stats?window_hours=${windowHours}`),
   runPromptIntelligence: () =>
     request<import('./types').PromptIntelligenceRun>('/prompt-filter/intelligence/run', { method: 'POST' }),
   getPromptIntelligenceHistory: (page = 1, pageSize = 20) =>

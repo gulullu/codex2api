@@ -1004,6 +1004,23 @@ export interface PromptFilterLogsResponse {
   page_size: number
 }
 
+export interface RelayRouteStats {
+  window_hours: number
+  route_attempts: number
+  logical_routes: number
+  cyb_rule: number
+  probe: number
+  oauth_overflow: number
+  relay_continuation: number
+  cyb_feedback: number
+  retries: number
+  same_group_switches: number
+  group_exhausted: number
+  detector_misses: number
+  relay_cyber_policies: number
+  route_violations: number
+}
+
 export interface PromptFilterTestResponse {
   verdict: PromptFilterVerdict
 }

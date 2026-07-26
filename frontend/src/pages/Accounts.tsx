@@ -32,6 +32,7 @@ import type {
   AddOpenAIResponsesAccountRequest,
   CodexClientMetadataMode,
   UpdateOpenAIResponsesAccountRequest,
+  UpdateAccountSchedulerRequest,
   APIKeyRow,
   OpsOverviewResponse,
   AccountGroup,
@@ -42,6 +43,11 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
+import {
+  DEFAULT_ACCOUNT_BASE_CONCURRENCY_MAX,
+  accountBaseConcurrencyMax,
+  buildOpenAIResponsesAccountDraft,
+} from "../lib/openAIResponsesAccountDraft";
 import {
   formatLongUsageWindowLabel,
   needsUsageReload,
@@ -940,6 +946,8 @@ export default function Accounts() {
       codex_client_metadata_mode: "auto",
       proxy_url: "",
     });
+  const copiedOpenAISchedulerRef =
+    useRef<UpdateAccountSchedulerRequest | null>(null);
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
   const [openAIModelMappingMode, setOpenAIModelMappingMode] =
     useState<ModelMappingMode>("form");
@@ -2225,13 +2233,21 @@ export default function Accounts() {
       return;
     }
     setSubmitting(true);
+    let createdAccountID: number | null = null;
     try {
-      await api.addOpenAIResponsesAccount({
+      const result = await api.addOpenAIResponsesAccount({
         ...openAIForm,
         models,
         model_mapping: parsedModelMapping.value,
         custom_headers: parsedCustomHeaders.value,
       });
+      createdAccountID = result.id;
+      if (copiedOpenAISchedulerRef.current) {
+        await api.updateAccountScheduler(
+          result.id,
+          copiedOpenAISchedulerRef.current,
+        );
+      }
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
       setOpenAIForm({
@@ -2246,12 +2262,26 @@ export default function Accounts() {
       setOpenAIModelMappingMode("form");
       setOpenAIModelMappingEntries(emptyModelMappingEntries());
       setAddCustomHeadersText("");
+      copiedOpenAISchedulerRef.current = null;
       void reload();
     } catch (error) {
-      showToast(
-        t("accounts.addFailed", { error: getErrorMessage(error) }),
-        "error",
-      );
+      if (createdAccountID !== null) {
+        copiedOpenAISchedulerRef.current = null;
+        setShowAdd(false);
+        showToast(
+          t("accounts.copySchedulerFailed", {
+            id: createdAccountID,
+            error: getErrorMessage(error),
+          }),
+          "error",
+        );
+        void reload();
+      } else {
+        showToast(
+          t("accounts.addFailed", { error: getErrorMessage(error) }),
+          "error",
+        );
+      }
     } finally {
       setSubmitting(false);
     }
@@ -3569,12 +3599,19 @@ export default function Accounts() {
   const batchBaseConcurrencyValue = batchBaseConcurrencyTrimmed
     ? parseIntegerInput(batchBaseConcurrencyTrimmed)
     : null;
+  const selectedAccountRows = accounts.filter((account) =>
+    selected.has(account.id),
+  );
+  const batchBaseConcurrencyMax =
+    selectedAccountRows.length === selected.size
+      ? accountBaseConcurrencyMax(selectedAccountRows)
+      : DEFAULT_ACCOUNT_BASE_CONCURRENCY_MAX;
   const batchBaseConcurrencyInvalid =
     batchUpdateBaseConcurrency &&
     batchBaseConcurrencyTrimmed !== "" &&
     (batchBaseConcurrencyValue === null ||
       batchBaseConcurrencyValue < 1 ||
-      batchBaseConcurrencyValue > 50);
+      batchBaseConcurrencyValue > batchBaseConcurrencyMax);
   const batchSchedulerPriorityInvalid =
     batchUpdateSchedulerPriority &&
     isSchedulerPriorityInputInvalid(batchSchedulerPriorityInput);
@@ -3779,6 +3816,31 @@ export default function Accounts() {
     }
   };
 
+  const openAddDialog = () => {
+    copiedOpenAISchedulerRef.current = null;
+    setShowAdd(true);
+  };
+
+  const openOpenAIResponsesCopyDraft = (account: AccountRow) => {
+    if (!account.openai_responses_api) return;
+    const draft = buildOpenAIResponsesAccountDraft(account);
+    const parsedMapping = parseModelMappingEntries(
+      draft.account.model_mapping ?? "",
+    );
+
+    copiedOpenAISchedulerRef.current = draft.scheduler;
+    setOpenAIForm(draft.account);
+    setOpenAIModelDraft("");
+    setOpenAIModelMappingText(draft.account.model_mapping ?? "");
+    setOpenAIModelMappingMode("form");
+    setOpenAIModelMappingEntries(
+      parsedMapping.ok ? parsedMapping.entries : emptyModelMappingEntries(),
+    );
+    setAddCustomHeadersText(formatCustomHeadersText(draft.account.custom_headers));
+    setAddMethod("openai");
+    setShowAdd(true);
+  };
+
   const openSchedulerEditor = (account: AccountRow) => {
     setEditingAccount(account);
     setEditTab("scheduler");
@@ -3906,6 +3968,9 @@ export default function Accounts() {
     scoreMode === "custom" ? parseIntegerInput(scoreInput) : null;
   const parsedBaseConcurrency =
     concurrencyMode === "custom" ? parseIntegerInput(concurrencyInput) : null;
+  const editBaseConcurrencyMax = accountBaseConcurrencyMax(
+    editingAccount ? [editingAccount] : [],
+  );
   const scoreInputInvalid =
     scoreMode === "custom" &&
     (parsedScoreBias === null ||
@@ -3915,7 +3980,7 @@ export default function Accounts() {
     concurrencyMode === "custom" &&
     (parsedBaseConcurrency === null ||
       parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > 50);
+      parsedBaseConcurrency > editBaseConcurrencyMax);
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
@@ -4441,7 +4506,7 @@ export default function Accounts() {
                       <Button
                         size="sm"
                         className="min-w-0 sm:flex-none"
-                        onClick={() => setShowAdd(true)}
+                        onClick={openAddDialog}
                       >
                         <Plus className="size-3.5" />
                         {t("accounts.addAccount")}
@@ -5208,7 +5273,7 @@ export default function Accounts() {
                 emptyTitle={t("accounts.noData")}
                 emptyDescription={t("accounts.noDataDesc")}
                 action={
-                  <Button onClick={() => setShowAdd(true)}>
+                  <Button onClick={openAddDialog}>
                     {t("accounts.addAccount")}
                   </Button>
                 }
@@ -5258,6 +5323,7 @@ export default function Accounts() {
                           onResetCredits={() =>
                             void handleResetCredits(account)
                           }
+                          onCopy={() => openOpenAIResponsesCopyDraft(account)}
                           onEditModels={() => openModelsEditor(account)}
                           onDelete={() => void handleDelete(account)}
                           onUsageRefreshed={() => void reloadSilently()}
@@ -5860,6 +5926,9 @@ export default function Accounts() {
                                     onResetCredits={() =>
                                       void handleResetCredits(account)
                                     }
+                                    onCopy={() =>
+                                      openOpenAIResponsesCopyDraft(account)
+                                    }
                                     onEditModels={() => openModelsEditor(account)}
                                     onDelete={() => void handleDelete(account)}
                                   />
@@ -5895,6 +5964,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
+              copiedOpenAISchedulerRef.current = null;
               setAllowDuplicate(false);
               setAddMethod("oauth");
               setOauthStep("generate");
@@ -5935,6 +6005,7 @@ export default function Accounts() {
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
+                    copiedOpenAISchedulerRef.current = null;
                     setAllowDuplicate(false);
                     setAddMethod("oauth");
                     setOauthStep("generate");
@@ -6254,6 +6325,11 @@ export default function Accounts() {
                   </p>
                   <p>{t("accounts.openaiResponsesDesc")}</p>
                 </div>
+                {copiedOpenAISchedulerRef.current ? (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-300">
+                    {t("accounts.copyAccountDraftHint")}
+                  </div>
+                ) : null}
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
                     {t("accounts.openaiNameLabel")}
@@ -7607,19 +7683,23 @@ export default function Accounts() {
                           <div className="mt-3 space-y-2">
                             <Input
                               inputMode="numeric"
+                              max={editBaseConcurrencyMax}
                               value={concurrencyInput}
                               onChange={(
                                 event: ChangeEvent<HTMLInputElement>,
                               ) => setConcurrencyInput(event.target.value)}
                               placeholder={t(
                                 "accounts.schedulerConcurrencyPlaceholder",
+                                { max: editBaseConcurrencyMax },
                               )}
                             />
                             <div
                               className={`text-xs ${concurrencyInputInvalid ? "text-red-500" : "text-muted-foreground"}`}
                             >
                               {concurrencyInputInvalid
-                                ? t("accounts.schedulerConcurrencyRange")
+                                ? t("accounts.schedulerConcurrencyRange", {
+                                    max: editBaseConcurrencyMax,
+                                  })
                                 : t("accounts.schedulerCustomValuePreview", {
                                     value:
                                       parsedBaseConcurrency ??
@@ -8311,12 +8391,14 @@ export default function Accounts() {
                     <Input
                       className="mt-3"
                       inputMode="numeric"
+                      max={batchBaseConcurrencyMax}
                       value={batchBaseConcurrencyInput}
                       onChange={(event: ChangeEvent<HTMLInputElement>) =>
                         setBatchBaseConcurrencyInput(event.target.value)
                       }
                       placeholder={t(
                         "accounts.schedulerConcurrencyPlaceholder",
+                        { max: batchBaseConcurrencyMax },
                       )}
                       disabled={!batchUpdateBaseConcurrency}
                     />
@@ -8324,7 +8406,9 @@ export default function Accounts() {
                       className={`mt-1.5 text-xs ${batchBaseConcurrencyInvalid ? "text-red-500" : "text-muted-foreground"}`}
                     >
                       {batchBaseConcurrencyInvalid
-                        ? t("accounts.schedulerConcurrencyRange")
+                        ? t("accounts.schedulerConcurrencyRange", {
+                            max: batchBaseConcurrencyMax,
+                          })
                         : t("accounts.batchMetaResetHint")}
                     </div>
                   </div>
@@ -11181,6 +11265,7 @@ function AccountRowActionsMenu({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onCopy,
   onEditModels,
   onDelete,
 }: {
@@ -11197,6 +11282,7 @@ function AccountRowActionsMenu({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onCopy?: () => void;
   onEditModels?: () => void;
   onDelete: () => void;
 }) {
@@ -11289,6 +11375,16 @@ function AccountRowActionsMenu({
       disabled: resetCredits <= 0,
       onSelect: onResetCredits,
     },
+    ...(onCopy && account.openai_responses_api
+      ? [
+          {
+            key: "copy-responses-account",
+            label: t("accounts.copyAccountDraft"),
+            icon: <Copy className="size-3.5" />,
+            onSelect: onCopy,
+          },
+        ]
+      : []),
     // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay/Grok 账号不显示。
     ...(onEditModels && !account.openai_responses_api && !account.grok_api
       ? [
@@ -11577,6 +11673,7 @@ function AccountMobileCard({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onCopy,
   onEditModels,
   onDelete,
   onUsageRefreshed,
@@ -11605,6 +11702,7 @@ function AccountMobileCard({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onCopy?: () => void;
   onEditModels?: () => void;
   onDelete: () => void;
   onUsageRefreshed?: () => void;
@@ -11944,6 +12042,7 @@ function AccountMobileCard({
               onToggleLock={onToggleLock}
               onResetStatus={onResetStatus}
               onResetCredits={onResetCredits}
+              onCopy={onCopy}
               onEditModels={onEditModels}
               onDelete={onDelete}
             />
@@ -12178,6 +12277,7 @@ function AccountMobileCard({
           onToggleLock={onToggleLock}
           onResetStatus={onResetStatus}
           onResetCredits={onResetCredits}
+          onCopy={onCopy}
           onEditModels={onEditModels}
           onDelete={onDelete}
         />
