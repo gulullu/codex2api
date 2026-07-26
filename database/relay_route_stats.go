@@ -22,6 +22,7 @@ type RelayRouteStats struct {
 	DetectorMisses     int64 `json:"detector_misses"`
 	RelayCyberPolicies int64 `json:"relay_cyber_policies"`
 	RouteViolations    int64 `json:"route_violations"`
+	StateFallbacks     int64 `json:"state_fallbacks"`
 }
 
 func (db *DB) GetRelayRouteStats(ctx context.Context, window time.Duration) (RelayRouteStats, error) {
@@ -56,6 +57,8 @@ func (db *DB) GetRelayRouteStats(ctx context.Context, window time.Duration) (Rel
 			stats.RelayCyberPolicies += count
 		case "relay_route_group_escape_violation":
 			stats.RouteViolations += count
+		case "relay_route_state_fallback":
+			stats.StateFallbacks += count
 		}
 		if relayRouteSelectionSource(source) {
 			stats.RouteAttempts += count
@@ -91,7 +94,8 @@ func relayRouteSelectionSource(source string) bool {
 		"relay_route_probe",
 		"relay_route_oauth_overflow",
 		"relay_route_relay_continuation",
-		"relay_route_cyb_feedback":
+		"relay_route_cyb_feedback",
+		"relay_route_official_default":
 		return true
 	default:
 		return false

@@ -42,6 +42,25 @@ func (h *Handler) logRelayGroupEscapeViolation(c *gin.Context, plan *relayRouteP
 	h.enqueueRelayRouteMetric(c, plan, relayRouteLogSourcePrefix+"group_escape_violation", "error", database.PromptFilterLogPriorityHigh)
 }
 
+func (h *Handler) logRelayRouteStateFallback(c *gin.Context, plan *relayRoutePlan, reason string) {
+	if plan == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "unknown"
+	}
+	snapshot := *plan
+	snapshot.Reason = reason
+	h.enqueueRelayRouteMetric(
+		c,
+		&snapshot,
+		relayRouteLogSourcePrefix+"state_fallback",
+		reason,
+		database.PromptFilterLogPriorityHigh,
+	)
+}
+
 func (h *Handler) logRelayCyberPolicyMetric(c *gin.Context, plan *relayRoutePlan, detectorMiss bool) {
 	source := relayRouteLogSourcePrefix + "relay_cyber_policy"
 	if detectorMiss {

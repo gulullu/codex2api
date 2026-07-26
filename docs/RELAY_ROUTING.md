@@ -45,20 +45,36 @@ different user or conversation   -> different value
 ```
 
 When this trusted header exists, it is the only route-pin scope used for the
-request. The implementation never stores the raw header, API key, prompt,
-response body, response ID, or Relay account ID. Without the trusted header it
-can fall back to explicit Session/Conversation headers or `prompt_cache_key`,
-but a required Relay route with no stable scope fails with HTTP 503. A request
-that has only `previous_response_id` and no stable scope also fails with 503.
+request. Otherwise, scope extraction reuses the official explicit identity
+fields, including Session/Conversation headers, `prompt_cache_key`, and
+`Idempotency-Key`. The implementation never stores a raw identity value, API
+key, prompt, response body, response ID, or Relay account ID.
+
+Missing identity is not an application-level error:
+
+- CYB, probe, and ordinary OAuth-overflow requests still use the target Relay
+  group, but no group pin is persisted when no stable scope exists.
+- A request with `previous_response_id` but no usable pin is conservatively
+  constrained to the target Relay group.
+- Pin-cache read or decoding failures conservatively constrain the request to
+  Relay. Pin writes are best effort and a write failure keeps the already
+  selected Relay route. None of these failures creates a custom HTTP 503; each
+  emits a warning/statistics event.
+- Normal scheduler behavior may still return 503 when the required Relay group
+  genuinely has no eligible account or capacity. The internal group-escape
+  invariant also remains fail-closed if a selector ever violates the required
+  group; that path is separately counted as a route violation.
 
 Use Redis for production and for every multi-instance deployment. The in-memory
 cache is suitable only for local development: pins disappear on restart and
-are not shared between processes. Cache read corruption or unavailability is
-fail-closed whenever a stable scope is present.
+are not shared between processes. Redis improves continuation consistency but
+is not placed on the request-success path: cache unavailability must not turn
+otherwise routable requests into 503 responses.
 
 The pin value contains only the Relay group ID and the original route source.
 It never binds a specific account, so official retry may switch to any other
-eligible account in the same group.
+eligible account in the same group. No session content, response content, or
+account ownership state is introduced.
 
 ## Deterministic routing rules
 
@@ -93,7 +109,9 @@ GET /api/admin/relay-route/stats?window_hours=24
 It exposes logical Relay routes, selection attempts, deterministic CYB routes,
 probe routes, OAuth overflow, Relay continuation, feedback routes, retries,
 same-group switches, group exhaustion, detector misses, Relay-side
-`cyber_policy`, and group escape violations. Metrics reuse
+`cyber_policy`, conservative route-state fallbacks, and group escape
+violations. The `state_fallbacks` total covers missing scope, continuation pin
+misses, pin read/write failures, and invalid or stale pin values. Metrics reuse
 `prompt_filter_logs`; no database schema or migration is added, and prompt text
 is never written to route events.
 
@@ -110,7 +128,9 @@ Before production rollout:
    replay.
 5. Confirm OAuth priority is higher than Relay priority and observe a real
    capacity overflow.
-6. Confirm Redis is shared by every application instance.
+6. Confirm Redis is shared by every application instance and that simulated
+   cache read/write/corruption failures route conservatively without a custom
+   503.
 
 Do not deploy if steps 3 or 4 fail. Cross-account continuation depends on the
 Relay upstream sharing response state; codex2api's selector cannot manufacture

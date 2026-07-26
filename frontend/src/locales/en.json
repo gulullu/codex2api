@@ -1692,7 +1692,7 @@
       "sourcesTitle": "Routing Sources",
       "sourcesDescription": "Counts selection attempts; retries from one logical request may appear more than once.",
       "healthTitle": "Routing Quality and Exceptions",
-      "healthDescription": "Monitor detector misses, upstream Relay blocks, exhausted groups, and route violations.",
+      "healthDescription": "Monitor detector misses, upstream Relay blocks, conservative state fallbacks, exhausted groups, and route violations.",
       "metrics": {
         "logicalRoutes": "Logical Routes",
         "routeAttempts": "Selection Attempts",
@@ -1706,7 +1706,8 @@
         "groupExhausted": "Relay Group Exhausted",
         "detectorMisses": "CYB Detector Misses",
         "relayCyberPolicies": "Relay Upstream CYB Blocks",
-        "routeViolations": "Group Escape Violations"
+        "routeViolations": "Group Escape Violations",
+        "stateFallbacks": "Conservative Route Fallbacks"
       },
       "metricHints": {
         "logicalRoutes": "Requests initially routed into the Relay group",
@@ -1721,7 +1722,8 @@
         "groupExhausted": "No schedulable account remained in the target Relay group",
         "detectorMisses": "An ordinary route reached an upstream cyber_policy block",
         "relayCyberPolicies": "A routed request still reached an upstream Relay cyber_policy block",
-        "routeViolations": "An account outside the target group was selected for a Relay route"
+        "routeViolations": "An account outside the target group was selected for a Relay route",
+        "stateFallbacks": "Conservative Relay routing decisions made when a stable session scope or route-pin state was unavailable"
       }
     },
     "loadingTitle": "Loading Prompt Filter",

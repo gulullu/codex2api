@@ -1,16 +1,44 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
+
+type relayRouteFailingRuntimeCache struct {
+	cache.TokenCache
+	getErr error
+	setErr error
+}
+
+func (c *relayRouteFailingRuntimeCache) GetRuntime(
+	context.Context,
+	string,
+	string,
+) (json.RawMessage, bool, error) {
+	return nil, false, c.getErr
+}
+
+func (c *relayRouteFailingRuntimeCache) SetRuntime(
+	context.Context,
+	string,
+	string,
+	json.RawMessage,
+	time.Duration,
+) error {
+	return c.setErr
+}
 
 func TestLoadRelayRouteConfig(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
@@ -79,6 +107,91 @@ func TestRelayRoutePinCandidatesTrustGatewayAffinityExclusively(t *testing.T) {
 	}
 }
 
+func TestRelayRoutePinCandidatesUseOfficialExplicitSessionID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	req.Header.Set("Idempotency-Key", "request-123")
+	c.Request = req
+
+	candidates := relayRoutePinCandidates(c, []byte(`{"model":"gpt-5.5"}`), 9)
+	if len(candidates) != 1 || candidates[0].Kind != "explicit_session" {
+		t.Fatalf("candidates = %+v, want Idempotency-Key explicit session", candidates)
+	}
+	want := relayRoutePinCacheKey(9, "explicit_session", ResolveExplicitSessionID(req.Header, nil))
+	if candidates[0].Key != want {
+		t.Fatalf("candidate key = %q, want %q", candidates[0].Key, want)
+	}
+}
+
+func TestOrdinaryRequestWithoutStableScopeStaysOnOfficialRoute(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("ordinary request returned an error: %v", err)
+	}
+	if plan.Required() || plan.Source != relayRouteSourceDefault || plan.StateFallbackLogged {
+		t.Fatalf("ordinary route plan = %+v", plan)
+	}
+}
+
+func TestOrdinaryRequestWithPinMissStaysOnOfficialRoute(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("ordinary pin miss returned an error: %v", err)
+	}
+	if plan.Required() || plan.Source != relayRouteSourceDefault || plan.StateFallbackLogged {
+		t.Fatalf("ordinary pin-miss plan = %+v", plan)
+	}
+}
+
+func TestProbeWithoutStableScopeRoutesRelayWithoutError(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"ping"}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("probe without stable scope returned an error: %v", err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 3 || plan.Source != relayRouteSourceProbe {
+		t.Fatalf("probe route plan = %+v", plan)
+	}
+	if !plan.SkipPinPersistence || plan.StateFallbackReason != "missing_scope" {
+		t.Fatalf("probe fallback state = %+v", plan)
+	}
+}
+
 func TestObserveRelayRouteSelectionLocksOverflowToGroup(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -106,7 +219,32 @@ func TestObserveRelayRouteSelectionLocksOverflowToGroup(t *testing.T) {
 	}
 }
 
-func TestRequiredRelayRouteRejectsMissingStableScope(t *testing.T) {
+func TestOverflowWithoutStableScopeKeepsRelaySelection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	plan := defaultRelayRoutePlan(relayRouteConfig{Enabled: true, GroupID: 3, PinTTL: time.Minute})
+	plan.Endpoint = "/v1/responses"
+
+	becameOverflow, err := handler.observeRelayRouteSelection(
+		c,
+		&plan,
+		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
+	)
+	if err != nil {
+		t.Fatalf("overflow without stable scope returned an error: %v", err)
+	}
+	if !becameOverflow || !plan.Required() || plan.Source != relayRouteSourceOverflow {
+		t.Fatalf("overflow plan = %+v", plan)
+	}
+	if !plan.SkipPinPersistence || plan.StateFallbackReason != "missing_scope" {
+		t.Fatalf("overflow fallback state = %+v", plan)
+	}
+}
+
+func TestRequiredRelayRouteWithoutStableScopeSkipsPin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
@@ -115,12 +253,22 @@ func TestRequiredRelayRouteRejectsMissingStableScope(t *testing.T) {
 	plan := defaultRelayRoutePlan(relayRouteConfig{Enabled: true, GroupID: 3, PinTTL: time.Minute})
 	plan.RequiredGroupID = 3
 
-	if _, err := handler.observeRelayRouteSelection(
+	becameOverflow, err := handler.observeRelayRouteSelection(
 		c,
 		&plan,
 		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
-	); err == nil {
-		t.Fatal("required Relay route proceeded without a stable conversation scope")
+	)
+	if err != nil {
+		t.Fatalf("required Relay route failed without a stable conversation scope: %v", err)
+	}
+	if becameOverflow {
+		t.Fatal("already-required Relay route was marked as overflow")
+	}
+	if !plan.SkipPinPersistence {
+		t.Fatal("missing stable scope did not disable pin persistence")
+	}
+	if plan.StateFallbackReason != "missing_scope" || !plan.StateFallbackLogged {
+		t.Fatalf("missing-scope fallback state = %+v", plan)
 	}
 }
 
@@ -198,7 +346,7 @@ func TestRelayRoutePinRejectsCorruptCachedState(t *testing.T) {
 	}
 }
 
-func TestRelayContinuationRejectsMissingStableScope(t *testing.T) {
+func TestRelayContinuationWithoutStableScopeFallsBackToRelay(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -206,11 +354,240 @@ func TestRelayContinuationRejectsMissingStableScope(t *testing.T) {
 	handler := &Handler{}
 	handler.SetRuntimeCache(cache.NewMemory(1))
 
-	if _, err := handler.prepareRelayRoutePlan(
+	plan, err := handler.prepareRelayRoutePlan(
 		c,
 		[]byte(`{"model":"gpt-5.5","previous_response_id":"resp_without_scope","input":"continue"}`),
 		"/v1/responses",
-	); err == nil {
-		t.Fatal("continuation without a stable conversation scope was accepted")
+	)
+	if err != nil {
+		t.Fatalf("continuation without stable scope returned an error: %v", err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 3 {
+		t.Fatalf("continuation fallback plan = %+v", plan)
+	}
+	if plan.Source != relayRouteSourceContinuation {
+		t.Fatalf("continuation fallback source = %q", plan.Source)
+	}
+	if plan.Reason != "missing_scope" || plan.StateFallbackReason != "missing_scope" {
+		t.Fatalf("continuation fallback reason = %q", plan.Reason)
+	}
+}
+
+func TestRelayContinuationWithPinMissFallsBackToRelay(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","previous_response_id":"resp_without_pin","input":"continue"}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("continuation pin miss returned an error: %v", err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 3 ||
+		plan.Source != relayRouteSourceContinuation ||
+		plan.Reason != "pin_miss_continuation" ||
+		plan.StateFallbackReason != "pin_miss_continuation" {
+		t.Fatalf("continuation pin-miss plan = %+v", plan)
+	}
+}
+
+func TestRelayRoutePinReadFailureFallsBackToRelay(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	handler := &Handler{}
+	handler.SetRuntimeCache(&relayRouteFailingRuntimeCache{
+		TokenCache: cache.NewMemory(1),
+		getErr:     errors.New("redis unavailable"),
+	})
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("pin read failure returned an error: %v", err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 3 ||
+		plan.Source != relayRouteSourceDefault ||
+		plan.Reason != "pin_read_error" ||
+		plan.StateFallbackReason != "pin_read_error" {
+		t.Fatalf("pin read fallback plan = %+v", plan)
+	}
+}
+
+func TestRelayRouteCorruptPinFallsBackToRelay(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	candidates := relayRoutePinCandidates(c, nil, 11)
+	if err := handler.cache.SetRuntime(
+		c.Request.Context(),
+		relayRoutePinNamespace,
+		candidates[0].Key,
+		json.RawMessage(`{"group_id":0}`),
+		time.Minute,
+	); err != nil {
+		t.Fatalf("SetRuntime(): %v", err)
+	}
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("corrupt pin returned an error: %v", err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 3 ||
+		plan.Reason != "pin_invalid" ||
+		plan.StateFallbackReason != "pin_invalid" {
+		t.Fatalf("corrupt pin fallback plan = %+v", plan)
+	}
+}
+
+func TestRelayRouteStalePinFallsBackToConfiguredGroup(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+	candidates := relayRoutePinCandidates(c, nil, 11)
+	raw, err := json.Marshal(relayRoutePinValue{GroupID: 8, Source: relayRouteSourceRule})
+	if err != nil {
+		t.Fatalf("Marshal(): %v", err)
+	}
+	if err := handler.cache.SetRuntime(
+		c.Request.Context(),
+		relayRoutePinNamespace,
+		candidates[0].Key,
+		raw,
+		time.Minute,
+	); err != nil {
+		t.Fatalf("SetRuntime(): %v", err)
+	}
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("stale pin returned an error: %v", err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 3 ||
+		plan.Reason != "pin_invalid" ||
+		plan.StateFallbackReason != "pin_invalid" {
+		t.Fatalf("stale pin fallback plan = %+v", plan)
+	}
+}
+
+func TestRelayRoutePinWriteFailureKeepsRelaySelection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	handler := &Handler{}
+	handler.SetRuntimeCache(&relayRouteFailingRuntimeCache{
+		TokenCache: cache.NewMemory(1),
+		setErr:     errors.New("redis unavailable"),
+	})
+	plan := defaultRelayRoutePlan(relayRouteConfig{Enabled: true, GroupID: 3, PinTTL: time.Minute})
+	plan.Endpoint = "/v1/responses"
+	plan.RequiredGroupID = 3
+	plan.Source = relayRouteSourceRule
+	plan.Origin = relayRouteSourceRule
+	plan.PinCandidates = relayRoutePinCandidates(c, nil, 11)
+
+	becameOverflow, err := handler.observeRelayRouteSelection(
+		c,
+		&plan,
+		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
+	)
+	if err != nil {
+		t.Fatalf("pin write failure returned an error: %v", err)
+	}
+	if becameOverflow {
+		t.Fatal("already-required Relay route was marked as overflow")
+	}
+	if !plan.SkipPinPersistence || plan.SelectionCount != 1 {
+		t.Fatalf("pin write fallback plan = %+v", plan)
+	}
+	if plan.StateFallbackReason != "pin_write_error" || !plan.StateFallbackLogged {
+		t.Fatalf("pin write fallback state = %+v", plan)
+	}
+}
+
+func TestRelayRouteStateFallbackMetricPersistsOncePerRequest(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	handler := &Handler{db: db}
+	handler.SetRuntimeCache(&relayRouteFailingRuntimeCache{
+		TokenCache: cache.NewMemory(1),
+		getErr:     errors.New("redis read unavailable"),
+		setErr:     errors.New("redis write unavailable"),
+	})
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepareRelayRoutePlan() error = %v", err)
+	}
+	if _, err := handler.observeRelayRouteSelection(
+		c,
+		plan,
+		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
+	); err != nil {
+		t.Fatalf("observeRelayRouteSelection() error = %v", err)
+	}
+	if !db.WaitPromptFilterAuditIdle(t.Context()) {
+		t.Fatal("prompt-filter audit queue did not become idle")
+	}
+	stats, err := db.GetRelayRouteStats(t.Context(), 24*time.Hour)
+	if err != nil {
+		t.Fatalf("GetRelayRouteStats() error = %v", err)
+	}
+	if stats.StateFallbacks != 1 {
+		t.Fatalf("state_fallbacks = %d, want 1", stats.StateFallbacks)
+	}
+	if stats.RouteAttempts != 1 || stats.LogicalRoutes != 1 {
+		t.Fatalf(
+			"fallback route totals = attempts:%d logical:%d, want 1/1",
+			stats.RouteAttempts,
+			stats.LogicalRoutes,
+		)
 	}
 }

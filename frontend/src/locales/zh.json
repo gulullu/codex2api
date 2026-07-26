@@ -1692,7 +1692,7 @@
       "sourcesTitle": "分流来源",
       "sourcesDescription": "按选号尝试计数；同一逻辑请求的重试可能重复计入。",
       "healthTitle": "分流质量与异常",
-      "healthDescription": "用于观察漏放、Relay 上游拦截、分组耗尽和越组异常。",
+      "healthDescription": "用于观察漏放、Relay 上游拦截、路由状态兜底、分组耗尽和越组异常。",
       "metrics": {
         "logicalRoutes": "逻辑分流请求",
         "routeAttempts": "分流选号尝试",
@@ -1706,7 +1706,8 @@
         "groupExhausted": "Relay 分组耗尽",
         "detectorMisses": "CYB 检测器漏放",
         "relayCyberPolicies": "Relay 上游 CYB 拦截",
-        "routeViolations": "分组逃逸异常"
+        "routeViolations": "分组逃逸异常",
+        "stateFallbacks": "路由状态保守兜底"
       },
       "metricHints": {
         "logicalRoutes": "首次进入 Relay 分组的请求数",
@@ -1721,7 +1722,8 @@
         "groupExhausted": "目标 Relay 分组没有可调度候选",
         "detectorMisses": "普通路径漏放后在上游触发 cyber_policy",
         "relayCyberPolicies": "已分流请求仍在 Relay 上游触发 cyber_policy",
-        "routeViolations": "要求 Relay 分组时选到了组外账号"
+        "routeViolations": "要求 Relay 分组时选到了组外账号",
+        "stateFallbacks": "缺少稳定会话标识或 pin 缓存异常时产生的保守 Relay 路由决策"
       }
     },
     "loadingTitle": "正在加载 Prompt 检查",

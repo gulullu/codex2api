@@ -45,6 +45,7 @@ const EMPTY_STATS: RelayRouteStats = {
   detector_misses: 0,
   relay_cyber_policies: 0,
   route_violations: 0,
+  state_fallbacks: 0,
 }
 
 const numberFormatter = new Intl.NumberFormat()
@@ -158,6 +159,12 @@ export default function RelayRouteStatsPanel() {
       label: t('promptFilter.routing.metrics.routeViolations'),
       description: t('promptFilter.routing.metricHints.routeViolations'),
       tone: 'danger',
+    },
+    {
+      key: 'state_fallbacks',
+      label: t('promptFilter.routing.metrics.stateFallbacks'),
+      description: t('promptFilter.routing.metricHints.stateFallbacks'),
+      tone: 'warning',
     },
   ]
 

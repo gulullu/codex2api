@@ -35,7 +35,10 @@ const (
 	relayRouteCacheTimeout  = 500 * time.Millisecond
 )
 
-var errRelayRoutePinUnavailable = errors.New("relay route pin storage unavailable")
+var (
+	errRelayRoutePinUnavailable = errors.New("relay route pin storage unavailable")
+	errRelayRoutePinInvalid     = errors.New("relay route pin is invalid")
+)
 
 type relayRouteConfig struct {
 	Enabled bool
@@ -66,6 +69,8 @@ type relayRoutePlan struct {
 	FeedbackDigest      relayCybFeedbackDigest
 	FeedbackDigestValid bool
 	SkipPinPersistence  bool
+	StateFallbackReason string
+	StateFallbackLogged bool
 	Pinned              bool
 	FirstAccountID      int64
 	PreviousAccount     int64
@@ -153,6 +158,7 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	apiKeyID := requestAPIKeyID(c)
 	plan.PinCandidates = relayRoutePinCandidates(c, rawBody, apiKeyID)
 	plan.FeedbackDigest, plan.FeedbackDigestValid = globalRelayCybFeedback.digest(endpoint, rawBody)
+	hasPreviousResponseID := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != ""
 
 	probeSignature, probe := cybroute.DetectProbe(rawBody, endpoint)
 	var result cybroute.Result
@@ -183,15 +189,26 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 		// turn one upstream cyber_policy response into a whole-conversation pin.
 		plan.SkipPinPersistence = true
 	default:
-		if strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != "" &&
-			len(plan.PinCandidates) == 0 {
-			return &plan, fmt.Errorf("%w: continuation requires a stable conversation scope", errRelayRoutePinUnavailable)
-		}
 		pin, found, err := h.readRelayRoutePin(c.Request.Context(), plan.PinCandidates)
 		if err != nil {
-			return &plan, err
-		}
-		if found && pin.GroupID > 0 {
+			// Pin state is an optional routing aid. If it is unavailable or
+			// corrupt, conservatively keep the request inside the configured
+			// Relay group instead of introducing a gateway-generated 503.
+			reason := "pin_read_error"
+			if errors.Is(err, errRelayRoutePinInvalid) {
+				reason = "pin_invalid"
+			}
+			requireRelayRouteFallback(&plan, reason, hasPreviousResponseID)
+			h.recordRelayRouteStateFallback(c, &plan, reason)
+			logRelayRoutePinDegraded(plan.Endpoint, "read", err)
+		} else if found && pin.GroupID != cfg.GroupID {
+			// A positive group ID from a previous configuration is still stale
+			// for this deployment. Never let cached state route to an arbitrary
+			// or retired group.
+			requireRelayRouteFallback(&plan, "pin_invalid", hasPreviousResponseID)
+			h.recordRelayRouteStateFallback(c, &plan, "pin_invalid")
+			logRelayRoutePinDegraded(plan.Endpoint, "read", errRelayRoutePinInvalid)
+		} else if found {
 			plan.RequiredGroupID = pin.GroupID
 			plan.Source = relayRouteSourceContinuation
 			plan.Origin = strings.TrimSpace(pin.Source)
@@ -200,7 +217,22 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 			}
 			plan.Reason = "relay_group_pin"
 			plan.Pinned = true
+		} else if hasPreviousResponseID {
+			// previous_response_id is not a trustworthy shared-key identity by
+			// itself. With no reliable group pin, route the continuation to the
+			// Relay group but do not manufacture a pin from the response ID.
+			reason := "pin_miss_continuation"
+			if len(plan.PinCandidates) == 0 {
+				reason = "missing_scope"
+				plan.SkipPinPersistence = true
+			}
+			requireRelayRouteFallback(&plan, reason, true)
+			h.recordRelayRouteStateFallback(c, &plan, reason)
 		}
+	}
+	if plan.Required() && len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
+		plan.SkipPinPersistence = true
+		h.recordRelayRouteStateFallback(c, &plan, "missing_scope")
 	}
 
 	setRelayRoutePlanContext(c, &plan)
@@ -278,8 +310,8 @@ func relayRoutePinCandidates(c *gin.Context, rawBody []byte, apiKeyID int64) []r
 	if c == nil {
 		return nil
 	}
-	candidates := make([]relayRoutePinCandidate, 0, 5)
-	seen := make(map[string]struct{}, 5)
+	candidates := make([]relayRoutePinCandidate, 0, 1)
+	seen := make(map[string]struct{}, 1)
 	add := func(kind, value string) {
 		key := relayRoutePinCacheKey(apiKeyID, kind, value)
 		if key == "" {
@@ -292,28 +324,56 @@ func relayRoutePinCandidates(c *gin.Context, rawBody []byte, apiKeyID int64) []r
 		candidates = append(candidates, relayRoutePinCandidate{Kind: kind, Key: key})
 	}
 
+	var headers http.Header
 	if c.Request != nil {
-		if affinityID := resolveDownstreamAffinityID(c.Request.Header); affinityID != "" {
+		headers = c.Request.Header
+		if affinityID := resolveDownstreamAffinityID(headers); affinityID != "" {
 			add("trusted_affinity", affinityID)
 			// The gateway-owned affinity is the authoritative shared-key scope.
 			// Do not also persist client-controlled session or response IDs,
 			// which would widen the pin beyond the trusted user+conversation.
 			return candidates
 		}
-		for _, header := range []struct {
-			kind string
-			name string
-		}{
-			{kind: "session_id", name: "Session-Id"},
-			{kind: "session_id", name: "Session_id"},
-			{kind: "conversation_id", name: "Conversation-Id"},
-			{kind: "conversation_id", name: "Conversation_id"},
-		} {
-			add(header.kind, c.Request.Header.Get(header.name))
-		}
 	}
-	add("prompt_cache_key", gjson.GetBytes(rawBody, "prompt_cache_key").String())
+	if explicitID := ResolveExplicitSessionID(headers, rawBody); explicitID != "" {
+		add("explicit_session", explicitID)
+	}
 	return candidates
+}
+
+func requireRelayRouteFallback(plan *relayRoutePlan, reason string, continuation bool) {
+	if plan == nil || !plan.Config.Enabled || plan.Config.GroupID <= 0 {
+		return
+	}
+	plan.RequiredGroupID = plan.Config.GroupID
+	if continuation {
+		plan.Source = relayRouteSourceContinuation
+		plan.Origin = relayRouteSourceContinuation
+	}
+	plan.Reason = reason
+	plan.Signals = []string{reason}
+}
+
+func (h *Handler) recordRelayRouteStateFallback(c *gin.Context, plan *relayRoutePlan, reason string) {
+	if plan == nil || plan.StateFallbackLogged {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return
+	}
+	plan.StateFallbackReason = reason
+	plan.StateFallbackLogged = true
+	h.logRelayRouteStateFallback(c, plan, reason)
+}
+
+func logRelayRoutePinDegraded(endpoint string, operation string, err error) {
+	log.Printf(
+		"Relay route pin degraded; continuing in configured Relay group (endpoint=%s, operation=%s): %v",
+		strings.TrimSpace(endpoint),
+		strings.TrimSpace(operation),
+		err,
+	)
 }
 
 func relayRoutePinCacheKey(apiKeyID int64, kind string, value string) string {
@@ -345,7 +405,7 @@ func (h *Handler) readRelayRoutePin(ctx context.Context, candidates []relayRoute
 		}
 		var pin relayRoutePinValue
 		if err := json.Unmarshal(raw, &pin); err != nil || pin.GroupID <= 0 {
-			return relayRoutePinValue{}, false, fmt.Errorf("%w: invalid pin value", errRelayRoutePinUnavailable)
+			return relayRoutePinValue{}, false, fmt.Errorf("%w: invalid pin value", errRelayRoutePinInvalid)
 		}
 		return pin, true, nil
 	}
@@ -357,7 +417,10 @@ func (h *Handler) writeRelayRoutePins(ctx context.Context, plan *relayRoutePlan)
 		return nil
 	}
 	if len(plan.PinCandidates) == 0 {
-		return fmt.Errorf("%w: stable conversation scope missing", errRelayRoutePinUnavailable)
+		// Routing remains valid without a stable identity; only persistence is
+		// skipped. The next continuation will conservatively enter Relay again.
+		plan.SkipPinPersistence = true
+		return nil
 	}
 	if h == nil || h.cache == nil {
 		return errRelayRoutePinUnavailable
@@ -395,8 +458,16 @@ func (h *Handler) observeRelayRouteSelection(c *gin.Context, plan *relayRoutePla
 	if !plan.Required() {
 		return false, nil
 	}
-	if err := h.writeRelayRoutePins(c.Request.Context(), plan); err != nil {
-		return becameOverflow, err
+	if len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
+		plan.SkipPinPersistence = true
+		h.recordRelayRouteStateFallback(c, plan, "missing_scope")
+	} else if err := h.writeRelayRoutePins(c.Request.Context(), plan); err != nil {
+		// The group constraint is already active. A cache write failure must not
+		// fail an otherwise routable request; retain the group constraint and
+		// avoid retrying the broken pin write on every account attempt.
+		plan.SkipPinPersistence = true
+		h.recordRelayRouteStateFallback(c, plan, "pin_write_error")
+		logRelayRoutePinDegraded(plan.Endpoint, "write", err)
 	}
 
 	plan.SelectionCount++

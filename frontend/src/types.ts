@@ -1019,6 +1019,7 @@ export interface RelayRouteStats {
   detector_misses: number
   relay_cyber_policies: number
   route_violations: number
+  state_fallbacks: number
 }
 
 export interface PromptFilterTestResponse {

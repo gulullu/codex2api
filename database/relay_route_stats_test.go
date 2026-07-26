@@ -14,6 +14,7 @@ func TestRelayRouteSelectionSource(t *testing.T) {
 		"relay_route_oauth_overflow",
 		"relay_route_relay_continuation",
 		"relay_route_cyb_feedback",
+		"relay_route_official_default",
 	} {
 		if !relayRouteSelectionSource(source) {
 			t.Fatalf("%q should be a selection source", source)
@@ -23,6 +24,7 @@ func TestRelayRouteSelectionSource(t *testing.T) {
 		"relay_route_detector_miss",
 		"relay_route_group_exhausted",
 		"relay_route_group_escape_violation",
+		"relay_route_state_fallback",
 	} {
 		if relayRouteSelectionSource(source) {
 			t.Fatalf("%q should not be a selection source", source)
@@ -52,7 +54,9 @@ func TestGetRelayRouteStatsSQLite(t *testing.T) {
 		{Source: "relay_route_cyb_rule", Mode: "initial"},
 		{Source: "relay_route_cyb_rule", Mode: "same_group_switch"},
 		{Source: "relay_route_oauth_overflow", Mode: "initial"},
+		{Source: "relay_route_official_default", Mode: "initial"},
 		{Source: "relay_route_detector_miss", Mode: "cyber_policy"},
+		{Source: "relay_route_state_fallback", Mode: "pin_read_error"},
 		{Source: "prompt_filter", Mode: "monitor"},
 	} {
 		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
@@ -64,10 +68,11 @@ func TestGetRelayRouteStatsSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRelayRouteStats(): %v", err)
 	}
-	if stats.RouteAttempts != 3 || stats.LogicalRoutes != 2 {
+	if stats.RouteAttempts != 4 || stats.LogicalRoutes != 3 {
 		t.Fatalf("route totals = attempts:%d logical:%d", stats.RouteAttempts, stats.LogicalRoutes)
 	}
-	if stats.CYBRule != 1 || stats.OAuthOverflow != 1 || stats.SameGroupSwitches != 1 || stats.DetectorMisses != 1 {
+	if stats.CYBRule != 1 || stats.OAuthOverflow != 1 || stats.SameGroupSwitches != 1 ||
+		stats.DetectorMisses != 1 || stats.StateFallbacks != 1 {
 		t.Fatalf("stats = %+v", stats)
 	}
 }
