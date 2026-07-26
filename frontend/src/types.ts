@@ -1013,6 +1013,9 @@ export interface RelayRouteStats {
   oauth_overflow: number
   relay_continuation: number
   cyb_feedback: number
+  replay_hits: number
+  replay_misses: number
+  replay_unavailable: number
   retries: number
   same_group_switches: number
   group_exhausted: number
@@ -1020,6 +1023,152 @@ export interface RelayRouteStats {
   relay_cyber_policies: number
   route_violations: number
   state_fallbacks: number
+}
+
+export interface RelayAuditWriterStats {
+  enqueued: number
+  completed: number
+  dropped: number
+  failed: number
+  pending: number
+  retained_bytes: number
+}
+
+export interface RelayAuditSummary {
+  logical_requests: number
+  relay_requests: number
+  route_attempts: number
+  cyb_rule: number
+  probe: number
+  oauth_overflow: number
+  relay_continuation: number
+  cyb_feedback: number
+  replay_hits: number
+  replay_misses: number
+  replay_unavailable: number
+  retries: number
+  same_group_switches: number
+  group_exhausted: number
+  detector_misses: number
+  relay_cyber_policies: number
+  oauth_cyber_misses: number
+  route_violations: number
+  state_fallbacks: number
+  relay_successes: number
+  relay_final_failures: number
+  session_bleed: number
+  requests_with_previous_response_id: number
+}
+
+export interface RelayAuditTimelinePoint {
+  bucket: ISODateString
+  relay_requests: number
+  cyb_rule: number
+  probe: number
+  oauth_overflow: number
+  relay_continuation: number
+  cyb_feedback: number
+  replay_hits: number
+  replay_misses: number
+  oauth_cyber_misses: number
+  relay_cyber_policies: number
+  final_failures: number
+}
+
+export interface RelayAuditSignalRow {
+  signal: string
+  requests: number
+  last_seen: ISODateString
+}
+
+export interface RelayAuditRouteRow {
+  account_id: number
+  account_name: string
+  account_type: string
+  route_source: string
+  requests: number
+  attempts: number
+  successes: number
+  errors_4xx: number
+  errors_5xx: number
+  cyber_policy: number
+}
+
+export interface RelayAuditReport {
+  window_start: ISODateString
+  window_end: ISODateString
+  generated_at: ISODateString
+  summary: RelayAuditSummary
+  timeline: RelayAuditTimelinePoint[]
+  route_signals: RelayAuditSignalRow[]
+  relay_routes: RelayAuditRouteRow[]
+  writer: RelayAuditWriterStats
+}
+
+export interface RelayAuditAttempt {
+  id: number
+  request_id: string
+  attempt_index: number
+  selection_mode: string
+  account_id: number
+  account_name: string
+  account_type: string
+  upstream_endpoint: string
+  transport: string
+  via_websocket: boolean
+  status_code: number
+  error_kind: string
+  error_message: string
+  selected_at: ISODateString
+  completed_at?: ISODateString
+}
+
+export interface RelayAuditCase {
+  request_id: string
+  created_at: ISODateString
+  updated_at: ISODateString
+  completed_at?: ISODateString
+  endpoint: string
+  model: string
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  client_ip: string
+  text_preview: string
+  full_text: string
+  payload_bytes: number
+  scanned_bytes: number
+  scan_truncated: boolean
+  scan_details: string
+  route_source: string
+  route_reason: string
+  route_signals: string
+  route_group_id: number
+  has_previous_response_id: boolean
+  replay_status: string
+  replay_source: string
+  state_fallback_reason: string
+  detector_miss: boolean
+  route_violation: boolean
+  group_exhausted: boolean
+  final_account_id: number
+  final_account_name: string
+  final_account_type: string
+  final_status_code: number
+  final_error_kind: string
+  final_error_message: string
+  final_transport: string
+  attempt_count: number
+  attempts: RelayAuditAttempt[]
+}
+
+export interface RelayAuditCasesPage {
+  items: RelayAuditCase[]
+  total: number
+  page: number
+  page_size: number
+  window_start: ISODateString
+  window_end: ISODateString
 }
 
 export interface PromptFilterTestResponse {

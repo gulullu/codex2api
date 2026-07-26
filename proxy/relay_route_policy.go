@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/security/cybroute"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -57,24 +58,39 @@ type relayRoutePinCandidate struct {
 }
 
 type relayRoutePlan struct {
-	Config              relayRouteConfig
-	Endpoint            string
-	Model               string
-	RequiredGroupID     int64
-	Source              string
-	Origin              string
-	Reason              string
-	Signals             []string
-	PinCandidates       []relayRoutePinCandidate
-	FeedbackDigest      relayCybFeedbackDigest
-	FeedbackDigestValid bool
-	SkipPinPersistence  bool
-	StateFallbackReason string
-	StateFallbackLogged bool
-	Pinned              bool
-	FirstAccountID      int64
-	PreviousAccount     int64
-	SelectionCount      int
+	Config                relayRouteConfig
+	Endpoint              string
+	Model                 string
+	HasPreviousResponseID bool
+	RequiredGroupID       int64
+	Source                string
+	Origin                string
+	Reason                string
+	Signals               []string
+	PinCandidates         []relayRoutePinCandidate
+	FeedbackDigest        relayCybFeedbackDigest
+	FeedbackDigestValid   bool
+	SkipPinPersistence    bool
+	StateFallbackReason   string
+	StateFallbackLogged   bool
+	Pinned                bool
+	FirstAccountID        int64
+	PreviousAccount       int64
+	SelectionCount        int
+	AuditRequestID        string
+	AuditCreatedAt        time.Time
+	AuditScanTruncated    bool
+	AuditScanDetails      string
+	AuditReplayStatus     string
+	AuditReplaySource     string
+	AuditFinalized        bool
+	AuditLastTransport    string
+	AuditLastStatusCode   int
+	AuditLastErrorKind    string
+	AuditLastError        string
+	DetectorMiss          bool
+	RouteViolation        bool
+	GroupExhausted        bool
 }
 
 func loadRelayRouteConfig() relayRouteConfig {
@@ -154,17 +170,22 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 		setRelayRoutePlanContext(c, &plan)
 		return &plan, nil
 	}
+	plan.AuditRequestID = database.NewRelayAuditRequestID()
+	plan.AuditCreatedAt = time.Now()
 
 	apiKeyID := requestAPIKeyID(c)
 	plan.PinCandidates = relayRoutePinCandidates(c, rawBody, apiKeyID)
 	plan.FeedbackDigest, plan.FeedbackDigestValid = globalRelayCybFeedback.digest(endpoint, rawBody)
 	hasPreviousResponseID := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != ""
+	plan.HasPreviousResponseID = hasPreviousResponseID
 
 	probeSignature, probe := cybroute.DetectProbe(rawBody, endpoint)
 	var result cybroute.Result
 	if h != nil && h.store != nil {
 		result = cybroute.Inspect(rawBody, endpoint, plan.Model, h.store.GetPromptFilterConfig())
 	}
+	plan.AuditScanTruncated = result.Truncated
+	plan.AuditScanDetails = relayRouteScanDetailsJSON(result)
 
 	switch {
 	case probe:
@@ -217,17 +238,6 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 			}
 			plan.Reason = "relay_group_pin"
 			plan.Pinned = true
-		} else if hasPreviousResponseID {
-			// previous_response_id is not a trustworthy shared-key identity by
-			// itself. With no reliable group pin, route the continuation to the
-			// Relay group but do not manufacture a pin from the response ID.
-			reason := "pin_miss_continuation"
-			if len(plan.PinCandidates) == 0 {
-				reason = "missing_scope"
-				plan.SkipPinPersistence = true
-			}
-			requireRelayRouteFallback(&plan, reason, true)
-			h.recordRelayRouteStateFallback(c, &plan, reason)
 		}
 	}
 	if plan.Required() && len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
@@ -236,6 +246,7 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	}
 
 	setRelayRoutePlanContext(c, &plan)
+	h.beginRelayAudit(c, &plan, rawBody)
 	return &plan, nil
 }
 
@@ -269,6 +280,10 @@ func (h *Handler) upgradeRelayRoutePlanFromPayloadRules(plan *relayRoutePlan, bo
 		return
 	}
 	result := cybroute.Inspect(body, endpoint, model, h.store.GetPromptFilterConfig())
+	plan.AuditScanTruncated = plan.AuditScanTruncated || result.Truncated
+	if details := relayRouteScanDetailsJSON(result); details != "" {
+		plan.AuditScanDetails = details
+	}
 	if !result.Route {
 		return
 	}
@@ -418,7 +433,7 @@ func (h *Handler) writeRelayRoutePins(ctx context.Context, plan *relayRoutePlan)
 	}
 	if len(plan.PinCandidates) == 0 {
 		// Routing remains valid without a stable identity; only persistence is
-		// skipped. The next continuation will conservatively enter Relay again.
+		// skipped. A later request is evaluated again from its own route facts.
 		plan.SkipPinPersistence = true
 		return nil
 	}
@@ -445,6 +460,7 @@ func (h *Handler) observeRelayRouteSelection(c *gin.Context, plan *relayRoutePla
 	}
 	inTargetGroup := plan.accountInTargetGroup(account)
 	if plan.Required() && !plan.accountInRequiredGroup(account) {
+		plan.RouteViolation = true
 		h.logRelayGroupEscapeViolation(c, plan)
 		return false, fmt.Errorf("relay route invariant violated: selected account outside group %d", plan.RequiredGroupID)
 	}
@@ -455,28 +471,21 @@ func (h *Handler) observeRelayRouteSelection(c *gin.Context, plan *relayRoutePla
 		plan.Reason = "official_priority_fallback"
 		becameOverflow = true
 	}
-	if !plan.Required() {
-		return false, nil
-	}
-	if len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
-		plan.SkipPinPersistence = true
-		h.recordRelayRouteStateFallback(c, plan, "missing_scope")
-	} else if err := h.writeRelayRoutePins(c.Request.Context(), plan); err != nil {
-		// The group constraint is already active. A cache write failure must not
-		// fail an otherwise routable request; retain the group constraint and
-		// avoid retrying the broken pin write on every account attempt.
-		plan.SkipPinPersistence = true
-		h.recordRelayRouteStateFallback(c, plan, "pin_write_error")
-		logRelayRoutePinDegraded(plan.Endpoint, "write", err)
+	if plan.Required() {
+		if len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
+			plan.SkipPinPersistence = true
+			h.recordRelayRouteStateFallback(c, plan, "missing_scope")
+		} else if err := h.writeRelayRoutePins(c.Request.Context(), plan); err != nil {
+			// The group constraint is already active. A cache write failure must not
+			// fail an otherwise routable request; retain the group constraint and
+			// avoid retrying the broken pin write on every account attempt.
+			plan.SkipPinPersistence = true
+			h.recordRelayRouteStateFallback(c, plan, "pin_write_error")
+			logRelayRoutePinDegraded(plan.Endpoint, "write", err)
+		}
 	}
 
-	plan.SelectionCount++
-	if plan.FirstAccountID == 0 {
-		plan.FirstAccountID = account.ID()
-	}
-	switched := plan.PreviousAccount != 0 && plan.PreviousAccount != account.ID()
-	plan.PreviousAccount = account.ID()
-	h.logRelayRouteSelection(c, plan, account, switched)
+	h.recordRelayRouteSelection(c, plan, account)
 	return becameOverflow, nil
 }
 
@@ -488,6 +497,7 @@ func (h *Handler) applyRelayRouteSelection(
 	retainedHTTPFallback bool,
 ) (auth.AccountFilter, bool) {
 	if retainedHTTPFallback {
+		h.recordRelayRouteSelection(c, plan, account)
 		return filter, true
 	}
 	becameOverflow, err := h.observeRelayRouteSelection(c, plan, account)
@@ -500,6 +510,54 @@ func (h *Handler) applyRelayRouteSelection(
 		filter = plan.composeFilter(filter)
 	}
 	return filter, true
+}
+
+func (h *Handler) recordRelayRouteSelection(c *gin.Context, plan *relayRoutePlan, account *auth.Account) {
+	if plan == nil || account == nil {
+		return
+	}
+	plan.SelectionCount++
+	if plan.FirstAccountID == 0 {
+		plan.FirstAccountID = account.ID()
+	}
+	switched := plan.PreviousAccount != 0 && plan.PreviousAccount != account.ID()
+	plan.PreviousAccount = account.ID()
+	h.logRelayRouteSelection(c, plan, account, switched)
+}
+
+func (h *Handler) applyRelayContinuationReplayRoute(
+	c *gin.Context,
+	plan *relayRoutePlan,
+	replayed bool,
+	groupID int64,
+) {
+	if plan == nil || !replayed || groupID <= 0 ||
+		!plan.Config.Enabled || groupID != plan.Config.GroupID {
+		return
+	}
+	if !plan.Required() {
+		plan.RequiredGroupID = groupID
+		plan.Source = relayRouteSourceContinuation
+		plan.Origin = relayRouteSourceContinuation
+		plan.Reason = "complete_replay_group"
+		plan.Signals = []string{"complete_replay_group"}
+	}
+	// prepareRelayRoutePlan persisted the raw request before replay resolution.
+	// Enrich that same logical row without replacing its retained request body.
+	h.beginRelayAudit(c, plan, nil)
+}
+
+func relayContinuationReplayResponseGroup(plan *relayRoutePlan, account *auth.Account) int64 {
+	if plan == nil || account == nil {
+		return 0
+	}
+	if plan.RequiredGroupID > 0 && plan.accountInRequiredGroup(account) {
+		return plan.RequiredGroupID
+	}
+	if plan.Config.Enabled && plan.Config.GroupID > 0 && plan.accountInTargetGroup(account) {
+		return plan.Config.GroupID
+	}
+	return 0
 }
 
 func (h *Handler) replyRelayRouteUnavailable(c *gin.Context, err error) {

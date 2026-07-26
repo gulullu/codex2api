@@ -116,12 +116,9 @@ func (q *promptFilterAuditQueue) close(timeout time.Duration) {
 	case <-timer.C:
 		q.cancel()
 	}
-	// Give canceled database calls a short, fixed window to unwind. Close may
-	// continue afterwards; workers hold no request-scoped data or raw bodies.
-	select {
-	case <-q.done:
-	case <-time.After(250 * time.Millisecond):
-	}
+	// Do not let DB.Close race workers that still own queued writes. Cancellation
+	// makes the workers discard queued jobs without issuing more database calls.
+	<-q.done
 }
 
 func (q *promptFilterAuditQueue) enqueue(input PromptFilterLogInput, priority PromptFilterLogPriority) bool {
@@ -223,6 +220,9 @@ func (q *promptFilterAuditQueue) worker() {
 					log.Printf("prompt filter audit worker panic: %v", recovered)
 				}
 			}()
+			if q.ctx.Err() != nil {
+				return
+			}
 			attempts := 1
 			if priority == PromptFilterLogPriorityHigh {
 				attempts = 2
@@ -233,6 +233,9 @@ func (q *promptFilterAuditQueue) worker() {
 				cancel()
 				if err == nil {
 					q.completed.Add(1)
+					return
+				}
+				if q.ctx.Err() != nil {
 					return
 				}
 				if attempt+1 < attempts {

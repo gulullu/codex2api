@@ -573,6 +573,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/intelligence/run", h.RunPromptIntelligence)
 	api.GET("/prompt-filter/intelligence/history", h.ListPromptIntelligenceHistory)
 	api.POST("/prompt-filter/intelligence/rules", h.AddPromptIntelligenceCandidate)
+	api.GET("/relay-audit/report", h.GetRelayAuditReport)
+	api.GET("/relay-audit/cases", h.GetRelayAuditCases)
 	api.GET("/relay-route/stats", h.GetRelayRouteStats)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)

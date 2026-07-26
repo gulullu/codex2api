@@ -7,31 +7,6 @@ import (
 	"time"
 )
 
-func TestRelayRouteSelectionSource(t *testing.T) {
-	for _, source := range []string{
-		"relay_route_cyb_rule",
-		"relay_route_probe",
-		"relay_route_oauth_overflow",
-		"relay_route_relay_continuation",
-		"relay_route_cyb_feedback",
-		"relay_route_official_default",
-	} {
-		if !relayRouteSelectionSource(source) {
-			t.Fatalf("%q should be a selection source", source)
-		}
-	}
-	for _, source := range []string{
-		"relay_route_detector_miss",
-		"relay_route_group_exhausted",
-		"relay_route_group_escape_violation",
-		"relay_route_state_fallback",
-	} {
-		if relayRouteSelectionSource(source) {
-			t.Fatalf("%q should not be a selection source", source)
-		}
-	}
-}
-
 func TestValidateRelayRouteStatsWindow(t *testing.T) {
 	window, err := ValidateRelayRouteStatsWindow(0)
 	if err != nil || window != 24*time.Hour {
@@ -50,25 +25,43 @@ func TestGetRelayRouteStatsSQLite(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	for _, input := range []*PromptFilterLogInput{
-		{Source: "relay_route_cyb_rule", Mode: "initial"},
-		{Source: "relay_route_cyb_rule", Mode: "same_group_switch"},
-		{Source: "relay_route_oauth_overflow", Mode: "initial"},
-		{Source: "relay_route_official_default", Mode: "initial"},
-		{Source: "relay_route_detector_miss", Mode: "cyber_policy"},
-		{Source: "relay_route_state_fallback", Mode: "pin_read_error"},
-		{Source: "prompt_filter", Mode: "monitor"},
+	now := time.Now()
+	for _, input := range []*RelayAuditRequestInput{
+		{RequestID: "cyb", CreatedAt: now, RouteSource: "cyb_rule", RouteGroupID: 7},
+		{RequestID: "overflow", CreatedAt: now, RouteSource: "oauth_overflow", RouteGroupID: 7},
+		{RequestID: "oauth-miss", CreatedAt: now, RouteSource: "official_default"},
 	} {
-		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
-			t.Fatalf("InsertPromptFilterLog(%s): %v", input.Source, err)
+		if err := db.WriteRelayAuditRequest(ctx, input); err != nil {
+			t.Fatalf("WriteRelayAuditRequest(%s): %v", input.RequestID, err)
 		}
+	}
+	for _, input := range []*RelayAuditOutcomeInput{
+		{RequestID: "cyb", AttemptIndex: 1, AccountID: 10, AccountType: "responses_api", StatusCode: 503, ErrorKind: "server_error", CompletedAt: now},
+		{RequestID: "cyb", AttemptIndex: 2, AccountID: 11, AccountType: "responses_api", StatusCode: 200, CompletedAt: now, Final: true},
+		{RequestID: "overflow", AttemptIndex: 1, AccountID: 12, AccountType: "responses_api", StatusCode: 200, CompletedAt: now, Final: true},
+		{RequestID: "oauth-miss", AttemptIndex: 1, AccountID: 13, AccountType: "oauth", StatusCode: 400, ErrorKind: "cyber_policy", CompletedAt: now, Final: true, DetectorMiss: true},
+	} {
+		if err := db.WriteRelayAuditOutcome(ctx, input); err != nil {
+			t.Fatalf("WriteRelayAuditOutcome(%s): %v", input.RequestID, err)
+		}
+	}
+	if err := db.WriteRelayAuditAttempt(ctx, &RelayAuditAttemptInput{
+		RequestID: "cyb", AttemptIndex: 2, SelectionMode: "same_group_switch",
+		AccountID: 11, AccountType: "responses_api", SelectedAt: now,
+	}); err != nil {
+		t.Fatalf("WriteRelayAuditAttempt(switch): %v", err)
+	}
+	if err := db.WriteRelayAuditState(ctx, &RelayAuditStateInput{
+		RequestID: "oauth-miss", DetectorMiss: true, StateFallbackReason: "pin_read_error",
+	}); err != nil {
+		t.Fatalf("WriteRelayAuditState(): %v", err)
 	}
 
 	stats, err := db.GetRelayRouteStats(ctx, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("GetRelayRouteStats(): %v", err)
 	}
-	if stats.RouteAttempts != 4 || stats.LogicalRoutes != 3 {
+	if stats.RouteAttempts != 4 || stats.LogicalRoutes != 2 {
 		t.Fatalf("route totals = attempts:%d logical:%d", stats.RouteAttempts, stats.LogicalRoutes)
 	}
 	if stats.CYBRule != 1 || stats.OAuthOverflow != 1 || stats.SameGroupSwitches != 1 ||

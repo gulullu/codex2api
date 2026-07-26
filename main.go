@@ -206,6 +206,7 @@ func main() {
 		log.Printf("%s 连接成功: %s, pool_size=%d", cfg.Cache.Label(), cache.RedactRedisAddr(cfg.Cache.Redis.Addr), redisPoolSize)
 	}
 	proxy.SetResponseContextCache(tc)
+	proxy.SetRelayContinuationReplayCache(tc)
 
 	// 4b. 应用数据库连接池设置
 	if settings.PgMaxConns > 0 {

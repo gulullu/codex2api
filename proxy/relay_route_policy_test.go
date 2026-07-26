@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,53 @@ func (c *relayRouteFailingRuntimeCache) SetRuntime(
 	time.Duration,
 ) error {
 	return c.setErr
+}
+
+func TestRelayAuditRequestTextRedactsIdentifiersAndSecrets(t *testing.T) {
+	body := []byte(`{
+		"previous_response_id":"resp_private",
+		"prompt_cache_key":"conversation_private",
+		"input":[{"role":"user","content":"keep this request text; Authorization: Bearer sk-sensitive123456"}]
+	}`)
+	got, truncated := relayAuditRequestText(body)
+	if truncated {
+		t.Fatal("small audit body was marked truncated")
+	}
+	for _, leaked := range []string{"resp_private", "conversation_private", "sk-sensitive123456"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("audit body leaked %q: %s", leaked, got)
+		}
+	}
+	if !strings.Contains(got, "keep this request text") {
+		t.Fatalf("audit body lost readable request content: %s", got)
+	}
+}
+
+func TestRelayAuditRequestTextBoundsInputBeforeRetention(t *testing.T) {
+	body := []byte(`{"input":"` + strings.Repeat("界", relayAuditRequestPrefixMaxBytes) + `"}`)
+	got, truncated := relayAuditRequestText(body)
+	if !truncated {
+		t.Fatal("oversized audit body was not marked truncated")
+	}
+	if len([]rune(got)) > database.RelayAuditFullTextMaxRunes {
+		t.Fatalf("retained audit runes=%d", len([]rune(got)))
+	}
+}
+
+func TestRelayAuditRequestTextRedactsSensitiveValueAcrossPrefixBoundary(t *testing.T) {
+	body := []byte(`{"input":"keep visible","encrypted_content":"` +
+		strings.Repeat("opaque-private-fragment-", relayAuditRequestPrefixMaxBytes) +
+		`"}`)
+	got, truncated := relayAuditRequestText(body)
+	if !truncated {
+		t.Fatal("oversized sensitive field was not marked truncated")
+	}
+	if strings.Contains(got, "opaque-private-fragment") {
+		t.Fatalf("audit body retained a truncated sensitive field: %s", got)
+	}
+	if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("audit body lost readable content or marker: %s", got)
+	}
 }
 
 func TestLoadRelayRouteConfig(t *testing.T) {
@@ -346,7 +394,7 @@ func TestRelayRoutePinRejectsCorruptCachedState(t *testing.T) {
 	}
 }
 
-func TestRelayContinuationWithoutStableScopeFallsBackToRelay(t *testing.T) {
+func TestRelayContinuationWithoutStableScopeKeepsOfficialRoute(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -362,18 +410,14 @@ func TestRelayContinuationWithoutStableScopeFallsBackToRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("continuation without stable scope returned an error: %v", err)
 	}
-	if !plan.Required() || plan.RequiredGroupID != 3 {
-		t.Fatalf("continuation fallback plan = %+v", plan)
-	}
-	if plan.Source != relayRouteSourceContinuation {
-		t.Fatalf("continuation fallback source = %q", plan.Source)
-	}
-	if plan.Reason != "missing_scope" || plan.StateFallbackReason != "missing_scope" {
-		t.Fatalf("continuation fallback reason = %q", plan.Reason)
+	if plan.Required() || plan.RequiredGroupID != 0 ||
+		plan.Source != relayRouteSourceDefault ||
+		plan.Reason != "" || plan.StateFallbackReason != "" {
+		t.Fatalf("ordinary continuation changed official route: %+v", plan)
 	}
 }
 
-func TestRelayContinuationWithPinMissFallsBackToRelay(t *testing.T) {
+func TestRelayContinuationWithPinMissKeepsOfficialRoute(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -391,11 +435,42 @@ func TestRelayContinuationWithPinMissFallsBackToRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("continuation pin miss returned an error: %v", err)
 	}
+	if plan.Required() || plan.RequiredGroupID != 0 ||
+		plan.Source != relayRouteSourceDefault ||
+		plan.Reason != "" || plan.StateFallbackReason != "" {
+		t.Fatalf("ordinary continuation pin miss changed official route: %+v", plan)
+	}
+}
+
+func TestCompleteReplayRestoresRelayGroupWithoutConversationPin(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	cfg := loadRelayRouteConfig()
+	plan := defaultRelayRoutePlan(cfg)
+	handler := &Handler{}
+
+	handler.applyRelayContinuationReplayRoute(nil, &plan, true, 3)
 	if !plan.Required() || plan.RequiredGroupID != 3 ||
 		plan.Source != relayRouteSourceContinuation ||
-		plan.Reason != "pin_miss_continuation" ||
-		plan.StateFallbackReason != "pin_miss_continuation" {
-		t.Fatalf("continuation pin-miss plan = %+v", plan)
+		plan.Reason != "complete_replay_group" {
+		t.Fatalf("replay provenance did not restore Relay group: %+v", plan)
+	}
+	filter := plan.composeFilter(nil)
+	if filter(&auth.Account{DBID: 1, GroupIDs: []int64{2}}) {
+		t.Fatal("replayed continuation allowed an account outside its Relay group")
+	}
+	if !filter(&auth.Account{DBID: 2, GroupIDs: []int64{3}}) {
+		t.Fatal("replayed continuation rejected an account inside its Relay group")
+	}
+}
+
+func TestUnknownContinuationReplayDoesNotForceRelayGroup(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	plan := defaultRelayRoutePlan(loadRelayRouteConfig())
+	handler := &Handler{}
+
+	handler.applyRelayContinuationReplayRoute(nil, &plan, false, 0)
+	if plan.Required() || plan.RequiredGroupID != 0 || plan.Source != relayRouteSourceDefault {
+		t.Fatalf("unknown continuation changed official route: %+v", plan)
 	}
 }
 
@@ -573,8 +648,8 @@ func TestRelayRouteStateFallbackMetricPersistsOncePerRequest(t *testing.T) {
 	); err != nil {
 		t.Fatalf("observeRelayRouteSelection() error = %v", err)
 	}
-	if !db.WaitPromptFilterAuditIdle(t.Context()) {
-		t.Fatal("prompt-filter audit queue did not become idle")
+	if !db.WaitRelayAuditIdle(t.Context()) {
+		t.Fatal("relay audit queue did not become idle")
 	}
 	stats, err := db.GetRelayRouteStats(t.Context(), 24*time.Hour)
 	if err != nil {
@@ -589,5 +664,73 @@ func TestRelayRouteStateFallbackMetricPersistsOncePerRequest(t *testing.T) {
 			stats.RouteAttempts,
 			stats.LogicalRoutes,
 		)
+	}
+}
+
+func TestRelayAuditFinalizerUsesOfficialSuccessUsageTransport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	handler := &Handler{db: db}
+	now := time.Now().UTC()
+	plan := &relayRoutePlan{
+		Endpoint:        "/v1/responses",
+		Model:           "gpt-5.4",
+		RequiredGroupID: 3,
+		AuditRequestID:  database.NewRelayAuditRequestID(),
+		AuditCreatedAt:  now,
+	}
+	setRelayRoutePlanContext(c, plan)
+	handler.beginRelayAudit(c, plan, []byte(`{"model":"gpt-5.4","input":"hello"}`))
+	handler.recordRelayRouteSelection(c, plan, &auth.Account{
+		DBID:         7,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		GroupIDs:     []int64{3},
+	})
+
+	// Successful official usage rows intentionally have AttemptIndex == 0.
+	handler.logRelayAuditUsage(c, &database.UsageLogInput{
+		AccountID:        7,
+		Endpoint:         "/v1/responses",
+		UpstreamEndpoint: "/v1/responses",
+		StatusCode:       http.StatusOK,
+		ViaWebsocket:     true,
+	})
+	handler.finalizeRelayAuditRequest(c, plan)
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !db.WaitRelayAuditIdle(waitCtx) {
+		t.Fatal("relay audit queue did not become idle")
+	}
+	page, err := db.ListRelayAuditCasesPage(context.Background(), database.RelayAuditCaseQuery{
+		Kind:     database.RelayAuditCaseRelayRoute,
+		Start:    now.Add(-time.Minute),
+		End:      now.Add(time.Minute),
+		Page:     1,
+		PageSize: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 {
+		t.Fatalf("page=%+v", page)
+	}
+	item := page.Items[0]
+	if item.FinalStatusCode != http.StatusOK || item.FinalTransport != "websocket" ||
+		item.FinalAccountID != 7 || item.AttemptCount != 1 {
+		t.Fatalf("final audit=%+v", item)
+	}
+	if len(item.Attempts) != 1 || !item.Attempts[0].ViaWebsocket ||
+		item.Attempts[0].Transport != "websocket" {
+		t.Fatalf("attempts=%+v", item.Attempts)
 	}
 }

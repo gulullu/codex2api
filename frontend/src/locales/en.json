@@ -13,6 +13,7 @@
     "proxies": "Proxies",
     "images": "Images",
     "promptFilter": "Prompt Filter",
+    "codexAudit": "Codex Audit",
     "modelPricing": "Model Pricing",
     "payloadRules": "Payload Rules"
   },

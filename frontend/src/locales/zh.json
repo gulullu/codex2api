@@ -13,6 +13,7 @@
     "proxies": "代理管理",
     "images": "生图工作台",
     "promptFilter": "Prompt 检查",
+    "codexAudit": "Codex 审计",
     "modelPricing": "模型定价",
     "payloadRules": "请求体重写"
   },

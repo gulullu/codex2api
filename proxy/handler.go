@@ -733,6 +733,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
 	h.observeRelayRouteUsage(c, input)
+	h.logRelayAuditUsage(c, input)
 	h.logUsage(input)
 }
 
@@ -1907,6 +1908,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if !ok {
 		return
 	}
+	defer h.finalizeRelayAuditRequest(c, routePlan)
 	bodyReadDone := time.Now()
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
@@ -2001,8 +2003,20 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备 Codex 上游请求体（Unmarshal→map→Marshal，一次序列化）。
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
-	// previous_response_id 缓存按下游 API Key 隔离，防止跨用户注入他人对话历史。
+	// Relay replay 按 API Key 隔离；有稳定会话标识时再追加哈希 scope。
 	respCacheOwner := responseCacheOwner(apiKeyID)
+	replayStableScope := relayContinuationStableScope(c.Request.Header, rawBody)
+	relayReplayOwner := relayContinuationReplayOwner(respCacheOwner, replayStableScope)
+	relayReplayBody, relayReplayReplayed, relayReplaySource, relayReplayGroupID, relayReplayErr := PrepareRelayContinuationHTTPFallback(c.Request.Context(), relayReplayOwner, rawBody)
+	h.applyRelayContinuationReplayRoute(c, routePlan, relayReplayReplayed, relayReplayGroupID)
+	h.recordRelayContinuationReplayAudit(routePlan, relayReplayReplayed, relayReplaySource, relayReplayErr)
+	relayReplayRequestComplete := relayReplayErr == nil
+	replaySourceBody := func() []byte {
+		if relayReplayReplayed {
+			return relayReplayBody
+		}
+		return rawBody
+	}
 	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
 	// strip 策略：剥离网关注入及客户端携带的图片工具能力声明，作为普通文本请求继续（issue #411）。
 	codexBody = applyImageGenerationStripPolicy(c, codexBody)
@@ -2014,7 +2028,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	getOpenAIResponsesBody := func() []byte {
 		if openAIResponsesBody == nil {
-			openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(rawBody))
+			openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(replaySourceBody()))
 		}
 		return openAIResponsesBody
 	}
@@ -2095,10 +2109,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
+		if account.IsRelayStyle() && relayReplayErr != nil {
+			h.store.Release(account)
+			replyRelayContinuationReplayUnavailable(c, relayReplayErr)
+			return
+		}
 		accountFilter, ok = h.applyRelayRouteSelection(c, routePlan, account, accountFilter, retainedHTTPFallback)
 		if !ok {
 			return
 		}
+		relayReplayResponseGroupID := relayContinuationReplayResponseGroup(routePlan, account)
 
 		if attempt == 0 {
 			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
@@ -2335,6 +2355,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			abortedForHTTPError := false
 			var imageLogInfo imageUsageLogInfo
 			var terminalFailurePayload []byte
+			relayStreamedOutputItems := make([]json.RawMessage, 0, 2)
+			relaySeenOutputItems := make(map[string]struct{})
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -2367,11 +2389,17 @@ func (h *Handler) Responses(c *gin.Context) {
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
+					if outputItem, ok := extractResponseOutputItemDone(data, relaySeenOutputItems); ok {
+						if replayItem, keep := sanitizeRelayReplayItem(outputItem, true); keep {
+							relayStreamedOutputItems = append(relayStreamedOutputItems, replayItem)
+						}
+					}
 					if eventType == "response.completed" {
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
 							actualServiceTier = tier
 						}
+						cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, relayStreamedOutputItems)
 						gotTerminal = true
 					}
 					if eventType == "response.failed" {
@@ -2416,6 +2444,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
+					cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, respBody, nil)
 					gotTerminal = true
 					contentType := resp.Header.Get("Content-Type")
 					if contentType == "" {
@@ -2750,6 +2779,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
 		var streamedOutputItems []json.RawMessage
+		var relayReplayStreamedOutputItems []json.RawMessage
+		seenStreamedOutputItems := make(map[string]struct{})
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -2802,10 +2833,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
-				if eventType == "response.output_item.done" {
-					item := parsed.Get("item")
-					if isCodexToolCallContextType(item.Get("type").String()) {
-						streamedOutputItems = append(streamedOutputItems, json.RawMessage(item.Raw))
+				if outputItem, ok := extractResponseOutputItemDone(data, seenStreamedOutputItems); ok {
+					relayReplayStreamedOutputItems = append(relayReplayStreamedOutputItems, outputItem)
+					if isCodexToolCallContextType(gjson.GetBytes(outputItem, "type").String()) {
+						// Keep the official response-cache input byte-for-byte,
+						// including provider IDs and encrypted tool context.
+						streamedOutputItems = append(streamedOutputItems, outputItem)
 					}
 				}
 
@@ -2817,6 +2850,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
 					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
+					cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, relayReplayStreamedOutputItems)
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -2956,6 +2990,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
 					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
+					cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, outputItems)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -3149,6 +3184,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	if !ok {
 		return
 	}
+	defer h.finalizeRelayAuditRequest(c, routePlan)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -3698,6 +3734,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	if !ok {
 		return
 	}
+	defer h.finalizeRelayAuditRequest(c, routePlan)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)

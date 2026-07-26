@@ -6,7 +6,6 @@ import { Activity, AlertTriangle, BookOpen, CheckCircle2, ChevronDown, Clipboard
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
-import RelayRouteStatsPanel from '../components/RelayRouteStatsPanel'
 import StateShell from '../components/StateShell'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import { useDataLoader } from '../hooks/useDataLoader'
@@ -42,7 +41,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
-const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules', 'routing', 'intelligence', 'docs'] as const
+const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules', 'intelligence', 'docs'] as const
 const HIT_START_MARKER = '⟦PF_HIT⟧'
 const HIT_END_MARKER = '⟦/PF_HIT⟧'
 type PromptFilterView = typeof PROMPT_FILTER_VIEWS[number]
@@ -583,7 +582,7 @@ export default function PromptFilter() {
                   {saving ? t('common.saving') : t('common.save')}
                 </Button>
               </>
-            ) : activeView === 'routing' ? null : (
+            ) : (
               <Button variant="outline" onClick={() => void reload()}>
                 <RefreshCw className="size-3.5" />
                 {t('common.refresh')}
@@ -636,8 +635,6 @@ export default function PromptFilter() {
           />
         ) : null}
 
-        {activeView === 'routing' ? <RelayRouteStatsPanel /> : null}
-
         {activeView === 'intelligence' ? <IntelligenceView /> : null}
 
         {activeView === 'docs' ? <DocsView /> : null}
@@ -653,7 +650,6 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
     { view: 'overview' as const, label: t('promptFilter.views.overview'), to: '/prompt-filter/overview' },
     { view: 'logs' as const, label: t('promptFilter.views.logs'), to: '/prompt-filter/logs' },
     { view: 'rules' as const, label: t('promptFilter.views.rules'), to: '/prompt-filter/rules' },
-    { view: 'routing' as const, label: t('promptFilter.views.routing'), to: '/prompt-filter/routing' },
     { view: 'intelligence' as const, label: t('promptFilter.views.intelligence'), to: '/prompt-filter/intelligence' },
     { view: 'docs' as const, label: t('promptFilter.views.docs'), to: '/prompt-filter/docs' },
   ]

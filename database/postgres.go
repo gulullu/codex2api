@@ -193,6 +193,7 @@ type DB struct {
 	driver string
 
 	promptFilterAudit *promptFilterAuditQueue
+	relayAudit        *relayAuditQueue
 
 	backgroundTaskMu      sync.Mutex
 	backgroundTaskWg      sync.WaitGroup
@@ -405,6 +406,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
+	if err := db.migrateRelayAudit(ctx); err != nil {
+		return nil, fmt.Errorf("Relay 审计数据库迁移失败: %w", err)
+	}
 
 	// 启动批量写入后台协程
 	db.startLogFlusher()
@@ -446,6 +450,8 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	}
 	db.promptFilterAudit = newPromptFilterAuditQueue(db)
 	db.promptFilterAudit.start()
+	db.relayAudit = newRelayAuditQueue(db)
+	db.relayAudit.start()
 
 	return db, nil
 }
@@ -496,6 +502,9 @@ func (db *DB) Close() error {
 	db.flushLogs() // 最后一次 flush
 	if db.promptFilterAudit != nil {
 		db.promptFilterAudit.close(2 * time.Second)
+	}
+	if db.relayAudit != nil {
+		db.relayAudit.close(2 * time.Second)
 	}
 	return db.conn.Close()
 }

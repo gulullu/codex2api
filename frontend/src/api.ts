@@ -57,6 +57,8 @@ import type {
   PromptFilterRulePatternTestResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  RelayAuditCasesPage,
+  RelayAuditReport,
   RelayRouteStats,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
@@ -790,6 +792,29 @@ export const api = {
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
   getRelayRouteStats: (windowHours = 24) =>
     request<RelayRouteStats>(`/relay-route/stats?window_hours=${windowHours}`),
+  getRelayAuditReport: (params: { hours: number; bucketMinutes: number }) => {
+    const search = new URLSearchParams({
+      hours: String(params.hours),
+      bucket_minutes: String(params.bucketMinutes),
+    })
+    return request<RelayAuditReport>(`/relay-audit/report?${search.toString()}`)
+  },
+  getRelayAuditCases: (params: {
+    kind: 'relay_route' | 'oauth_cyber' | 'relay_cyber' | 'continuation' | 'session_bleed'
+    start: string
+    end: string
+    page: number
+    pageSize: number
+  }) => {
+    const search = new URLSearchParams({
+      kind: params.kind,
+      start: params.start,
+      end: params.end,
+      page: String(params.page),
+      page_size: String(params.pageSize),
+    })
+    return request<RelayAuditCasesPage>(`/relay-audit/cases?${search.toString()}`)
+  },
   runPromptIntelligence: () =>
     request<import('./types').PromptIntelligenceRun>('/prompt-filter/intelligence/run', { method: 'POST' }),
   getPromptIntelligenceHistory: (page = 1, pageSize = 20) =>
