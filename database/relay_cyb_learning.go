@@ -67,6 +67,26 @@ type RelayCYBMissSample struct {
 	LearnedAt        *time.Time `json:"learned_at,omitempty"`
 }
 
+// RelayCYBMissBackfillCandidate is a bounded, already-redacted audit record
+// from before automatic CYB learning was enabled. Protocol parsing remains in
+// the proxy layer; the database layer only identifies missing OAuth samples.
+type RelayCYBMissBackfillCandidate struct {
+	RequestID        string
+	CreatedAt        time.Time
+	Endpoint         string
+	RedactedRequest  string
+	RequestTruncated bool
+	AccountID        int64
+	AccountName      string
+	AccountType      string
+}
+
+type RelayCYBMissBackfillResult struct {
+	Scanned  int
+	Queued   int
+	Rejected int
+}
+
 type RelayCYBLearningSummary struct {
 	Status           string    `json:"status"`
 	Model            string    `json:"model"`
@@ -287,6 +307,151 @@ func (db *DB) WriteRelayCYBMissSample(ctx context.Context, input *RelayCYBMissSa
 			normalized.AccountName, normalized.AccountType, normalized.RedactedRequest,
 			normalized.UserText, normalized.RequestTruncated, normalized.ContentHash)
 		return err
+	})
+}
+
+// ListRelayCYBMissBackfillCandidates returns at most one OAuth cyber_policy
+// attempt per logical request and excludes every request already represented in
+// the learning table. This keeps startup backfill bounded and restart-safe.
+func (db *DB) ListRelayCYBMissBackfillCandidates(
+	ctx context.Context,
+	limit int,
+) ([]RelayCYBMissBackfillCandidate, error) {
+	if db == nil || db.conn == nil {
+		return nil, fmt.Errorf("database is nil")
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT request.request_id, request.created_at,
+		       COALESCE(request.endpoint, ''), COALESCE(request.full_text, ''),
+		       COALESCE(request.scan_truncated, FALSE),
+		       COALESCE(attempt.account_id, 0), COALESCE(attempt.account_name, ''),
+		       COALESCE(attempt.account_type, '')
+		FROM rb_route_requests request
+		JOIN rb_route_attempts attempt
+		  ON attempt.id = (
+			SELECT candidate.id
+			FROM rb_route_attempts candidate
+			WHERE candidate.request_id = request.request_id
+			  AND LOWER(TRIM(COALESCE(candidate.error_kind, ''))) = 'cyber_policy'
+			  AND LOWER(TRIM(COALESCE(candidate.account_type, ''))) NOT IN
+			      ('responses_api', 'openai_responses', 'relay', 'relay_style')
+			ORDER BY candidate.attempt_index, candidate.id
+			LIMIT 1
+		  )
+		LEFT JOIN rb_cyb_miss_samples sample
+		  ON sample.request_id = request.request_id
+		WHERE sample.request_id IS NULL
+		ORDER BY request.created_at, request.request_id
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := make([]RelayCYBMissBackfillCandidate, 0, limit)
+	for rows.Next() {
+		var item RelayCYBMissBackfillCandidate
+		var createdRaw any
+		if err := rows.Scan(
+			&item.RequestID,
+			&createdRaw,
+			&item.Endpoint,
+			&item.RedactedRequest,
+			&item.RequestTruncated,
+			&item.AccountID,
+			&item.AccountName,
+			&item.AccountType,
+		); err != nil {
+			return nil, err
+		}
+		item.CreatedAt, err = parseDBTimeValue(createdRaw)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+// InsertRelayCYBMissBackfillSample differs from the live writer in two ways:
+// it never updates an existing sample, and it can persist an unrecoverable
+// historical request directly as rejected. Both properties make replays and
+// concurrent startup attempts idempotent.
+func (db *DB) InsertRelayCYBMissBackfillSample(
+	ctx context.Context,
+	input *RelayCYBMissSampleInput,
+	rejectionReason string,
+) (bool, error) {
+	if db == nil || db.conn == nil || input == nil {
+		return false, nil
+	}
+	normalized := normalizeRelayCYBMissSampleInput(*input)
+	if normalized.RequestID == "" {
+		return false, fmt.Errorf("relay CYB miss request id is empty")
+	}
+	if normalized.CreatedAt.IsZero() {
+		normalized.CreatedAt = time.Now().UTC()
+	}
+	rejectionReason, _ = truncateRelayAuditRunes(strings.TrimSpace(rejectionReason), 1000)
+	status := RelayCYBLearningStatusQueued
+	if rejectionReason != "" {
+		status = RelayCYBLearningStatusRejected
+	}
+	var inserted bool
+	err := db.withRelayAuditTransaction(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `
+			INSERT INTO rb_cyb_miss_samples (
+				request_id, created_at, updated_at,
+				oauth_account_id, oauth_account_name, oauth_account_type,
+				redacted_request, user_text, request_truncated, content_hash,
+				learning_status, learning_error
+			) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT(request_id) DO NOTHING
+		`, normalized.RequestID, db.timeArg(normalized.CreatedAt), normalized.AccountID,
+			normalized.AccountName, normalized.AccountType, normalized.RedactedRequest,
+			normalized.UserText, normalized.RequestTruncated, normalized.ContentHash,
+			status, rejectionReason)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		inserted = affected == 1
+		return nil
+	})
+	return inserted, err
+}
+
+func (db *DB) RecordRelayCYBMissBackfillEvent(
+	ctx context.Context,
+	result RelayCYBMissBackfillResult,
+) error {
+	if db == nil || db.conn == nil || result.Queued+result.Rejected == 0 {
+		return nil
+	}
+	message := fmt.Sprintf(
+		"历史 OAuth CYB 漏放回填完成：%d 条进入学习队列，%d 条因历史正文不完整而记录为不可学习。",
+		result.Queued,
+		result.Rejected,
+	)
+	return db.withRelayAuditTransaction(ctx, func(tx *sql.Tx) error {
+		return insertRelayCYBLearningEventWith(
+			ctx,
+			tx,
+			"legacy_backfill",
+			0,
+			"历史 OAuth CYB 漏放已回填",
+			message,
+			time.Now().UTC(),
+		)
 	})
 }
 

@@ -28,6 +28,7 @@ const (
 	relayCYBRuleGuardWindow      = 10 * time.Minute
 	relayCYBRuleGuardMinRequests = 100
 	relayCYBRuleGuardMaxPercent  = 20
+	relayCYBLegacyBackfillLimit  = 100
 )
 
 type relayCYBLearningConfigResponse struct {
@@ -55,6 +56,20 @@ func (h *Handler) StartRelayCYBLearning(ctx context.Context) {
 	h.relayCYBLearningStartOnce.Do(func() {
 		if err := h.reloadRelayCYBLearnedRules(ctx); err != nil {
 			log.Printf("Relay CYB 学习规则初始加载失败: %v", err)
+		}
+		result, err := h.imageProxy.BackfillLegacyRelayCYBMissSamples(
+			ctx,
+			relayCYBLegacyBackfillLimit,
+		)
+		if err != nil {
+			log.Printf("Relay CYB 历史漏放回填失败: %v", err)
+		} else if result.Queued+result.Rejected > 0 {
+			log.Printf(
+				"Relay CYB 历史漏放回填完成: scanned=%d queued=%d rejected=%d",
+				result.Scanned,
+				result.Queued,
+				result.Rejected,
+			)
 		}
 		h.startDBBackgroundTaskWithParent(ctx, h.runRelayCYBLearningWorker)
 	})
