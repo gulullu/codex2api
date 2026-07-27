@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -32,12 +31,7 @@ const (
 	relayAuditWriteTimeout  = 3 * time.Second
 	relayAuditRetention     = 30 * 24 * time.Hour
 	relayAuditCleanupEvery  = 6 * time.Hour
-
-	relayAuditReportMaxRequests = 25000
-	relayAuditReportMaxAttempts = 100000
 )
-
-var ErrRelayAuditReportTooLarge = errors.New("relay audit report window is too large")
 
 // RelayAuditRequestInput creates or enriches one logical routing audit case.
 // Request content belongs exclusively to rb_route_requests; the Prompt Filter
@@ -1429,109 +1423,69 @@ type RelayAuditAttempt struct {
 	CompletedAt      *time.Time `json:"completed_at,omitempty"`
 }
 
-type relayAuditAttemptFlags struct {
-	oauthCyber   bool
-	relayCyber   bool
-	sessionBleed bool
-}
-
-func relayAuditAccountTypeIsRelay(accountType string) bool {
-	switch strings.ToLower(strings.TrimSpace(accountType)) {
-	case "responses_api", "openai_responses", "relay", "relay_style":
-		return true
-	default:
-		return false
-	}
-}
-
-func (db *DB) loadRelayAuditAttemptFlags(
-	ctx context.Context,
-	start time.Time,
-	end time.Time,
-) (map[string]relayAuditAttemptFlags, error) {
-	startArg, endArg := db.timeRangeArgs(start, end)
-	rows, err := db.conn.QueryContext(ctx, `
-		SELECT a.request_id, COALESCE(a.account_type, ''), COALESCE(a.error_kind, '')
+const relayAuditClassifiedRequestsCTE = `
+	WITH attempt_flags AS (
+		SELECT a.request_id,
+		       MAX(CASE
+		             WHEN COALESCE(a.error_kind, '') = 'cyber_policy'
+		              AND LOWER(TRIM(COALESCE(a.account_type, ''))) IN
+		                  ('responses_api', 'openai_responses', 'relay', 'relay_style')
+		             THEN 1 ELSE 0
+		           END) AS relay_cyber,
+		       MAX(CASE
+		             WHEN COALESCE(a.error_kind, '') = 'cyber_policy'
+		              AND LOWER(TRIM(COALESCE(a.account_type, ''))) NOT IN
+		                  ('responses_api', 'openai_responses', 'relay', 'relay_style')
+		             THEN 1 ELSE 0
+		           END) AS oauth_cyber,
+		       MAX(CASE
+		             WHEN COALESCE(a.error_kind, '') = 'websocket_isolation_violation'
+		             THEN 1 ELSE 0
+		           END) AS session_bleed
 		FROM rb_route_attempts a
-		JOIN rb_route_requests r ON r.request_id = a.request_id
-		WHERE r.created_at >= $1 AND r.created_at <= $2
+		JOIN rb_route_requests request_window ON request_window.request_id = a.request_id
+		WHERE request_window.created_at >= $1 AND request_window.created_at <= $2
 		  AND COALESCE(a.error_kind, '') IN ('cyber_policy', 'websocket_isolation_violation')
-	`, startArg, endArg)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	flagsByRequest := make(map[string]relayAuditAttemptFlags)
-	for rows.Next() {
-		var requestID, accountType, errorKind string
-		if err := rows.Scan(&requestID, &accountType, &errorKind); err != nil {
-			return nil, err
-		}
-		flags := flagsByRequest[requestID]
-		switch errorKind {
-		case "cyber_policy":
-			if relayAuditAccountTypeIsRelay(accountType) {
-				flags.relayCyber = true
-			} else {
-				flags.oauthCyber = true
-			}
-		case "websocket_isolation_violation":
-			flags.sessionBleed = true
-		}
-		flagsByRequest[requestID] = flags
-	}
-	return flagsByRequest, rows.Err()
-}
-
-func validateRelayAuditReportCardinality(requests, attempts int64) error {
-	switch {
-	case requests > relayAuditReportMaxRequests:
-		return fmt.Errorf(
-			"%w: requests=%d limit=%d",
-			ErrRelayAuditReportTooLarge,
-			requests,
-			relayAuditReportMaxRequests,
-		)
-	case attempts > relayAuditReportMaxAttempts:
-		return fmt.Errorf(
-			"%w: attempts=%d limit=%d",
-			ErrRelayAuditReportTooLarge,
-			attempts,
-			relayAuditReportMaxAttempts,
-		)
-	default:
-		return nil
-	}
-}
-
-func (db *DB) ensureRelayAuditReportCardinality(
-	ctx context.Context,
-	start time.Time,
-	end time.Time,
-) error {
-	startArg, endArg := db.timeRangeArgs(start, end)
-	var requests int64
-	if err := db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM rb_route_requests
-		WHERE created_at >= $1 AND created_at <= $2
-	`, startArg, endArg).Scan(&requests); err != nil {
-		return err
-	}
-	if err := validateRelayAuditReportCardinality(requests, 0); err != nil {
-		return err
-	}
-	var attempts int64
-	if err := db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM rb_route_attempts a
-		JOIN rb_route_requests r ON r.request_id = a.request_id
+		GROUP BY a.request_id
+	),
+	classified AS (
+		SELECT r.created_at,
+		       r.route_source,
+		       r.route_group_id,
+		       r.has_previous_response_id,
+		       r.replay_status,
+		       r.state_fallback_reason,
+		       r.detector_miss,
+		       r.route_violation,
+		       r.group_exhausted,
+		       r.final_status_code,
+		       r.final_error_kind,
+		       CASE
+		         WHEN COALESCE(flags.oauth_cyber, 0) > 0
+		           OR (
+		             COALESCE(r.final_error_kind, '') = 'cyber_policy'
+		             AND (COALESCE(r.route_group_id, 0) <= 0 OR COALESCE(r.detector_miss, FALSE))
+		           )
+		         THEN 1 ELSE 0
+		       END AS oauth_cyber,
+		       CASE
+		         WHEN COALESCE(flags.relay_cyber, 0) > 0
+		           OR (
+		             COALESCE(r.final_error_kind, '') = 'cyber_policy'
+		             AND COALESCE(r.route_group_id, 0) > 0
+		           )
+		         THEN 1 ELSE 0
+		       END AS relay_cyber,
+		       CASE
+		         WHEN COALESCE(flags.session_bleed, 0) > 0
+		           OR COALESCE(r.final_error_kind, '') = 'websocket_isolation_violation'
+		         THEN 1 ELSE 0
+		       END AS session_bleed
+		FROM rb_route_requests r
+		LEFT JOIN attempt_flags flags ON flags.request_id = r.request_id
 		WHERE r.created_at >= $1 AND r.created_at <= $2
-	`, startArg, endArg).Scan(&attempts); err != nil {
-		return err
-	}
-	return validateRelayAuditReportCardinality(requests, attempts)
-}
+	)
+`
 
 func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) (*RelayAuditReport, error) {
 	if db == nil {
@@ -1554,55 +1508,141 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 	if bucketMinutes > 1440 {
 		bucketMinutes = 1440
 	}
-	if err := db.ensureRelayAuditReportCardinality(ctx, start, end); err != nil {
-		return nil, err
-	}
 	report := &RelayAuditReport{
 		WindowStart: start, WindowEnd: end, GeneratedAt: time.Now(),
 		Timeline: []RelayAuditTimelinePoint{}, RouteSignals: []RelayAuditSignalRow{},
 		RelayRoutes: []RelayAuditRouteRow{}, Writer: db.RelayAuditWriterStats(),
 	}
 	startArg, endArg := db.timeRangeArgs(start, end)
-	rows, err := db.conn.QueryContext(ctx, `
-			SELECT request_id, created_at, COALESCE(route_source, ''), COALESCE(route_signals, '[]'),
-			       COALESCE(route_group_id, 0), COALESCE(has_previous_response_id, FALSE),
-			       COALESCE(replay_status, ''), COALESCE(replay_source, ''),
-			       COALESCE(state_fallback_reason, ''), COALESCE(detector_miss, FALSE),
-		       COALESCE(route_violation, FALSE), COALESCE(group_exhausted, FALSE),
-		       COALESCE(final_status_code, 0), COALESCE(final_error_kind, '')
-		FROM rb_route_requests
-		WHERE created_at >= $1 AND created_at <= $2
-		ORDER BY created_at
-	`, startArg, endArg)
+	summarySQL := relayAuditClassifiedRequestsCTE + `
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_group_id, 0) > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_rule' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'probe' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'oauth_overflow' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'relay_continuation' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_feedback' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(replay_status, '') = 'hit' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(replay_status, '') <> '' AND COALESCE(replay_status, '') <> 'hit'
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(final_error_kind, '') = 'continuation_replay_unavailable'
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(group_exhausted, FALSE) THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(detector_miss, FALSE) OR oauth_cyber > 0 THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE WHEN relay_cyber > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN oauth_cyber > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_violation, FALSE) THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(state_fallback_reason, '') <> '' THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(route_group_id, 0) > 0
+		          AND COALESCE(final_status_code, 0) >= 200
+		          AND COALESCE(final_status_code, 0) < 300
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(route_group_id, 0) > 0
+		          AND COALESCE(final_status_code, 0) >= 400
+		          AND relay_cyber = 0
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE WHEN session_bleed > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(has_previous_response_id, FALSE) THEN 1 ELSE 0
+		       END), 0)
+		FROM classified
+	`
+	if err := db.conn.QueryRowContext(ctx, summarySQL, startArg, endArg).Scan(
+		&report.Summary.LogicalRequests,
+		&report.Summary.RelayRequests,
+		&report.Summary.CYBRule,
+		&report.Summary.Probe,
+		&report.Summary.OAuthOverflow,
+		&report.Summary.Continuation,
+		&report.Summary.Feedback,
+		&report.Summary.ReplayHits,
+		&report.Summary.ReplayMisses,
+		&report.Summary.ReplayUnavailable,
+		&report.Summary.GroupExhausted,
+		&report.Summary.DetectorMisses,
+		&report.Summary.RelayCyberPolicies,
+		&report.Summary.OAuthCyberMisses,
+		&report.Summary.RouteViolations,
+		&report.Summary.StateFallbacks,
+		&report.Summary.RelaySuccesses,
+		&report.Summary.RelayFinalFailures,
+		&report.Summary.SessionBleed,
+		&report.Summary.RequestsWithPrevious,
+	); err != nil {
+		return nil, err
+	}
+
+	bucketSeconds := int64(bucketMinutes) * 60
+	bucketExpression := `FLOOR(EXTRACT(EPOCH FROM created_at) / $3)::BIGINT`
+	if db.isSQLite() {
+		bucketExpression = `CAST(CAST(strftime('%s', created_at) AS INTEGER) / $3 AS INTEGER)`
+	}
+	timelineSQL := relayAuditClassifiedRequestsCTE + fmt.Sprintf(`
+		SELECT bucket_index,
+		       COALESCE(SUM(CASE WHEN COALESCE(route_group_id, 0) > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_rule' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'probe' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'oauth_overflow' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'relay_continuation' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_feedback' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(replay_status, '') = 'hit' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(replay_status, '') <> '' AND COALESCE(replay_status, '') <> 'hit'
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE WHEN oauth_cyber > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN relay_cyber > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(route_group_id, 0) > 0
+		          AND COALESCE(final_status_code, 0) >= 400
+		          AND relay_cyber = 0
+		         THEN 1 ELSE 0
+		       END), 0)
+		FROM (
+			SELECT classified.*, %s AS bucket_index
+			FROM classified
+		) bucketed
+		GROUP BY bucket_index
+		ORDER BY bucket_index
+	`, bucketExpression)
+	rows, err := db.conn.QueryContext(ctx, timelineSQL, startArg, endArg, bucketSeconds)
 	if err != nil {
 		return nil, err
 	}
-	type compactRequest struct {
-		id, source, signals, replayStatus, replaySource string
-		fallback, errorKind                             string
-		at                                              time.Time
-		groupID                                         int64
-		hasPrevious, detector, violation                bool
-		exhausted                                       bool
-		status                                          int
-	}
-	requests := make([]compactRequest, 0)
 	for rows.Next() {
-		var item compactRequest
-		var createdRaw any
-		if err := rows.Scan(&item.id, &createdRaw, &item.source, &item.signals, &item.groupID,
-			&item.hasPrevious, &item.replayStatus, &item.replaySource,
-			&item.fallback, &item.detector, &item.violation,
-			&item.exhausted, &item.status, &item.errorKind); err != nil {
+		var bucketIndex int64
+		var point RelayAuditTimelinePoint
+		if err := rows.Scan(
+			&bucketIndex,
+			&point.RelayRequests,
+			&point.CYBRule,
+			&point.Probe,
+			&point.OAuthOverflow,
+			&point.Continuation,
+			&point.Feedback,
+			&point.ReplayHits,
+			&point.ReplayMisses,
+			&point.OAuthCyberMisses,
+			&point.RelayCyberPolicies,
+			&point.FinalFailures,
+		); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		item.at, err = parseDBTimeValue(createdRaw)
-		if err != nil {
-			rows.Close()
-			return nil, err
-		}
-		requests = append(requests, item)
+		point.Bucket = time.Unix(bucketIndex*bucketSeconds, 0).UTC()
+		report.Timeline = append(report.Timeline, point)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -1610,145 +1650,63 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	attemptFlags, err := db.loadRelayAuditAttemptFlags(ctx, start, end)
-	if err != nil {
-		return nil, err
-	}
 
-	bucketDuration := time.Duration(bucketMinutes) * time.Minute
-	buckets := make(map[int64]*RelayAuditTimelinePoint)
 	type signalAggregate struct {
 		count int64
 		last  time.Time
 	}
 	signals := make(map[string]signalAggregate)
-	report.Summary.LogicalRequests = int64(len(requests))
-	for _, item := range requests {
-		flags := attemptFlags[item.id]
-		relay := item.groupID > 0
-		if relay {
-			report.Summary.RelayRequests++
+	rows, err = db.conn.QueryContext(ctx, `
+		SELECT COALESCE(route_signals, '[]'), COUNT(*), MAX(created_at)
+		FROM rb_route_requests
+		WHERE created_at >= $1 AND created_at <= $2
+		  AND COALESCE(route_signals, '') NOT IN ('', '[]')
+		GROUP BY COALESCE(route_signals, '[]')
+	`, startArg, endArg)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var rawSignals string
+		var groupedRequests int64
+		var lastRaw any
+		if err := rows.Scan(&rawSignals, &groupedRequests, &lastRaw); err != nil {
+			rows.Close()
+			return nil, err
 		}
-		switch item.source {
-		case "cyb_rule":
-			report.Summary.CYBRule++
-		case "probe":
-			report.Summary.Probe++
-		case "oauth_overflow":
-			report.Summary.OAuthOverflow++
-		case "relay_continuation":
-			report.Summary.Continuation++
-		case "cyb_feedback":
-			report.Summary.Feedback++
-		}
-		if item.hasPrevious {
-			report.Summary.RequestsWithPrevious++
-		}
-		switch item.replayStatus {
-		case "hit":
-			report.Summary.ReplayHits++
-		case "":
-		default:
-			report.Summary.ReplayMisses++
-		}
-		if item.errorKind == "continuation_replay_unavailable" {
-			report.Summary.ReplayUnavailable++
-		}
-		if item.fallback != "" {
-			report.Summary.StateFallbacks++
-		}
-		oauthCyber := flags.oauthCyber || (item.errorKind == "cyber_policy" && (!relay || item.detector))
-		relayCyber := flags.relayCyber || (item.errorKind == "cyber_policy" && relay)
-		detectorMiss := item.detector || oauthCyber
-		sessionBleed := flags.sessionBleed || item.errorKind == "websocket_isolation_violation"
-		if detectorMiss {
-			report.Summary.DetectorMisses++
-		}
-		if item.violation {
-			report.Summary.RouteViolations++
-		}
-		if item.exhausted {
-			report.Summary.GroupExhausted++
-		}
-		if relayCyber {
-			report.Summary.RelayCyberPolicies++
-		}
-		if oauthCyber {
-			report.Summary.OAuthCyberMisses++
-		}
-		if sessionBleed {
-			report.Summary.SessionBleed++
-		}
-		if relay && item.status >= 200 && item.status < 300 {
-			report.Summary.RelaySuccesses++
-		}
-		if relay && item.status >= 400 && !relayCyber {
-			report.Summary.RelayFinalFailures++
-		}
-		bucketTime := item.at.Truncate(bucketDuration)
-		point := buckets[bucketTime.UnixNano()]
-		if point == nil {
-			point = &RelayAuditTimelinePoint{Bucket: bucketTime}
-			buckets[bucketTime.UnixNano()] = point
-		}
-		if relay {
-			point.RelayRequests++
-		}
-		switch item.source {
-		case "cyb_rule":
-			point.CYBRule++
-		case "probe":
-			point.Probe++
-		case "oauth_overflow":
-			point.OAuthOverflow++
-		case "relay_continuation":
-			point.Continuation++
-		case "cyb_feedback":
-			point.Feedback++
-		}
-		switch item.replayStatus {
-		case "hit":
-			point.ReplayHits++
-		case "":
-		default:
-			point.ReplayMisses++
-		}
-		if relayCyber {
-			point.RelayCyberPolicies++
-		}
-		if oauthCyber {
-			point.OAuthCyberMisses++
-		}
-		if relay && item.status >= 400 && !relayCyber {
-			point.FinalFailures++
+		lastSeen, err := parseDBTimeValue(lastRaw)
+		if err != nil {
+			rows.Close()
+			return nil, err
 		}
 		var parsedSignals []string
-		if json.Unmarshal([]byte(item.signals), &parsedSignals) == nil {
-			seenSignals := make(map[string]struct{}, len(parsedSignals))
-			for _, signal := range parsedSignals {
-				signal = strings.TrimSpace(signal)
-				if signal == "" {
-					continue
-				}
-				if _, exists := seenSignals[signal]; exists {
-					continue
-				}
-				seenSignals[signal] = struct{}{}
-				aggregate := signals[signal]
-				aggregate.count++
-				if item.at.After(aggregate.last) {
-					aggregate.last = item.at
-				}
-				signals[signal] = aggregate
+		if json.Unmarshal([]byte(rawSignals), &parsedSignals) != nil {
+			continue
+		}
+		seenSignals := make(map[string]struct{}, len(parsedSignals))
+		for _, signal := range parsedSignals {
+			signal = strings.TrimSpace(signal)
+			if signal == "" {
+				continue
 			}
+			if _, exists := seenSignals[signal]; exists {
+				continue
+			}
+			seenSignals[signal] = struct{}{}
+			aggregate := signals[signal]
+			aggregate.count += groupedRequests
+			if lastSeen.After(aggregate.last) {
+				aggregate.last = lastSeen
+			}
+			signals[signal] = aggregate
 		}
 	}
-	for _, point := range buckets {
-		report.Timeline = append(report.Timeline, *point)
+	if err := rows.Close(); err != nil {
+		return nil, err
 	}
-	sort.Slice(report.Timeline, func(i, j int) bool {
-		return report.Timeline[i].Bucket.Before(report.Timeline[j].Bucket)
-	})
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	for signal, aggregate := range signals {
 		report.RouteSignals = append(report.RouteSignals, RelayAuditSignalRow{
 			Signal: signal, Requests: aggregate.count, LastSeen: aggregate.last,
@@ -1770,87 +1728,63 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 func (db *DB) populateRelayAuditAttemptSummary(ctx context.Context, start, end time.Time, report *RelayAuditReport) error {
 	startArg, endArg := db.timeRangeArgs(start, end)
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT a.request_id, COALESCE(a.attempt_index, 0),
-		       COALESCE(a.account_id, 0), COALESCE(a.account_name, ''),
+		SELECT COALESCE(a.account_id, 0), COALESCE(a.account_name, ''),
 		       COALESCE(a.account_type, ''), COALESCE(r.route_source, ''),
-		       COALESCE(a.selection_mode, ''), COALESCE(a.status_code, 0),
-		       COALESCE(a.error_kind, '')
+		       COUNT(DISTINCT a.request_id),
+		       COUNT(*),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(a.status_code, 0) >= 200 AND COALESCE(a.status_code, 0) < 300
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(a.status_code, 0) >= 400 AND COALESCE(a.status_code, 0) < 500
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(a.status_code, 0) >= 500 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(a.error_kind, '') = 'cyber_policy' THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(a.attempt_index, 0) > 1 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(a.selection_mode, '') = 'same_group_switch' THEN 1 ELSE 0
+		       END), 0)
 		FROM rb_route_attempts a
 		JOIN rb_route_requests r ON r.request_id = a.request_id
 		WHERE r.created_at >= $1 AND r.created_at <= $2
-		ORDER BY a.id
+		GROUP BY COALESCE(a.account_id, 0), COALESCE(a.account_name, ''),
+		         COALESCE(a.account_type, ''), COALESCE(r.route_source, '')
+		ORDER BY COUNT(DISTINCT a.request_id) DESC,
+		         COALESCE(a.account_name, ''), COALESCE(r.route_source, '')
 	`, startArg, endArg)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	type routeKey struct {
-		accountID                int64
-		accountName, accountType string
-		source                   string
-	}
-	type routeAggregate struct {
-		row      RelayAuditRouteRow
-		requests map[string]struct{}
-	}
-	aggregates := make(map[routeKey]*routeAggregate)
 	for rows.Next() {
-		var requestID, accountName, accountType, source, selectionMode, errorKind string
-		var accountID int64
-		var attemptIndex, status int
-		if err := rows.Scan(&requestID, &attemptIndex, &accountID, &accountName, &accountType, &source,
-			&selectionMode, &status, &errorKind); err != nil {
+		var item RelayAuditRouteRow
+		var retries, sameGroupSwitches int64
+		if err := rows.Scan(
+			&item.AccountID,
+			&item.AccountName,
+			&item.AccountType,
+			&item.RouteSource,
+			&item.Requests,
+			&item.Attempts,
+			&item.Successes,
+			&item.Errors4xx,
+			&item.Errors5xx,
+			&item.CyberPolicy,
+			&retries,
+			&sameGroupSwitches,
+		); err != nil {
 			return err
 		}
-		report.Summary.RouteAttempts++
-		if attemptIndex > 1 {
-			report.Summary.Retries++
-		}
-		if selectionMode == "same_group_switch" {
-			report.Summary.SameGroupSwitches++
-		}
-		key := routeKey{accountID: accountID, accountName: accountName, accountType: accountType, source: source}
-		aggregate := aggregates[key]
-		if aggregate == nil {
-			aggregate = &routeAggregate{
-				row: RelayAuditRouteRow{
-					AccountID: accountID, AccountName: accountName, AccountType: accountType, RouteSource: source,
-				},
-				requests: make(map[string]struct{}),
-			}
-			aggregates[key] = aggregate
-		}
-		aggregate.requests[requestID] = struct{}{}
-		aggregate.row.Attempts++
-		switch {
-		case status >= 200 && status < 300:
-			aggregate.row.Successes++
-		case status >= 400 && status < 500:
-			aggregate.row.Errors4xx++
-		case status >= 500:
-			aggregate.row.Errors5xx++
-		}
-		if errorKind == "cyber_policy" {
-			aggregate.row.CyberPolicy++
-		}
+		report.Summary.RouteAttempts += item.Attempts
+		report.Summary.Retries += retries
+		report.Summary.SameGroupSwitches += sameGroupSwitches
+		report.RelayRoutes = append(report.RelayRoutes, item)
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, aggregate := range aggregates {
-		aggregate.row.Requests = int64(len(aggregate.requests))
-		report.RelayRoutes = append(report.RelayRoutes, aggregate.row)
-	}
-	sort.Slice(report.RelayRoutes, func(i, j int) bool {
-		if report.RelayRoutes[i].Requests == report.RelayRoutes[j].Requests {
-			if report.RelayRoutes[i].AccountName == report.RelayRoutes[j].AccountName {
-				return report.RelayRoutes[i].RouteSource < report.RelayRoutes[j].RouteSource
-			}
-			return report.RelayRoutes[i].AccountName < report.RelayRoutes[j].AccountName
-		}
-		return report.RelayRoutes[i].Requests > report.RelayRoutes[j].Requests
-	})
-	return nil
+	return rows.Err()
 }
 
 func (db *DB) ListRelayAuditCasesPage(ctx context.Context, query RelayAuditCaseQuery) (*RelayAuditCasesPage, error) {

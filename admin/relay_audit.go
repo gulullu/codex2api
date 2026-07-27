@@ -45,10 +45,6 @@ func (h *Handler) GetRelayAuditReport(c *gin.Context) {
 		Start: start, End: end, BucketMinutes: bucketMinutes,
 	})
 	if err != nil {
-		if errors.Is(err, database.ErrRelayAuditReportTooLarge) {
-			writeError(c, http.StatusUnprocessableEntity, "范围内审计数据过多，请缩短时间范围")
-			return
-		}
 		writeInternalError(c, err)
 		return
 	}

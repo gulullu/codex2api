@@ -2,32 +2,11 @@ package database
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestValidateRelayAuditReportCardinalityRejectsOversizedWindows(t *testing.T) {
-	if err := validateRelayAuditReportCardinality(
-		relayAuditReportMaxRequests,
-		relayAuditReportMaxAttempts,
-	); err != nil {
-		t.Fatalf("limits should be accepted: %v", err)
-	}
-	for _, test := range []struct {
-		requests int64
-		attempts int64
-	}{
-		{requests: relayAuditReportMaxRequests + 1},
-		{attempts: relayAuditReportMaxAttempts + 1},
-	} {
-		if err := validateRelayAuditReportCardinality(test.requests, test.attempts); !errors.Is(err, ErrRelayAuditReportTooLarge) {
-			t.Fatalf("requests=%d attempts=%d err=%v", test.requests, test.attempts, err)
-		}
-	}
-}
 
 func newRelayAuditSQLite(t *testing.T) *DB {
 	t.Helper()

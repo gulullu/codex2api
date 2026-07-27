@@ -2,7 +2,6 @@ package admin
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,10 +30,6 @@ func (h *Handler) GetRelayRouteStats(c *gin.Context) {
 	defer cancel()
 	stats, err := h.db.GetRelayRouteStats(ctx, window)
 	if err != nil {
-		if errors.Is(err, database.ErrRelayAuditReportTooLarge) {
-			writeError(c, http.StatusUnprocessableEntity, "范围内审计数据过多，请缩短时间范围")
-			return
-		}
 		writeInternalError(c, err)
 		return
 	}
