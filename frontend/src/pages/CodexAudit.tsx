@@ -75,6 +75,12 @@ function formatNumber(value?: number) {
   return Number(value || 0).toLocaleString('zh-CN')
 }
 
+function formatPercent(numerator?: number, denominator?: number) {
+  const total = Number(denominator || 0)
+  if (total <= 0) return '0.0%'
+  return `${((Number(numerator || 0) / total) * 100).toFixed(1)}%`
+}
+
 function statusTone(status: number) {
   if (status >= 200 && status < 300) return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
   if (status >= 500 || status === 0) return 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300'
@@ -213,8 +219,20 @@ export default function CodexAudit() {
       >
         {report ? (
           <div className="space-y-4">
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-4 xl:grid-cols-8">
-              <MetricCard icon={<Route />} label="Relay 逻辑请求" value={summary?.relay_requests} detail={`上游尝试 ${formatNumber(summary?.route_attempts)}`} />
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+              <MetricCard
+                icon={<Database />}
+                label="审计请求总数"
+                value={summary?.logical_requests}
+                detail={writerProblem ? '写入异常，当前比例可能不完整' : '当前时间窗口的逻辑请求'}
+                bad={writerProblem}
+              />
+              <MetricCard
+                icon={<Route />}
+                label="Relay 逻辑请求"
+                value={summary?.relay_requests}
+                detail={`分流率 ${formatPercent(summary?.relay_requests, summary?.logical_requests)} · 上游尝试 ${formatNumber(summary?.route_attempts)}`}
+              />
               <MetricCard icon={<ShieldAlert />} label="CYB 规则" value={summary?.cyb_rule} detail={`反馈分流 ${formatNumber(summary?.cyb_feedback)}`} />
               <MetricCard icon={<Activity />} label="探针分流" value={summary?.probe} detail="命中探针签名" />
               <MetricCard icon={<Shuffle />} label="OAuth 溢出" value={summary?.oauth_overflow} detail="无更高优先级候选" />
