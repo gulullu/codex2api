@@ -24,12 +24,15 @@ const (
 	relayCYBRuleReloadInterval   = 30 * time.Second
 	relayCYBLearningCallTimeout  = 90 * time.Second
 	relayCYBLearningMaxAttempts  = 5
+	relayCYBCandidateMaxAttempts = 3
 	relayCYBRecentBenignLimit    = 1000
 	relayCYBRuleGuardWindow      = 10 * time.Minute
 	relayCYBRuleGuardMinRequests = 100
 	relayCYBRuleGuardMaxPercent  = 20
 	relayCYBLegacyBackfillLimit  = 100
 )
+
+var errRelayCYBRecentTrafficUnavailable = errors.New("relay CYB recent traffic unavailable")
 
 type relayCYBLearningConfigResponse struct {
 	Enabled                  bool                                    `json:"enabled"`
@@ -128,45 +131,54 @@ func (h *Handler) processOneRelayCYBLearningSample(ctx context.Context) error {
 		)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, relayCYBLearningCallTimeout)
-	defer cancel()
-	body, _ := json.Marshal(map[string]any{
-		"model":             model,
-		"input":             cyblearn.BuildPrompt(sample.UserText),
-		"stream":            false,
-		"store":             false,
-		"max_output_tokens": 2000,
-	})
-	status, response, callErr := h.imageProxy.ExecuteInternalRelayResponse(callCtx, body)
-	if callErr != nil {
-		return h.retryRelayCYBLearningSample(ctx, sample, callErr)
-	}
-	if status < 200 || status >= 300 {
-		return h.retryRelayCYBLearningSample(ctx, sample, fmt.Errorf("Relay 分组模型调用 HTTP %d", status))
-	}
-	candidate, err := cyblearn.ParseCandidate(extractResponseOutputText(response))
-	if err != nil {
-		return h.db.MarkRelayCYBLearningRejected(
-			ctx,
-			sample.RequestID,
-			sample.LearningAttempts,
-			err.Error(),
+	prompt := cyblearn.BuildPrompt(sample.UserText)
+	var candidate cyblearn.Candidate
+	var candidateErr error
+	for generation := 0; generation < relayCYBCandidateMaxAttempts; generation++ {
+		body, _ := json.Marshal(map[string]any{
+			"model":             model,
+			"input":             prompt,
+			"stream":            false,
+			"store":             false,
+			"max_output_tokens": 2000,
+		})
+		callCtx, cancel := context.WithTimeout(ctx, relayCYBLearningCallTimeout)
+		status, response, callErr := h.imageProxy.ExecuteInternalRelayResponse(callCtx, body)
+		cancel()
+		if callErr != nil {
+			return h.retryRelayCYBLearningSample(ctx, sample, callErr)
+		}
+		if status < 200 || status >= 300 {
+			return h.retryRelayCYBLearningSample(
+				ctx,
+				sample,
+				fmt.Errorf("Relay 分组模型调用 HTTP %d", status),
+			)
+		}
+		candidate, candidateErr = cyblearn.ParseCandidate(extractResponseOutputText(response))
+		if candidateErr == nil {
+			candidateErr = cyblearn.ValidateCandidate(candidate, sample.UserText)
+		}
+		if candidateErr == nil {
+			candidateErr = h.validateRelayCYBCandidateAgainstRecentTraffic(ctx, candidate)
+			if errors.Is(candidateErr, errRelayCYBRecentTrafficUnavailable) {
+				return h.retryRelayCYBLearningSample(ctx, sample, candidateErr)
+			}
+		}
+		if candidateErr == nil {
+			break
+		}
+		prompt = cyblearn.BuildPromptWithFeedback(
+			sample.UserText,
+			relayCYBCandidateFeedback(candidateErr),
 		)
 	}
-	if err := cyblearn.ValidateCandidate(candidate, sample.UserText); err != nil {
+	if candidateErr != nil {
 		return h.db.MarkRelayCYBLearningRejected(
 			ctx,
 			sample.RequestID,
 			sample.LearningAttempts,
-			err.Error(),
-		)
-	}
-	if err := h.validateRelayCYBCandidateAgainstRecentTraffic(ctx, candidate); err != nil {
-		return h.db.MarkRelayCYBLearningRejected(
-			ctx,
-			sample.RequestID,
-			sample.LearningAttempts,
-			err.Error(),
+			candidateErr.Error(),
 		)
 	}
 	latestSettings, err := h.db.GetRelayCYBLearningSettings(ctx)
@@ -221,6 +233,38 @@ func (h *Handler) processOneRelayCYBLearningSample(ctx context.Context) error {
 	return h.reloadRelayCYBLearnedRules(ctx)
 }
 
+func relayCYBCandidateFeedback(err error) string {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	switch {
+	case strings.Contains(message, "模型未返回 JSON"),
+		strings.Contains(message, "候选规则 JSON 无效"):
+		return "上一候选不是严格有效的 JSON 对象；请只返回要求的四个字段。"
+	case strings.Contains(message, "没有命中原漏放样本"):
+		return "上一候选的 pattern 没有命中原用户语料；请保留至少两个共同风险特征并确保命中。"
+	case strings.Contains(message, "泛化变体"):
+		return "上一候选的 pattern 没有通过 positive_variants 校验；请先生成 2 到 4 条不同短变体，再确保 pattern 逐条命中。"
+	case strings.Contains(message, "良性语料"),
+		strings.Contains(message, "近期普通请求"):
+		return "上一候选过宽并命中了普通语料；请增加共同风险特征并收窄每个匹配分支。"
+	case strings.Contains(message, "至少需要两个同时成立"):
+		return "上一候选每条匹配分支的必需文字风险特征不足两个；请增加第二个同时成立的特征。"
+	case strings.Contains(message, "近似复制原样本"),
+		strings.Contains(message, "复制原漏放样本"):
+		return "上一候选过度复制原文；请保留共同风险特征并改写泛化变体。"
+	case strings.Contains(message, "RE2"),
+		strings.Contains(message, "规则名称"),
+		strings.Contains(message, "规则长度"),
+		strings.Contains(message, "匹配空文本"),
+		strings.Contains(message, "内部样本分隔"):
+		return "上一候选的名称或 RE2 结构不合法；请使用英文 snake_case 名称和非空匹配的 Go RE2 正则。"
+	default:
+		return "上一候选未通过本地机械校验；请重新生成并逐项自检所有要求。"
+	}
+}
+
 func (h *Handler) validateRelayCYBCandidateAgainstRecentTraffic(
 	ctx context.Context,
 	candidate cyblearn.Candidate,
@@ -231,7 +275,8 @@ func (h *Handler) validateRelayCYBCandidateAgainstRecentTraffic(
 	}
 	texts, err := h.db.ListRecentOfficialDefaultAuditTexts(ctx, relayCYBRecentBenignLimit)
 	if err != nil {
-		return fmt.Errorf("读取近期良性回归语料失败: %w", err)
+		return fmt.Errorf("%w: 读取近期良性回归语料失败: %v",
+			errRelayCYBRecentTrafficUnavailable, err)
 	}
 	hits := 0
 	for _, text := range texts {
