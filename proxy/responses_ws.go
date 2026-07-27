@@ -661,7 +661,9 @@ func (h *Handler) streamResponsesWSUpstream(
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
-			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+			if c == nil || !c.GetBool(skipCYBLearningPipelineContextKey) {
+				cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+			}
 			gotTerminal = true
 		}
 		if eventType == "response.failed" {

@@ -18,8 +18,18 @@ import (
 const relayAuditRequestPrefixMaxBytes = database.RelayAuditFullTextMaxRunes * 4
 
 var relayAuditSensitiveJSONFieldPattern = regexp.MustCompile(
-	`(?i)("(?:previous_response_id|prompt_cache_key|encrypted_content|authorization|api_key|access_token|refresh_token|password|secret)"\s*:\s*)"(?:\\.|[^"\\])*(?:"|$)`,
+	`(?i)("(?:previous_response_id|prompt_cache_key|encrypted_content|authorization|api_key|access_token|refresh_token|password|secret|credential|credentials|private_key)"\s*:\s*)"(?:\\.|[^"\\])*(?:"|$)`,
 )
+
+var relayAuditTruncatedPrivateKeyPattern = regexp.MustCompile(
+	`(?s)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*$`,
+)
+
+func redactRelayAuditSensitiveText(text string) string {
+	text = promptfilter.RedactSensitive(text)
+	text = relayAuditSensitiveJSONFieldPattern.ReplaceAllString(text, `${1}"[REDACTED]"`)
+	return relayAuditTruncatedPrivateKeyPattern.ReplaceAllString(text, "[REDACTED_PRIVATE_KEY]")
+}
 
 func relayRouteScanDetailsJSON(result cybroute.Result) string {
 	type scanDetails struct {
@@ -90,8 +100,7 @@ func relayAuditRequestText(rawBody []byte) (string, bool) {
 		prefix = prefix[:relayAuditRequestPrefixMaxBytes]
 		truncated = true
 	}
-	text := promptfilter.RedactSensitive(string(prefix))
-	text = relayAuditSensitiveJSONFieldPattern.ReplaceAllString(text, `${1}"[REDACTED]"`)
+	text := redactRelayAuditSensitiveText(strings.ToValidUTF8(string(prefix), "\uFFFD"))
 	_, bounded, runeTruncated := database.BoundRelayAuditText(text)
 	return bounded, truncated || runeTruncated
 }

@@ -6,6 +6,7 @@ package cybroute
 import (
 	"strings"
 
+	"github.com/codex2api/security/cyblearn"
 	"github.com/codex2api/security/promptfilter"
 )
 
@@ -47,8 +48,21 @@ type provenancePartition struct {
 // Inspect evaluates only user-authored provenance that can represent a routing
 // request. Evidence is never joined across origins. Developer/system/assistant
 // replay cannot initiate a route, while prior user turns may preserve the CYB
-// route for a full-history conversation.
+// route for a full-history conversation. The current routing-only learned rule
+// snapshot is applied without involving Prompt Filter configuration.
 func Inspect(body []byte, endpoint, model string, cfg promptfilter.Config) Result {
+	return InspectWithLearnedPatterns(body, endpoint, model, cfg, currentLearnedRules())
+}
+
+// InspectWithLearnedPatterns evaluates an independent routing-only rule
+// snapshot in addition to the stable local CYB rules. The supplied patterns
+// are never written back to or exposed as Prompt Filter configuration.
+func InspectWithLearnedPatterns(
+	body []byte,
+	endpoint, model string,
+	cfg promptfilter.Config,
+	learned []cyblearn.Rule,
+) Result {
 	cfg = routingConfig(cfg)
 	envelope := promptfilter.BuildEnvelopeWithModelsAndConfig(
 		body,
@@ -58,7 +72,49 @@ func Inspect(body []byte, endpoint, model string, cfg promptfilter.Config) Resul
 		promptfilter.TransportHTTP,
 		cfg,
 	)
-	return inspectEnvelope(envelope, cfg)
+	result := inspectEnvelope(envelope, cfg)
+	applyLearnedRules(envelope, learned, &result)
+	return result
+}
+
+func applyLearnedRules(envelope promptfilter.RequestEnvelope, learned []cyblearn.Rule, result *Result) {
+	if result == nil || len(learned) == 0 || envelope.AdapterUnclassified || len(envelope.Segments) == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(result.Matches)+len(learned))
+	for _, match := range result.Matches {
+		seen[strings.ToLower(strings.TrimSpace(match.Name))] = struct{}{}
+	}
+	for _, partition := range partitionEnvelope(envelope) {
+		text := strings.TrimSpace(partition.text.String())
+		if text == "" {
+			continue
+		}
+		for _, rule := range learned {
+			if !rule.MatchString(text) {
+				continue
+			}
+			if !result.Route {
+				result.PrimaryOrigin = partition.origin
+			}
+			result.Route = true
+			if result.Score < 250 {
+				result.Score = 250
+			}
+			result.Signals = appendUnique(result.Signals, "learned_rule:"+strings.TrimSpace(rule.Name))
+			key := strings.ToLower(strings.TrimSpace(rule.Name))
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			result.Matches = append(result.Matches, promptfilter.Match{
+				Name:     rule.Name,
+				Weight:   250,
+				Category: "cyb_learned",
+				Strict:   true,
+			})
+		}
+	}
 }
 
 func inspectEnvelope(envelope promptfilter.RequestEnvelope, cfg promptfilter.Config) Result {

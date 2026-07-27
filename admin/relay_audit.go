@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -86,7 +87,7 @@ func (h *Handler) GetRelayAuditCases(c *gin.Context) {
 	defer cancel()
 	result, err := h.db.ListRelayAuditCasesPage(ctx, database.RelayAuditCaseQuery{
 		Kind:  strings.TrimSpace(c.DefaultQuery("kind", database.RelayAuditCaseRelayRoute)),
-		Start: start, End: end, Page: page, PageSize: pageSize,
+		Start: start, End: end, Page: page, PageSize: pageSize, SummaryOnly: true,
 	})
 	if err != nil {
 		if strings.Contains(err.Error(), "unsupported relay audit case kind") {
@@ -96,7 +97,35 @@ func (h *Handler) GetRelayAuditCases(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, result)
+}
+
+// GetRelayAuditCaseDetail fetches the large, already-redacted request sample
+// and attempt chain only when an administrator expands a paged case.
+func (h *Handler) GetRelayAuditCaseDetail(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "审计数据库不可用")
+		return
+	}
+	requestID := strings.TrimSpace(c.Param("request_id"))
+	if requestID == "" || len(requestID) > 128 {
+		writeError(c, http.StatusBadRequest, "request_id 参数无效")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+	detail, err := h.db.GetRelayAuditCaseDetail(ctx, requestID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "审计案卷不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, detail)
 }
 
 func relayAuditWindowFromQuery(c *gin.Context) (time.Time, time.Time, error) {

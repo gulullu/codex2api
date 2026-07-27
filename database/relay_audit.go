@@ -134,25 +134,28 @@ const (
 	relayAuditJobAttempt
 	relayAuditJobOutcome
 	relayAuditJobState
+	relayAuditJobCYBMissSample
 )
 
 type relayAuditJob struct {
-	kind    relayAuditJobKind
-	bytes   int64
-	request RelayAuditRequestInput
-	attempt RelayAuditAttemptInput
-	outcome RelayAuditOutcomeInput
-	state   RelayAuditStateInput
+	kind      relayAuditJobKind
+	bytes     int64
+	request   RelayAuditRequestInput
+	attempt   RelayAuditAttemptInput
+	outcome   RelayAuditOutcomeInput
+	state     RelayAuditStateInput
+	cybSample RelayCYBMissSampleInput
 }
 
 type relayAuditQueue struct {
-	db     *DB
-	jobs   chan relayAuditJob
-	stop   chan struct{}
-	done   chan struct{}
-	ctx    context.Context
-	cancel context.CancelFunc
-	closed atomic.Bool
+	db             *DB
+	jobs           chan relayAuditJob
+	stop           chan struct{}
+	done           chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	closed         atomic.Bool
+	cleanupEnabled bool
 
 	enqueueMu sync.RWMutex
 	pending   atomic.Int64
@@ -173,14 +176,23 @@ type RelayAuditWriterStats struct {
 }
 
 func newRelayAuditQueue(db *DB) *relayAuditQueue {
+	return newRelayAuditQueueWithCleanup(db, true)
+}
+
+func newRelayCYBSampleQueue(db *DB) *relayAuditQueue {
+	return newRelayAuditQueueWithCleanup(db, false)
+}
+
+func newRelayAuditQueueWithCleanup(db *DB, cleanupEnabled bool) *relayAuditQueue {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &relayAuditQueue{
-		db:     db,
-		jobs:   make(chan relayAuditJob, relayAuditQueueCapacity),
-		stop:   make(chan struct{}),
-		done:   make(chan struct{}),
-		ctx:    ctx,
-		cancel: cancel,
+		db:             db,
+		jobs:           make(chan relayAuditJob, relayAuditQueueCapacity),
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		cleanupEnabled: cleanupEnabled,
 	}
 }
 
@@ -256,14 +268,19 @@ func (q *relayAuditQueue) enqueue(job relayAuditJob) bool {
 
 func (q *relayAuditQueue) worker() {
 	defer close(q.done)
-	cleanupTicker := time.NewTicker(relayAuditCleanupEvery)
-	defer cleanupTicker.Stop()
-	q.cleanup()
+	var cleanupTicker *time.Ticker
+	var cleanup <-chan time.Time
+	if q.cleanupEnabled {
+		cleanupTicker = time.NewTicker(relayAuditCleanupEvery)
+		cleanup = cleanupTicker.C
+		defer cleanupTicker.Stop()
+		q.cleanup()
+	}
 	for {
 		select {
 		case job := <-q.jobs:
 			q.run(job)
-		case <-cleanupTicker.C:
+		case <-cleanup:
 			q.cleanup()
 		case <-q.stop:
 			q.drain()
@@ -310,20 +327,37 @@ func (q *relayAuditQueue) discard(job relayAuditJob) {
 func (q *relayAuditQueue) run(job relayAuditJob) {
 	defer q.pending.Add(-1)
 	defer q.retained.Add(-job.bytes)
-	ctx, cancel := context.WithTimeout(q.ctx, relayAuditWriteTimeout)
-	defer cancel()
+	maxAttempts := 1
+	if job.kind == relayAuditJobCYBMissSample {
+		maxAttempts = 3
+	}
 	var err error
-	switch job.kind {
-	case relayAuditJobRequest:
-		err = q.db.WriteRelayAuditRequest(ctx, &job.request)
-	case relayAuditJobAttempt:
-		err = q.db.WriteRelayAuditAttempt(ctx, &job.attempt)
-	case relayAuditJobOutcome:
-		err = q.db.WriteRelayAuditOutcome(ctx, &job.outcome)
-	case relayAuditJobState:
-		err = q.db.WriteRelayAuditState(ctx, &job.state)
-	default:
-		err = fmt.Errorf("unknown relay audit job kind %d", job.kind)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(q.ctx, relayAuditWriteTimeout)
+		switch job.kind {
+		case relayAuditJobRequest:
+			err = q.db.WriteRelayAuditRequest(ctx, &job.request)
+		case relayAuditJobAttempt:
+			err = q.db.WriteRelayAuditAttempt(ctx, &job.attempt)
+		case relayAuditJobOutcome:
+			err = q.db.WriteRelayAuditOutcome(ctx, &job.outcome)
+		case relayAuditJobState:
+			err = q.db.WriteRelayAuditState(ctx, &job.state)
+		case relayAuditJobCYBMissSample:
+			err = q.db.WriteRelayCYBMissSample(ctx, &job.cybSample)
+		default:
+			err = fmt.Errorf("unknown relay audit job kind %d", job.kind)
+		}
+		cancel()
+		if err == nil || attempt == maxAttempts || q.ctx.Err() != nil {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt) * 100 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-q.ctx.Done():
+			timer.Stop()
+		}
 	}
 	if err != nil {
 		q.failed.Add(1)
@@ -413,11 +447,35 @@ func (db *DB) EnqueueRelayAuditState(input *RelayAuditStateInput) bool {
 	})
 }
 
+func (db *DB) EnqueueRelayCYBMissSample(input *RelayCYBMissSampleInput) bool {
+	if db == nil || db.relayCYBSamples == nil || input == nil {
+		return false
+	}
+	normalized := normalizeRelayCYBMissSampleInput(*input)
+	cloneRelayCYBMissSampleInput(&normalized)
+	return db.relayCYBSamples.enqueue(relayAuditJob{
+		kind: relayAuditJobCYBMissSample, cybSample: normalized, bytes: relayCYBMissSampleBytes(normalized),
+	})
+}
+
 func (db *DB) RelayAuditWriterStats() RelayAuditWriterStats {
 	if db == nil || db.relayAudit == nil {
 		return RelayAuditWriterStats{}
 	}
-	q := db.relayAudit
+	return relayAuditQueueStats(db.relayAudit)
+}
+
+func (db *DB) RelayCYBSampleWriterStats() RelayAuditWriterStats {
+	if db == nil || db.relayCYBSamples == nil {
+		return RelayAuditWriterStats{}
+	}
+	return relayAuditQueueStats(db.relayCYBSamples)
+}
+
+func relayAuditQueueStats(q *relayAuditQueue) RelayAuditWriterStats {
+	if q == nil {
+		return RelayAuditWriterStats{}
+	}
 	return RelayAuditWriterStats{
 		Enqueued: q.enqueued.Load(), Completed: q.completed.Load(), Dropped: q.dropped.Load(),
 		Failed: q.failed.Load(), Pending: q.pending.Load(), RetainedBytes: q.retained.Load(),
@@ -425,13 +483,15 @@ func (db *DB) RelayAuditWriterStats() RelayAuditWriterStats {
 }
 
 func (db *DB) WaitRelayAuditIdle(ctx context.Context) bool {
-	if db == nil || db.relayAudit == nil {
+	if db == nil {
 		return true
 	}
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if db.relayAudit.pending.Load() == 0 {
+		routeIdle := db.relayAudit == nil || db.relayAudit.pending.Load() == 0
+		sampleIdle := db.relayCYBSamples == nil || db.relayCYBSamples.pending.Load() == 0
+		if routeIdle && sampleIdle {
 			return true
 		}
 		select {
@@ -778,9 +838,16 @@ func (db *DB) CleanupRelayAuditBefore(ctx context.Context, cutoff time.Time) err
 			return err
 		}
 		if deleted == 0 {
-			return nil
+			break
 		}
 	}
+	return db.withSQLiteWriteLock(ctx, func() error {
+		_, err := db.conn.ExecContext(ctx,
+			`DELETE FROM rb_cyb_learning_events WHERE created_at < $1`,
+			db.timeArg(cutoff),
+		)
+		return err
+	})
 }
 
 func (db *DB) cleanupRelayAuditRequestBatch(ctx context.Context, cutoff time.Time, limit int) (int, error) {
@@ -835,6 +902,9 @@ func (db *DB) cleanupRelayAuditRequestBatch(ctx context.Context, cutoff time.Tim
 			args[index] = requestID
 		}
 		inClause := strings.Join(placeholders, ",")
+		if _, err := tx.ExecContext(ctx, `DELETE FROM rb_cyb_miss_samples WHERE request_id IN (`+inClause+`)`, args...); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM rb_route_attempts WHERE request_id IN (`+inClause+`)`, args...); err != nil {
 			return err
 		}
@@ -1281,6 +1351,9 @@ type RelayAuditCaseQuery struct {
 	End      time.Time
 	Page     int
 	PageSize int
+	// SummaryOnly keeps paged responses lightweight. Full request text and the
+	// attempt chain remain available from GetRelayAuditCaseDetail.
+	SummaryOnly bool
 }
 
 type RelayAuditCasesPage struct {
@@ -1292,43 +1365,50 @@ type RelayAuditCasesPage struct {
 	WindowEnd   time.Time         `json:"window_end"`
 }
 
+type RelayAuditCaseDetail struct {
+	Case    *RelayAuditCase     `json:"case"`
+	CYBMiss *RelayCYBMissSample `json:"cyb_miss,omitempty"`
+	Rule    *RelayCYBRule       `json:"rule,omitempty"`
+}
+
 type RelayAuditCase struct {
-	RequestID             string              `json:"request_id"`
-	CreatedAt             time.Time           `json:"created_at"`
-	UpdatedAt             time.Time           `json:"updated_at"`
-	CompletedAt           *time.Time          `json:"completed_at,omitempty"`
-	Endpoint              string              `json:"endpoint"`
-	Model                 string              `json:"model"`
-	APIKeyID              int64               `json:"api_key_id"`
-	APIKeyName            string              `json:"api_key_name"`
-	APIKeyMasked          string              `json:"api_key_masked"`
-	ClientIP              string              `json:"client_ip"`
-	TextPreview           string              `json:"text_preview"`
-	FullText              string              `json:"full_text"`
-	PayloadBytes          int64               `json:"payload_bytes"`
-	ScannedBytes          int64               `json:"scanned_bytes"`
-	ScanTruncated         bool                `json:"scan_truncated"`
-	ScanDetails           string              `json:"scan_details"`
-	RouteSource           string              `json:"route_source"`
-	RouteReason           string              `json:"route_reason"`
-	RouteSignals          string              `json:"route_signals"`
-	RouteGroupID          int64               `json:"route_group_id"`
-	HasPreviousResponseID bool                `json:"has_previous_response_id"`
-	ReplayStatus          string              `json:"replay_status"`
-	ReplaySource          string              `json:"replay_source"`
-	StateFallbackReason   string              `json:"state_fallback_reason"`
-	DetectorMiss          bool                `json:"detector_miss"`
-	RouteViolation        bool                `json:"route_violation"`
-	GroupExhausted        bool                `json:"group_exhausted"`
-	FinalAccountID        int64               `json:"final_account_id"`
-	FinalAccountName      string              `json:"final_account_name"`
-	FinalAccountType      string              `json:"final_account_type"`
-	FinalStatusCode       int                 `json:"final_status_code"`
-	FinalErrorKind        string              `json:"final_error_kind"`
-	FinalErrorMessage     string              `json:"final_error_message"`
-	FinalTransport        string              `json:"final_transport"`
-	AttemptCount          int                 `json:"attempt_count"`
-	Attempts              []RelayAuditAttempt `json:"attempts"`
+	RequestID             string                   `json:"request_id"`
+	CreatedAt             time.Time                `json:"created_at"`
+	UpdatedAt             time.Time                `json:"updated_at"`
+	CompletedAt           *time.Time               `json:"completed_at,omitempty"`
+	Endpoint              string                   `json:"endpoint"`
+	Model                 string                   `json:"model"`
+	APIKeyID              int64                    `json:"api_key_id"`
+	APIKeyName            string                   `json:"api_key_name"`
+	APIKeyMasked          string                   `json:"api_key_masked"`
+	ClientIP              string                   `json:"client_ip"`
+	TextPreview           string                   `json:"text_preview"`
+	FullText              string                   `json:"full_text"`
+	PayloadBytes          int64                    `json:"payload_bytes"`
+	ScannedBytes          int64                    `json:"scanned_bytes"`
+	ScanTruncated         bool                     `json:"scan_truncated"`
+	ScanDetails           string                   `json:"scan_details"`
+	RouteSource           string                   `json:"route_source"`
+	RouteReason           string                   `json:"route_reason"`
+	RouteSignals          string                   `json:"route_signals"`
+	RouteGroupID          int64                    `json:"route_group_id"`
+	HasPreviousResponseID bool                     `json:"has_previous_response_id"`
+	ReplayStatus          string                   `json:"replay_status"`
+	ReplaySource          string                   `json:"replay_source"`
+	StateFallbackReason   string                   `json:"state_fallback_reason"`
+	DetectorMiss          bool                     `json:"detector_miss"`
+	RouteViolation        bool                     `json:"route_violation"`
+	GroupExhausted        bool                     `json:"group_exhausted"`
+	FinalAccountID        int64                    `json:"final_account_id"`
+	FinalAccountName      string                   `json:"final_account_name"`
+	FinalAccountType      string                   `json:"final_account_type"`
+	FinalStatusCode       int                      `json:"final_status_code"`
+	FinalErrorKind        string                   `json:"final_error_kind"`
+	FinalErrorMessage     string                   `json:"final_error_message"`
+	FinalTransport        string                   `json:"final_transport"`
+	AttemptCount          int                      `json:"attempt_count"`
+	Attempts              []RelayAuditAttempt      `json:"attempts"`
+	CYBLearning           *RelayCYBLearningSummary `json:"cyb_learning,omitempty"`
 }
 
 type RelayAuditAttempt struct {
@@ -1803,11 +1883,15 @@ func (db *DB) ListRelayAuditCasesPage(ctx context.Context, query RelayAuditCaseQ
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM rb_route_requests WHERE `+where, startArg, endArg).Scan(&total); err != nil {
 		return nil, err
 	}
+	fullTextExpression := `COALESCE(full_text, '')`
+	if query.SummaryOnly {
+		fullTextExpression = `''`
+	}
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT request_id, created_at, updated_at, completed_at,
 		       COALESCE(endpoint, ''), COALESCE(model, ''),
 		       COALESCE(api_key_id, 0), COALESCE(api_key_name, ''), COALESCE(api_key_masked, ''),
-		       COALESCE(client_ip, ''), COALESCE(text_preview, ''), COALESCE(full_text, ''),
+		       COALESCE(client_ip, ''), COALESCE(text_preview, ''), `+fullTextExpression+`,
 		       COALESCE(payload_bytes, 0), COALESCE(scanned_bytes, 0), COALESCE(scan_truncated, FALSE),
 		       COALESCE(scan_details, '{}'), COALESCE(route_source, ''), COALESCE(route_reason, ''),
 		       COALESCE(route_signals, '[]'), COALESCE(route_group_id, 0),
@@ -1869,13 +1953,97 @@ func (db *DB) ListRelayAuditCasesPage(ctx context.Context, query RelayAuditCaseQ
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := db.attachRelayAuditAttempts(ctx, items); err != nil {
+	if !query.SummaryOnly {
+		if err := db.attachRelayAuditAttempts(ctx, items); err != nil {
+			return nil, err
+		}
+	}
+	if err := db.attachRelayCYBLearningSummaries(ctx, items); err != nil {
 		return nil, err
 	}
 	return &RelayAuditCasesPage{
 		Items: items, Total: total, Page: page, PageSize: pageSize,
 		WindowStart: query.Start, WindowEnd: query.End,
 	}, nil
+}
+
+func (db *DB) GetRelayAuditCaseDetail(ctx context.Context, requestID string) (*RelayAuditCaseDetail, error) {
+	if db == nil || db.conn == nil {
+		return nil, fmt.Errorf("database is nil")
+	}
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return nil, sql.ErrNoRows
+	}
+	item := &RelayAuditCase{Attempts: []RelayAuditAttempt{}}
+	var createdRaw, updatedRaw, completedRaw any
+	err := db.conn.QueryRowContext(ctx, `
+		SELECT request_id, created_at, updated_at, completed_at,
+		       COALESCE(endpoint, ''), COALESCE(model, ''),
+		       COALESCE(api_key_id, 0), COALESCE(api_key_name, ''), COALESCE(api_key_masked, ''),
+		       COALESCE(client_ip, ''), COALESCE(text_preview, ''), COALESCE(full_text, ''),
+		       COALESCE(payload_bytes, 0), COALESCE(scanned_bytes, 0), COALESCE(scan_truncated, FALSE),
+		       COALESCE(scan_details, '{}'), COALESCE(route_source, ''), COALESCE(route_reason, ''),
+		       COALESCE(route_signals, '[]'), COALESCE(route_group_id, 0),
+		       COALESCE(has_previous_response_id, FALSE), COALESCE(replay_status, ''),
+		       COALESCE(replay_source, ''), COALESCE(state_fallback_reason, ''),
+		       COALESCE(detector_miss, FALSE), COALESCE(route_violation, FALSE), COALESCE(group_exhausted, FALSE),
+		       COALESCE(final_account_id, 0), COALESCE(final_account_name, ''), COALESCE(final_account_type, ''),
+		       COALESCE(final_status_code, 0), COALESCE(final_error_kind, ''), COALESCE(final_error_message, ''),
+		       COALESCE(final_transport, ''),
+		       (SELECT COUNT(*) FROM rb_route_attempts audit_attempt_count
+		        WHERE audit_attempt_count.request_id = rb_route_requests.request_id)
+		FROM rb_route_requests
+		WHERE request_id = $1
+	`, requestID).Scan(
+		&item.RequestID, &createdRaw, &updatedRaw, &completedRaw,
+		&item.Endpoint, &item.Model, &item.APIKeyID, &item.APIKeyName, &item.APIKeyMasked,
+		&item.ClientIP, &item.TextPreview, &item.FullText, &item.PayloadBytes, &item.ScannedBytes,
+		&item.ScanTruncated, &item.ScanDetails, &item.RouteSource, &item.RouteReason,
+		&item.RouteSignals, &item.RouteGroupID, &item.HasPreviousResponseID,
+		&item.ReplayStatus, &item.ReplaySource, &item.StateFallbackReason,
+		&item.DetectorMiss, &item.RouteViolation, &item.GroupExhausted,
+		&item.FinalAccountID, &item.FinalAccountName, &item.FinalAccountType,
+		&item.FinalStatusCode, &item.FinalErrorKind, &item.FinalErrorMessage,
+		&item.FinalTransport, &item.AttemptCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	item.CreatedAt, err = parseDBTimeValue(createdRaw)
+	if err != nil {
+		return nil, err
+	}
+	item.UpdatedAt, err = parseDBTimeValue(updatedRaw)
+	if err != nil {
+		return nil, err
+	}
+	item.CompletedAt, err = parseOptionalRelayAuditTime(completedRaw)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.attachRelayAuditAttempts(ctx, []*RelayAuditCase{item}); err != nil {
+		return nil, err
+	}
+	if err := db.attachRelayCYBLearningSummaries(ctx, []*RelayAuditCase{item}); err != nil {
+		return nil, err
+	}
+	detail := &RelayAuditCaseDetail{Case: item}
+	sample, err := db.GetRelayCYBMissSample(ctx, requestID)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	if err == nil {
+		detail.CYBMiss = sample
+		if sample.RuleID > 0 {
+			rule, ruleErr := db.GetRelayCYBRule(ctx, sample.RuleID)
+			if ruleErr != nil && ruleErr != sql.ErrNoRows {
+				return nil, ruleErr
+			}
+			detail.Rule = rule
+		}
+	}
+	return detail, nil
 }
 
 func relayAuditCasePredicate(kind string) (string, error) {

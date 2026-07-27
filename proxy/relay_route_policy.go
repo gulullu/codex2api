@@ -31,8 +31,9 @@ const (
 
 	// v2 invalidates v1 pins that may have been created from developer/history
 	// provenance or from probe/overflow routes before those sources were scoped.
-	relayRoutePinNamespace = "relay-group-pin-v2"
-	relayRouteContextKey   = "relayRoutePlan"
+	relayRoutePinNamespace       = "relay-group-pin-v2"
+	relayRouteContextKey         = "relayRoutePlan"
+	internalRelayGroupContextKey = "internalRelayRequiredGroupID"
 
 	defaultRelayRoutePinTTL = 24 * time.Hour
 	relayRouteCacheTimeout  = 500 * time.Millisecond
@@ -93,6 +94,11 @@ type relayRoutePlan struct {
 	DetectorMiss          bool
 	RouteViolation        bool
 	GroupExhausted        bool
+	// AuditRawBody is an immutable request-lifetime reference. It is never
+	// persisted for ordinary traffic and is cleared immediately after a real
+	// OAuth cyber_policy miss is captured.
+	AuditRawBody         []byte
+	LearningCaseCaptured bool
 }
 
 func loadRelayRouteConfig() relayRouteConfig {
@@ -116,6 +122,17 @@ func loadRelayRouteConfig() relayRouteConfig {
 		cfg.Enabled = false
 	}
 	return cfg
+}
+
+// ConfiguredCYBRelayGroupID exposes only the resolved numeric group target for
+// administrative learning status and model validation. No credential or
+// upstream endpoint is returned.
+func ConfiguredCYBRelayGroupID() int64 {
+	cfg := loadRelayRouteConfig()
+	if !cfg.Enabled {
+		return 0
+	}
+	return cfg.GroupID
 }
 
 func defaultRelayRoutePlan(cfg relayRouteConfig) relayRoutePlan {
@@ -168,12 +185,27 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	plan := defaultRelayRoutePlan(cfg)
 	plan.Endpoint = strings.TrimSpace(endpoint)
 	plan.Model = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	if c != nil && c.GetBool(skipCYBLearningPipelineContextKey) {
+		if value, exists := c.Get(internalRelayGroupContextKey); exists {
+			if groupID, ok := value.(int64); ok && groupID > 0 {
+				plan.Config = relayRouteConfig{Enabled: true, GroupID: groupID, PinTTL: cfg.PinTTL}
+				plan.RequiredGroupID = groupID
+				plan.Source = "internal_cyb_learning"
+				plan.Origin = plan.Source
+				plan.Reason = "internal_relay_group"
+				plan.SkipPinPersistence = true
+				setRelayRoutePlanContext(c, &plan)
+				return &plan, nil
+			}
+		}
+	}
 	if !cfg.Enabled || c == nil {
 		setRelayRoutePlanContext(c, &plan)
 		return &plan, nil
 	}
 	plan.AuditRequestID = database.NewRelayAuditRequestID()
 	plan.AuditCreatedAt = time.Now()
+	plan.AuditRawBody = rawBody
 
 	apiKeyID := requestAPIKeyID(c)
 	plan.PinCandidates = relayRoutePinCandidates(c, rawBody, apiKeyID)
@@ -184,7 +216,12 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	probeSignature, probe := cybroute.DetectProbe(rawBody, endpoint)
 	var result cybroute.Result
 	if h != nil && h.store != nil {
-		result = cybroute.Inspect(rawBody, endpoint, plan.Model, h.store.GetPromptFilterConfig())
+		result = cybroute.Inspect(
+			rawBody,
+			endpoint,
+			plan.Model,
+			h.store.GetPromptFilterConfig(),
+		)
 	}
 	plan.AuditScanTruncated = result.Truncated
 	plan.AuditScanDetails = relayRouteScanDetailsJSON(result)
@@ -204,8 +241,8 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 		plan.RequiredGroupID = cfg.GroupID
 		plan.Source = relayRouteSourceRule
 		plan.Origin = relayRouteSourceRule
-		plan.Reason = firstRelayRouteSignal(result.Signals)
 		plan.Signals = append([]string(nil), result.Signals...)
+		plan.Reason = firstRelayRouteSignal(plan.Signals)
 	case plan.FeedbackDigestValid && globalRelayCybFeedback.contains(plan.FeedbackDigest):
 		plan.RequiredGroupID = cfg.GroupID
 		plan.Source = relayRouteSourceFeedback

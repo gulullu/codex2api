@@ -43,28 +43,29 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store                  *auth.Store
-	cache                  cache.TokenCache
-	db                     *database.DB
-	rateLimiter            *proxy.RateLimiter
-	systemUpdate           *systemUpdater
-	systemUpdateOnce       sync.Once
-	refreshAccount         func(context.Context, int64) error
-	probeUsage             func(context.Context, *auth.Account) error
-	syncAccountPlanOnReset func(context.Context, *auth.Account) error
-	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
-	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
-	recordAccountEvent     func(int64, string, string)
-	cpuSampler             *cpuSampler
-	startedAt              time.Time
-	pgMaxConns             int
-	redisPoolSize          int
-	databaseDriver         string
-	databaseLabel          string
-	cacheDriver            string
-	cacheLabel             string
-	adminSecretEnv         string
-	imageProxy             *proxy.Handler
+	store                     *auth.Store
+	cache                     cache.TokenCache
+	db                        *database.DB
+	rateLimiter               *proxy.RateLimiter
+	systemUpdate              *systemUpdater
+	systemUpdateOnce          sync.Once
+	refreshAccount            func(context.Context, int64) error
+	probeUsage                func(context.Context, *auth.Account) error
+	syncAccountPlanOnReset    func(context.Context, *auth.Account) error
+	queryResetCredits         func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit        func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	recordAccountEvent        func(int64, string, string)
+	cpuSampler                *cpuSampler
+	startedAt                 time.Time
+	pgMaxConns                int
+	redisPoolSize             int
+	databaseDriver            string
+	databaseLabel             string
+	cacheDriver               string
+	cacheLabel                string
+	adminSecretEnv            string
+	imageProxy                *proxy.Handler
+	relayCYBLearningStartOnce sync.Once
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -575,6 +576,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/intelligence/rules", h.AddPromptIntelligenceCandidate)
 	api.GET("/relay-audit/report", h.GetRelayAuditReport)
 	api.GET("/relay-audit/cases", h.GetRelayAuditCases)
+	api.GET("/relay-audit/cases/:request_id", h.GetRelayAuditCaseDetail)
+	api.GET("/relay-audit/learning/config", h.GetRelayCYBLearningConfig)
+	api.PUT("/relay-audit/learning/config", h.UpdateRelayCYBLearningConfig)
+	api.GET("/relay-audit/learning/rules", h.ListRelayCYBLearnedRules)
 	api.GET("/relay-route/stats", h.GetRelayRouteStats)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)

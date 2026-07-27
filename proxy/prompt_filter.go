@@ -33,7 +33,7 @@ func (h *Handler) InspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 }
 
 func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
-	if c != nil && c.GetBool("prompt_intelligence_internal") {
+	if c != nil && (c.GetBool("prompt_intelligence_internal") || c.GetBool(skipCYBLearningPipelineContextKey)) {
 		return false
 	}
 	if h == nil || h.store == nil {
@@ -328,7 +328,7 @@ func applyVerifiedNewAPIAuditMeta(policyContext verifiedNewAPIPolicyContext, inp
 }
 
 func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model string, body []byte) {
-	if h == nil || h.store == nil {
+	if h == nil || h.store == nil || (c != nil && c.GetBool(skipCYBLearningPipelineContextKey)) {
 		return
 	}
 	errorCode := upstreamCyberPolicyCode(body)

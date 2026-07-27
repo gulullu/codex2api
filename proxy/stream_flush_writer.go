@@ -31,6 +31,9 @@ type streamFlushWriter struct {
 
 func (h *Handler) newStreamFlushWriter(c *gin.Context, writer io.Writer, flusher http.Flusher) *streamFlushWriter {
 	w := newStreamFlushWriter(writer, flusher)
+	if c != nil && c.GetBool(skipCYBLearningPipelineContextKey) {
+		return w
+	}
 	if h != nil && h.store != nil {
 		cfg := h.promptFilterConfigForRequest(c)
 		if cfg.Enabled && cfg.Advanced.Output.Enabled {

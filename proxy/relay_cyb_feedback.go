@@ -177,7 +177,9 @@ func (c *relayCybFeedbackCache) removeLocked(element *list.Element) {
 }
 
 func (h *Handler) observeRelayRouteUsage(c *gin.Context, input *database.UsageLogInput) {
-	if h == nil || h.store == nil || input == nil || input.AccountID <= 0 || input.UpstreamErrorKind != "cyber_policy" {
+	if h == nil || h.store == nil || input == nil || input.AccountID <= 0 ||
+		input.UpstreamErrorKind != "cyber_policy" ||
+		(c != nil && c.GetBool(skipCYBLearningPipelineContextKey)) {
 		return
 	}
 	plan, ok := relayRoutePlanFromContext(c)
@@ -196,6 +198,7 @@ func (h *Handler) observeRelayRouteUsage(c *gin.Context, input *database.UsageLo
 		return
 	}
 	h.logRelayCyberPolicyMetric(c, plan, true)
+	h.enqueueRelayCYBMissSample(plan, account)
 	if !relayCybFeedbackLearnEligible(plan, account) {
 		return
 	}

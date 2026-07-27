@@ -2,10 +2,14 @@ package proxy
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
 )
 
 func TestRelayCybFeedbackDigestUsesNormalizedLatestUserText(t *testing.T) {
@@ -107,5 +111,47 @@ func TestRelayCybFeedbackLearnsOnlyDefaultOAuthRoute(t *testing.T) {
 	disabled.Config.Enabled = false
 	if relayCybFeedbackLearnEligible(&disabled, oauth) {
 		t.Fatal("disabled Relay routing learned feedback")
+	}
+}
+
+func TestRelayCybFeedbackSkipMarkerPreventsLearning(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousFeedback := globalRelayCybFeedback
+	globalRelayCybFeedback = newRelayCybFeedbackCache()
+	t.Cleanup(func() { globalRelayCybFeedback = previousFeedback })
+
+	body := []byte(`{"model":"gpt-5.4","input":"unique internal feedback sentinel text"}`)
+	digest, ok := globalRelayCybFeedback.digest("/v1/responses", body)
+	if !ok {
+		t.Fatal("test request did not produce a feedback digest")
+	}
+	plan := &relayRoutePlan{
+		Config:              relayRouteConfig{Enabled: true, GroupID: 3},
+		Endpoint:            "/v1/responses",
+		Source:              relayRouteSourceDefault,
+		FeedbackDigest:      digest,
+		FeedbackDigestValid: true,
+		AuditRequestID:      "internal-feedback-test",
+		AuditRawBody:        body,
+	}
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{DBID: 1})
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(skipCYBLearningPipelineContextKey, true)
+	setRelayRoutePlanContext(c, plan)
+
+	handler.observeRelayRouteUsage(c, &database.UsageLogInput{
+		AccountID:         1,
+		UpstreamErrorKind: "cyber_policy",
+	})
+	if globalRelayCybFeedback.contains(digest) {
+		t.Fatal("CYB learning request recursively entered the feedback cache")
+	}
+	if plan.LearningCaseCaptured {
+		t.Fatal("CYB learning request recursively created a miss sample")
 	}
 }

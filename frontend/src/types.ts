@@ -1160,6 +1160,7 @@ export interface RelayAuditCase {
   final_transport: string
   attempt_count: number
   attempts: RelayAuditAttempt[]
+  cyb_learning?: RelayCYBLearningSummary
 }
 
 export interface RelayAuditCasesPage {
@@ -1169,6 +1170,99 @@ export interface RelayAuditCasesPage {
   page_size: number
   window_start: ISODateString
   window_end: ISODateString
+}
+
+export interface RelayCYBLearningSummary {
+  status: string
+  model: string
+  attempts: number
+  message: string
+  rule_id: number
+  rule_name: string
+  updated_at: ISODateString
+  account_id: number
+  account_name: string
+  account_type: string
+  request_truncated: boolean
+}
+
+export interface RelayCYBMissSample {
+  request_id: string
+  created_at: ISODateString
+  updated_at: ISODateString
+  account_id: number
+  account_name: string
+  account_type: string
+  redacted_request: string
+  user_text: string
+  request_truncated: boolean
+  learning_status: string
+  learning_model: string
+  learning_attempts: number
+  next_attempt_at?: ISODateString
+  learning_error: string
+  rule_id: number
+  learned_at?: ISODateString
+}
+
+export interface RelayCYBRule {
+  id: number
+  name: string
+  pattern: string
+  rationale: string
+  source_request_id: string
+  model: string
+  enabled: boolean
+  disabled_reason: string
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface RelayAuditCaseDetail {
+  case: RelayAuditCase
+  cyb_miss?: RelayCYBMissSample
+  rule?: RelayCYBRule
+}
+
+export interface RelayCYBLearningStats {
+  queued: number
+  processing: number
+  retry: number
+  applied: number
+  merged: number
+  rejected: number
+  failed: number
+  rules: number
+}
+
+export interface RelayCYBLearningConfig {
+  enabled: boolean
+  model: string
+  updated_at: ISODateString
+  available_models: string[]
+  relay_group_id: number
+  relay_group_name: string
+  stats: RelayCYBLearningStats
+  sample_writer: RelayAuditWriterStats
+  notifications: RelayCYBLearningNotification[]
+  internal_requests_excluded: boolean
+}
+
+export interface RelayCYBLearningNotification {
+  id: number
+  event_type: string
+  rule_id: number
+  title: string
+  message: string
+  count: number
+  created_at: ISODateString
+}
+
+export interface RelayCYBRulesPage {
+  items: RelayCYBRule[]
+  total: number
+  page: number
+  page_size: number
 }
 
 export interface PromptFilterTestResponse {

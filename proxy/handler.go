@@ -2399,7 +2399,9 @@ func (h *Handler) Responses(c *gin.Context) {
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
 							actualServiceTier = tier
 						}
-						cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, relayStreamedOutputItems)
+						if !c.GetBool(skipCYBLearningPipelineContextKey) {
+							cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, relayStreamedOutputItems)
+						}
 						gotTerminal = true
 					}
 					if eventType == "response.failed" {
@@ -2444,7 +2446,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
-					cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, respBody, nil)
+					if !c.GetBool(skipCYBLearningPipelineContextKey) {
+						cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, respBody, nil)
+					}
 					gotTerminal = true
 					contentType := resp.Header.Get("Content-Type")
 					if contentType == "" {
@@ -2849,8 +2853,10 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
-					cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, relayReplayStreamedOutputItems)
+					if !c.GetBool(skipCYBLearningPipelineContextKey) {
+						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
+						cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, relayReplayStreamedOutputItems)
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -2989,8 +2995,10 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
-					cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, outputItems)
+					if !c.GetBool(skipCYBLearningPipelineContextKey) {
+						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
+						cacheRelayContinuationReplay(relayReplayOwner, replaySourceBody(), relayReplayRequestComplete, relayReplayResponseGroupID, data, outputItems)
+					}
 					gotTerminal = true
 					lastResponseData = data
 					return false

@@ -194,6 +194,7 @@ type DB struct {
 
 	promptFilterAudit *promptFilterAuditQueue
 	relayAudit        *relayAuditQueue
+	relayCYBSamples   *relayAuditQueue
 
 	backgroundTaskMu      sync.Mutex
 	backgroundTaskWg      sync.WaitGroup
@@ -409,6 +410,9 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if err := db.migrateRelayAudit(ctx); err != nil {
 		return nil, fmt.Errorf("Relay 审计数据库迁移失败: %w", err)
 	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		return nil, fmt.Errorf("Relay CYB 学习数据库迁移失败: %w", err)
+	}
 
 	// 启动批量写入后台协程
 	db.startLogFlusher()
@@ -452,6 +456,10 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	db.promptFilterAudit.start()
 	db.relayAudit = newRelayAuditQueue(db)
 	db.relayAudit.start()
+	// CYB miss samples can be hundreds of KiB. Keep them off the route-audit
+	// writer so a burst of learning samples cannot evict request/attempt data.
+	db.relayCYBSamples = newRelayCYBSampleQueue(db)
+	db.relayCYBSamples.start()
 
 	return db, nil
 }
@@ -505,6 +513,9 @@ func (db *DB) Close() error {
 	}
 	if db.relayAudit != nil {
 		db.relayAudit.close(2 * time.Second)
+	}
+	if db.relayCYBSamples != nil {
+		db.relayCYBSamples.close(2 * time.Second)
 	}
 	return db.conn.Close()
 }

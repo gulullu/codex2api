@@ -27,13 +27,17 @@ import { getErrorMessage } from '../utils/error'
 import { formatBeijingTime } from '../utils/time'
 import type {
   RelayAuditCase,
+  RelayAuditCaseDetail,
   RelayAuditCasesPage,
   RelayAuditReport,
+  RelayCYBLearningConfig,
+  RelayCYBLearningSummary,
 } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Select } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -114,7 +118,17 @@ export default function CodexAudit() {
   const [casesError, setCasesError] = useState<string | null>(null)
   const [refreshToken, setRefreshToken] = useState(0)
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [caseDetails, setCaseDetails] = useState<Record<string, RelayAuditCaseDetail>>({})
+  const [caseDetailLoading, setCaseDetailLoading] = useState<Set<string>>(new Set())
+  const [caseDetailErrors, setCaseDetailErrors] = useState<Record<string, string>>({})
+  const [learningConfig, setLearningConfig] = useState<RelayCYBLearningConfig | null>(null)
+  const [learningDraft, setLearningDraft] = useState({ enabled: false, model: '' })
+  const [learningLoading, setLearningLoading] = useState(true)
+  const [learningSaving, setLearningSaving] = useState(false)
+  const [learningError, setLearningError] = useState<string | null>(null)
+  const [learningSaved, setLearningSaved] = useState(false)
   const reportRequestSequence = useRef(0)
+  const casePageGeneration = useRef(0)
 
   const loadReport = useCallback(async () => {
     const sequence = ++reportRequestSequence.current
@@ -137,6 +151,20 @@ export default function CodexAudit() {
     }
   }, [hours])
 
+  const loadLearningConfig = useCallback(async () => {
+    setLearningLoading(true)
+    setLearningError(null)
+    try {
+      const config = await api.getRelayCYBLearningConfig()
+      setLearningConfig(config)
+      setLearningDraft({ enabled: config.enabled, model: config.model || '' })
+    } catch (err) {
+      setLearningError(getErrorMessage(err))
+    } finally {
+      setLearningLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     localStorage.setItem('codex_audit_hours', String(hours))
     setPage(1)
@@ -145,11 +173,20 @@ export default function CodexAudit() {
   }, [hours, loadReport, refreshToken])
 
   useEffect(() => {
+    void loadLearningConfig()
+  }, [loadLearningConfig, refreshToken])
+
+  useEffect(() => {
     if (!report) return
     let cancelled = false
+    casePageGeneration.current += 1
     setCasesLoading(true)
     setCases(null)
     setCasesError(null)
+    setExpanded(new Set())
+    setCaseDetails({})
+    setCaseDetailLoading(new Set())
+    setCaseDetailErrors({})
     void api.getRelayAuditCases({
       kind,
       start: report.window_start,
@@ -174,12 +211,53 @@ export default function CodexAudit() {
   })), [report?.timeline])
 
   const toggleExpanded = (requestID: string) => {
+    const opening = !expanded.has(requestID)
     setExpanded((current) => {
       const next = new Set(current)
       if (next.has(requestID)) next.delete(requestID)
       else next.add(requestID)
       return next
     })
+    if (!opening || caseDetails[requestID] || caseDetailLoading.has(requestID)) return
+
+    const generation = casePageGeneration.current
+    setCaseDetailLoading((current) => new Set(current).add(requestID))
+    setCaseDetailErrors((current) => {
+      const next = { ...current }
+      delete next[requestID]
+      return next
+    })
+    void api.getRelayAuditCase(requestID).then((detail) => {
+      if (generation !== casePageGeneration.current) return
+      setCaseDetails((current) => ({ ...current, [requestID]: detail }))
+    }).catch((err) => {
+      if (generation !== casePageGeneration.current) return
+      setCaseDetailErrors((current) => ({ ...current, [requestID]: getErrorMessage(err) }))
+    }).finally(() => {
+      if (generation !== casePageGeneration.current) return
+      setCaseDetailLoading((current) => {
+        const next = new Set(current)
+        next.delete(requestID)
+        return next
+      })
+    })
+  }
+
+  const saveLearningConfig = async () => {
+    if (!learningConfig || learningSaving) return
+    setLearningSaving(true)
+    setLearningError(null)
+    setLearningSaved(false)
+    try {
+      const config = await api.updateRelayCYBLearningConfig(learningDraft)
+      setLearningConfig(config)
+      setLearningDraft({ enabled: config.enabled, model: config.model || '' })
+      setLearningSaved(true)
+    } catch (err) {
+      setLearningError(getErrorMessage(err))
+    } finally {
+      setLearningSaving(false)
+    }
   }
 
   const summary = report?.summary
@@ -189,6 +267,13 @@ export default function CodexAudit() {
     + Number(summary?.probe || 0)
     + Number(summary?.oauth_overflow || 0)
     + Number(summary?.cyb_feedback || 0)
+  const learningChanged = Boolean(learningConfig)
+    && (learningDraft.enabled !== learningConfig?.enabled || learningDraft.model !== (learningConfig?.model || ''))
+  const learningModelAvailable = Boolean(learningDraft.model)
+    && Boolean(learningConfig?.available_models?.includes(learningDraft.model))
+  const learningModelOptions = useMemo(() => {
+    return (learningConfig?.available_models || []).map((model) => ({ label: model, value: model }))
+  }, [learningConfig?.available_models])
 
   return (
     <>
@@ -346,6 +431,118 @@ export default function CodexAudit() {
 
             <Card className="overflow-hidden">
               <CardContent className="p-4 sm:p-5">
+                <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-semibold">CYB 漏放自动学习</h3>
+                      {learningConfig ? (
+                        <Badge variant="outline" className={learningConfig.enabled
+                          ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                          : ''}>
+                          {learningConfig.enabled ? '已开启' : '已关闭'}
+                        </Badge>
+                      ) : null}
+                    </div>
+                    <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
+                      OAuth 实际触发 CYB 后异步总结规则；本地机械校验通过即自动启用。关闭开关会同时暂停学习与全部自动规则。学习请求固定使用下方 Relay 分组，并从审计、回放缓存与再次学习中排除。
+                    </p>
+                    {learningConfig ? (
+                      <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                        <Badge variant="outline">等待 {formatNumber(learningConfig.stats?.queued)}</Badge>
+                        <Badge variant="outline">处理中 {formatNumber(learningConfig.stats?.processing)}</Badge>
+                        <Badge variant="outline">待重试 {formatNumber(learningConfig.stats?.retry)}</Badge>
+                        <Badge variant="outline">已启用 {formatNumber(learningConfig.stats?.applied)}</Badge>
+                        <Badge variant="outline">合并旧规则 {formatNumber(learningConfig.stats?.merged)}</Badge>
+                        <Badge variant="outline">校验拒绝 {formatNumber(learningConfig.stats?.rejected)}</Badge>
+                        <Badge variant="outline">失败 {formatNumber(learningConfig.stats?.failed)}</Badge>
+                        <Badge variant="outline">规则 {formatNumber(learningConfig.stats?.rules)}</Badge>
+                        {(learningConfig.sample_writer?.dropped || learningConfig.sample_writer?.failed) ? (
+                          <Badge variant="outline" className="border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300">
+                            样本写入异常 {formatNumber((learningConfig.sample_writer?.dropped || 0) + (learningConfig.sample_writer?.failed || 0))}
+                          </Badge>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
+
+                  <div className="grid w-full shrink-0 gap-3 rounded-xl border border-border/70 bg-muted/20 p-3 sm:grid-cols-[auto_minmax(220px,1fr)_auto] sm:items-end xl:w-auto xl:min-w-[620px]">
+                    <label className="flex h-9 items-center gap-2 text-xs font-medium">
+                      <Switch
+                        checked={learningDraft.enabled}
+                        onCheckedChange={(enabled) => {
+                          setLearningDraft((current) => ({ ...current, enabled }))
+                          setLearningSaved(false)
+                        }}
+                        disabled={learningLoading || learningSaving || !learningConfig}
+                        aria-label="开启 CYB 漏放自动学习"
+                      />
+                      自动学习
+                    </label>
+                    <div>
+                      <div className="mb-1.5 text-[11px] font-medium text-muted-foreground">学习模型</div>
+                      <Select
+                        value={learningDraft.model}
+                        onValueChange={(model) => {
+                          setLearningDraft((current) => ({ ...current, model }))
+                          setLearningSaved(false)
+                        }}
+                        options={learningModelOptions}
+                        placeholder={learningLoading ? '正在加载…' : '请选择 Relay 模型'}
+                        disabled={learningLoading || learningSaving || !learningConfig}
+                        compact
+                      />
+                    </div>
+                    <Button
+                      size="sm"
+                      onClick={() => void saveLearningConfig()}
+                      disabled={!learningChanged || learningSaving || (learningDraft.enabled && !learningModelAvailable)}
+                    >
+                      {learningSaving ? '保存中…' : '保存'}
+                    </Button>
+                    <div className="sm:col-span-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                      <span>
+                        Relay 分组（只读）：{learningConfig
+                          ? learningConfig.relay_group_name || `#${learningConfig.relay_group_id || '-'}`
+                          : '正在加载…'}
+                      </span>
+                      <span>
+                        {learningConfig?.internal_requests_excluded ? '内部学习请求已隔离，不会二次触发 CYB' : '等待确认内部学习请求隔离状态'}
+                      </span>
+                      {learningDraft.model && !learningModelAvailable ? (
+                        <span className="text-amber-700 dark:text-amber-300">
+                          当前模型已不在 Relay 分组可调度列表中，请重新选择
+                        </span>
+                      ) : null}
+                      {learningConfig?.updated_at ? <span>更新于 {formatBeijingTime(learningConfig.updated_at)}</span> : null}
+                    </div>
+                  </div>
+                </div>
+                {learningError ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">{learningError}</div> : null}
+                {learningSaved ? <div className="mt-3 text-xs text-emerald-700 dark:text-emerald-300">自动学习设置已保存。</div> : null}
+                {learningConfig?.notifications?.length ? (
+                  <div className="mt-4 rounded-xl border border-border/70 bg-muted/20 p-3">
+                    <div className="mb-2 text-[11px] font-medium">最近 24 小时学习通知</div>
+                    <div className="space-y-2">
+                      {learningConfig.notifications.slice(0, 5).map((notification) => (
+                        <div key={notification.id} className="flex flex-col gap-1 rounded-lg bg-background/70 px-3 py-2 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
+                              <span>{notification.title}</span>
+                              {notification.count > 1 ? <Badge variant="outline">×{formatNumber(notification.count)}</Badge> : null}
+                            </div>
+                            <div className="mt-0.5 text-[11px] leading-5 text-muted-foreground">{notification.message}</div>
+                          </div>
+                          <span className="shrink-0 text-[10px] text-muted-foreground">{formatBeijingTime(notification.created_at)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+              </CardContent>
+            </Card>
+
+            <Card className="overflow-hidden">
+              <CardContent className="p-4 sm:p-5">
                 <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
                   <div>
                     <h3 className="text-sm font-semibold">详细案卷</h3>
@@ -371,6 +568,9 @@ export default function CodexAudit() {
                     <AuditCaseRow
                       key={item.request_id}
                       item={item}
+                      detail={caseDetails[item.request_id]}
+                      detailLoading={caseDetailLoading.has(item.request_id)}
+                      detailError={caseDetailErrors[item.request_id]}
                       open={expanded.has(item.request_id)}
                       onToggle={() => toggleExpanded(item.request_id)}
                     />
@@ -451,43 +651,142 @@ function EmptyTable({ colSpan, label }: { colSpan: number; label: string }) {
   )
 }
 
-function AuditCaseRow({ item, open, onToggle }: { item: RelayAuditCase; open: boolean; onToggle: () => void }) {
-  const signals = parsedSignals(item.route_signals)
-  const finalAccount = item.final_account_name || (item.final_account_id ? `#${item.final_account_id}` : '未记录')
+function learningStatusLabel(status?: string) {
+  const labels: Record<string, string> = {
+    queued: '等待学习',
+    processing: '学习中',
+    retry: '等待重试',
+    applied: '规则已启用',
+    merged: '已合并到旧规则',
+    rejected: '机械校验未通过',
+    failed: '学习失败',
+    skipped: '已跳过',
+  }
+  const value = (status || '').trim()
+  return labels[value] || value || '未进入学习'
+}
+
+function learningStatusTone(status?: string) {
+  switch ((status || '').trim()) {
+    case 'applied':
+    case 'merged':
+      return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+    case 'failed':
+    case 'rejected':
+      return 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300'
+    case 'processing':
+    case 'retry':
+      return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+    default:
+      return ''
+  }
+}
+
+function accountLabel(account?: Pick<RelayCYBLearningSummary, 'account_id' | 'account_name'>) {
+  if (!account) return ''
+  if (account.account_name && account.account_id) return `${account.account_name} · #${account.account_id}`
+  return account.account_name || (account.account_id ? `#${account.account_id}` : '')
+}
+
+function AuditCaseRow({
+  item,
+  detail,
+  detailLoading,
+  detailError,
+  open,
+  onToggle,
+}: {
+  item: RelayAuditCase
+  detail?: RelayAuditCaseDetail
+  detailLoading: boolean
+  detailError?: string
+  open: boolean
+  onToggle: () => void
+}) {
+  const auditCase = detail?.case || item
+  const learning = auditCase.cyb_learning || item.cyb_learning
+  const miss = detail?.cyb_miss
+  const rule = detail?.rule
+  const signals = parsedSignals(auditCase.route_signals)
+  const routedAccount = auditCase.final_account_name || (auditCase.final_account_id ? `#${auditCase.final_account_id}` : '未记录')
+  const actualCYBAccount = accountLabel(learning) || accountLabel(miss)
+  const displayedAccount = actualCYBAccount || routedAccount
+  const requestText = miss?.redacted_request || auditCase.full_text
+  const requestTruncated = miss?.request_truncated ?? learning?.request_truncated ?? auditCase.scan_truncated
+  const learningStatus = miss?.learning_status || learning?.status || ''
+  const learningModel = miss?.learning_model || learning?.model || rule?.model || ''
+  const learningAttempts = miss?.learning_attempts ?? learning?.attempts
+  const learningMessage = miss?.learning_error || learning?.message || ''
   return (
     <div className="overflow-hidden rounded-xl border border-border/70 bg-background/60">
       <button type="button" onClick={onToggle} className="flex w-full min-w-0 items-center gap-2 px-3 py-3 text-left sm:gap-3">
-        <Badge className={statusTone(item.final_status_code)}>{item.final_status_code || '未完成'}</Badge>
-        <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:inline">{formatBeijingTime(item.created_at)}</span>
-        <span className="hidden shrink-0 text-xs font-medium md:inline">{routeSourceLabel(item.route_source)}</span>
-        <span className="min-w-0 flex-1 truncate text-xs">{item.text_preview || '未保存请求预览'}</span>
-        <span className="hidden max-w-40 truncate text-xs text-muted-foreground lg:inline">{finalAccount}</span>
+        <Badge className={statusTone(auditCase.final_status_code)}>{auditCase.final_status_code || '未完成'}</Badge>
+        <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:inline">{formatBeijingTime(auditCase.created_at)}</span>
+        <span className="hidden shrink-0 text-xs font-medium md:inline">{routeSourceLabel(auditCase.route_source)}</span>
+        <span className="min-w-0 flex-1 truncate text-xs">{auditCase.text_preview || '未保存请求预览'}</span>
+        {learningStatus ? <Badge variant="outline" className={`hidden shrink-0 lg:inline-flex ${learningStatusTone(learningStatus)}`}>{learningStatusLabel(learningStatus)}</Badge> : null}
+        <span className="hidden max-w-40 truncate text-xs text-muted-foreground xl:inline">{displayedAccount}</span>
         <ChevronDown className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
       {open ? (
         <div className="space-y-3 border-t border-border/70 p-3">
+          {detailLoading ? <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">正在加载完整案卷…</div> : null}
+          {detailError ? <div className="rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">完整案卷加载失败：{detailError}</div> : null}
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-            <span>请求 {item.request_id}</span>
-            <span>{item.endpoint || '-'} · {item.model || '-'}</span>
-            <span>API Key {item.api_key_name || item.api_key_masked || `#${item.api_key_id || '-'}`}</span>
-            <span>客户端 {item.client_ip || '-'}</span>
-            <span>最终账号 {finalAccount}</span>
-            <span>传输 {item.final_transport || '-'}</span>
-            <span>尝试 {formatNumber(item.attempt_count)}</span>
-            {item.has_previous_response_id ? <span>携带 previous_response_id</span> : null}
-            {item.replay_status ? <span>回放 {item.replay_status}{item.replay_source ? ` / ${item.replay_source}` : ''}</span> : null}
-            {item.scan_truncated ? <span className="text-amber-700 dark:text-amber-300">扫描内容已按上限截断</span> : null}
+            <span>请求 {auditCase.request_id}</span>
+            <span>{auditCase.endpoint || '-'} · {auditCase.model || '-'}</span>
+            <span>API Key {auditCase.api_key_name || auditCase.api_key_masked || `#${auditCase.api_key_id || '-'}`}</span>
+            <span>客户端 {auditCase.client_ip || '-'}</span>
+            <span>最终路由账号 {routedAccount}</span>
+            {actualCYBAccount ? <span className="font-medium text-foreground">实际触发 CYB 账号 {actualCYBAccount}</span> : null}
+            {learning?.account_type || miss?.account_type ? <span>账号类型 {learning?.account_type || miss?.account_type}</span> : null}
+            <span>传输 {auditCase.final_transport || '-'}</span>
+            <span>尝试 {formatNumber(auditCase.attempt_count)}</span>
+            {auditCase.has_previous_response_id ? <span>携带 previous_response_id</span> : null}
+            {auditCase.replay_status ? <span>回放 {auditCase.replay_status}{auditCase.replay_source ? ` / ${auditCase.replay_source}` : ''}</span> : null}
+            {requestTruncated ? <span className="text-amber-700 dark:text-amber-300">原始请求已按保存上限截断</span> : null}
           </div>
           {signals.length ? (
             <div className="flex flex-wrap gap-1.5">
               {signals.map((signal) => <Badge key={signal} variant="outline" className="font-mono text-[10px]">{signal}</Badge>)}
             </div>
           ) : null}
-          {item.attempts?.length ? (
+          {learningStatus ? (
+            <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="text-[11px] font-medium">自动学习</div>
+                <Badge variant="outline" className={learningStatusTone(learningStatus)}>{learningStatusLabel(learningStatus)}</Badge>
+                {learningModel ? <Badge variant="outline">模型 {learningModel}</Badge> : null}
+                {learningAttempts !== undefined ? <Badge variant="outline">尝试 {formatNumber(learningAttempts)}</Badge> : null}
+                {miss?.next_attempt_at ? <span className="text-[11px] text-muted-foreground">下次重试 {formatBeijingTime(miss.next_attempt_at)}</span> : null}
+                {miss?.learned_at ? <span className="text-[11px] text-muted-foreground">完成于 {formatBeijingTime(miss.learned_at)}</span> : null}
+              </div>
+              {learningMessage ? <div className="mt-2 text-xs text-red-700 dark:text-red-300">{learningMessage}</div> : null}
+              {rule ? (
+                <div className="mt-3 space-y-2 border-t border-border/70 pt-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-medium">启用规则：{rule.name || `#${rule.id}`}</span>
+                    <Badge variant="outline" className={rule.enabled
+                      ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                      : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'}>
+                      {rule.enabled ? '已启用' : '未启用'}
+                    </Badge>
+                    {rule.model ? <span className="text-[11px] text-muted-foreground">{rule.model}</span> : null}
+                  </div>
+                  <pre className="overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/45 p-2.5 font-mono text-[11px] leading-5">{rule.pattern || '（未保存规则表达式）'}</pre>
+                  {rule.rationale ? <div className="text-xs leading-5 text-muted-foreground">{rule.rationale}</div> : null}
+                  {rule.disabled_reason ? <div className="text-xs text-amber-700 dark:text-amber-300">{rule.disabled_reason}</div> : null}
+                </div>
+              ) : learning?.rule_id ? (
+                <div className="mt-2 text-xs text-muted-foreground">启用规则：{learning.rule_name || `#${learning.rule_id}`}</div>
+              ) : null}
+            </div>
+          ) : null}
+          {auditCase.attempts?.length ? (
             <div>
               <div className="mb-2 text-[11px] font-medium">上游尝试链路</div>
               <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                {item.attempts.map((attempt, index) => (
+                {auditCase.attempts.map((attempt, index) => (
                   <div key={`${attempt.id}-${attempt.attempt_index}`} className="contents">
                     {index ? <span className="text-muted-foreground">→</span> : null}
                     <span
@@ -504,8 +803,22 @@ function AuditCaseRow({ item, open, onToggle }: { item: RelayAuditCase; open: bo
               </div>
             </div>
           ) : null}
-          {item.final_error_message ? <div className="rounded-md border border-red-500/20 bg-red-500/[0.06] p-2.5 text-xs text-red-700 dark:text-red-300">{item.final_error_message}</div> : null}
-          <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/45 p-3 text-xs leading-5">{item.full_text || '（没有保存可展示的请求正文）'}</pre>
+          {auditCase.final_error_message ? <div className="rounded-md border border-red-500/20 bg-red-500/[0.06] p-2.5 text-xs text-red-700 dark:text-red-300">{auditCase.final_error_message}</div> : null}
+          <div>
+            <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] font-medium">
+              <span>{miss ? '原始请求（已脱敏）' : '扫描到的请求正文（已脱敏）'}</span>
+              {requestTruncated ? <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">已截断</Badge> : null}
+            </div>
+            <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/45 p-3 text-xs leading-5">
+              {detailLoading && !requestText ? '（正在加载）' : requestText || '（没有保存可展示的请求正文）'}
+            </pre>
+          </div>
+          {miss?.user_text ? (
+            <details className="rounded-lg border border-border/70 bg-muted/20">
+              <summary className="cursor-pointer px-3 py-2 text-[11px] font-medium">查看供模型总结的用户文本（已脱敏）</summary>
+              <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-words border-t border-border/70 p-3 text-xs leading-5">{miss.user_text}</pre>
+            </details>
+          ) : null}
         </div>
       ) : null}
     </div>

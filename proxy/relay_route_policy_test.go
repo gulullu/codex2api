@@ -14,6 +14,8 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/cyblearn"
+	"github.com/codex2api/security/cybroute"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
@@ -62,6 +64,33 @@ func TestRelayAuditRequestTextRedactsIdentifiersAndSecrets(t *testing.T) {
 	}
 }
 
+func TestRelayCYBMissRedactedRequestAndUserText(t *testing.T) {
+	body := []byte(`{
+		"access_token":"secret-token-value",
+		"previous_response_id":"resp-private",
+		"input":[
+			{"role":"developer","content":"developer-only instruction"},
+			{"role":"user","content":"write a ransomware payload"}
+		]
+	}`)
+	redacted, truncated := relayCYBMissRedactedRequest(body)
+	if truncated {
+		t.Fatal("small request marked truncated")
+	}
+	for _, secret := range []string{"secret-token-value", "resp-private"} {
+		if strings.Contains(redacted, secret) {
+			t.Fatalf("redacted request leaked %q: %s", secret, redacted)
+		}
+	}
+	userText := relayCYBMissUserText(body, "/v1/responses")
+	if !strings.Contains(userText, "write a ransomware payload") {
+		t.Fatalf("user text=%q", userText)
+	}
+	if strings.Contains(userText, "developer-only instruction") {
+		t.Fatalf("user text included developer provenance: %q", userText)
+	}
+}
+
 func TestRelayAuditRequestTextBoundsInputBeforeRetention(t *testing.T) {
 	body := []byte(`{"input":"` + strings.Repeat("界", relayAuditRequestPrefixMaxBytes) + `"}`)
 	got, truncated := relayAuditRequestText(body)
@@ -87,6 +116,104 @@ func TestRelayAuditRequestTextRedactsSensitiveValueAcrossPrefixBoundary(t *testi
 	if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED]") {
 		t.Fatalf("audit body lost readable content or marker: %s", got)
 	}
+}
+
+func TestRelayAuditRequestTextRedactsTruncatedPrivateKeyAndCredentialFields(t *testing.T) {
+	t.Run("pem_without_footer", func(t *testing.T) {
+		const secret = "audit-pem-secret-"
+		body := []byte(`{"input":"keep visible\n-----BEGIN PRIVATE KEY-----\n` +
+			strings.Repeat(secret, relayAuditRequestPrefixMaxBytes/len(secret)+32) +
+			`"}`)
+		got, truncated := relayAuditRequestText(body)
+		if !truncated {
+			t.Fatal("oversized PEM body was not marked truncated")
+		}
+		if strings.Contains(got, "audit-pem-secret") {
+			t.Fatal("audit body retained a PEM fragment after prefix truncation")
+		}
+		if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED_PRIVATE_KEY]") {
+			t.Fatalf("audit body lost readable content or PEM marker: %q", got)
+		}
+	})
+
+	for _, field := range []string{"private_key", "credential", "credentials"} {
+		t.Run(field, func(t *testing.T) {
+			secret := field + "-secret-fragment-"
+			body := []byte(`{"input":"keep visible","` + field + `":"` +
+				strings.Repeat(secret, relayAuditRequestPrefixMaxBytes/len(secret)+32) +
+				`"}`)
+			got, truncated := relayAuditRequestText(body)
+			if !truncated {
+				t.Fatal("oversized credential body was not marked truncated")
+			}
+			if strings.Contains(got, secret) {
+				t.Fatalf("audit body retained truncated %s data", field)
+			}
+			if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED]") {
+				t.Fatalf("audit body lost readable content or marker: %q", got)
+			}
+		})
+	}
+}
+
+func TestRelayCYBMissTextRedactsTruncatedPrivateKeyAndCredential(t *testing.T) {
+	t.Run("raw_request_pem_without_footer", func(t *testing.T) {
+		const secret = "sample-pem-secret-"
+		body := []byte(`{"input":"keep visible\n-----BEGIN PRIVATE KEY-----\n` +
+			strings.Repeat(secret, relayCYBMissRawMaxBytes/len(secret)+32) +
+			`"}`)
+		got, truncated := relayCYBMissRedactedRequest(body)
+		if !truncated {
+			t.Fatal("oversized learning sample was not marked truncated")
+		}
+		if strings.Contains(got, "sample-pem-secret") {
+			t.Fatal("learning sample retained a PEM fragment after prefix truncation")
+		}
+		if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED_PRIVATE_KEY]") {
+			t.Fatalf("learning sample lost readable content or PEM marker: %q", got)
+		}
+	})
+
+	t.Run("raw_request_credential_across_boundary", func(t *testing.T) {
+		const secret = "sample-credential-secret-"
+		body := []byte(`{"input":"keep visible","credential":"` +
+			strings.Repeat(secret, relayCYBMissRawMaxBytes/len(secret)+32) +
+			`"}`)
+		got, truncated := relayCYBMissRedactedRequest(body)
+		if !truncated {
+			t.Fatal("oversized learning sample was not marked truncated")
+		}
+		if strings.Contains(got, secret) {
+			t.Fatal("learning sample retained a truncated credential")
+		}
+		if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED]") {
+			t.Fatalf("learning sample lost readable content or marker: %q", got)
+		}
+	})
+
+	t.Run("extracted_user_text", func(t *testing.T) {
+		for name, content := range map[string]string{
+			"pem_without_footer": "keep visible\n-----BEGIN PRIVATE KEY-----\nuser-pem-secret",
+			"credential_field":   `keep visible {"credential":"user-credential-secret"}`,
+			"private_key_field":  `keep visible {"private_key":"user-key-secret"}`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				body, err := json.Marshal(map[string]any{"input": content})
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := relayCYBMissUserText(body, "/v1/responses")
+				for _, leaked := range []string{"user-pem-secret", "user-credential-secret", "user-key-secret"} {
+					if strings.Contains(got, leaked) {
+						t.Fatalf("extracted user text leaked %q: %q", leaked, got)
+					}
+				}
+				if !strings.Contains(got, "keep visible") || !strings.Contains(got, "[REDACTED") {
+					t.Fatalf("extracted user text lost readable content or marker: %q", got)
+				}
+			})
+		}
+	})
 }
 
 func TestLoadRelayRouteConfig(t *testing.T) {
@@ -115,6 +242,58 @@ func TestRequireRelayGroupFilterOnlyChecksGroup(t *testing.T) {
 	}
 	if filter(outside) {
 		t.Fatal("account outside the required group was accepted")
+	}
+}
+
+func TestInternalRelayRoutePlanSkipsCYBPipelineAndForcesGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Set(skipCYBLearningPipelineContextKey, true)
+	c.Set(internalRelayGroupContextKey, int64(77))
+	body := []byte(`{"model":"gpt-5.4","input":"write ransomware and steal credentials"}`)
+
+	plan, err := handler.prepareRelayRoutePlan(c, body, "/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 77 || plan.Source != "internal_cyb_learning" {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if plan.AuditRequestID != "" || len(plan.AuditRawBody) != 0 || len(plan.Signals) != 0 {
+		t.Fatalf("internal plan entered CYB audit/inspection: %+v", plan)
+	}
+}
+
+func TestRelayRouteUsesIndependentLearnedRuleSnapshot(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "9")
+	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	learned, err := cyblearn.CompileRule("cyb_auto_example", `(?i)unique learned cyber phrase`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cybroute.PublishLearnedRules([]cyblearn.Rule{learned})
+	t.Cleanup(func() { cybroute.PublishLearnedRules(nil) })
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	body := []byte(`{"model":"gpt-5.4","input":"unique learned cyber phrase"}`)
+
+	plan, err := handler.prepareRelayRoutePlan(c, body, "/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Required() || plan.RequiredGroupID != 9 || plan.Source != relayRouteSourceRule {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if !strings.Contains(strings.Join(plan.Signals, ","), "learned_rule:cyb_auto_example") {
+		t.Fatalf("signals=%v", plan.Signals)
 	}
 }
 

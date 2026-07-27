@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codex2api/security/cyblearn"
 	"github.com/codex2api/security/promptfilter"
 )
 
@@ -46,6 +47,69 @@ func hasSignal(result Result, signal string) bool {
 		}
 	}
 	return false
+}
+
+func TestLearnedRuleUsesOnlyRoutingProvenance(t *testing.T) {
+	rule, err := cyblearn.CompileRule("cyb_auto_unique", `(?i)learned-danger-sentinel`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := baseConfig()
+	userResult := InspectWithLearnedPatterns(
+		responsesBody(t, "learned-danger-sentinel"),
+		"/v1/responses",
+		"gpt-5.5",
+		cfg,
+		[]cyblearn.Rule{rule},
+	)
+	if !userResult.Route || !hasSignal(userResult, "learned_rule:cyb_auto_unique") {
+		t.Fatalf("user-authored learned rule did not route: %+v", userResult)
+	}
+	developerResult := InspectWithLearnedPatterns(
+		responsesBodyWithInstructions(t, "learned-danger-sentinel", "Please summarize the status."),
+		"/v1/responses",
+		"gpt-5.5",
+		cfg,
+		[]cyblearn.Rule{rule},
+	)
+	if hasSignal(developerResult, "learned_rule:cyb_auto_unique") {
+		t.Fatalf("developer text triggered learned rule: %+v", developerResult)
+	}
+}
+
+func TestInspectReadsIndependentPublishedLearnedRuleSnapshot(t *testing.T) {
+	PublishLearnedRules(nil)
+	t.Cleanup(func() { PublishLearnedRules(nil) })
+
+	rule, err := cyblearn.CompileRule("cyb_auto_runtime", `(?i)runtime-learned-danger-sentinel`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := []cyblearn.Rule{rule}
+	PublishLearnedRules(published)
+	published[0] = cyblearn.Rule{}
+
+	cfg := baseConfig()
+	body := responsesBody(t, "runtime-learned-danger-sentinel")
+	result := Inspect(body, "/v1/responses", "gpt-5.5", cfg)
+	if !result.Route || !hasSignal(result, "learned_rule:cyb_auto_runtime") {
+		t.Fatalf("published learned rule did not route: %+v", result)
+	}
+
+	snapshot := LearnedRulesSnapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("snapshot length = %d, want 1", len(snapshot))
+	}
+	snapshot[0] = cyblearn.Rule{}
+	result = Inspect(body, "/v1/responses", "gpt-5.5", cfg)
+	if !hasSignal(result, "learned_rule:cyb_auto_runtime") {
+		t.Fatalf("snapshot caller mutated live routing rules: %+v", result)
+	}
+
+	explicit := InspectWithLearnedPatterns(body, "/v1/responses", "gpt-5.5", cfg, nil)
+	if hasSignal(explicit, "learned_rule:cyb_auto_runtime") {
+		t.Fatalf("explicit inspection unexpectedly read runtime snapshot: %+v", explicit)
+	}
 }
 
 func TestInspectProductionOnlyPatterns(t *testing.T) {

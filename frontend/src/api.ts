@@ -58,7 +58,10 @@ import type {
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
   RelayAuditCasesPage,
+  RelayAuditCaseDetail,
   RelayAuditReport,
+  RelayCYBLearningConfig,
+  RelayCYBRulesPage,
   RelayRouteStats,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
@@ -815,6 +818,17 @@ export const api = {
     })
     return request<RelayAuditCasesPage>(`/relay-audit/cases?${search.toString()}`)
   },
+  getRelayAuditCase: (requestID: string) =>
+    request<RelayAuditCaseDetail>(`/relay-audit/cases/${encodeURIComponent(requestID)}`),
+  getRelayCYBLearningConfig: () =>
+    request<RelayCYBLearningConfig>('/relay-audit/learning/config'),
+  updateRelayCYBLearningConfig: (data: { enabled: boolean; model: string }) =>
+    request<RelayCYBLearningConfig>('/relay-audit/learning/config', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  getRelayCYBLearningRules: (page = 1, pageSize = 20) =>
+    request<RelayCYBRulesPage>(`/relay-audit/learning/rules?page=${page}&page_size=${pageSize}`),
   runPromptIntelligence: () =>
     request<import('./types').PromptIntelligenceRun>('/prompt-filter/intelligence/run', { method: 'POST' }),
   getPromptIntelligenceHistory: (page = 1, pageSize = 20) =>

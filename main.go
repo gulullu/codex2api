@@ -339,6 +339,7 @@ func main() {
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterExternalImageRoutes(r, handler)
 	adminHandler.StartPromptIntelligence(backgroundCtx)
+	adminHandler.StartRelayCYBLearning(backgroundCtx)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
