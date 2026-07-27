@@ -242,6 +242,10 @@ func normalizeRelayCYBMissSampleInput(input RelayCYBMissSampleInput) RelayCYBMis
 		relayCYBMissRequestMaxRunes,
 		input.RequestTruncated,
 	)
+	// JSON strings may legally contain an escaped \u0000. After decoding that
+	// becomes a NUL byte, which PostgreSQL text columns reject. Preserve the
+	// surrounding learning evidence while making every writer backend-safe.
+	input.UserText = strings.ReplaceAll(input.UserText, "\x00", "\uFFFD")
 	input.UserText, _ = boundRelayCYBText(input.UserText, relayCYBMissUserTextMaxRunes, false)
 	if !input.CreatedAt.IsZero() {
 		input.CreatedAt = input.CreatedAt.UTC()

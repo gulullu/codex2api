@@ -30,7 +30,7 @@ func TestBackfillLegacyRelayCYBMissSamplesRepairsPrefixAndIsIdempotent(t *testin
 			{"role":"system","content":"system text must not be learned"},
 			{"role":"user","content":"older dangerous user intent"},
 			{"role":"assistant","content":"assistant text must not be learned"},
-			{"role":"user","content":"current dangerous user intent`,
+			{"role":"user","content":"current dangerous user intent\u0000with suffix`,
 		ScanTruncated: true,
 	}, "oauth")
 	writeLegacyCYBAuditCase(t, db, database.RelayAuditRequestInput{
@@ -62,8 +62,12 @@ func TestBackfillLegacyRelayCYBMissSamplesRepairsPrefixAndIsIdempotent(t *testin
 	}
 	if recovered.LearningStatus != database.RelayCYBLearningStatusQueued ||
 		!strings.Contains(recovered.UserText, "current dangerous user intent") ||
+		!strings.Contains(recovered.UserText, "with suffix") ||
 		!strings.Contains(recovered.UserText, "older dangerous user intent") {
 		t.Fatalf("recovered sample = %+v", recovered)
+	}
+	if strings.ContainsRune(recovered.UserText, '\x00') {
+		t.Fatalf("NUL was persisted in learning text: %q", recovered.UserText)
 	}
 	if strings.Contains(recovered.UserText, "system text") ||
 		strings.Contains(recovered.UserText, "assistant text") {
