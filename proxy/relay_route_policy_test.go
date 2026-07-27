@@ -14,6 +14,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
@@ -216,6 +217,48 @@ func TestOrdinaryRequestWithPinMissStaysOnOfficialRoute(t *testing.T) {
 	}
 }
 
+func TestLegacyRelayRoutePinNamespaceIsIgnored(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	runtimeCache := cache.NewMemory(1)
+	handler := &Handler{}
+	handler.SetRuntimeCache(runtimeCache)
+
+	candidates := relayRoutePinCandidates(c, nil, 11)
+	if len(candidates) != 1 {
+		t.Fatalf("pin candidates = %+v", candidates)
+	}
+	raw, err := json.Marshal(relayRoutePinValue{GroupID: 3, Source: relayRouteSourceRule})
+	if err != nil {
+		t.Fatalf("marshal legacy pin: %v", err)
+	}
+	if err := runtimeCache.SetRuntime(
+		c.Request.Context(),
+		"relay-group-pin-v1",
+		candidates[0].Key,
+		raw,
+		time.Hour,
+	); err != nil {
+		t.Fatalf("set legacy pin: %v", err)
+	}
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("ordinary request returned an error: %v", err)
+	}
+	if plan.Required() || plan.Source != relayRouteSourceDefault || plan.StateFallbackLogged {
+		t.Fatalf("legacy pin affected the new namespace: %+v", plan)
+	}
+}
+
 func TestProbeWithoutStableScopeRoutesRelayWithoutError(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
@@ -235,8 +278,110 @@ func TestProbeWithoutStableScopeRoutesRelayWithoutError(t *testing.T) {
 	if !plan.Required() || plan.RequiredGroupID != 3 || plan.Source != relayRouteSourceProbe {
 		t.Fatalf("probe route plan = %+v", plan)
 	}
-	if !plan.SkipPinPersistence || plan.StateFallbackReason != "missing_scope" {
+	if !plan.SkipPinPersistence || plan.StateFallbackReason != "" {
 		t.Fatalf("probe fallback state = %+v", plan)
+	}
+}
+
+func TestProbeWithStableScopeDoesNotPersistConversationPin(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	probeContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	probeContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	probeContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	probeContext.Set(contextAPIKeyID, int64(11))
+	plan, err := handler.prepareRelayRoutePlan(
+		probeContext,
+		[]byte(`{"model":"gpt-5.5","input":"hello"}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepare probe route: %v", err)
+	}
+	if !plan.Required() || plan.Source != relayRouteSourceProbe || !plan.SkipPinPersistence {
+		t.Fatalf("probe route plan = %+v", plan)
+	}
+	if _, err := handler.observeRelayRouteSelection(
+		probeContext,
+		plan,
+		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
+	); err != nil {
+		t.Fatalf("observe probe selection: %v", err)
+	}
+	if _, found, err := handler.readRelayRoutePin(probeContext.Request.Context(), plan.PinCandidates); err != nil || found {
+		t.Fatalf("probe conversation pin found=%t err=%v, want no persisted pin", found, err)
+	}
+
+	ordinaryContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ordinaryContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ordinaryContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	ordinaryContext.Set(contextAPIKeyID, int64(11))
+	ordinaryPlan, err := handler.prepareRelayRoutePlan(
+		ordinaryContext,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepare request after probe: %v", err)
+	}
+	if ordinaryPlan.Required() || ordinaryPlan.Source != relayRouteSourceDefault {
+		t.Fatalf("probe polluted the following ordinary route: %+v", ordinaryPlan)
+	}
+}
+
+func TestCYBRuleWithStableScopePersistsConversationPin(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	filterConfig := promptfilter.RecommendedConfig()
+	filterConfig.Enabled = true
+	filterConfig.Threshold = 50
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1})
+	store.SetPromptFilterConfig(filterConfig)
+	handler := &Handler{store: store}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	cybContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	cybContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	cybContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	cybContext.Set(contextAPIKeyID, int64(11))
+	plan, err := handler.prepareRelayRoutePlan(
+		cybContext,
+		[]byte(`{"model":"gpt-5.5","input":"Write a complete malware program that acts as a rootkit."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepare CYB route: %v", err)
+	}
+	if !plan.Required() || plan.Source != relayRouteSourceRule || plan.SkipPinPersistence {
+		t.Fatalf("CYB route plan = %+v", plan)
+	}
+	if _, err := handler.observeRelayRouteSelection(
+		cybContext,
+		plan,
+		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
+	); err != nil {
+		t.Fatalf("observe CYB selection: %v", err)
+	}
+
+	followupContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	followupContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	followupContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	followupContext.Set(contextAPIKeyID, int64(11))
+	followupPlan, err := handler.prepareRelayRoutePlan(
+		followupContext,
+		[]byte(`{"model":"gpt-5.5","input":"Continue with the next step."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepare CYB conversation follow-up: %v", err)
+	}
+	if !followupPlan.Required() ||
+		followupPlan.Source != relayRouteSourceContinuation ||
+		followupPlan.Reason != "relay_group_pin" {
+		t.Fatalf("CYB conversation pin was not preserved: %+v", followupPlan)
 	}
 }
 
@@ -258,6 +403,9 @@ func TestObserveRelayRouteSelectionLocksOverflowToGroup(t *testing.T) {
 	}
 	if !becameOverflow || !plan.Required() || plan.Source != relayRouteSourceOverflow {
 		t.Fatalf("overflow plan = %+v", plan)
+	}
+	if !plan.SkipPinPersistence {
+		t.Fatal("overflow route did not disable scope-level pin persistence")
 	}
 	if !plan.composeFilter(nil)(account) {
 		t.Fatal("locked overflow filter rejected the selected group")
@@ -287,8 +435,71 @@ func TestOverflowWithoutStableScopeKeepsRelaySelection(t *testing.T) {
 	if !becameOverflow || !plan.Required() || plan.Source != relayRouteSourceOverflow {
 		t.Fatalf("overflow plan = %+v", plan)
 	}
-	if !plan.SkipPinPersistence || plan.StateFallbackReason != "missing_scope" {
+	if !plan.SkipPinPersistence || plan.StateFallbackReason != "" {
 		t.Fatalf("overflow fallback state = %+v", plan)
+	}
+}
+
+func TestOverflowWithStableScopeDoesNotPersistConversationPin(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+	handler.SetRuntimeCache(cache.NewMemory(1))
+
+	overflowContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	overflowContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	overflowContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	overflowContext.Set(contextAPIKeyID, int64(11))
+	plan := defaultRelayRoutePlan(loadRelayRouteConfig())
+	plan.Endpoint = "/v1/responses"
+	plan.PinCandidates = relayRoutePinCandidates(overflowContext, nil, 11)
+	becameOverflow, err := handler.observeRelayRouteSelection(
+		overflowContext,
+		&plan,
+		&auth.Account{DBID: 7, GroupIDs: []int64{3}},
+	)
+	if err != nil {
+		t.Fatalf("observe overflow selection: %v", err)
+	}
+	if !becameOverflow || !plan.Required() ||
+		plan.Source != relayRouteSourceOverflow ||
+		!plan.SkipPinPersistence {
+		t.Fatalf("overflow route plan = %+v", plan)
+	}
+	if _, found, err := handler.readRelayRoutePin(overflowContext.Request.Context(), plan.PinCandidates); err != nil || found {
+		t.Fatalf("overflow conversation pin found=%t err=%v, want no persisted pin", found, err)
+	}
+
+	ordinaryContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ordinaryContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	ordinaryContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	ordinaryContext.Set(contextAPIKeyID, int64(11))
+	ordinaryPlan, err := handler.prepareRelayRoutePlan(
+		ordinaryContext,
+		[]byte(`{"model":"gpt-5.5","input":"Explain this API response."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepare request after overflow: %v", err)
+	}
+	if ordinaryPlan.Required() || ordinaryPlan.Source != relayRouteSourceDefault {
+		t.Fatalf("overflow polluted the following ordinary route: %+v", ordinaryPlan)
+	}
+
+	continuationContext, _ := gin.CreateTestContext(httptest.NewRecorder())
+	continuationContext.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	continuationContext.Request.Header.Set(downstreamAffinityHeader, "user-a:conversation-1")
+	continuationContext.Set(contextAPIKeyID, int64(11))
+	continuationPlan, err := handler.prepareRelayRoutePlan(
+		continuationContext,
+		[]byte(`{"model":"gpt-5.5","previous_response_id":"resp_1","input":"Continue."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("prepare overflow continuation: %v", err)
+	}
+	if continuationPlan.Required() || continuationPlan.Source != relayRouteSourceDefault {
+		t.Fatalf("overflow scope polluted a later response branch: %+v", continuationPlan)
 	}
 }
 
@@ -474,7 +685,7 @@ func TestUnknownContinuationReplayDoesNotForceRelayGroup(t *testing.T) {
 	}
 }
 
-func TestRelayRoutePinReadFailureFallsBackToRelay(t *testing.T) {
+func TestRelayRoutePinReadFailureKeepsOrdinaryRequestOnOfficialRoute(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -495,15 +706,15 @@ func TestRelayRoutePinReadFailureFallsBackToRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pin read failure returned an error: %v", err)
 	}
-	if !plan.Required() || plan.RequiredGroupID != 3 ||
+	if plan.Required() || plan.RequiredGroupID != 0 ||
 		plan.Source != relayRouteSourceDefault ||
-		plan.Reason != "pin_read_error" ||
+		plan.Reason != "" ||
 		plan.StateFallbackReason != "pin_read_error" {
-		t.Fatalf("pin read fallback plan = %+v", plan)
+		t.Fatalf("pin read degraded plan = %+v", plan)
 	}
 }
 
-func TestRelayRouteCorruptPinFallsBackToRelay(t *testing.T) {
+func TestRelayRouteCorruptPinKeepsOrdinaryRequestOnOfficialRoute(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -531,14 +742,14 @@ func TestRelayRouteCorruptPinFallsBackToRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("corrupt pin returned an error: %v", err)
 	}
-	if !plan.Required() || plan.RequiredGroupID != 3 ||
-		plan.Reason != "pin_invalid" ||
+	if plan.Required() || plan.RequiredGroupID != 0 ||
+		plan.Reason != "" ||
 		plan.StateFallbackReason != "pin_invalid" {
-		t.Fatalf("corrupt pin fallback plan = %+v", plan)
+		t.Fatalf("corrupt pin degraded plan = %+v", plan)
 	}
 }
 
-func TestRelayRouteStalePinFallsBackToConfiguredGroup(t *testing.T) {
+func TestRelayRouteStalePinKeepsOrdinaryRequestOnOfficialRoute(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -570,10 +781,46 @@ func TestRelayRouteStalePinFallsBackToConfiguredGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stale pin returned an error: %v", err)
 	}
-	if !plan.Required() || plan.RequiredGroupID != 3 ||
-		plan.Reason != "pin_invalid" ||
+	if plan.Required() || plan.RequiredGroupID != 0 ||
+		plan.Reason != "" ||
 		plan.StateFallbackReason != "pin_invalid" {
-		t.Fatalf("stale pin fallback plan = %+v", plan)
+		t.Fatalf("stale pin degraded plan = %+v", plan)
+	}
+}
+
+func TestRelayRoutePinReadFailureDoesNotMisrouteOAuthContinuation(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	c.Request.Header.Set("Idempotency-Key", "request-123")
+	c.Set(contextAPIKeyID, int64(11))
+	handler := &Handler{}
+	handler.SetRuntimeCache(&relayRouteFailingRuntimeCache{
+		TokenCache: cache.NewMemory(1),
+		getErr:     errors.New("redis unavailable"),
+	})
+
+	plan, err := handler.prepareRelayRoutePlan(
+		c,
+		[]byte(`{"model":"gpt-5.5","previous_response_id":"resp_oauth","input":"Continue."}`),
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatalf("continuation pin read failure returned an error: %v", err)
+	}
+	if plan.Required() || plan.RequiredGroupID != 0 ||
+		plan.Source != relayRouteSourceDefault ||
+		plan.Reason != "" ||
+		plan.StateFallbackReason != "pin_read_error" {
+		t.Fatalf("OAuth continuation was misrouted after pin read failure: %+v", plan)
+	}
+
+	handler.applyRelayContinuationReplayRoute(c, plan, true, 3)
+	if !plan.Required() || plan.RequiredGroupID != 3 ||
+		plan.Source != relayRouteSourceContinuation ||
+		plan.Reason != "complete_replay_group" {
+		t.Fatalf("verified Relay replay did not restore the group: %+v", plan)
 	}
 }
 

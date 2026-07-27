@@ -185,6 +185,10 @@ export default function CodexAudit() {
   const summary = report?.summary
   const writerProblem = Boolean(report && (report.writer.dropped > 0 || report.writer.failed > 0))
   const totalPages = Math.max(1, Math.ceil((cases?.total || 0) / PAGE_SIZE))
+  const firstRelayTriggers = Number(summary?.cyb_rule || 0)
+    + Number(summary?.probe || 0)
+    + Number(summary?.oauth_overflow || 0)
+    + Number(summary?.cyb_feedback || 0)
 
   return (
     <>
@@ -231,7 +235,19 @@ export default function CodexAudit() {
                 icon={<Route />}
                 label="Relay 逻辑请求"
                 value={summary?.relay_requests}
-                detail={`分流率 ${formatPercent(summary?.relay_requests, summary?.logical_requests)} · 上游尝试 ${formatNumber(summary?.route_attempts)}`}
+                detail={`实际占比 ${formatPercent(summary?.relay_requests, summary?.logical_requests)} · 上游尝试 ${formatNumber(summary?.route_attempts)}`}
+              />
+              <MetricCard
+                icon={<Shuffle />}
+                label="首次触发"
+                value={firstRelayTriggers}
+                detail={`占总请求 ${formatPercent(firstRelayTriggers, summary?.logical_requests)} · 不含续接`}
+              />
+              <MetricCard
+                icon={<RefreshCw />}
+                label="Relay 续接"
+                value={summary?.relay_continuation}
+                detail={`占总请求 ${formatPercent(summary?.relay_continuation, summary?.logical_requests)} · 不计入首次触发`}
               />
               <MetricCard icon={<ShieldAlert />} label="CYB 规则" value={summary?.cyb_rule} detail={`反馈分流 ${formatNumber(summary?.cyb_feedback)}`} />
               <MetricCard icon={<Activity />} label="探针分流" value={summary?.probe} detail="命中探针签名" />

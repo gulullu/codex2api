@@ -44,9 +44,10 @@ type provenancePartition struct {
 	text   strings.Builder
 }
 
-// Inspect evaluates each official envelope provenance partition independently.
-// Evidence is never joined across origins, so a system/tool witness cannot
-// complete a composite rule started by current-user text.
+// Inspect evaluates only user-authored provenance that can represent a routing
+// request. Evidence is never joined across origins. Developer/system/assistant
+// replay cannot initiate a route, while prior user turns may preserve the CYB
+// route for a full-history conversation.
 func Inspect(body []byte, endpoint, model string, cfg promptfilter.Config) Result {
 	cfg = routingConfig(cfg)
 	envelope := promptfilter.BuildEnvelopeWithModelsAndConfig(
@@ -57,6 +58,10 @@ func Inspect(body []byte, endpoint, model string, cfg promptfilter.Config) Resul
 		promptfilter.TransportHTTP,
 		cfg,
 	)
+	return inspectEnvelope(envelope, cfg)
+}
+
+func inspectEnvelope(envelope promptfilter.RequestEnvelope, cfg promptfilter.Config) Result {
 	result := Result{
 		Threshold: cfg.Threshold,
 		Truncated: envelope.Truncated || envelope.CurrentUserTruncated || envelope.AuxiliaryTruncated,
@@ -98,10 +103,29 @@ func Inspect(body []byte, endpoint, model string, cfg promptfilter.Config) Resul
 }
 
 func partitionEnvelope(envelope promptfilter.RequestEnvelope) []provenancePartition {
+	partitions := partitionEnvelopeMatching(envelope, canInitiateRoute)
+	if len(partitions) > 0 {
+		// Full-history clients may not send a stable session identifier. Keep
+		// prior user-authored turns as conversation evidence, but never let
+		// developer/system/assistant replay or tool output override a new user
+		// turn. Each origin remains a separate rule-engine partition.
+		return append(partitions, partitionEnvelopeMatching(envelope, canContinueUserHistory)...)
+	}
+	// A tool continuation can legitimately have no new current-user segment.
+	// In that case, retain only user-authored history and tool output as
+	// continuation evidence. Assistant/developer/system replay never becomes
+	// routing evidence on its own.
+	return partitionEnvelopeMatching(envelope, canContinueRoute)
+}
+
+func partitionEnvelopeMatching(
+	envelope promptfilter.RequestEnvelope,
+	include func(promptfilter.Segment) bool,
+) []provenancePartition {
 	partitions := make([]provenancePartition, 0, 8)
 	indexByOrigin := make(map[promptfilter.SegmentOrigin]int, 8)
 	for _, segment := range envelope.Segments {
-		if strings.TrimSpace(segment.Text) == "" {
+		if !include(segment) || strings.TrimSpace(segment.Text) == "" {
 			continue
 		}
 		index, ok := indexByOrigin[segment.Origin]
@@ -116,6 +140,26 @@ func partitionEnvelope(envelope promptfilter.RequestEnvelope) []provenancePartit
 		partitions[index].text.WriteString(segment.Text)
 	}
 	return partitions
+}
+
+func canInitiateRoute(segment promptfilter.Segment) bool {
+	return segment.Origin == promptfilter.OriginCurrentUser
+}
+
+func canContinueRoute(segment promptfilter.Segment) bool {
+	switch segment.Origin {
+	case promptfilter.OriginHistory:
+		return strings.EqualFold(strings.TrimSpace(segment.Role), "user")
+	case promptfilter.OriginToolOutput:
+		return true
+	default:
+		return false
+	}
+}
+
+func canContinueUserHistory(segment promptfilter.Segment) bool {
+	return segment.Origin == promptfilter.OriginHistory &&
+		strings.EqualFold(strings.TrimSpace(segment.Role), "user")
 }
 
 func routingConfig(cfg promptfilter.Config) promptfilter.Config {

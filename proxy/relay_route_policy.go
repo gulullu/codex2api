@@ -29,7 +29,9 @@ const (
 	relayRouteSourceOverflow     = "oauth_overflow"
 	relayRouteSourceFeedback     = "cyb_feedback"
 
-	relayRoutePinNamespace = "relay-group-pin-v1"
+	// v2 invalidates v1 pins that may have been created from developer/history
+	// provenance or from probe/overflow routes before those sources were scoped.
+	relayRoutePinNamespace = "relay-group-pin-v2"
 	relayRouteContextKey   = "relayRoutePlan"
 
 	defaultRelayRoutePinTTL = 24 * time.Hour
@@ -194,6 +196,10 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 		plan.Origin = relayRouteSourceProbe
 		plan.Reason = probeSignature
 		plan.Signals = []string{"probe:" + probeSignature}
+		// A probe is an isolated routing decision, not conversation evidence.
+		// Persisting its group pin would make unrelated requests that reuse the
+		// same downstream scope look like Relay continuations for the full TTL.
+		plan.SkipPinPersistence = true
 	case result.Route:
 		plan.RequiredGroupID = cfg.GroupID
 		plan.Source = relayRouteSourceRule
@@ -212,21 +218,22 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	default:
 		pin, found, err := h.readRelayRoutePin(c.Request.Context(), plan.PinCandidates)
 		if err != nil {
-			// Pin state is an optional routing aid. If it is unavailable or
-			// corrupt, conservatively keep the request inside the configured
-			// Relay group instead of introducing a gateway-generated 503.
+			// Pin state is an optional routing aid. A Redis problem must not
+			// turn ordinary or OAuth continuation traffic into global Relay
+			// failover. Verified replay provenance can still apply its group
+			// later in the request.
 			reason := "pin_read_error"
 			if errors.Is(err, errRelayRoutePinInvalid) {
 				reason = "pin_invalid"
 			}
-			requireRelayRouteFallback(&plan, reason, hasPreviousResponseID)
 			h.recordRelayRouteStateFallback(c, &plan, reason)
 			logRelayRoutePinDegraded(plan.Endpoint, "read", err)
+		} else if found && !relayRoutePinAppliesToRequest(pin.Source) {
+			// One-shot route provenance must not redirect later requests.
 		} else if found && pin.GroupID != cfg.GroupID {
 			// A positive group ID from a previous configuration is still stale
 			// for this deployment. Never let cached state route to an arbitrary
 			// or retired group.
-			requireRelayRouteFallback(&plan, "pin_invalid", hasPreviousResponseID)
 			h.recordRelayRouteStateFallback(c, &plan, "pin_invalid")
 			logRelayRoutePinDegraded(plan.Endpoint, "read", errRelayRoutePinInvalid)
 		} else if found {
@@ -356,19 +363,6 @@ func relayRoutePinCandidates(c *gin.Context, rawBody []byte, apiKeyID int64) []r
 	return candidates
 }
 
-func requireRelayRouteFallback(plan *relayRoutePlan, reason string, continuation bool) {
-	if plan == nil || !plan.Config.Enabled || plan.Config.GroupID <= 0 {
-		return
-	}
-	plan.RequiredGroupID = plan.Config.GroupID
-	if continuation {
-		plan.Source = relayRouteSourceContinuation
-		plan.Origin = relayRouteSourceContinuation
-	}
-	plan.Reason = reason
-	plan.Signals = []string{reason}
-}
-
 func (h *Handler) recordRelayRouteStateFallback(c *gin.Context, plan *relayRoutePlan, reason string) {
 	if plan == nil || plan.StateFallbackLogged {
 		return
@@ -384,7 +378,7 @@ func (h *Handler) recordRelayRouteStateFallback(c *gin.Context, plan *relayRoute
 
 func logRelayRoutePinDegraded(endpoint string, operation string, err error) {
 	log.Printf(
-		"Relay route pin degraded; continuing in configured Relay group (endpoint=%s, operation=%s): %v",
+		"Relay route pin degraded; continuing with request-local routing (endpoint=%s, operation=%s): %v",
 		strings.TrimSpace(endpoint),
 		strings.TrimSpace(operation),
 		err,
@@ -399,6 +393,15 @@ func relayRoutePinCacheKey(apiKeyID int64, kind string, value string) string {
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s", apiKeyID, kind, value)))
 	return kind + ":" + hex.EncodeToString(sum[:])
+}
+
+func relayRoutePinAppliesToRequest(source string) bool {
+	switch strings.TrimSpace(source) {
+	case relayRouteSourceRule, relayRouteSourceContinuation:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handler) readRelayRoutePin(ctx context.Context, candidates []relayRoutePinCandidate) (relayRoutePinValue, bool, error) {
@@ -469,6 +472,10 @@ func (h *Handler) observeRelayRouteSelection(c *gin.Context, plan *relayRoutePla
 		plan.Source = relayRouteSourceOverflow
 		plan.Origin = relayRouteSourceOverflow
 		plan.Reason = "official_priority_fallback"
+		// Capacity overflow reflects only the scheduler state for this request.
+		// A scope-level pin cannot prove which later response branch is being
+		// continued, so it must not outlive the current request.
+		plan.SkipPinPersistence = true
 		becameOverflow = true
 	}
 	if plan.Required() {

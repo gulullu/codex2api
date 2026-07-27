@@ -9,6 +9,11 @@ exclusions, retries, and same-group account switching.
 The first-release rules are:
 
 - CYB, probe, and OAuth-capacity overflow constrain only the target Relay group.
+- A new always-applicable conversation group pin may be created only by a
+  deterministic CYB decision from user-authored request provenance or a verified
+  Relay replay continuation. An existing valid pin may refresh its own TTL.
+  Probe, feedback, and capacity-overflow decisions apply to the current request
+  only.
 - No custom component selects or pins a concrete Relay account.
 - A Relay continuation may switch accounts only after a complete local replay
   has removed `previous_response_id`.
@@ -95,6 +100,14 @@ internals and is outside this extension.
 - reuses the existing prompt envelope and deterministic rule engine;
 - adds the RelayBases production rule set and exclusions;
 - preserves provenance partition isolation;
+- scans the current user turn and prior user-role turns from the same
+  full-history request as separate partitions, preserving a CYB conversation
+  even when the client sends no stable session identifier;
+- developer, system, instruction, assistant, and tool-output replay cannot
+  override a new user turn;
+- when a tool continuation has no new current-user segment, allows
+  only user-role history and tool output as bounded continuation evidence;
+  assistant, developer, system, and instruction replay still cannot trigger;
 - recognizes the production exact probes and bounded probe heuristics;
 - keeps configured sensitive words and custom patterns;
 - returns route facts only;
@@ -111,8 +124,8 @@ account.
 
 ## Conversation group pin
 
-The ingress proxy should remove any public client value and inject a stable
-`X-Codex2API-Affinity-Key` derived from the final user and conversation:
+When available, a trusted ingress may remove any public client value and inject
+a stable `X-Codex2API-Affinity-Key` derived from the final user and conversation:
 
 ```text
 same user + same conversation     -> same value
@@ -124,9 +137,22 @@ stores a Relay account ID. Redis is required for consistent pins in a
 multi-instance deployment; bounded memory is suitable as a local cache, not as
 the sole production source.
 
-A pin constrains future requests to the same Relay group while leaving account
-choice to the official scheduler. Pin failure must never cause a request to
-escape the required group.
+The current pin namespace is `relay-group-pin-v2`. Version 1 is deliberately
+ignored because older builds could create pins from replayed developer/history
+content and from one-shot probe or capacity-overflow decisions. Old keys are
+left to expire by TTL and are never refreshed by version 2.
+
+A deterministic CYB hit with a stable conversation scope creates a pin that
+constrains future requests to the same Relay group while leaving account choice
+to the official scheduler. A verified Relay replay continuation may create the
+same group-only pin, and a request that resolves an existing valid pin refreshes
+its TTL. Exact probes and feedback-cache hits do not create a conversation pin.
+Transient OAuth-capacity overflow also does not create a scope-level pin because
+that scope cannot prove which response branch a later `previous_response_id`
+belongs to. Pin failure must never cause a request that already requires Relay
+to escape the required group. A pin read/corruption error is recorded but does
+not turn an otherwise ordinary or OAuth-continuation request into global Relay
+failover; verified replay provenance may still apply the Relay group later.
 
 The conversation pin and the continuation replay store have different keys and
 purposes:
@@ -350,7 +376,8 @@ Do not deploy until all gates pass on the exact release artifact:
 12. Re-run the per-account capability probe described above.
 13. Verify `/codex-audit` totals reconcile one logical request to all attempts,
     including retries, same-group switches, replay paths, failures, and
-    detector misses.
+    detector misses. Verify the page distinguishes Relay actual share, first
+    route triggers, and Relay continuations.
 14. Verify audit queue saturation/database failure does not alter request
     routing, while dropped/failed writes remain visible.
 15. Run SQLite and PostgreSQL migration, query, retention, and rollback
