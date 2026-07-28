@@ -70,6 +70,7 @@ const kindOptions: Array<{ label: string; value: AuditKind }> = [
 const sourceLabels: Record<string, string> = {
   cyb_rule: 'CYB 规则',
   probe: '探针分流',
+  no_affinity_split: '官方无指纹分流',
   oauth_overflow: 'OAuth 容量溢出',
   relay_continuation: 'Relay 续接',
   cyb_feedback: 'CYB 反馈',
@@ -265,6 +266,7 @@ export default function CodexAudit() {
   const totalPages = Math.max(1, Math.ceil((cases?.total || 0) / PAGE_SIZE))
   const firstRelayTriggers = Number(summary?.cyb_rule || 0)
     + Number(summary?.probe || 0)
+    + Number(summary?.no_affinity_split || 0)
     + Number(summary?.oauth_overflow || 0)
     + Number(summary?.cyb_feedback || 0)
   const learningChanged = Boolean(learningConfig)
@@ -279,7 +281,7 @@ export default function CodexAudit() {
     <>
       <PageHeader
         title="Codex 审计"
-        description="独立查看 CYB/探针分流、OAuth 容量溢出、续接、漏放和每次实际调用的账号链路。"
+        description="独立查看官方无指纹分流、CYB/探针分流、OAuth 容量溢出、续接、漏放和每次实际调用的账号链路。"
         actions={(
           <>
             <div className="w-[150px]">
@@ -336,6 +338,12 @@ export default function CodexAudit() {
               />
               <MetricCard icon={<ShieldAlert />} label="CYB 规则" value={summary?.cyb_rule} detail={`反馈分流 ${formatNumber(summary?.cyb_feedback)}`} />
               <MetricCard icon={<Activity />} label="探针分流" value={summary?.probe} detail="命中探针签名" />
+              <MetricCard
+                icon={<Route />}
+                label="官方无指纹分流"
+                value={summary?.no_affinity_split}
+                detail={`占总请求 ${formatPercent(summary?.no_affinity_split, summary?.logical_requests)}`}
+              />
               <MetricCard icon={<Shuffle />} label="OAuth 溢出" value={summary?.oauth_overflow} detail="无更高优先级候选" />
               <MetricCard icon={<CheckCircle2 />} label="Relay 成功" value={summary?.relay_successes} detail={`最终失败 ${formatNumber(summary?.relay_final_failures)}`} bad={Boolean(summary?.relay_final_failures)} />
               <MetricCard icon={<AlertTriangle />} label="OAuth CYB 漏放" value={summary?.oauth_cyber_misses} detail={`Relay CYB ${formatNumber(summary?.relay_cyber_policies)}`} bad={Boolean(summary?.oauth_cyber_misses)} />
@@ -368,6 +376,7 @@ export default function CodexAudit() {
                       <RechartsTooltip />
                       <Line type="monotone" dataKey="cyb_rule" name="CYB 规则" stroke="#16a34a" strokeWidth={2} dot={false} />
                       <Line type="monotone" dataKey="probe" name="探针" stroke="#7c3aed" strokeWidth={2} dot={false} />
+                      <Line type="monotone" dataKey="no_affinity_split" name="官方无指纹分流" stroke="#0284c7" strokeWidth={2} dot={false} />
                       <Line type="monotone" dataKey="oauth_overflow" name="OAuth 溢出" stroke="#d97706" strokeWidth={2} dot={false} />
                       <Line type="monotone" dataKey="relay_continuation" name="Relay 续接" stroke="#db2777" strokeWidth={2} dot={false} />
                       <Line type="monotone" dataKey="replay_misses" name="回放未命中" stroke="#f97316" strokeWidth={2} dot={false} />

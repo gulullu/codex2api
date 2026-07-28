@@ -12,6 +12,7 @@ type RelayRouteStats struct {
 	LogicalRoutes      int64 `json:"logical_routes"`
 	CYBRule            int64 `json:"cyb_rule"`
 	Probe              int64 `json:"probe"`
+	NoAffinitySplit    int64 `json:"no_affinity_split"`
 	OAuthOverflow      int64 `json:"oauth_overflow"`
 	Continuation       int64 `json:"relay_continuation"`
 	Feedback           int64 `json:"cyb_feedback"`
@@ -46,6 +47,7 @@ func (db *DB) GetRelayRouteStats(ctx context.Context, window time.Duration) (Rel
 	stats.LogicalRoutes = summary.RelayRequests
 	stats.CYBRule = summary.CYBRule
 	stats.Probe = summary.Probe
+	stats.NoAffinitySplit = summary.NoAffinitySplit
 	stats.OAuthOverflow = summary.OAuthOverflow
 	stats.Continuation = summary.Continuation
 	stats.Feedback = summary.Feedback

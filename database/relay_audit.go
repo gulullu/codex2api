@@ -1285,6 +1285,7 @@ type RelayAuditSummary struct {
 	RouteAttempts        int64 `json:"route_attempts"`
 	CYBRule              int64 `json:"cyb_rule"`
 	Probe                int64 `json:"probe"`
+	NoAffinitySplit      int64 `json:"no_affinity_split"`
 	OAuthOverflow        int64 `json:"oauth_overflow"`
 	Continuation         int64 `json:"relay_continuation"`
 	Feedback             int64 `json:"cyb_feedback"`
@@ -1310,6 +1311,7 @@ type RelayAuditTimelinePoint struct {
 	RelayRequests      int64     `json:"relay_requests"`
 	CYBRule            int64     `json:"cyb_rule"`
 	Probe              int64     `json:"probe"`
+	NoAffinitySplit    int64     `json:"no_affinity_split"`
 	OAuthOverflow      int64     `json:"oauth_overflow"`
 	Continuation       int64     `json:"relay_continuation"`
 	Feedback           int64     `json:"cyb_feedback"`
@@ -1519,6 +1521,7 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 		       COALESCE(SUM(CASE WHEN COALESCE(route_group_id, 0) > 0 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_rule' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'probe' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'no_affinity_split' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'oauth_overflow' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'relay_continuation' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_feedback' THEN 1 ELSE 0 END), 0),
@@ -1564,6 +1567,7 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 		&report.Summary.RelayRequests,
 		&report.Summary.CYBRule,
 		&report.Summary.Probe,
+		&report.Summary.NoAffinitySplit,
 		&report.Summary.OAuthOverflow,
 		&report.Summary.Continuation,
 		&report.Summary.Feedback,
@@ -1594,6 +1598,7 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 		       COALESCE(SUM(CASE WHEN COALESCE(route_group_id, 0) > 0 THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_rule' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'probe' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'no_affinity_split' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'oauth_overflow' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'relay_continuation' THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(route_source, '') = 'cyb_feedback' THEN 1 ELSE 0 END), 0),
@@ -1629,6 +1634,7 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 			&point.RelayRequests,
 			&point.CYBRule,
 			&point.Probe,
+			&point.NoAffinitySplit,
 			&point.OAuthOverflow,
 			&point.Continuation,
 			&point.Feedback,

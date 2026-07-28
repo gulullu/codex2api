@@ -23,6 +23,7 @@ import (
 
 const (
 	relayRouteSourceDefault      = "official_default"
+	relayRouteSourceNoAffinity   = "no_affinity_split"
 	relayRouteSourceRule         = "cyb_rule"
 	relayRouteSourceProbe        = "probe"
 	relayRouteSourceContinuation = "relay_continuation"
@@ -143,6 +144,30 @@ func defaultRelayRoutePlan(cfg relayRouteConfig) relayRoutePlan {
 	}
 }
 
+// requestUsesOfficialNoAffinityRelaySplit mirrors the official fingerprint
+// decision only for the narrow deployment shape where the API key sends all
+// no-fingerprint traffic to this installation's configured Relay group.
+//
+// Requiring an exact single-group match keeps the custom audit layer from
+// narrowing a future official multi-group split or changing its scheduler.
+func requestUsesOfficialNoAffinityRelaySplit(c *gin.Context, rawBody []byte, relayGroupID int64) bool {
+	if c == nil || c.Request == nil || relayGroupID <= 0 {
+		return false
+	}
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return false
+	}
+	splitGroups := int64GroupSet(row.Limits.NoAffinityGroupIDs)
+	if len(splitGroups) != 1 {
+		return false
+	}
+	if _, ok := splitGroups[relayGroupID]; !ok {
+		return false
+	}
+	return !resolveRequestSessionIdentity(c.Request.Header, rawBody).hasRequestFingerprint
+}
+
 func (p *relayRoutePlan) Required() bool {
 	return p != nil && p.Config.Enabled && p.RequiredGroupID > 0
 }
@@ -207,11 +232,25 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	plan.AuditCreatedAt = time.Now()
 	plan.AuditRawBody = rawBody
 
+	hasPreviousResponseID := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != ""
+	plan.HasPreviousResponseID = hasPreviousResponseID
+	if requestUsesOfficialNoAffinityRelaySplit(c, rawBody, cfg.GroupID) {
+		plan.RequiredGroupID = cfg.GroupID
+		plan.Source = relayRouteSourceNoAffinity
+		plan.Origin = relayRouteSourceNoAffinity
+		plan.Reason = "official_no_affinity_group"
+		plan.Signals = []string{"official_no_affinity_split"}
+		// This is a per-request official fingerprint decision, not conversation
+		// evidence. Do not turn it into a scope-level continuation pin.
+		plan.SkipPinPersistence = true
+		setRelayRoutePlanContext(c, &plan)
+		h.beginRelayAudit(c, &plan, rawBody)
+		return &plan, nil
+	}
+
 	apiKeyID := requestAPIKeyID(c)
 	plan.PinCandidates = relayRoutePinCandidates(c, rawBody, apiKeyID)
 	plan.FeedbackDigest, plan.FeedbackDigestValid = globalRelayCybFeedback.digest(endpoint, rawBody)
-	hasPreviousResponseID := strings.TrimSpace(gjson.GetBytes(rawBody, "previous_response_id").String()) != ""
-	plan.HasPreviousResponseID = hasPreviousResponseID
 
 	probeSignature, probe := cybroute.DetectProbe(rawBody, endpoint)
 	var result cybroute.Result
@@ -579,7 +618,7 @@ func (h *Handler) applyRelayContinuationReplayRoute(
 		!plan.Config.Enabled || groupID != plan.Config.GroupID {
 		return
 	}
-	if !plan.Required() {
+	if !plan.Required() || plan.Source == relayRouteSourceNoAffinity {
 		plan.RequiredGroupID = groupID
 		plan.Source = relayRouteSourceContinuation
 		plan.Origin = relayRouteSourceContinuation

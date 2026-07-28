@@ -8,6 +8,9 @@ exclusions, retries, and same-group account switching.
 
 The first-release rules are:
 
+- The official API-key no-affinity split runs first. When its only split target
+  is the configured Relay group, requests without a Codex fingerprint are
+  constrained to that group and audited as `no_affinity_split`.
 - CYB, probe, and OAuth-capacity overflow constrain only the target Relay group.
 - A new always-applicable conversation group pin may be created only by a
   deterministic CYB decision from user-authored request provenance or a verified
@@ -36,6 +39,10 @@ WebSocket adapter are outside the first release.
 
 RelayStyle remains an account property. Membership in the target group does not
 change an account's type or force a transport that the account cannot support.
+In particular, a client that directly upgrades `/v1/responses` to WebSocket
+cannot use a RelayStyle account, and `/v1/alpha/search` requires ChatGPT OAuth.
+Do not use a Relay-only no-affinity split for callers of those two endpoint
+shapes; ordinary HTTP Responses remains the supported Relay path.
 
 ## Configuration
 
@@ -47,6 +54,21 @@ CODEX_CYB_RELAY_PIN_TTL_SECONDS=86400
 
 `CODEX_CYB_RELAY_GROUP_ID` is required. Routing is enabled by default when the
 group ID is positive. The group pin TTL defaults to 24 hours.
+
+For the API key used by the caller, configure:
+
+```text
+no_affinity_group_ids = [target Relay group]
+allowed_group_ids     = [every ordinary OAuth group, target Relay group]
+```
+
+The Relay group must be present in `allowed_group_ids`. Official filters and
+the custom CYB group constraint are composed with logical AND; leaving the
+allowed groups empty, or listing only ordinary OAuth groups, would make a
+fingerprinted CYB request exclude Relay and then simultaneously require Relay,
+leaving no eligible account. The custom audit classification deliberately
+recognizes only the exact single-group no-affinity shape above, so it never
+narrows an official multi-group split.
 
 Production continuation replay uses the deployment's shared Redis service plus
 a bounded in-process cache. Replay TTL, maximum entries, and maximum retained
@@ -64,7 +86,7 @@ The routing layer produces only a constraint and an audit reason:
 
 ```text
 required_group_id    optional Relay group restriction
-route_source         cyb_rule | probe | oauth_overflow |
+route_source         no_affinity_split | cyb_rule | probe | oauth_overflow |
                      relay_continuation | cyb_feedback
 route_signals        deterministic matched rule/probe identifiers
 ```
@@ -73,11 +95,17 @@ It never returns an account ID.
 
 | Request condition | Constraint | Account selection |
 |---|---|---|
+| No Codex fingerprint; official split targets Relay | Target Relay group | Official scheduler |
 | Deterministic CYB hit | Target Relay group | Official scheduler |
 | Probe hit | Target Relay group | Official scheduler |
 | OAuth has no schedulable candidate and Relay is eligible | Target Relay group | Official scheduler |
 | Replayed Relay continuation | Original Relay group | Official scheduler; same-group switching allowed |
 | New ordinary request | Existing official filters | Official scheduler |
+
+The no-affinity decision precedes CYB, probe, feedback, and conversation-pin
+inspection for that request. It is request-local and never creates or refreshes
+a conversation pin. A verified complete Relay replay still takes precedence in
+audit as `relay_continuation`.
 
 The group constraint is composed with all existing official authorization,
 model, API-key, and group filters. It never broadens access.
@@ -377,7 +405,7 @@ Do not deploy until all gates pass on the exact release artifact:
 13. Verify `/codex-audit` totals reconcile one logical request to all attempts,
     including retries, same-group switches, replay paths, failures, and
     detector misses. Verify the page distinguishes Relay actual share, first
-    route triggers, and Relay continuations.
+    route triggers, official no-fingerprint splits, and Relay continuations.
 14. Verify audit queue saturation/database failure does not alter request
     routing, while dropped/failed writes remain visible.
 15. Run SQLite and PostgreSQL migration, query, retention, and rollback

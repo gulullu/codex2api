@@ -268,6 +268,136 @@ func TestInternalRelayRoutePlanSkipsCYBPipelineAndForcesGroup(t *testing.T) {
 	}
 }
 
+func TestRequestUsesOfficialNoAffinityRelaySplit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	newContext := func(groups []int64, headers map[string]string) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		for name, value := range headers {
+			c.Request.Header.Set(name, value)
+		}
+		c.Set(contextAPIKeyRow, &database.APIKeyRow{
+			Limits: database.APIKeyLimits{NoAffinityGroupIDs: groups},
+		})
+		return c
+	}
+	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+
+	if !requestUsesOfficialNoAffinityRelaySplit(newContext([]int64{9}, nil), body, 9) {
+		t.Fatal("exact Relay-only split without a fingerprint was not detected")
+	}
+	if requestUsesOfficialNoAffinityRelaySplit(
+		newContext([]int64{9}, map[string]string{"X-Codex-Client": "codex-cli"}),
+		body,
+		9,
+	) {
+		t.Fatal("Codex-fingerprinted request was classified as no-affinity")
+	}
+	if requestUsesOfficialNoAffinityRelaySplit(
+		newContext([]int64{9}, map[string]string{downstreamAffinityHeader: "user:conversation"}),
+		body,
+		9,
+	) {
+		t.Fatal("request with the local affinity header was classified as no-affinity")
+	}
+	if requestUsesOfficialNoAffinityRelaySplit(newContext([]int64{8, 9}, nil), body, 9) {
+		t.Fatal("multi-group official split was narrowed to the custom Relay group")
+	}
+	if requestUsesOfficialNoAffinityRelaySplit(newContext([]int64{8}, nil), body, 9) {
+		t.Fatal("unrelated official split group was classified as the custom Relay group")
+	}
+}
+
+func TestOfficialNoAffinityRelaySplitPrecedesCYBRules(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "9")
+	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	learned, err := cyblearn.CompileRule("cyb_auto_no_affinity_order", `(?i)unique split cyber phrase`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cybroute.PublishLearnedRules([]cyblearn.Rule{learned})
+	t.Cleanup(func() { cybroute.PublishLearnedRules(nil) })
+	handler := NewHandler(store, nil, nil, nil)
+
+	newContext := func(withFingerprint bool) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		if withFingerprint {
+			c.Request.Header.Set("X-Codex-Client", "codex-cli")
+		}
+		c.Set(contextAPIKeyRow, &database.APIKeyRow{
+			AllowedGroupIDs: []int64{7, 9},
+			Limits: database.APIKeyLimits{
+				NoAffinityGroupIDs: []int64{9},
+			},
+		})
+		return c
+	}
+	body := []byte(`{"model":"gpt-5.5","input":"unique split cyber phrase"}`)
+
+	noAffinityContext := newContext(false)
+	noAffinityPlan, err := handler.prepareRelayRoutePlan(noAffinityContext, body, "/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !noAffinityPlan.Required() || noAffinityPlan.RequiredGroupID != 9 ||
+		noAffinityPlan.Source != relayRouteSourceNoAffinity ||
+		!noAffinityPlan.SkipPinPersistence ||
+		noAffinityPlan.Reason != "official_no_affinity_group" {
+		t.Fatalf("no-affinity plan=%+v", noAffinityPlan)
+	}
+	if strings.Join(noAffinityPlan.Signals, ",") != "official_no_affinity_split" {
+		t.Fatalf("no-affinity request entered CYB detection: %v", noAffinityPlan.Signals)
+	}
+	becameOverflow, err := handler.observeRelayRouteSelection(
+		noAffinityContext,
+		noAffinityPlan,
+		&auth.Account{DBID: 11, GroupIDs: []int64{9}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if becameOverflow || noAffinityPlan.Source != relayRouteSourceNoAffinity {
+		t.Fatalf("official split was reclassified as overflow: %+v", noAffinityPlan)
+	}
+	noAffinityFilter := applyAffinityGroupRouting(
+		noAffinityContext,
+		resolveRequestSessionIdentity(noAffinityContext.Request.Header, body),
+		nil,
+	)
+	noAffinityFilter = noAffinityPlan.composeFilter(noAffinityFilter)
+	if noAffinityFilter(&auth.Account{DBID: 12, GroupIDs: []int64{7}}) ||
+		!noAffinityFilter(&auth.Account{DBID: 13, GroupIDs: []int64{9}}) {
+		t.Fatal("official and custom no-affinity filters did not preserve the Relay-only candidate set")
+	}
+
+	fingerprintedContext := newContext(true)
+	fingerprintedPlan, err := handler.prepareRelayRoutePlan(
+		fingerprintedContext,
+		body,
+		"/v1/responses",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fingerprintedPlan.Required() || fingerprintedPlan.RequiredGroupID != 9 ||
+		fingerprintedPlan.Source != relayRouteSourceRule {
+		t.Fatalf("fingerprinted CYB plan=%+v", fingerprintedPlan)
+	}
+	fingerprintedFilter := applyAffinityGroupRouting(
+		fingerprintedContext,
+		resolveRequestSessionIdentity(fingerprintedContext.Request.Header, body),
+		nil,
+	)
+	fingerprintedFilter = fingerprintedPlan.composeFilter(fingerprintedFilter)
+	if fingerprintedFilter(&auth.Account{DBID: 14, GroupIDs: []int64{7}}) ||
+		!fingerprintedFilter(&auth.Account{DBID: 15, GroupIDs: []int64{9}}) {
+		t.Fatal("allowed groups and the CYB Relay constraint produced the wrong candidate set")
+	}
+}
+
 func TestRelayRouteUsesIndependentLearnedRuleSnapshot(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "9")
 	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
@@ -850,6 +980,24 @@ func TestCompleteReplayRestoresRelayGroupWithoutConversationPin(t *testing.T) {
 	}
 	if !filter(&auth.Account{DBID: 2, GroupIDs: []int64{3}}) {
 		t.Fatal("replayed continuation rejected an account inside its Relay group")
+	}
+}
+
+func TestCompleteReplayOverridesNoAffinityAuditSource(t *testing.T) {
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
+	plan := defaultRelayRoutePlan(loadRelayRouteConfig())
+	plan.RequiredGroupID = 3
+	plan.Source = relayRouteSourceNoAffinity
+	plan.Origin = relayRouteSourceNoAffinity
+	plan.Reason = "official_no_affinity_group"
+	handler := &Handler{}
+
+	handler.applyRelayContinuationReplayRoute(nil, &plan, true, 3)
+	if !plan.Required() || plan.RequiredGroupID != 3 ||
+		plan.Source != relayRouteSourceContinuation ||
+		plan.Origin != relayRouteSourceContinuation ||
+		plan.Reason != "complete_replay_group" {
+		t.Fatalf("replay did not take precedence over no-affinity source: %+v", plan)
 	}
 }
 

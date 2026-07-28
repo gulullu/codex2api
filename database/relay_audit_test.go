@@ -74,6 +74,51 @@ func TestRelayAuditReportKeepsOAuthCyberAttemptAfterFinalSuccess(t *testing.T) {
 	}
 }
 
+func TestRelayAuditReportCountsNoAffinitySplitSeparately(t *testing.T) {
+	db := newRelayAuditSQLite(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := db.WriteRelayAuditRequest(ctx, &RelayAuditRequestInput{
+		RequestID:    "no-affinity",
+		CreatedAt:    now,
+		RouteSource:  "no_affinity_split",
+		RouteGroupID: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteRelayAuditOutcome(ctx, &RelayAuditOutcomeInput{
+		RequestID:    "no-affinity",
+		AttemptIndex: 1,
+		AccountID:    2,
+		AccountType:  "responses_api",
+		StatusCode:   200,
+		CompletedAt:  now,
+		Final:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := db.BuildRelayAuditReport(ctx, RelayAuditQuery{
+		Start: now.Add(-time.Minute), End: now.Add(time.Minute), BucketMinutes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.LogicalRequests != 1 || report.Summary.RelayRequests != 1 ||
+		report.Summary.NoAffinitySplit != 1 || report.Summary.OAuthOverflow != 0 ||
+		report.Summary.CYBRule != 0 {
+		t.Fatalf("summary=%+v", report.Summary)
+	}
+	if len(report.Timeline) != 1 || report.Timeline[0].NoAffinitySplit != 1 ||
+		report.Timeline[0].OAuthOverflow != 0 {
+		t.Fatalf("timeline=%+v", report.Timeline)
+	}
+	if len(report.RelayRoutes) != 1 ||
+		report.RelayRoutes[0].RouteSource != "no_affinity_split" {
+		t.Fatalf("relay routes=%+v", report.RelayRoutes)
+	}
+}
+
 func TestRelayAuditRetentionDeletesInBatchesAndRemovesOrphans(t *testing.T) {
 	db := newRelayAuditSQLite(t)
 	ctx := context.Background()

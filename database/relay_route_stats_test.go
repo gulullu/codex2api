@@ -28,6 +28,7 @@ func TestGetRelayRouteStatsSQLite(t *testing.T) {
 	now := time.Now()
 	for _, input := range []*RelayAuditRequestInput{
 		{RequestID: "cyb", CreatedAt: now, RouteSource: "cyb_rule", RouteGroupID: 7},
+		{RequestID: "no-affinity", CreatedAt: now, RouteSource: "no_affinity_split", RouteGroupID: 7},
 		{RequestID: "overflow", CreatedAt: now, RouteSource: "oauth_overflow", RouteGroupID: 7},
 		{RequestID: "oauth-miss", CreatedAt: now, RouteSource: "official_default"},
 	} {
@@ -38,6 +39,7 @@ func TestGetRelayRouteStatsSQLite(t *testing.T) {
 	for _, input := range []*RelayAuditOutcomeInput{
 		{RequestID: "cyb", AttemptIndex: 1, AccountID: 10, AccountType: "responses_api", StatusCode: 503, ErrorKind: "server_error", CompletedAt: now},
 		{RequestID: "cyb", AttemptIndex: 2, AccountID: 11, AccountType: "responses_api", StatusCode: 200, CompletedAt: now, Final: true},
+		{RequestID: "no-affinity", AttemptIndex: 1, AccountID: 14, AccountType: "responses_api", StatusCode: 200, CompletedAt: now, Final: true},
 		{RequestID: "overflow", AttemptIndex: 1, AccountID: 12, AccountType: "responses_api", StatusCode: 200, CompletedAt: now, Final: true},
 		{RequestID: "oauth-miss", AttemptIndex: 1, AccountID: 13, AccountType: "oauth", StatusCode: 400, ErrorKind: "cyber_policy", CompletedAt: now, Final: true, DetectorMiss: true},
 	} {
@@ -61,10 +63,10 @@ func TestGetRelayRouteStatsSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRelayRouteStats(): %v", err)
 	}
-	if stats.RouteAttempts != 4 || stats.LogicalRoutes != 2 {
+	if stats.RouteAttempts != 5 || stats.LogicalRoutes != 3 {
 		t.Fatalf("route totals = attempts:%d logical:%d", stats.RouteAttempts, stats.LogicalRoutes)
 	}
-	if stats.CYBRule != 1 || stats.OAuthOverflow != 1 || stats.SameGroupSwitches != 1 ||
+	if stats.CYBRule != 1 || stats.NoAffinitySplit != 1 || stats.OAuthOverflow != 1 || stats.SameGroupSwitches != 1 ||
 		stats.DetectorMisses != 1 || stats.StateFallbacks != 1 {
 		t.Fatalf("stats = %+v", stats)
 	}

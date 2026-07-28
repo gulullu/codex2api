@@ -1018,6 +1018,7 @@ export interface RelayRouteStats {
   logical_routes: number
   cyb_rule: number
   probe: number
+  no_affinity_split: number
   oauth_overflow: number
   relay_continuation: number
   cyb_feedback: number
@@ -1048,6 +1049,7 @@ export interface RelayAuditSummary {
   route_attempts: number
   cyb_rule: number
   probe: number
+  no_affinity_split: number
   oauth_overflow: number
   relay_continuation: number
   cyb_feedback: number
@@ -1073,6 +1075,7 @@ export interface RelayAuditTimelinePoint {
   relay_requests: number
   cyb_rule: number
   probe: number
+  no_affinity_split: number
   oauth_overflow: number
   relay_continuation: number
   cyb_feedback: number
