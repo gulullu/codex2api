@@ -199,7 +199,7 @@ type importGrokRefreshReq struct {
 }
 
 const (
-	grokRefreshImportMaxTokens = 200
+	grokRefreshImportMaxTokens = 5000
 	grokRefreshImportPerToken  = 30 * time.Second
 )
 

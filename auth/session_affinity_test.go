@@ -126,6 +126,43 @@ func TestNextForSessionWithFilterFallsBackWhenBoundAccountRejected(t *testing.T)
 	}
 }
 
+func TestNoAffinitySplitGroupKeepsSessionStickyWithinTargetGroup(t *testing.T) {
+	store := &Store{
+		accounts: []*Account{
+			{DBID: 1, AccessToken: "primary", GroupIDs: []int64{10}},
+			{DBID: 2, AccessToken: "split-a", GroupIDs: []int64{20}},
+			{DBID: 3, AccessToken: "split-b", GroupIDs: []int64{20}},
+		},
+		maxConcurrency: 1,
+	}
+	store.SetAPIKeyAllowedGroups(7, []int64{10})
+	store.SetAPIKeyNoAffinityGroups(7, []int64{20})
+	splitGroups := map[int64]struct{}{20: {}}
+	splitFilter := func(account *Account) bool { return account.InAnyGroup(splitGroups) }
+
+	first, _ := store.NextForSessionWithFilter("fallback-session::api-key:7", 7, nil, splitFilter)
+	if first == nil {
+		t.Fatal("expected an account from the no-affinity split group")
+	}
+	if first.DBID == 1 || !first.InAnyGroup(splitGroups) {
+		t.Fatalf("first request selected account %d outside split group", first.DBID)
+	}
+	store.BindSessionAffinity("fallback-session::api-key:7", first, "http://split-proxy")
+	store.Release(first)
+
+	second, proxyURL := store.NextForSessionWithFilter("fallback-session::api-key:7", 7, nil, splitFilter)
+	if second == nil {
+		t.Fatal("expected the bound split-group account on the next request")
+	}
+	defer store.Release(second)
+	if second.DBID != first.DBID {
+		t.Fatalf("split-group affinity moved from account %d to %d", first.DBID, second.DBID)
+	}
+	if proxyURL != "http://split-proxy" {
+		t.Fatalf("sticky proxy = %q, want %q", proxyURL, "http://split-proxy")
+	}
+}
+
 func TestNextForSessionFallsBackWhenBoundAccountIsError(t *testing.T) {
 	store := &Store{
 		accounts: []*Account{

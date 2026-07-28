@@ -276,6 +276,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)

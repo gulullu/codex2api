@@ -176,6 +176,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	serviceTier := extractServiceTier(codexBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
+	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 

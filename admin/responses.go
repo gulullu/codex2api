@@ -274,6 +274,8 @@ type runtimeUsageLogResponse struct {
 	FlushIntervalSeconds int    `json:"flush_interval_seconds"`
 	BufferLength         int    `json:"buffer_length"`
 	BufferCapacity       int    `json:"buffer_capacity"`
+	BufferLimit          int    `json:"buffer_limit"`
+	DroppedTotal         int64  `json:"dropped_total"`
 }
 
 type runtimeProbesResponse struct {

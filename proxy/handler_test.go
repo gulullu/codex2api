@@ -3903,6 +3903,88 @@ func TestSessionAffinityKeySeparatesDifferentAPIKeys(t *testing.T) {
 	}
 }
 
+func TestApplyAffinityGroupRoutingSplitsByRequestFingerprint(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{
+		AllowedGroupIDs: []int64{10},
+		Limits: database.APIKeyLimits{
+			NoAffinityGroupIDs: []int64{20},
+		},
+	})
+	primary := &auth.Account{DBID: 1, GroupIDs: []int64{10}}
+	split := &auth.Account{DBID: 2, GroupIDs: []int64{20}}
+
+	withoutAffinity := applyAffinityGroupRouting(c, requestSessionIdentity{}, nil)
+	if withoutAffinity(primary) || !withoutAffinity(split) {
+		t.Fatal("request without affinity header must use only the split groups")
+	}
+
+	withFingerprint := applyAffinityGroupRouting(c, requestSessionIdentity{hasRequestFingerprint: true}, nil)
+	if !withFingerprint(primary) || withFingerprint(split) {
+		t.Fatal("fingerprinted request must keep using the original groups")
+	}
+}
+
+func TestApplyAffinityGroupRoutingDisabledKeepsExistingFilter(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{AllowedGroupIDs: []int64{10}})
+	want := auth.AccountFilter(func(account *auth.Account) bool { return account != nil && account.DBID == 1 })
+	if got := applyAffinityGroupRouting(c, requestSessionIdentity{}, want); got(&auth.Account{DBID: 1}) != true || got(&auth.Account{DBID: 2}) != false {
+		t.Fatal("disabled split routing must preserve the existing account filter")
+	}
+}
+
+// TestApplyAffinityGroupRoutingExcludesSplitGroupsWhenNoAllowedGroups 覆盖最常见的配置：
+// Key 不限分组。此时带指纹的请求必须避开分流组，否则分流组照样接真 Codex 流量，隔离等于没做。
+func TestApplyAffinityGroupRoutingExcludesSplitGroupsWhenNoAllowedGroups(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{
+		Limits: database.APIKeyLimits{NoAffinityGroupIDs: []int64{20}},
+	})
+	split := &auth.Account{DBID: 1, GroupIDs: []int64{20}}
+	other := &auth.Account{DBID: 2, GroupIDs: []int64{30}}
+	ungrouped := &auth.Account{DBID: 3}
+
+	withFingerprint := applyAffinityGroupRouting(c, requestSessionIdentity{hasRequestFingerprint: true}, nil)
+	if withFingerprint(split) {
+		t.Fatal("fingerprinted request must not land on a split group account")
+	}
+	if !withFingerprint(other) || !withFingerprint(ungrouped) {
+		t.Fatal("fingerprinted request must keep every non-split account available")
+	}
+
+	withoutFingerprint := applyAffinityGroupRouting(c, requestSessionIdentity{}, nil)
+	if !withoutFingerprint(split) || withoutFingerprint(other) || withoutFingerprint(ungrouped) {
+		t.Fatal("request without a fingerprint must use only the split groups")
+	}
+}
+
+// TestApplyAffinityGroupRoutingKeepsInnerFilter 分组门必须叠加在既有 filter 之上，
+// 不能把模型/冷却/预算这些闸门盖掉。
+func TestApplyAffinityGroupRoutingKeepsInnerFilter(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{
+		Limits: database.APIKeyLimits{NoAffinityGroupIDs: []int64{20}},
+	})
+	inner := auth.AccountFilter(func(account *auth.Account) bool { return account != nil && account.DBID == 1 })
+
+	split := applyAffinityGroupRouting(c, requestSessionIdentity{}, inner)
+	if !split(&auth.Account{DBID: 1, GroupIDs: []int64{20}}) {
+		t.Fatal("split routing dropped an account the inner filter accepts")
+	}
+	if split(&auth.Account{DBID: 2, GroupIDs: []int64{20}}) {
+		t.Fatal("split routing must not bypass the inner filter")
+	}
+
+	fingerprinted := applyAffinityGroupRouting(c, requestSessionIdentity{hasRequestFingerprint: true}, inner)
+	if !fingerprinted(&auth.Account{DBID: 1, GroupIDs: []int64{30}}) {
+		t.Fatal("exclusion routing dropped an account the inner filter accepts")
+	}
+	if fingerprinted(&auth.Account{DBID: 2, GroupIDs: []int64{30}}) {
+		t.Fatal("exclusion routing must not bypass the inner filter")
+	}
+}
+
 // TestResponsesWebSocketStripsInjectedImageTool verifies that a plain
 // conversation request — which PrepareResponsesWebSocketBody auto-injects an
 // image_generation tool into — has that tool stripped before going to the

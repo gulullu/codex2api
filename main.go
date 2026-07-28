@@ -116,6 +116,7 @@ func main() {
 			SmartPacingMinConcurrency:         1,
 			SmartPacingWindows:                "5h,7d",
 			AutoResetCreditsBeforeExpiryMin:   60,
+			UTLSShutdownTimeoutMinutes:        30,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -166,6 +167,7 @@ func main() {
 			SmartPacingMinConcurrency:         1,
 			SmartPacingWindows:                "5h,7d",
 			AutoResetCreditsBeforeExpiryMin:   60,
+			UTLSShutdownTimeoutMinutes:        30,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",

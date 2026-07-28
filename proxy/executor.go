@@ -105,10 +105,27 @@ func evictExpiredClients() {
 		entry := value.(*poolEntry)
 		if entry.lastUsed.Load() < cutoff {
 			clientPool.Delete(key)
-			entry.client.CloseIdleConnections()
+			releaseEvictedClient(entry.client)
 		}
 		return true
 	})
+}
+
+// releaseEvictedClient 彻底释放一个已从连接池逐出、后续不会再被取用的 Client。
+//
+// 普通 transport 用 CloseIdleConnections 即可（剩下的在途请求结束后由
+// IdleConnTimeout 回收）。但 uTLS transport 自管连接池，此处需要连带在途连接
+// 一起摘掉（在途 stream 走优雅关闭）：否则 entry 一旦从 map 删除，就再没有
+// 任何人持有该 transport，它名下的连接会泄漏到进程结束（issue #446）。
+func releaseEvictedClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	if rt, ok := client.Transport.(*utlsRoundTripper); ok {
+		rt.CloseAllConnections()
+		return
+	}
+	client.CloseIdleConnections()
 }
 
 const (
@@ -145,7 +162,7 @@ func shouldRecyclePooledClient(err error) bool {
 func recyclePooledClient(account *auth.Account, proxyURL string) {
 	key := clientPoolKey(account, proxyURL, codexTransportModeFromEnv())
 	if v, ok := clientPool.LoadAndDelete(key); ok {
-		v.(*poolEntry).client.CloseIdleConnections()
+		releaseEvictedClient(v.(*poolEntry).client)
 	}
 }
 
@@ -1062,9 +1079,11 @@ const downstreamAffinityHeader = "X-Codex2API-Affinity-Key"
 // dedicated downstream affinity header may only replace affinityID; it must
 // never change upstreamSeed or become an explicit upstream session.
 type requestSessionIdentity struct {
-	affinityID         string
-	upstreamSeed       string
-	explicitUpstreamID string
+	affinityID            string
+	upstreamSeed          string
+	explicitUpstreamID    string
+	hasDownstreamAffinity bool
+	hasRequestFingerprint bool
 }
 
 // ResolveSessionID 从下游请求提取或生成 session ID
@@ -1087,6 +1106,7 @@ func ResolveSessionID(headers http.Header, body []byte) string {
 }
 
 func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSessionIdentity {
+	hasEngineFingerprint := EvaluateEngineFingerprint(headers, body, nil)
 	explicitID := ResolveExplicitSessionID(headers, body)
 	upstreamSeed := explicitID
 	if upstreamSeed == "" {
@@ -1111,11 +1131,19 @@ func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSess
 	affinityID := upstreamSeed
 	if localAffinityID := resolveDownstreamAffinityID(headers); localAffinityID != "" {
 		affinityID = localAffinityID
+		return requestSessionIdentity{
+			affinityID:            affinityID,
+			upstreamSeed:          upstreamSeed,
+			explicitUpstreamID:    explicitID,
+			hasDownstreamAffinity: true,
+			hasRequestFingerprint: true,
+		}
 	}
 	return requestSessionIdentity{
-		affinityID:         affinityID,
-		upstreamSeed:       upstreamSeed,
-		explicitUpstreamID: explicitID,
+		affinityID:            affinityID,
+		upstreamSeed:          upstreamSeed,
+		explicitUpstreamID:    explicitID,
+		hasRequestFingerprint: hasEngineFingerprint,
 	}
 }
 

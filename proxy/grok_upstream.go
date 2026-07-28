@@ -252,6 +252,28 @@ func sanitizeGrokRequestBody(body []byte) []byte {
 		}
 	}
 	body = clampGrokReasoningEffort(body)
+	body = dropGrokToolChoiceWithoutTools(body)
+	return body
+}
+
+// dropGrokToolChoiceWithoutTools 在没有工具声明时撤掉残留的 tool_choice。Grok 上游对
+// "设了 tool_choice 但 tools 为空" 硬校验（400 invalid-argument "A tool_choice was set on
+// the request but no tools were specified."），Codex/ChatGPT 上游则容忍，因此只在 Grok 侧归一。
+// 两种来源都要兜住：客户端压缩轮自带 tools:[] + tool_choice:"auto"（issue #450），以及归一化
+// 把工具全剥空后残留的选择（如 external_web_access:false 丢弃唯一的 web_search 工具）。
+// 没有工具时 tool_choice 本就无意义，删除对语义无损。
+func dropGrokToolChoiceWithoutTools(body []byte) []byte {
+	if !gjson.GetBytes(body, "tool_choice").Exists() {
+		return body
+	}
+	// 仅在 tools 缺失或为空数组时动手：非数组形态属于畸形请求，保持原样交给上游报错。
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && (!tools.IsArray() || len(tools.Array()) > 0) {
+		return body
+	}
+	if updated, err := sjson.DeleteBytes(body, "tool_choice"); err == nil {
+		return updated
+	}
 	return body
 }
 

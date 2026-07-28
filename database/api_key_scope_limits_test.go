@@ -106,6 +106,16 @@ func TestAPIKeyLimitsIsZeroCoversScopeLimits(t *testing.T) {
 	}
 }
 
+func TestAPIKeyLimitsIsZeroCoversNoAffinityGroups(t *testing.T) {
+	limits := APIKeyLimits{NoAffinityGroupIDs: []int64{20}}
+	if limits.IsZero() {
+		t.Fatal("no-affinity routing must keep the full API key metadata out of the slim auth cache")
+	}
+	if encoded := encodeAPIKeyLimits(limits); encoded == "{}" {
+		t.Fatalf("encoded limits = %q, want no-affinity groups persisted", encoded)
+	}
+}
+
 func TestAPIKeyScopeExhaustionDescribeKeepsTinyBudgetsReadable(t *testing.T) {
 	hit := APIKeyScopeExhaustion{Window: "1d", Metric: "cost", Used: 0.0003875, Limit: 0.00005}
 	msg := hit.Describe(`group "111"`)

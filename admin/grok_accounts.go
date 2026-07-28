@@ -419,7 +419,28 @@ type grokBatchImportItem struct {
 	Error string `json:"error,omitempty"`
 }
 
-const grokBatchImportMaxFiles = 500
+const grokBatchImportMaxFiles = 5000
+
+// 批量导入的整体超时按文件数缩放：整个循环串行地逐个文件落库，写死一个常量会让
+// 每个文件分到的预算随批量增大而被摊薄（5000 个文件时只剩 12ms/个），数据库稍有抖动
+// 就会中途超时、后面的文件全部报 context deadline exceeded。封顶是为了不让一个超大
+// 请求无限期占住连接。
+const (
+	grokBatchImportBaseTimeout    = 30 * time.Second
+	grokBatchImportPerFileTimeout = 100 * time.Millisecond
+	grokBatchImportMaxTimeout     = 10 * time.Minute
+)
+
+func grokBatchImportTimeout(files int) time.Duration {
+	if files < 0 {
+		files = 0
+	}
+	timeout := grokBatchImportBaseTimeout + time.Duration(files)*grokBatchImportPerFileTimeout
+	if timeout > grokBatchImportMaxTimeout {
+		return grokBatchImportMaxTimeout
+	}
+	return timeout
+}
 
 // BatchImportGrokAccounts 批量导入 Grok 凭据文件（POST /api/admin/accounts/grok/import）。
 // 每个文件独立解析入库，按 subject / refresh_token 去重（批内 + 与现有账号）。
@@ -468,7 +489,7 @@ func (h *Handler) BatchImportGrokAccounts(c *gin.Context) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), grokBatchImportTimeout(len(req.Files)))
 	defer cancel()
 	groupIDs, err := h.resolveImportGroupIDsJSON(ctx, req.GroupIDs)
 	if err != nil {

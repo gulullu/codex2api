@@ -98,6 +98,11 @@ const GROK_LIMITED_STATUSES = new Set([
 
 // 与 Codex 账号页一致的表格/卡片双布局，选择持久化到 localStorage。
 const GROK_VIEW_MODE_KEY = "codex2api:grok-accounts:view-mode";
+
+// 批量导入的分片大小。后端单次上限是 5000，但一次请求要串行落库/刷新几千条，
+// 墙钟时间会长到浏览器或反代先断开；切成小片可以让每次请求都在一分钟量级完成，
+// 同时给用户可见的进度，失败也只影响当前这一片。
+const GROK_IMPORT_CHUNK_SIZE = 200;
 type GrokViewMode = "table" | "grid";
 
 function getInitialGrokViewMode(): GrokViewMode {
@@ -399,6 +404,11 @@ export default function GrokAccounts({
   const ssoFileInputRef = useRef<HTMLInputElement | null>(null);
   const refreshFileInputRef = useRef<HTMLInputElement | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  // 分片导入的进度（done/total 为分片数）；单片导入时为 null。
+  const [importProgress, setImportProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const [importResult, setImportResult] = useState<{
     total: number;
     imported: number;
@@ -914,24 +924,76 @@ export default function GrokAccounts({
       failed: number;
       items: GrokSSOImportItem[];
     }>,
+  ) => runImportChunks([fn]);
+
+  // runImportChunks 按分片顺序调用导入接口并合并结果。
+  // 分片是为了避开中间层超时：后端单次上限已放宽到 5000，但一个请求要串行落库
+  // 几千条，墙钟时间会长到浏览器/反代先断开，用户既看不到进度也不知道进了多少。
+  // 每片结束就把已合并的结果写回去，中途失败也能看到前面那些片的明细。
+  const runImportChunks = async (
+    chunks: Array<
+      () => Promise<{
+        total: number;
+        imported: number;
+        failed: number;
+        items: GrokSSOImportItem[];
+      }>
+    >,
   ) => {
+    if (chunks.length === 0) return;
     setImportBusy(true);
     setImportResult(null);
     setShowImportPicker(false);
+    setImportProgress(
+      chunks.length > 1 ? { done: 0, total: chunks.length } : null,
+    );
+    const merged = {
+      total: 0,
+      imported: 0,
+      failed: 0,
+      items: [] as GrokSSOImportItem[],
+    };
     try {
-      const res = await fn();
-      setImportResult(res);
-      if (res.imported > 0) {
+      for (let i = 0; i < chunks.length; i++) {
+        const res = await chunks[i]();
+        merged.total += res.total ?? 0;
+        merged.imported += res.imported ?? 0;
+        merged.failed += res.failed ?? 0;
+        merged.items = merged.items.concat(res.items ?? []);
+        if (chunks.length > 1) {
+          setImportProgress({ done: i + 1, total: chunks.length });
+        }
+      }
+      setImportResult({ ...merged, items: [...merged.items] });
+      if (merged.imported > 0) {
         showToast(
-          t("grok.fileImportDone", { imported: res.imported, total: res.total }),
+          t("grok.fileImportDone", {
+            imported: merged.imported,
+            total: merged.total,
+          }),
         );
         void reload();
       }
     } catch (err) {
       showToast(getErrorMessage(err), "error");
+      // 中途失败时把已完成分片的结果留在弹窗里，用户能看到哪些已经进去了。
+      if (merged.total > 0) {
+        setImportResult({ ...merged, items: [...merged.items] });
+      }
+      if (merged.imported > 0) void reload();
     } finally {
       setImportBusy(false);
+      setImportProgress(null);
     }
+  };
+
+  // chunkList 把待导入项切成固定大小的分片。
+  const chunkList = <T,>(items: T[], size: number): T[][] => {
+    const chunks: T[][] = [];
+    for (let i = 0; i < items.length; i += size) {
+      chunks.push(items.slice(i, i + size));
+    }
+    return chunks;
   };
 
   // JSON 凭据文件（CPA / auth.json，可多选）
@@ -941,8 +1003,14 @@ export default function GrokAccounts({
       Array.from(fileList).map((file) => file.text()),
     );
     if (authFileInputRef.current) authFileInputRef.current.value = "";
-    await runImport(() =>
-      api.batchImportGrokAccounts({ files, group_ids: importGroupIds }),
+    await runImportChunks(
+      chunkList(files, GROK_IMPORT_CHUNK_SIZE).map(
+        (part) => () =>
+          api.batchImportGrokAccounts({
+            files: part,
+            group_ids: importGroupIds,
+          }),
+      ),
     );
   };
 
@@ -961,8 +1029,24 @@ export default function GrokAccounts({
     if (!fileList || fileList.length === 0) return;
     const text = await fileList[0].text();
     if (refreshFileInputRef.current) refreshFileInputRef.current.value = "";
-    await runImport(() =>
-      api.importGrokRefreshTokens({ tokens: text, group_ids: importGroupIds }),
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    if (lines.length === 0) {
+      await runImport(() =>
+        api.importGrokRefreshTokens({ tokens: text, group_ids: importGroupIds }),
+      );
+      return;
+    }
+    await runImportChunks(
+      chunkList(lines, GROK_IMPORT_CHUNK_SIZE).map(
+        (part) => () =>
+          api.importGrokRefreshTokens({
+            tokens: part.join("\n"),
+            group_ids: importGroupIds,
+          }),
+      ),
     );
   };
 
@@ -1382,7 +1466,12 @@ export default function GrokAccounts({
                 )}
                 <span className="hidden sm:inline">
                   {importBusy
-                    ? t("grok.fileImporting")
+                    ? importProgress
+                      ? t("grok.fileImportProgress", {
+                          done: importProgress.done,
+                          total: importProgress.total,
+                        })
+                      : t("grok.fileImporting")
                     : t("grok.fileImportBtn")}
                 </span>
               </Button>
@@ -1748,7 +1837,12 @@ export default function GrokAccounts({
                     <Upload className="size-3.5" />
                   )}
                   {importBusy
-                    ? t("grok.fileImporting")
+                    ? importProgress
+                      ? t("grok.fileImportProgress", {
+                          done: importProgress.done,
+                          total: importProgress.total,
+                        })
+                      : t("grok.fileImporting")
                     : t("grok.fileImportBtn")}
                 </Button>
               </div>

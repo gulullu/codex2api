@@ -84,7 +84,7 @@ func StartGrokDeviceFlow(ctx context.Context, proxyURL string) (*GrokDeviceCodeR
 		return nil, err
 	}
 	form := url.Values{
-		"client_id": {GrokDefaultOAuthClientID},
+		"client_id": {EffectiveGrokOAuthClientID()},
 		"scope":     {GrokDefaultOAuthScope},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, discovery.DeviceAuthorizationEndpoint, strings.NewReader(form.Encode()))
@@ -146,7 +146,7 @@ func PollGrokDeviceToken(ctx context.Context, deviceCode, tokenEndpoint, proxyUR
 	form := url.Values{
 		"grant_type":  {GrokDeviceCodeGrantType},
 		"device_code": {deviceCode},
-		"client_id":   {GrokDefaultOAuthClientID},
+		"client_id":   {EffectiveGrokOAuthClientID()},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {

@@ -289,7 +289,7 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 	if in.Token == nil {
 		return 0, "", fmt.Errorf("token 为空")
 	}
-	clientID := auth.GrokDefaultOAuthClientID
+	clientID := auth.EffectiveGrokOAuthClientID()
 	subject := strings.TrimSpace(in.Subject)
 	if subject == "" {
 		subject = auth.GrokSubjectFromAccessToken(in.Token.AccessToken)

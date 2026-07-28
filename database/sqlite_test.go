@@ -748,10 +748,10 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 		t.Fatalf("InsertAccount codex 返回错误: %v", err)
 	}
 	grokID, err := db.InsertAccountWithUpstream(ctx, "grok-one", "xai", "oauth", map[string]interface{}{
-		"upstream_type":  "grok",
-		"refresh_token":  "rt-grok",
-		"access_token":   "at-grok",
-		"email":          "g@example.com",
+		"upstream_type": "grok",
+		"refresh_token": "rt-grok",
+		"access_token":  "at-grok",
+		"email":         "g@example.com",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithUpstream grok 返回错误: %v", err)
@@ -3271,5 +3271,62 @@ func TestSQLiteSystemSettingsContinueThinkingRoundtrip(t *testing.T) {
 	}
 	if clamped.CodexContinueMaxRounds != 32 {
 		t.Errorf("越界轮数应归一到 32, got %d", clamped.CodexContinueMaxRounds)
+	}
+}
+
+// TestSQLiteSystemSettingsUTLSShutdownTimeoutRoundtrip 验证 uTLS 优雅关闭上限
+// （issue #446）能在 SQLite 上完成 播种默认 → 写入 → 读回 → 越界夹取 的全链路。
+func TestSQLiteSystemSettingsUTLSShutdownTimeoutRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// 全新库播种：未显式指定该字段时必须落到默认 30 分钟，而不是 0
+	//（0 会让在途流式请求被立即截断）。
+	seed := &SystemSettings{
+		MaxConcurrency:  2,
+		TestConcurrency: 1,
+		TestModel:       "gpt-5.4",
+	}
+	if err := db.UpdateSystemSettings(ctx, seed); err != nil {
+		t.Fatalf("UpdateSystemSettings(seed): %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got.UTLSShutdownTimeoutMinutes != 30 {
+		t.Fatalf("默认 utls_shutdown_timeout_minutes = %d, want 30", got.UTLSShutdownTimeoutMinutes)
+	}
+
+	// 写入合法值后读回。
+	got.UTLSShutdownTimeoutMinutes = 7
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(7): %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(after): %v", err)
+	}
+	if after.UTLSShutdownTimeoutMinutes != 7 {
+		t.Fatalf("往返后 = %d, want 7", after.UTLSShutdownTimeoutMinutes)
+	}
+
+	// 越界值必须在持久化时被夹到上界。
+	after.UTLSShutdownTimeoutMinutes = 100000
+	if err := db.UpdateSystemSettings(ctx, after); err != nil {
+		t.Fatalf("UpdateSystemSettings(越界): %v", err)
+	}
+	clamped, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(clamped): %v", err)
+	}
+	if clamped.UTLSShutdownTimeoutMinutes != 240 {
+		t.Fatalf("越界值应夹到 240, got %d", clamped.UTLSShutdownTimeoutMinutes)
 	}
 }
