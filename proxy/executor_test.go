@@ -16,6 +16,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+type maxChunkReader struct {
+	reader io.Reader
+	size   int
+}
+
+func (r *maxChunkReader) Read(p []byte) (int, error) {
+	if len(p) > r.size {
+		p = p[:r.size]
+	}
+	return r.reader.Read(p)
+}
+
 func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	input := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\n" +
 		"data: \"delta\":\"hello\"}\n\n" +
@@ -35,6 +47,32 @@ func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	want := "{\"type\":\"response.output_text.delta\",\n\"delta\":\"hello\"}"
 	if events[0] != want {
 		t.Fatalf("unexpected merged event: got %q want %q", events[0], want)
+	}
+}
+
+func TestReadSSEStreamPreservesEventsAcrossReadBoundaries(t *testing.T) {
+	const eventCount = 2048
+
+	var input strings.Builder
+	for i := 0; i < eventCount; i++ {
+		input.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	}
+	input.WriteString("data: [DONE]\n\n")
+
+	got := 0
+	reader := &maxChunkReader{reader: strings.NewReader(input.String()), size: 37}
+	err := ReadSSEStream(reader, func(data []byte) bool {
+		if string(data) != `{"type":"response.output_text.delta","delta":"hello"}` {
+			t.Fatalf("unexpected event %d: %q", got, data)
+		}
+		got++
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadSSEStream returned error: %v", err)
+	}
+	if got != eventCount {
+		t.Fatalf("event count = %d, want %d", got, eventCount)
 	}
 }
 

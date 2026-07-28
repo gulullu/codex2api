@@ -3,6 +3,7 @@ package admin
 import (
 	"bufio"
 	"context"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -154,6 +155,42 @@ func parseMeminfoKB(line string) uint64 {
 	return v
 }
 
+func parseLinuxProcessRSS(r io.Reader) (uint64, bool) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		if rssKB := parseMeminfoKB(line); rssKB > 0 {
+			return rssKB * 1024, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// readProcessMemory 返回当前进程实际驻留在物理内存中的字节数。
+//
+// runtime.MemStats.Sys 是 Go 运行时从 OS 申请/保留过的虚拟内存总量，包含已空闲
+// 甚至已归还的堆页，流量峰值过后仍会保持高水位，不能当成当前进程内存展示。
+// Linux/Docker 使用 /proc/self/status 的 VmRSS；非 Linux 才回退到 Sys。
+func readProcessMemory() uint64 {
+	if runtime.GOOS == "linux" {
+		file, err := os.Open("/proc/self/status")
+		if err == nil {
+			defer file.Close()
+			if rss, ok := parseLinuxProcessRSS(file); ok {
+				return rss
+			}
+		}
+	}
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return mem.Sys
+}
+
 // GetOpsOverview 获取系统运维概览
 func (h *Handler) GetOpsOverview(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -203,10 +240,7 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 	usedMemory, totalMemory, memoryPercent := readSystemMemory()
 	cpuPercent := h.cpuSampler.Sample()
 
-	var processMemory uint64
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	processMemory = memStats.Sys
+	processMemory := readProcessMemory()
 
 	var activeRequests int64
 	var totalRuntimeRequests int64

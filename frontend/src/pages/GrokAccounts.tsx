@@ -51,6 +51,7 @@ import AccountHealthBar from "../components/AccountHealthBar";
 import AccountUsageModal from "../components/AccountUsageModal";
 import Modal from "../components/Modal";
 import ModelLogo from "../components/ModelLogo";
+import OperationResultsModal from "../components/OperationResultsModal";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
@@ -58,6 +59,7 @@ import StatusBadge from "../components/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -76,6 +78,7 @@ import {
 import OperationProgressToast from "../components/OperationProgressToast";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
+import { resolveChannelBatchTestAccountIDs } from "../lib/accountOperationResults";
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
@@ -337,17 +340,26 @@ function planCategory(account: AccountRow): Exclude<PlanFilter, "all"> {
 
 export default function GrokAccounts({
   headerSlot,
+  showOperationResults = false,
+  onShowOperationResultsChange,
 }: {
   // headerSlot 由账号管理页注入 Codex/Grok 顶部切换器，渲染在标题旁。
   headerSlot?: ReactNode;
+  showOperationResults?: boolean;
+  onShowOperationResultsChange?: (visible: boolean) => void;
 } = {}) {
   const { t } = useTranslation();
   const { showToast } = useToast();
   // 与 Codex 账号页一致：用系统自定义确认弹窗，不用 window.confirm。
   const { confirm, confirmDialog } = useConfirmDialog();
   // 批量测试的右上角进度浮层，与 Codex 账号页共用同一实现。
-  const { operationProgress, runStreamingOperation, closeOperationProgress } =
-    useOperationProgress();
+  const {
+    operationProgress,
+    operationResults,
+    runStreamingOperation,
+    closeOperationProgress,
+    closeOperationResults,
+  } = useOperationProgress(showOperationResults);
 
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
@@ -1258,6 +1270,7 @@ export default function GrokAccounts({
       if (!confirmed) return;
       ids = accounts.map((a) => a.id);
     }
+    ids = resolveChannelBatchTestAccountIDs(accounts, "grok", ids);
     if (ids.length === 0) return;
 
     setBatchTesting(true);
@@ -1432,6 +1445,12 @@ export default function GrokAccounts({
         progress={operationProgress}
         onClose={closeOperationProgress}
       />
+      <OperationResultsModal
+        state={showOperationResults ? operationResults : null}
+        accounts={accounts}
+        channel="grok"
+        onClose={closeOperationResults}
+      />
       <StateShell
         variant="page"
         loading={loading}
@@ -1490,6 +1509,20 @@ export default function GrokAccounts({
                     : t("accounts.testConnection")}
                 </span>
               </Button>
+              <label
+                className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-muted-foreground"
+                title={t("accounts.operationResultsPreferenceHint")}
+              >
+                <Switch
+                  checked={showOperationResults}
+                  onCheckedChange={onShowOperationResultsChange}
+                  disabled={!onShowOperationResultsChange}
+                  aria-label={t("accounts.operationResultsPreference")}
+                />
+                <span className="hidden lg:inline">
+                  {t("accounts.operationResultsPreference")}
+                </span>
+              </label>
               <Button
                 variant="outline"
                 size="sm"

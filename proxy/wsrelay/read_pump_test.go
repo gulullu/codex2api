@@ -1335,6 +1335,18 @@ func TestProbeSkipsRoundtripAfterRecentInbound(t *testing.T) {
 	}
 }
 
+// TestWeakNetworkProbeRequiresRoundtripAfterRecentInbound 验证弱网模式不会因最近
+// 收到过业务帧而跳过探活；每次复用都必须拿到本次 Ping 对应的 Pong（issue #442）。
+func TestWeakNetworkProbeRequiresRoundtripAfterRecentInbound(t *testing.T) {
+	setWeakNetworkModeForTest(t, true)
+	manager, wc := newProbeDeafTestConnection(t)
+
+	wc.touchInbound()
+	if manager.probe(wc) {
+		t.Fatal("weak-network mode must require a fresh ping/pong even after recent inbound activity")
+	}
+}
+
 // TestProbeRoundtripsWhenInboundStale 入站活动过期后 probe 回退完整往返；
 // 对端不回 Pong 时按超时判死，不能凭旧活跃放行。
 func TestProbeRoundtripsWhenInboundStale(t *testing.T) {

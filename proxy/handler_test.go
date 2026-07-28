@@ -2081,6 +2081,56 @@ func newOpenAIResponsesRelayStore(upstreamURL string) *auth.Store {
 	return store
 }
 
+func TestResponsesAcceptsCustomOpenAIResponsesModelID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const customModel = "openrouter/gpt-5:free"
+	var seenPath, seenAuth string
+	var seenBody []byte
+	upstream := newOpenAIResponsesSSEUpstream(&seenPath, &seenAuth, &seenBody)
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{customModel},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"openrouter/gpt-5:free","input":"hello","stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+	if seenAuth != "Bearer sk-direct" {
+		t.Fatalf("Authorization = %q, want Bearer sk-direct", seenAuth)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != customModel {
+		t.Fatalf("upstream model = %q, want %q; body=%s", model, customModel, seenBody)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"response.completed"`) {
+		t.Fatalf("downstream stream missing response.completed; body=%s", recorder.Body.String())
+	}
+}
+
 func newOpenAIResponsesRelayStoreWithModelMapping(upstreamURL string) *auth.Store {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:      2,

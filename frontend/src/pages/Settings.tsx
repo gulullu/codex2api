@@ -1147,6 +1147,7 @@ export default function Settings() {
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
     codex_force_websocket: false,
+    codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
     codex_ws_keepalive_interval_sec: 60,
     codex_ws_hide_upstream_errors: true,
@@ -1202,7 +1203,7 @@ export default function Settings() {
     prompt_filter_review_timeout_seconds: 10,
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
-    codex_min_cli_version: '0.118.0',
+    codex_min_cli_version: '0.144.1',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
@@ -2336,9 +2337,16 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_force_websocket', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.codexWSWeakNetworkMode')} description={t('settings.codexWSWeakNetworkModeDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_weak_network_mode}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_weak_network_mode', checked)}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.codexWSKeepaliveEnabled')} description={t('settings.codexWSKeepaliveEnabledDesc')} layout="switch">
                   <Switch
                     checked={settingsForm.codex_ws_keepalive_enabled}
+                    disabled={settingsForm.codex_ws_weak_network_mode}
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_keepalive_enabled', checked)}
                   />
                 </SettingField>
@@ -2373,16 +2381,16 @@ export default function Settings() {
                   label={t('settings.codexWSKeepaliveInterval')}
                   description={t('settings.codexWSKeepaliveIntervalDesc')}
                   suffix={t('settings.unit.sec')}
-                  className={cn(!settingsForm.codex_ws_keepalive_enabled && 'opacity-60')}
+                  className={cn((!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode) && 'opacity-60')}
                 >
                   <DraftNumberInput
                     min={10}
                     max={600}
-                    disabled={!settingsForm.codex_ws_keepalive_enabled}
+                    disabled={!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode}
                     value={settingsForm.codex_ws_keepalive_interval_sec}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: value }))}
                     onValueCommit={(value) => {
-                      if (!settingsForm.codex_ws_keepalive_enabled) return
+                      if (!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode) return
                       void autoSaveSettingsPatch({
                         codex_ws_keepalive_interval_sec: value,
                       })

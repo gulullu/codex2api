@@ -1,5 +1,11 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getAdminKey, resetAdminAuthState } from "../api";
+import {
+  collectAccountOperationResult,
+  snapshotAccountOperationResults,
+  type AccountOperationResult,
+  type AccountOperationResultsState,
+} from "../lib/accountOperationResults";
 
 // 批量操作（测试/删除/刷新）的流式进度：SSE 读取 + 右上角进度浮层状态机。
 // 从 Codex 账号页抽出，供 Codex / Grok 账号页共用，确保两处进度条一致。
@@ -11,6 +17,8 @@ export type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refres
 export interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
   action: BatchOperationAction;
+  status?: string;
+  http_status?: number;
   current?: number;
   total?: number;
   success?: number;
@@ -100,6 +108,7 @@ export async function postAdminSSE(
 
 export interface UseOperationProgressResult {
   operationProgress: OperationProgressState | null;
+  operationResults: AccountOperationResultsState | null;
   // 发起一次流式批量操作，把进度事件驱动到右上角浮层；返回 complete 事件。
   runStreamingOperation: (
     path: string,
@@ -107,12 +116,21 @@ export interface UseOperationProgressResult {
     title: string,
   ) => Promise<BatchOperationEvent | null>;
   closeOperationProgress: () => void;
+  closeOperationResults: () => void;
 }
 
 // useOperationProgress 封装批量操作的进度浮层状态机（含节流刷新与自动隐藏）。
-export function useOperationProgress(): UseOperationProgressResult {
+export function useOperationProgress(
+  showOperationResults = false,
+): UseOperationProgressResult {
   const [operationProgress, setOperationProgress] =
     useState<OperationProgressState | null>(null);
+  const [operationResults, setOperationResults] =
+    useState<AccountOperationResultsState | null>(null);
+  const showOperationResultsRef = useRef(showOperationResults);
+  const operationResultMap = useRef<Map<number, AccountOperationResult>>(
+    new Map(),
+  );
   const operationProgressHideTimer = useRef<number | null>(null);
   const operationProgressFrame = useRef<number | null>(null);
   const operationProgressFlushTimer = useRef<number | null>(null);
@@ -129,6 +147,17 @@ export function useOperationProgress(): UseOperationProgressResult {
     }
     setOperationProgress(null);
   }, []);
+
+  const closeOperationResults = useCallback(() => {
+    setOperationResults(null);
+  }, []);
+
+  useEffect(() => {
+    showOperationResultsRef.current = showOperationResults;
+    if (!showOperationResults) {
+      setOperationResults(null);
+    }
+  }, [showOperationResults]);
 
   const scheduleOperationProgressClose = useCallback(() => {
     if (operationProgressHideTimer.current !== null) {
@@ -157,6 +186,18 @@ export function useOperationProgress(): UseOperationProgressResult {
         message: event.error || event.message || prev?.message,
       }));
       if (event.type === "complete") {
+        if (
+          showOperationResultsRef.current &&
+          (event.action === "batch_test" ||
+            event.action === "batch_refresh")
+        ) {
+          setOperationResults({
+            action: event.action,
+            results: snapshotAccountOperationResults(
+              operationResultMap.current,
+            ),
+          });
+        }
         scheduleOperationProgressClose();
       }
     },
@@ -174,6 +215,10 @@ export function useOperationProgress(): UseOperationProgressResult {
 
   const applyOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      collectAccountOperationResult(operationResultMap.current, event);
+      if (event.type === "start") {
+        setOperationResults(null);
+      }
       if (operationProgressHideTimer.current !== null) {
         window.clearTimeout(operationProgressHideTimer.current);
         operationProgressHideTimer.current = null;
@@ -221,6 +266,22 @@ export function useOperationProgress(): UseOperationProgressResult {
     [flushOperationProgressEvent],
   );
 
+  useEffect(() => {
+    return () => {
+      if (operationProgressHideTimer.current !== null) {
+        window.clearTimeout(operationProgressHideTimer.current);
+      }
+      if (operationProgressFrame.current !== null) {
+        window.cancelAnimationFrame(operationProgressFrame.current);
+      }
+      if (operationProgressFlushTimer.current !== null) {
+        window.clearTimeout(operationProgressFlushTimer.current);
+      }
+      pendingOperationProgress.current = null;
+      operationResultMap.current.clear();
+    };
+  }, []);
+
   const runStreamingOperation = useCallback(
     async (
       path: string,
@@ -240,5 +301,11 @@ export function useOperationProgress(): UseOperationProgressResult {
     [applyOperationProgressEvent],
   );
 
-  return { operationProgress, runStreamingOperation, closeOperationProgress };
+  return {
+    operationProgress,
+    operationResults,
+    runStreamingOperation,
+    closeOperationProgress,
+    closeOperationResults,
+  };
 }

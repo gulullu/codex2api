@@ -149,17 +149,16 @@ func (wc *WsConnection) recentInboundWithin(window time.Duration) bool {
 // IsExpired 检查连接是否过期
 func (wc *WsConnection) IsExpired() bool {
 	lastUsed := time.Unix(0, wc.lastUsed.Load())
-	return time.Since(lastUsed) > IdleTimeout
+	return time.Since(lastUsed) > connectionIdleTimeout()
 }
 
-// IsOverAge 检查连接是否超过最大寿命（MaxConnLifetime）。到龄连接不能再接新请求：
-// 上游按连接建立时间计 60 分钟寿命，撞线后 response.create 一律报错，但 Ping
-// 探活仍成功，必须按年龄主动识别。
+// IsOverAge 检查连接是否超过当前模式的最大寿命。到龄连接不能再接新请求：
+// 默认模式提前规避上游 60 分钟硬限制；弱网模式使用更短窗口主动轮换。
 func (wc *WsConnection) IsOverAge() bool {
 	if wc.createdAt == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, wc.createdAt)) > MaxConnLifetime
+	return time.Since(time.Unix(0, wc.createdAt)) > connectionMaxLifetime()
 }
 
 // IsConnected 检查是否已连接
@@ -1017,7 +1016,7 @@ func (m *Manager) probe(wc *WsConnection) bool {
 	if fn != nil {
 		return fn(wc)
 	}
-	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
+	if !weakNetworkModeEnabled() && wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
 		return true
 	}
 	return probeConnection(wc)

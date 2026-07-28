@@ -161,7 +161,7 @@ func (s *Session) Touch() {
 func (s *Session) IsExpired() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return time.Since(s.LastActiveAt) > IdleTimeout
+	return time.Since(s.LastActiveAt) > connectionIdleTimeout()
 }
 
 // SetConnected 设置连接状态
@@ -281,6 +281,13 @@ func (s *Session) heartbeatTick(sendPing func() error) {
 	s.mu.RUnlock()
 
 	if !connected {
+		return
+	}
+
+	// 弱网模式不靠心跳无限续住空闲连接；没有在途请求时停止心跳，
+	// 让短空闲窗口把连接自然轮换掉。在途请求仍保留原心跳保护。
+	if weakNetworkModeEnabled() && s.PendingCount() == 0 {
+		s.StopHeartbeat()
 		return
 	}
 

@@ -375,7 +375,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		PromptFilterCustomPatterns:        "[]",
 		PromptFilterDisabledPatterns:      "[]",
 		ClientCompatMode:                  proxy.ClientCompatModePreserve,
-		CodexMinCLIVersion:                "0.118.0",
+		CodexMinCLIVersion:                "0.144.1",
 		UsageLogMode:                      database.UsageLogModeFull,
 		UsageLogBatchSize:                 200,
 		UsageLogFlushIntervalSeconds:      5,

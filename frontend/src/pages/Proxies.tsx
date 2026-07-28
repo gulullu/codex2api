@@ -8,8 +8,6 @@ import {
   MapPin,
   Loader2,
   Zap,
-  ChevronLeft,
-  ChevronRight,
   Eye,
   EyeOff,
   AlertTriangle,
@@ -26,11 +24,15 @@ import { api, type ProxyRow } from "../api";
 import type { AccountRow } from "../types";
 import ChannelLogo from "../components/ChannelLogo";
 import Modal from "../components/Modal";
+import Pagination from "../components/Pagination";
 import StatusBadge from "../components/StatusBadge";
+import {
+  DEFAULT_PAGE_SIZE_OPTIONS,
+  usePersistedPageSize,
+} from "../hooks/usePersistedPageSize";
 import { useToast } from "../hooks/useToast";
 import { getErrorMessage } from "../utils/error";
 
-const PAGE_SIZE = 10;
 const TEST_ALL_CONCURRENCY = 4;
 
 const PROXY_SCHEMES = ["http:", "https:", "socks5:", "socks5h:"];
@@ -142,6 +144,12 @@ export default function Proxies() {
   const [testAllDone, setTestAllDone] = useState(0);
   const [testAllFailed, setTestAllFailed] = useState(0);
   const [page, setPage] = useState(1);
+  const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
+  const [pageSize, setPageSize] = usePersistedPageSize(
+    "proxies",
+    10,
+    pageSizeOptions,
+  );
   const [revealedIds, setRevealedIds] = useState<Set<number>>(new Set());
   const [editingProxy, setEditingProxy] = useState<ProxyRow | null>(null);
   const [editUrl, setEditUrl] = useState("");
@@ -203,8 +211,12 @@ export default function Proxies() {
     reload();
   }, [reload]);
 
-  const totalPages = Math.max(1, Math.ceil(proxies.length / PAGE_SIZE));
-  const pagedProxies = proxies.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+  const totalPages = Math.max(1, Math.ceil(proxies.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pagedProxies = proxies.slice(
+    (currentPage - 1) * pageSize,
+    currentPage * pageSize,
+  );
 
   // proxy_url → 绑定账号数
   const boundCountByProxyUrl = useMemo(() => {
@@ -333,8 +345,8 @@ export default function Proxies() {
   };
 
   useEffect(() => {
-    if (page > totalPages) setPage(totalPages);
-  }, [page, totalPages]);
+    if (page !== currentPage) setPage(currentPage);
+  }, [currentPage, page]);
 
   const handleTogglePool = async () => {
     const next = !poolEnabled;
@@ -1101,51 +1113,20 @@ export default function Proxies() {
                 </table>
               </div>
 
-              {/* Pagination */}
-              {totalPages > 1 && (
-                <div className="flex flex-col gap-2 px-4 py-3 border-t border-border sm:flex-row sm:items-center sm:justify-between">
-                  <span className="text-xs text-muted-foreground">
-                    {t("proxies.pagination", {
-                      total: proxies.length,
-                      page,
-                      totalPages,
-                    })}
-                  </span>
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => setPage((p) => Math.max(1, p - 1))}
-                      disabled={page <= 1}
-                      className="flex items-center justify-center size-9 rounded-lg border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <ChevronLeft className="size-4" />
-                    </button>
-                    {Array.from({ length: totalPages }, (_, i) => i + 1).map(
-                      (n) => (
-                        <button
-                          key={n}
-                          onClick={() => setPage(n)}
-                          className={`flex items-center justify-center size-9 rounded-lg text-xs font-medium transition-all ${
-                            n === page
-                              ? "bg-primary text-primary-foreground shadow-sm"
-                              : "border border-border text-foreground hover:bg-muted/50"
-                          }`}
-                        >
-                          {n}
-                        </button>
-                      ),
-                    )}
-                    <button
-                      onClick={() =>
-                        setPage((p) => Math.min(totalPages, p + 1))
-                      }
-                      disabled={page >= totalPages}
-                      className="flex items-center justify-center size-9 rounded-lg border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
-                    >
-                      <ChevronRight className="size-4" />
-                    </button>
-                  </div>
-                </div>
-              )}
+              <div className="px-4 pb-3">
+                <Pagination
+                  page={currentPage}
+                  totalPages={totalPages}
+                  onPageChange={setPage}
+                  totalItems={proxies.length}
+                  pageSize={pageSize}
+                  pageSizeOptions={pageSizeOptions}
+                  onPageSizeChange={(nextPageSize) => {
+                    setPageSize(nextPageSize);
+                    setPage(1);
+                  }}
+                />
+              </div>
             </>
           )}
         </CardContent>

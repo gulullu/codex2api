@@ -1229,12 +1229,21 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 			return true
 		}
 
-		data := bytes.Join(dataLines, []byte("\n"))
-		dataLines = dataLines[:0]
-		if bytes.Equal(data, []byte("[DONE]")) {
-			return false
+		// 绝大多数上游事件只有一条 data: 行，直接交给 callback，避免
+		// bytes.Join 为每个 token 事件再复制一遍 payload。多行 SSE 才合并。
+		data := dataLines[0]
+		if len(dataLines) > 1 {
+			data = bytes.Join(dataLines, []byte("\n"))
 		}
-		return callback(data)
+		isDone := bytes.Equal(data, []byte("[DONE]"))
+		keepReading := !isDone && callback(data)
+		// 清掉 backing array 中的切片引用，避免最后一个大事件一直被
+		// dataLines 的容量槽位持有到整条流结束。
+		for i := range dataLines {
+			dataLines[i] = nil
+		}
+		dataLines = dataLines[:0]
+		return keepReading
 	}
 
 	for {
@@ -1242,15 +1251,19 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 		if n > 0 {
 			lineBuf = append(lineBuf, buf[:n]...)
 
-			// 按行处理
+			// 按行处理。用偏移量扫描，最后一次性把未完成行搬到缓冲区头部；
+			// 不能反复 lineBuf = lineBuf[idx+1:]，否则每消费一行都会缩短 cap，
+			// 下一次 64KB Read 几乎必然重新分配，池化缓冲区形同失效。
+			consumed := 0
 			for {
-				idx := bytes.IndexByte(lineBuf, '\n')
+				idx := bytes.IndexByte(lineBuf[consumed:], '\n')
 				if idx < 0 {
 					break
 				}
 
-				line := bytes.TrimRight(lineBuf[:idx], "\r")
-				lineBuf = lineBuf[idx+1:]
+				lineEnd := consumed + idx
+				line := bytes.TrimRight(lineBuf[consumed:lineEnd], "\r")
+				consumed = lineEnd + 1
 
 				if len(line) == 0 {
 					if !emitEvent() {
@@ -1274,11 +1287,9 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 				}
 			}
 
-			// 缩容：已消费数据超过一半时，将剩余数据移到头部释放前端内存
-			if len(lineBuf) > 0 && cap(lineBuf) > 4096 && len(lineBuf) < cap(lineBuf)/4 {
-				compact := make([]byte, len(lineBuf), cap(lineBuf)/2)
-				copy(compact, lineBuf)
-				lineBuf = compact
+			if consumed > 0 {
+				remaining := copy(lineBuf, lineBuf[consumed:])
+				lineBuf = lineBuf[:remaining]
 			}
 		}
 

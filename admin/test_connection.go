@@ -589,6 +589,8 @@ func (h *Handler) persistRecycleBinTestResult(id int64, status string) {
 type batchOperationEvent struct {
 	Type        string `json:"type"` // start | progress | complete
 	Action      string `json:"action"`
+	Status      string `json:"status,omitempty"`
+	HTTPStatus  int    `json:"http_status,omitempty"`
 	Current     int    `json:"current"`
 	Total       int    `json:"total"`
 	Success     int64  `json:"success"`
@@ -599,6 +601,37 @@ type batchOperationEvent struct {
 	AccountID   int64  `json:"account_id,omitempty"`
 	Message     string `json:"message,omitempty"`
 	Error       string `json:"error,omitempty"`
+}
+
+func batchOperationHTTPStatus(status, message string) int {
+	if status == "success" {
+		return http.StatusOK
+	}
+
+	normalized := strings.ToLower(message)
+	for _, marker := range []string{
+		"上游返回 ",
+		"http ",
+		"status code ",
+		"status ",
+		"status=",
+		"status:",
+		"状态码 ",
+	} {
+		index := strings.Index(normalized, marker)
+		if index < 0 {
+			continue
+		}
+		remainder := strings.TrimLeft(normalized[index+len(marker):], " :=-")
+		if len(remainder) < 3 {
+			continue
+		}
+		code, err := strconv.Atoi(remainder[:3])
+		if err == nil && code >= 100 && code <= 599 {
+			return code
+		}
+	}
+	return 0
 }
 
 type batchTestCounts struct {
@@ -880,6 +913,8 @@ func (h *Handler) emitBatchTestProgress(
 	event := batchOperationEvent{
 		Type:        "progress",
 		Action:      "batch_test",
+		Status:      status,
+		HTTPStatus:  batchOperationHTTPStatus(status, message),
 		Current:     current,
 		Total:       total,
 		Success:     atomic.LoadInt64(successCount),
@@ -968,7 +1003,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			proxy.SyncCodexUsageState(h.store, acc, resp)
 		}
 		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
-		return "banned", "账号授权失败"
+		return "banned", "上游返回 401: 账号授权失败"
 	case http.StatusTooManyRequests:
 		body, readErr := readBatchTestErrorBody(testCtx, resp.Body)
 		if readErr != nil {
@@ -984,7 +1019,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			}
 			proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 		}
-		return "rate_limited", "账号触发 429 限流"
+		return "rate_limited", "上游返回 429: 账号触发限流"
 	default:
 		body, readErr := readBatchTestErrorBody(testCtx, resp.Body)
 		if readErr != nil {

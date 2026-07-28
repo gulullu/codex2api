@@ -47,6 +47,9 @@ func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
 	if strings.TrimSpace(settings.PromptFilterAdvancedConfig) != "{}" {
 		t.Fatalf("compatibility advanced config = %q, want {}", settings.PromptFilterAdvancedConfig)
 	}
+	if settings.CodexMinCLIVersion != "0.144.1" {
+		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.144.1", settings.CodexMinCLIVersion)
+	}
 }
 
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
@@ -3328,5 +3331,45 @@ func TestSQLiteSystemSettingsUTLSShutdownTimeoutRoundtrip(t *testing.T) {
 	}
 	if clamped.UTLSShutdownTimeoutMinutes != 240 {
 		t.Fatalf("越界值应夹到 240, got %d", clamped.UTLSShutdownTimeoutMinutes)
+	}
+}
+
+func TestSQLiteSystemSettingsWeakNetworkModeRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		CodexWSWeakNetworkMode: true,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings(true): %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(true): %v", err)
+	}
+	if got == nil || !got.CodexWSWeakNetworkMode {
+		t.Fatalf("codex_ws_weak_network_mode = %v, want true", got != nil && got.CodexWSWeakNetworkMode)
+	}
+
+	got.CodexWSWeakNetworkMode = false
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(false): %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(false): %v", err)
+	}
+	if after.CodexWSWeakNetworkMode {
+		t.Fatal("codex_ws_weak_network_mode = true after disabling, want false")
 	}
 }

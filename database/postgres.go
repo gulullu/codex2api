@@ -983,7 +983,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_timeout_seconds INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.144.1';
+	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.144.1';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_mode VARCHAR(20) DEFAULT 'full';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_batch_size INT DEFAULT 200;
@@ -999,6 +1000,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_image_studio_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_account_portal_page_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_weak_network_mode BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_hide_upstream_errors BOOLEAN DEFAULT TRUE;
@@ -1739,6 +1741,7 @@ type SystemSettings struct {
 	PublicImageStudioPageEnabled        bool
 	PublicAccountPortalPageEnabled      bool // 账号自助添加公开门户开关，默认 false
 	CodexForceWebsocket                 bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexWSWeakNetworkMode              bool // WS 弱网保守复用模式，默认 false
 	CodexWSKeepaliveEnabled             bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
 	CodexWSKeepaliveIntervalSec         int  // WS 保活 Ping 间隔（秒），默认 60
 	CodexWSHideUpstreamErrors           bool // 隐藏上游 WS 原始错误，默认 true
@@ -1893,7 +1896,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_review_timeout_seconds, 10),
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
-		       COALESCE(codex_min_cli_version, '0.118.0'),
+		       COALESCE(codex_min_cli_version, '0.144.1'),
 		       COALESCE(codex_user_agent_config, '{}'),
 		       COALESCE(usage_log_mode, 'full'),
 		       COALESCE(usage_log_batch_size, 200),
@@ -1944,7 +1947,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(overflow_auto_compact_enabled, false),
 			       COALESCE(first_token_excludes_ws_acquire, false),
 			       COALESCE(codex_preflight_sse_passthrough_enabled, false),
-			       COALESCE(utls_shutdown_timeout_minutes, 30)
+			       COALESCE(utls_shutdown_timeout_minutes, 30),
+			       COALESCE(codex_ws_weak_network_mode, false)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2008,6 +2012,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.FirstTokenExcludesWsAcquire,
 		&s.CodexPreflightSSEPassthroughEnabled,
 		&s.UTLSShutdownTimeoutMinutes,
+		&s.CodexWSWeakNetworkMode,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2120,9 +2125,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					overflow_auto_compact_enabled,
 					first_token_excludes_ws_acquire,
 					codex_preflight_sse_passthrough_enabled,
-					utls_shutdown_timeout_minutes
+					utls_shutdown_timeout_minutes,
+					codex_ws_weak_network_mode
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2223,7 +2229,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					overflow_auto_compact_enabled = EXCLUDED.overflow_auto_compact_enabled,
 					first_token_excludes_ws_acquire = EXCLUDED.first_token_excludes_ws_acquire,
 					codex_preflight_sse_passthrough_enabled = EXCLUDED.codex_preflight_sse_passthrough_enabled,
-					utls_shutdown_timeout_minutes = EXCLUDED.utls_shutdown_timeout_minutes
+					utls_shutdown_timeout_minutes = EXCLUDED.utls_shutdown_timeout_minutes,
+					codex_ws_weak_network_mode = EXCLUDED.codex_ws_weak_network_mode
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2257,7 +2264,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.OverflowAutoCompactEnabled,
 		s.FirstTokenExcludesWsAcquire,
 		s.CodexPreflightSSEPassthroughEnabled,
-		NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMinutes))
+		NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMinutes),
+		s.CodexWSWeakNetworkMode)
 	return err
 }
 
