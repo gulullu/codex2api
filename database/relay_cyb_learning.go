@@ -579,8 +579,9 @@ func (db *DB) ListRelayCYBMissBackfillCandidatesAfter(
 	} else {
 		cutoff = cutoff.UTC()
 	}
+	hasCursor := !afterCreatedAt.IsZero()
 	var afterCreatedAtArg any
-	if !afterCreatedAt.IsZero() {
+	if hasCursor {
 		afterCreatedAtArg = db.timeArg(afterCreatedAt.UTC())
 	}
 	afterRequestID = strings.TrimSpace(afterRequestID)
@@ -661,13 +662,13 @@ func (db *DB) ListRelayCYBMissBackfillCandidatesAfter(
 		WHERE sample.request_id IS NULL
 		  AND request.created_at < $2
 		  AND (
-		    CAST($3 AS TIMESTAMP) IS NULL
-		    OR request.created_at > $3
-		    OR (request.created_at = $3 AND request.request_id > $4)
+		    $3 = FALSE
+		    OR request.created_at > $4
+		    OR (request.created_at = $4 AND request.request_id > $5)
 		  )
 		ORDER BY request.created_at, request.request_id
-		LIMIT $5
-	`, relayGroupID, db.timeArg(cutoff), afterCreatedAtArg, afterRequestID, limit)
+		LIMIT $6
+	`, relayGroupID, db.timeArg(cutoff), hasCursor, afterCreatedAtArg, afterRequestID, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -587,32 +587,44 @@ func TestRelayCYBBackfillKeysetAgainstPostgres(t *testing.T) {
 		}
 	}
 
-	first, err := db.ListRelayCYBMissBackfillCandidatesAfter(
-		ctx,
-		0,
-		createdAt.Add(time.Minute),
-		time.Time{},
-		"",
-		1,
-	)
-	if err != nil {
-		t.Fatalf("first PostgreSQL keyset page: %v", err)
-	}
-	if len(first) != 1 || first[0].RequestID != "postgres-keyset-a" {
-		t.Fatalf("first PostgreSQL keyset page = %+v", first)
-	}
-	second, err := db.ListRelayCYBMissBackfillCandidatesAfter(
-		ctx,
-		0,
-		createdAt.Add(time.Minute),
-		first[0].CreatedAt,
-		first[0].RequestID,
-		1,
-	)
-	if err != nil {
-		t.Fatalf("second PostgreSQL keyset page: %v", err)
-	}
-	if len(second) != 1 || second[0].RequestID != "postgres-keyset-b" {
-		t.Fatalf("second PostgreSQL keyset page = %+v", second)
+	for _, sessionTimeZone := range []string{"America/Los_Angeles", "Asia/Shanghai"} {
+		t.Run(sessionTimeZone, func(t *testing.T) {
+			if _, err := conn.ExecContext(
+				ctx,
+				`SELECT set_config('TimeZone', $1, false)`,
+				sessionTimeZone,
+			); err != nil {
+				t.Fatalf("set PostgreSQL session timezone: %v", err)
+			}
+
+			first, err := db.ListRelayCYBMissBackfillCandidatesAfter(
+				ctx,
+				0,
+				createdAt.Add(time.Minute),
+				time.Time{},
+				"",
+				1,
+			)
+			if err != nil {
+				t.Fatalf("first PostgreSQL keyset page: %v", err)
+			}
+			if len(first) != 1 || first[0].RequestID != "postgres-keyset-a" {
+				t.Fatalf("first PostgreSQL keyset page = %+v", first)
+			}
+			second, err := db.ListRelayCYBMissBackfillCandidatesAfter(
+				ctx,
+				0,
+				createdAt.Add(time.Minute),
+				first[0].CreatedAt,
+				first[0].RequestID,
+				1,
+			)
+			if err != nil {
+				t.Fatalf("second PostgreSQL keyset page: %v", err)
+			}
+			if len(second) != 1 || second[0].RequestID != "postgres-keyset-b" {
+				t.Fatalf("second PostgreSQL keyset page = %+v", second)
+			}
+		})
 	}
 }
