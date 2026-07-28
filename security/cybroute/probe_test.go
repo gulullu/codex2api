@@ -2,6 +2,7 @@ package cybroute
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -75,5 +76,30 @@ func TestDetectProbeUsesLatestUserTextOnly(t *testing.T) {
 	}
 	if signature, matched := DetectProbe(body, "/v1/chat/completions"); !matched || signature != "ping" {
 		t.Fatalf("latest probe missed: signature=%q matched=%v", signature, matched)
+	}
+}
+
+func TestDetectProbeKeepsSmallCurrentUserWithOversizedNonUserContext(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"instructions": strings.Repeat("system context ", 2*1024*1024),
+		"input":        "ping",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signature, matched := DetectProbe(body, "/v1/responses"); !matched || signature != "ping" {
+		t.Fatalf("oversized non-user context hid current probe: signature=%q matched=%v", signature, matched)
+	}
+}
+
+func TestDetectProbeRejectsOversizedCurrentUserEvenWhenTailLooksLikeProbe(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"input": strings.Repeat("ordinary user context ", 2*1024*1024) + " ping",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signature, matched := DetectProbe(body, "/v1/responses"); matched || signature != "" {
+		t.Fatalf("oversized current user became a probe: signature=%q matched=%v", signature, matched)
 	}
 }

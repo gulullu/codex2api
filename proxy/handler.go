@@ -1224,7 +1224,7 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 	if strings.TrimSpace(message) == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
 		message = "上游返回 response.failed"
 	}
-	kind := upstreamErrorKind(statusCode, payload, codex429Decision{})
+	kind := upstreamErrorKind(statusCode, responseFailedErrorBody(payload), codex429Decision{})
 	if kind == "" {
 		if statusCode >= 500 {
 			kind = "server"
@@ -1877,6 +1877,9 @@ func upstreamAccountErrorMessage(statusCode int, body []byte) string {
 }
 
 func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) string {
+	if upstreamCyberPolicyCode(body) != "" {
+		return "cyber_policy"
+	}
 	if IsUsageLimitReachedError(body) {
 		if decision.Reason != "" {
 			return decision.Reason
@@ -2063,6 +2066,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	replayStableScope := relayContinuationStableScope(c.Request.Header, rawBody)
 	relayReplayOwner := relayContinuationReplayOwner(respCacheOwner, replayStableScope)
 	relayReplayBody, relayReplayReplayed, relayReplaySource, relayReplayGroupID, relayReplayErr := PrepareRelayContinuationHTTPFallback(c.Request.Context(), relayReplayOwner, rawBody)
+	if relayReplayReplayed {
+		routePlan.setCYBUpstreamBody(relayReplayBody)
+	}
 	h.applyRelayContinuationReplayRoute(c, routePlan, relayReplayReplayed, relayReplayGroupID)
 	h.recordRelayContinuationReplayAudit(routePlan, relayReplayReplayed, relayReplaySource, relayReplayErr)
 	relayReplayRequestComplete := relayReplayErr == nil
@@ -2538,6 +2544,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+				h.recordRelayCYBStreamAttempt(
+					c, account, outcome, attempt+1, upstreamEndpoint, useWebsocket, true,
+				)
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
@@ -3112,6 +3121,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			h.recordRelayCYBStreamAttempt(
+				c, account, outcome, attempt+1, "/v1/responses", useWebsocket, true,
+			)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -4355,6 +4367,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			h.recordRelayCYBStreamAttempt(
+				c, account, outcome, attempt+1, upstreamEndpoint, useWebsocket, true,
+			)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {

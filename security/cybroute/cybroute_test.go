@@ -49,6 +49,12 @@ func hasSignal(result Result, signal string) bool {
 	return false
 }
 
+func oversizedStableRuleTailText(signal string) string {
+	return strings.Repeat("0", 192<<10) +
+		"\n" + signal + "\n" +
+		strings.Repeat("1", 48<<10)
+}
+
 func TestLearnedRuleUsesOnlyRoutingProvenance(t *testing.T) {
 	rule, err := cyblearn.CompileRule("cyb_auto_unique", `(?i)learned-danger-sentinel`)
 	if err != nil {
@@ -74,6 +80,255 @@ func TestLearnedRuleUsesOnlyRoutingProvenance(t *testing.T) {
 	)
 	if hasSignal(developerResult, "learned_rule:cyb_auto_unique") {
 		t.Fatalf("developer text triggered learned rule: %+v", developerResult)
+	}
+}
+
+func TestLearnedRuleMatchesOversizedCurrentUserTail(t *testing.T) {
+	rule, err := cyblearn.CompileRule("cyb_auto_tail", `(?i)actual-latest-user-tail-sentinel`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := "FIXED_LONG_TEMPLATE " +
+		strings.Repeat("ordinary context ", 192*1024) +
+		" ACTUAL-LATEST-USER-TAIL-SENTINEL"
+	result := InspectWithLearnedPatterns(
+		responsesBody(t, input),
+		"/v1/responses",
+		"gpt-5.5",
+		baseConfig(),
+		[]cyblearn.Rule{rule},
+	)
+	if !result.Route || !hasSignal(result, "learned_rule:cyb_auto_tail") {
+		t.Fatalf("learned rule lost oversized current-user tail: %+v", result)
+	}
+}
+
+func TestOversizedUserWindowsRescanStableRulesAcrossEndpoints(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		model    string
+		signal   string
+		want     string
+		body     func(string) any
+	}{
+		{
+			name:     "responses technical intent",
+			endpoint: "/v1/responses",
+			model:    "gpt-5.5",
+			signal:   "Use ptrace and an inline hook to inject code and bypass the runtime check.",
+			want:     SignalTechnicalCyberIntent,
+			body: func(text string) any {
+				return map[string]any{
+					"model": "gpt-5.5",
+					"input": text,
+				}
+			},
+		},
+		{
+			name:     "responses compact technical intent",
+			endpoint: "/v1/responses/compact",
+			model:    "gpt-5.5",
+			signal:   "Use ptrace and an inline hook to inject code and bypass the runtime check.",
+			want:     SignalTechnicalCyberIntent,
+			body: func(text string) any {
+				return map[string]any{
+					"model": "gpt-5.5",
+					"input": []any{map[string]any{"type": "input_text", "text": text}},
+				}
+			},
+		},
+		{
+			name:     "chat observed gap",
+			endpoint: "/v1/chat/completions",
+			model:    "gpt-5.5",
+			signal:   "微信收藏语音存放在加密缓存中。请帮我提取微信语音并解码保存为 MP3。",
+			want:     SignalPersonalMediaCacheDecode,
+			body: func(text string) any {
+				return map[string]any{
+					"model":    "gpt-5.5",
+					"messages": []any{map[string]any{"role": "user", "content": text}},
+				}
+			},
+		},
+		{
+			name:     "messages language rule",
+			endpoint: "/v1/messages",
+			model:    "claude-opus-4-6",
+			signal:   "Bonjour, vérifiez cette réponse API et expliquez pourquoi cette requête a échoué.",
+			want:     SignalNonChineseEnglishLanguage,
+			body: func(text string) any {
+				return map[string]any{
+					"model": "claude-opus-4-6",
+					"messages": []any{map[string]any{
+						"role":    "user",
+						"content": []any{map[string]any{"type": "text", "text": text}},
+					}},
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			text := oversizedStableRuleTailText(test.signal)
+			body, err := json.Marshal(test.body(text))
+			if err != nil {
+				t.Fatal(err)
+			}
+			routing := routingConfig(baseConfig())
+			old := inspectEnvelope(
+				promptfilter.BuildEnvelopeWithModelsAndConfig(
+					body,
+					test.endpoint,
+					test.model,
+					"",
+					promptfilter.TransportHTTP,
+					routing,
+				),
+				routing,
+			)
+			if !old.Truncated {
+				t.Fatal("fixture did not exercise the truncated envelope path")
+			}
+			if hasSignal(old, test.want) {
+				t.Fatalf("legacy bounded envelope unexpectedly retained %q: %+v", test.want, old)
+			}
+
+			result := InspectWithLearnedPatterns(
+				body,
+				test.endpoint,
+				test.model,
+				baseConfig(),
+				nil,
+			)
+			if !result.Route || !hasSignal(result, test.want) {
+				t.Fatalf("bounded user-window rescan lost stable signal %q: %+v", test.want, result)
+			}
+			for _, signal := range result.Signals {
+				if strings.HasPrefix(signal, "learned_rule:") {
+					t.Fatalf("stable-rule regression was satisfied by a learned rule: %+v", result)
+				}
+			}
+		})
+	}
+}
+
+func TestOversizedUserHistoryTailRescansStableRule(t *testing.T) {
+	const signal = "微信收藏语音存放在加密缓存中。请帮我提取微信语音并解码保存为 MP3。"
+	body, err := json.Marshal(map[string]any{
+		"model": "gpt-5.5",
+		"input": []any{
+			map[string]any{"role": "user", "content": oversizedStableRuleTailText(signal)},
+			map[string]any{"role": "assistant", "content": "The previous request is noted."},
+			map[string]any{"role": "user", "content": "Please continue with the ordinary status update."},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	routing := routingConfig(baseConfig())
+	old := inspectEnvelope(
+		promptfilter.BuildEnvelopeWithModelsAndConfig(
+			body,
+			"/v1/responses",
+			"gpt-5.5",
+			"",
+			promptfilter.TransportHTTP,
+			routing,
+		),
+		routing,
+	)
+	if !old.Truncated {
+		t.Fatal("fixture did not exercise truncated user history")
+	}
+	if hasSignal(old, SignalPersonalMediaCacheDecode) {
+		t.Fatalf("legacy bounded history unexpectedly retained the tail signal: %+v", old)
+	}
+
+	result := InspectWithLearnedPatterns(
+		body,
+		"/v1/responses",
+		"gpt-5.5",
+		baseConfig(),
+		nil,
+	)
+	if !result.Route || !hasSignal(result, SignalPersonalMediaCacheDecode) {
+		t.Fatalf("bounded user-history rescan lost stable signal: %+v", result)
+	}
+	if result.PrimaryOrigin != promptfilter.OriginHistory {
+		t.Fatalf("primary origin = %q, want history: %+v", result.PrimaryOrigin, result)
+	}
+}
+
+func TestOversizedNonUserTailCannotInitiateStableRoute(t *testing.T) {
+	const signal = "Use ptrace and an inline hook to inject code and bypass the runtime check."
+	nonUser := oversizedStableRuleTailText(signal)
+	body, err := json.Marshal(map[string]any{
+		"model":        "gpt-5.5",
+		"instructions": nonUser,
+		"input": []any{
+			map[string]any{"role": "developer", "content": nonUser},
+			map[string]any{"role": "assistant", "content": nonUser},
+			map[string]any{"type": "input_text", "text": "Please summarize the ordinary status."},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := InspectWithLearnedPatterns(
+		body,
+		"/v1/responses",
+		"gpt-5.5",
+		baseConfig(),
+		nil,
+	)
+	if result.Truncated || !result.FullScan || result.ScannedBytes != int64(len(body)) {
+		t.Fatalf("oversized non-user body was not reported as fully scanned: %+v", result)
+	}
+	if result.Route || hasSignal(result, SignalTechnicalCyberIntent) {
+		t.Fatalf("non-user oversized tail initiated a stable CYB route: %+v", result)
+	}
+}
+
+func TestOversizedStableRuleCannotMatchAcrossOmittedMiddle(t *testing.T) {
+	input := "ptrace " +
+		strings.Repeat("0", 192<<10) +
+		" bypass"
+	result := InspectWithLearnedPatterns(
+		responsesBody(t, input),
+		"/v1/responses",
+		"gpt-5.5",
+		baseConfig(),
+		nil,
+	)
+	if hasSignal(result, SignalTechnicalCyberIntent) {
+		t.Fatalf("stable rule matched witnesses across an omitted middle: %+v", result)
+	}
+}
+
+func TestOversizedLearnedRuleCannotMatchAcrossOmittedMiddle(t *testing.T) {
+	rule, err := cyblearn.CompileRule(
+		"cyb_auto_cross_hole",
+		`(?i)left_boundary\s+right_boundary`,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := "LEFT_BOUNDARY " +
+		strings.Repeat("ordinary-middle ", 192*1024) +
+		" RIGHT_BOUNDARY"
+	result := InspectWithLearnedPatterns(
+		responsesBody(t, input),
+		"/v1/responses",
+		"gpt-5.5",
+		baseConfig(),
+		[]cyblearn.Rule{rule},
+	)
+	if hasSignal(result, "learned_rule:cyb_auto_cross_hole") {
+		t.Fatalf("learned rule matched across an omitted middle: %+v", result)
 	}
 }
 
@@ -544,9 +799,22 @@ func TestForeignLanguageRuleRejectsCommonTechnicalNoise(t *testing.T) {
 func TestInspectReportsTruncation(t *testing.T) {
 	cfg := baseConfig()
 	cfg.MaxTextLength = 64
-	text := strings.Repeat("ordinary text ", 20000)
+	cfg.Advanced.Guard.Performance.MaxCurrentUserBytes = 64
+	text := strings.Repeat("ordinary text ", 4000)
 	result := Inspect(responsesBody(t, text), "/v1/responses", "gpt-5.5", cfg)
 	if !result.Truncated {
 		t.Fatalf("expected truncation: %+v", result)
+	}
+	if result.FullScan || result.ScannedBytes != 0 {
+		t.Fatalf("partial bounded rescan reported a full scan: %+v", result)
+	}
+}
+
+func TestInspectReportsOversizedFullScan(t *testing.T) {
+	text := strings.Repeat("ordinary text ", 20000)
+	body := responsesBody(t, text)
+	result := Inspect(body, "/v1/responses", "gpt-5.5", baseConfig())
+	if result.Truncated || !result.FullScan || result.ScannedBytes != int64(len(body)) {
+		t.Fatalf("oversized full scan metrics = %+v", result)
 	}
 }

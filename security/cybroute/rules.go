@@ -100,10 +100,22 @@ var targetedCovertSurveillanceDefensivePattern = regexp.MustCompile(`(?i)\b(?:de
 
 func targetedCovertSurveillanceVerdict(text string) bool {
 	text = strings.TrimSpace(text)
-	if text == "" || targetedCovertSurveillanceDefensivePattern.MatchString(text) {
+	if text == "" || !targetedCovertSurveillanceMayMatch(text) ||
+		targetedCovertSurveillanceDefensivePattern.MatchString(text) {
 		return false
 	}
 	return allWitnessesMatch(text, targetedCovertSurveillancePatterns)
+}
+
+func targetedCovertSurveillanceMayMatch(text string) bool {
+	if containsNonASCII(text) {
+		return true
+	}
+	// Every English branch of the communications witness contains at least one
+	// of these stems. The full regexes remain authoritative after this gate.
+	return containsAny(strings.ToLower(text), []string{
+		"intercept", "wiretap", "tap", "eavesdrop", "monitor", "captur", "read", "record",
+	})
 }
 
 var operationalRansomwareAuthoringRequestPattern = regexp.MustCompile(`(?i)\b(?:build(?:ing)?|creat(?:e|ing)|develop(?:ing)?|implement(?:ing)?|writ(?:e|ing)|generat(?:e|ing)|produc(?:e|ing)|cod(?:e|ing))\b[^.!?\n]{0,100}\b(?:technically\s+complete|complete|deployable|functional|working|runnable|production[- ]ready)\s+ransomware(?:\s*[,.;:]|\s+(?:that|which|with|using|including|capable|project|program|payload|implementation|source|code)\b|$)`)
@@ -276,28 +288,36 @@ func personalMediaCacheDecodeVerdict(text string) bool {
 
 func observedGapSignals(text string) []string {
 	var signals []string
-	if allWitnessesMatch(text, ctfFlagExploitationPatterns) {
+	nonASCII := containsNonASCII(text)
+	lower := strings.ToLower(text)
+	mayMatch := func(seeds ...string) bool {
+		return nonASCII || containsAny(lower, seeds)
+	}
+	if mayMatch("ctf", "capture") && allWitnessesMatch(text, ctfFlagExploitationPatterns) {
 		signals = append(signals, SignalCTFFlagExploitation)
 	}
-	if operationalSecurityTestingPlatformVerdict(text) {
+	if mayMatch("pentest", "penetration", "security", "vulnerability", "attack") &&
+		operationalSecurityTestingPlatformVerdict(text) {
 		signals = append(signals, SignalOperationalSecurityTesting)
 	}
-	if operationalRansomwareAuthoringVerdict(text) {
+	if mayMatch("ransomware") && operationalRansomwareAuthoringVerdict(text) {
 		signals = append(signals, SignalOperationalRansomwareAuthoring)
 	}
-	if allWitnessesMatch(text, mlModelBackdoorTrainingPatterns) {
+	if mayMatch("backdoor", "trojan") && allWitnessesMatch(text, mlModelBackdoorTrainingPatterns) {
 		signals = append(signals, SignalMLModelBackdoorTraining)
 	}
-	if allWitnessesMatch(text, remoteCommandControlPlatformPatterns) {
+	if mayMatch("command", "c2") && allWitnessesMatch(text, remoteCommandControlPlatformPatterns) {
 		signals = append(signals, SignalRemoteCommandControlPlatform)
 	}
-	if allWitnessesMatch(text, securityCodeAuditPatterns) {
+	if mayMatch("security", "vulnerabilit", "fail", "bypass", "exploit", "mre") &&
+		allWitnessesMatch(text, securityCodeAuditPatterns) {
 		signals = append(signals, SignalSecurityCodeAudit)
 	}
-	if loginProtectionReverseEngineeringVerdict(text) {
+	if mayMatch("login", "log-in", "authentication", "auth") &&
+		loginProtectionReverseEngineeringVerdict(text) {
 		signals = append(signals, SignalLoginProtectionReverseEngineering)
 	}
-	if personalMediaCacheDecodeVerdict(text) {
+	if mayMatch("wechat") && personalMediaCacheDecodeVerdict(text) {
 		signals = append(signals, SignalPersonalMediaCacheDecode)
 	}
 	return signals

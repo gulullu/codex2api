@@ -4,33 +4,18 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/codex2api/security/promptfilter"
+	"github.com/codex2api/security/cybtext"
 )
 
 // DetectProbe extracts only the latest official current-user envelope
 // partition. Historical, system and tool text cannot turn a request into a
 // probe.
 func DetectProbe(body []byte, endpoint string) (signature string, matched bool) {
-	envelope := promptfilter.BuildEnvelope(
-		body,
-		endpoint,
-		"",
-		promptfilter.TransportHTTP,
-		4096,
-	)
-	if envelope.AdapterUnclassified {
+	current, _ := cybtext.ExtractUserWindows(body, endpoint, 1024)
+	if len(current) != 1 {
 		return "", false
 	}
-	var parts []string
-	for _, segment := range envelope.Segments {
-		if segment.Origin != promptfilter.OriginCurrentUser {
-			continue
-		}
-		if text := strings.TrimSpace(segment.Text); text != "" {
-			parts = append(parts, text)
-		}
-	}
-	signature = ProbeSignature(strings.Join(parts, "\n"))
+	signature = ProbeSignature(current[0])
 	return signature, signature != ""
 }
 

@@ -38,6 +38,8 @@ func relayRouteScanDetailsJSON(result cybroute.Result) string {
 		PrimaryOrigin string   `json:"primary_origin,omitempty"`
 		Signals       []string `json:"signals,omitempty"`
 		Truncated     bool     `json:"truncated"`
+		ScannedBytes  int64    `json:"scanned_bytes"`
+		FullScan      bool     `json:"full_scan"`
 	}
 	raw, err := json.Marshal(scanDetails{
 		Score:         result.Score,
@@ -45,6 +47,8 @@ func relayRouteScanDetailsJSON(result cybroute.Result) string {
 		PrimaryOrigin: string(result.PrimaryOrigin),
 		Signals:       append([]string(nil), result.Signals...),
 		Truncated:     result.Truncated,
+		ScannedBytes:  result.ScannedBytes,
+		FullScan:      result.FullScan,
 	})
 	if err != nil {
 		return "{}"
@@ -110,10 +114,7 @@ func (h *Handler) beginRelayAudit(c *gin.Context, plan *relayRoutePlan, rawBody 
 		return
 	}
 	fullText, auditTextTruncated := relayAuditRequestText(rawBody)
-	scannedBytes := int64(len(rawBody))
-	if plan.AuditScanTruncated {
-		scannedBytes = 0
-	}
+	scannedBytes := plan.AuditScannedBytes
 	input := &database.RelayAuditRequestInput{
 		RequestID:             plan.AuditRequestID,
 		CreatedAt:             plan.AuditCreatedAt,
@@ -139,6 +140,24 @@ func (h *Handler) beginRelayAudit(c *gin.Context, plan *relayRoutePlan, rawBody 
 	}
 	populateRelayAuditAPIKeyMeta(c, input)
 	_ = h.db.EnqueueRelayAuditRequest(input)
+}
+
+// enrichRelayAuditScan persists a deferred local-rule scan without retaining
+// or reprocessing the request body a second time. This is used by the official
+// no-affinity Relay path, where local rules are intentionally evaluated only
+// after a real upstream cyber_policy response.
+func (h *Handler) enrichRelayAuditScan(plan *relayRoutePlan) {
+	if h == nil || h.db == nil || plan == nil || plan.AuditRequestID == "" ||
+		!plan.LocalRuleInspected {
+		return
+	}
+	_ = h.db.EnqueueRelayAuditRequest(&database.RelayAuditRequestInput{
+		RequestID:     plan.AuditRequestID,
+		CreatedAt:     plan.AuditCreatedAt,
+		ScannedBytes:  plan.AuditScannedBytes,
+		ScanTruncated: plan.AuditScanTruncated,
+		ScanDetails:   plan.AuditScanDetails,
+	})
 }
 
 func (h *Handler) recordRelayContinuationReplayAudit(

@@ -4,13 +4,19 @@
 package cybroute
 
 import (
+	"encoding/json"
 	"strings"
+	"sync"
 
 	"github.com/codex2api/security/cyblearn"
+	"github.com/codex2api/security/cybtext"
 	"github.com/codex2api/security/promptfilter"
 )
 
 const (
+	boundedUserWindowBodyThreshold          = 128 * 1024
+	oversizedScanChunkBytes                 = 64 * 1024
+	oversizedScanOverlapBytes               = 8 * 1024
 	SignalLocalThreshold                    = "local_threshold"
 	SignalLocalHighRisk                     = "local_high_risk"
 	SignalExplicitHighRiskRule              = "explicit_high_risk_rule"
@@ -38,11 +44,99 @@ type Result struct {
 	Threshold     int
 	PrimaryOrigin promptfilter.SegmentOrigin
 	Truncated     bool
+	ScannedBytes  int64
+	FullScan      bool
 }
 
 type provenancePartition struct {
 	origin promptfilter.SegmentOrigin
 	text   strings.Builder
+}
+
+type routeOriginEvidence struct {
+	origin  promptfilter.SegmentOrigin
+	matches map[string]promptfilter.Match
+}
+
+func (e *routeOriginEvidence) add(verdict promptfilter.Verdict) {
+	if e == nil {
+		return
+	}
+	if e.matches == nil {
+		e.matches = make(map[string]promptfilter.Match, len(verdict.Matched))
+	}
+	for _, match := range verdict.Matched {
+		key := strings.ToLower(strings.TrimSpace(match.Name)) + "\x00" +
+			strings.ToLower(strings.TrimSpace(match.Category))
+		if _, exists := e.matches[key]; exists {
+			continue
+		}
+		e.matches[key] = match
+	}
+}
+
+func (e *routeOriginEvidence) cumulativeVerdict(cfg promptfilter.Config) promptfilter.Verdict {
+	verdict := promptfilter.Verdict{
+		Enabled:   true,
+		Mode:      cfg.Mode,
+		Threshold: cfg.Threshold,
+	}
+	for _, match := range e.matches {
+		verdict.Matched = append(verdict.Matched, match)
+		verdict.RawScore += match.Weight
+		if !match.SignalOnly || match.Strict {
+			verdict.Score += match.Weight
+		}
+		if match.Strict {
+			verdict.StrictHit = true
+		}
+	}
+	return verdict
+}
+
+type routingEngineEntry struct {
+	engine *promptfilter.Engine
+	err    error
+}
+
+const maxRoutingEngineCacheEntries = 16
+
+var routingEngineCache = struct {
+	sync.Mutex
+	entries map[string]routingEngineEntry
+	order   []string
+}{
+	entries: make(map[string]routingEngineEntry),
+}
+
+func compiledRoutingEngine(cfg promptfilter.Config) (*promptfilter.Engine, error) {
+	encoded, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	key := string(encoded)
+	routingEngineCache.Lock()
+	if entry, ok := routingEngineCache.entries[key]; ok {
+		routingEngineCache.Unlock()
+		return entry.engine, entry.err
+	}
+	routingEngineCache.Unlock()
+
+	engine, compileErr := promptfilter.NewEngine(cfg)
+	entry := routingEngineEntry{engine: engine, err: compileErr}
+	routingEngineCache.Lock()
+	defer routingEngineCache.Unlock()
+	if actual, ok := routingEngineCache.entries[key]; ok {
+		return actual.engine, actual.err
+	}
+	if len(routingEngineCache.entries) >= maxRoutingEngineCacheEntries && len(routingEngineCache.order) > 0 {
+		oldest := routingEngineCache.order[0]
+		delete(routingEngineCache.entries, oldest)
+		routingEngineCache.order = routingEngineCache.order[1:]
+	}
+	routingEngineCache.entries[key] = entry
+	routingEngineCache.order = append(routingEngineCache.order, key)
+	return entry.engine, entry.err
 }
 
 // Inspect evaluates only user-authored provenance that can represent a routing
@@ -64,6 +158,20 @@ func InspectWithLearnedPatterns(
 	learned []cyblearn.Rule,
 ) Result {
 	cfg = routingConfig(cfg)
+	if len(body) > boundedUserWindowBodyThreshold && supportsBoundedUserWindows(endpoint) {
+		// The general Prompt Filter envelope intentionally serves many policy
+		// features and materializes gjson string results. Routing only needs
+		// user provenance, so oversized requests take the independent bounded
+		// parser directly and never decode a multi-megabyte user scalar first.
+		result := Result{Threshold: cfg.Threshold}
+		if inspectOversizedRouteBody(body, endpoint, cfg, learned, &result) {
+			result.ScannedBytes = int64(len(body))
+			result.FullScan = true
+		} else {
+			result.Truncated = true
+		}
+		return result
+	}
 	envelope := promptfilter.BuildEnvelopeWithModelsAndConfig(
 		body,
 		endpoint,
@@ -73,47 +181,214 @@ func InspectWithLearnedPatterns(
 		cfg,
 	)
 	result := inspectEnvelope(envelope, cfg)
+	if result.Truncated {
+		if !result.Route {
+			partitions := boundedUserWindowPartitions(body, endpoint)
+			inspectRoutePartitions(partitions, cfg, &result)
+			applyLearnedRulesToPartitions(partitions, learned, &result)
+		}
+		return result
+	}
 	applyLearnedRules(envelope, learned, &result)
+	result.ScannedBytes = int64(len(body))
+	result.FullScan = true
 	return result
+}
+
+func supportsBoundedUserWindows(endpoint string) bool {
+	switch strings.ToLower(strings.TrimSpace(endpoint)) {
+	case "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/messages":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyLearnedRules(envelope promptfilter.RequestEnvelope, learned []cyblearn.Rule, result *Result) {
 	if result == nil || len(learned) == 0 || envelope.AdapterUnclassified || len(envelope.Segments) == 0 {
 		return
 	}
-	seen := make(map[string]struct{}, len(result.Matches)+len(learned))
-	for _, match := range result.Matches {
-		seen[strings.ToLower(strings.TrimSpace(match.Name))] = struct{}{}
+	applyLearnedRulesToPartitions(partitionEnvelope(envelope), learned, result)
+}
+
+func boundedUserWindowPartitions(body []byte, endpoint string) []provenancePartition {
+	current, history, tool := cybtext.ExtractRoutingWindows(body, endpoint, 128*1024)
+	partitions := make([]provenancePartition, 0, len(current)+len(history)+len(tool))
+	add := func(origin promptfilter.SegmentOrigin, windows []string) {
+		for _, window := range windows {
+			window = strings.TrimSpace(window)
+			if window == "" {
+				continue
+			}
+			var partition provenancePartition
+			partition.origin = origin
+			partition.text.WriteString(window)
+			partitions = append(partitions, partition)
+		}
 	}
-	for _, partition := range partitionEnvelope(envelope) {
+	add(promptfilter.OriginCurrentUser, current)
+	add(promptfilter.OriginHistory, history)
+	if len(current) == 0 {
+		add(promptfilter.OriginToolOutput, tool)
+	}
+	return partitions
+}
+
+func inspectOversizedRouteBody(
+	body []byte,
+	endpoint string,
+	cfg promptfilter.Config,
+	learned []cyblearn.Rule,
+	result *Result,
+) bool {
+	if result == nil {
+		return false
+	}
+	// A user may configure the official prompt-filter scan budget below this
+	// routing walker's chunk size. Do not let that setting create a fresh hole
+	// inside each already bounded chunk; the override is local to this
+	// routing-only pass and does not change the stored Prompt Filter config.
+	chunkConfig := cfg
+	if chunkConfig.MaxTextLength < oversizedScanChunkBytes {
+		chunkConfig.MaxTextLength = oversizedScanChunkBytes
+	}
+	engine, _ := compiledRoutingEngine(chunkConfig)
+	matchSeen := routeMatchSeen(result)
+	learnedSeen := learnedMatchSeen(result, learned)
+	evidence := make(map[promptfilter.SegmentOrigin]*routeOriginEvidence, 3)
+	evidenceOrder := make([]*routeOriginEvidence, 0, 3)
+	_, ok := cybtext.WalkRoutingTextChunks(
+		body,
+		endpoint,
+		oversizedScanChunkBytes,
+		oversizedScanOverlapBytes,
+		func(origin cybtext.TextOrigin, text string) {
+			mapped, mappedOK := routingTextOrigin(origin)
+			if !mappedOK {
+				return
+			}
+			originEvidence := evidence[mapped]
+			if originEvidence == nil {
+				originEvidence = &routeOriginEvidence{origin: mapped}
+				evidence[mapped] = originEvidence
+				evidenceOrder = append(evidenceOrder, originEvidence)
+			}
+			verdict := inspectRoutePartitionTextWithEngine(
+				mapped,
+				text,
+				chunkConfig,
+				engine,
+				result,
+				matchSeen,
+			)
+			originEvidence.add(verdict)
+			applyLearnedRulesToText(mapped, text, learned, result, learnedSeen)
+		},
+	)
+	if !ok {
+		return false
+	}
+	for _, originEvidence := range evidenceOrder {
+		applyRouteVerdict(
+			originEvidence.origin,
+			"",
+			originEvidence.cumulativeVerdict(chunkConfig),
+			chunkConfig,
+			result,
+			matchSeen,
+		)
+	}
+	return true
+}
+
+func routingTextOrigin(origin cybtext.TextOrigin) (promptfilter.SegmentOrigin, bool) {
+	switch origin {
+	case cybtext.TextOriginCurrentUser:
+		return promptfilter.OriginCurrentUser, true
+	case cybtext.TextOriginHistory:
+		return promptfilter.OriginHistory, true
+	case cybtext.TextOriginToolOutput:
+		return promptfilter.OriginToolOutput, true
+	default:
+		return "", false
+	}
+}
+
+func applyLearnedRulesToPartitions(
+	partitions []provenancePartition,
+	learned []cyblearn.Rule,
+	result *Result,
+) {
+	if result == nil || len(learned) == 0 || len(partitions) == 0 {
+		return
+	}
+	seen := learnedMatchSeen(result, learned)
+	for _, partition := range partitions {
 		text := strings.TrimSpace(partition.text.String())
 		if text == "" {
 			continue
 		}
-		for _, rule := range learned {
-			if !rule.MatchString(text) {
-				continue
-			}
-			if !result.Route {
-				result.PrimaryOrigin = partition.origin
-			}
-			result.Route = true
-			if result.Score < 250 {
-				result.Score = 250
-			}
-			result.Signals = appendUnique(result.Signals, "learned_rule:"+strings.TrimSpace(rule.Name))
-			key := strings.ToLower(strings.TrimSpace(rule.Name))
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			seen[key] = struct{}{}
-			result.Matches = append(result.Matches, promptfilter.Match{
-				Name:     rule.Name,
-				Weight:   250,
-				Category: "cyb_learned",
-				Strict:   true,
-			})
+		applyLearnedRulesToText(partition.origin, text, learned, result, seen)
+	}
+}
+
+func learnedMatchSeen(result *Result, learned []cyblearn.Rule) map[string]struct{} {
+	size := len(learned)
+	if result != nil {
+		size += len(result.Matches)
+	}
+	seen := make(map[string]struct{}, size)
+	if result == nil {
+		return seen
+	}
+	for _, match := range result.Matches {
+		seen[strings.ToLower(strings.TrimSpace(match.Name))] = struct{}{}
+	}
+	return seen
+}
+
+func applyLearnedRulesToText(
+	origin promptfilter.SegmentOrigin,
+	text string,
+	learned []cyblearn.Rule,
+	result *Result,
+	seen map[string]struct{},
+) {
+	text = strings.TrimSpace(text)
+	if result == nil || text == "" || len(learned) == 0 {
+		return
+	}
+	if seen == nil {
+		seen = learnedMatchSeen(result, learned)
+	}
+	lowerText := strings.ToLower(text)
+	nonASCII := containsNonASCII(text)
+	for _, rule := range learned {
+		if !nonASCII && !rule.MayMatchLowerText(lowerText) {
+			continue
 		}
+		if !rule.MatchString(text) {
+			continue
+		}
+		if !result.Route {
+			result.PrimaryOrigin = origin
+		}
+		result.Route = true
+		if result.Score < 250 {
+			result.Score = 250
+		}
+		result.Signals = appendUnique(result.Signals, "learned_rule:"+strings.TrimSpace(rule.Name))
+		key := strings.ToLower(strings.TrimSpace(rule.Name))
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result.Matches = append(result.Matches, promptfilter.Match{
+			Name:     rule.Name,
+			Weight:   250,
+			Category: "cyb_learned",
+			Strict:   true,
+		})
 	}
 }
 
@@ -125,37 +400,122 @@ func inspectEnvelope(envelope promptfilter.RequestEnvelope, cfg promptfilter.Con
 	if envelope.AdapterUnclassified || len(envelope.Segments) == 0 {
 		return result
 	}
+	inspectRoutePartitions(partitionEnvelope(envelope), cfg, &result)
+	return result
+}
 
-	partitions := partitionEnvelope(envelope)
-	matchSeen := make(map[string]struct{})
+func inspectRoutePartitions(
+	partitions []provenancePartition,
+	cfg promptfilter.Config,
+	result *Result,
+) {
+	if result == nil || len(partitions) == 0 {
+		return
+	}
+	matchSeen := routeMatchSeen(result)
 	for _, partition := range partitions {
 		text := strings.TrimSpace(partition.text.String())
 		if text == "" {
 			continue
 		}
-		verdict := promptfilter.InspectText(text, cfg)
-		signals := routeSignals(verdict, text, cfg)
-		if len(signals) == 0 {
+		inspectRoutePartitionText(partition.origin, text, cfg, result, matchSeen)
+	}
+}
+
+func routeMatchSeen(result *Result) map[string]struct{} {
+	size := 0
+	if result != nil {
+		size = len(result.Matches)
+	}
+	seen := make(map[string]struct{}, size)
+	if result == nil {
+		return seen
+	}
+	for _, match := range result.Matches {
+		seen[match.Name+"\x00"+match.Category] = struct{}{}
+	}
+	return seen
+}
+
+func inspectRoutePartitionText(
+	origin promptfilter.SegmentOrigin,
+	text string,
+	cfg promptfilter.Config,
+	result *Result,
+	matchSeen map[string]struct{},
+) promptfilter.Verdict {
+	return inspectRoutePartitionTextWithEngine(origin, text, cfg, nil, result, matchSeen)
+}
+
+func inspectRoutePartitionTextWithEngine(
+	origin promptfilter.SegmentOrigin,
+	text string,
+	cfg promptfilter.Config,
+	engine *promptfilter.Engine,
+	result *Result,
+	matchSeen map[string]struct{},
+) promptfilter.Verdict {
+	text = strings.TrimSpace(text)
+	if result == nil || text == "" {
+		return promptfilter.Verdict{}
+	}
+	var verdict promptfilter.Verdict
+	if engine != nil {
+		// The hint gate may prove that no Prompt Filter regexp can match this
+		// bounded chunk. Keep an enabled empty verdict so the independent raw
+		// routing helpers below still inspect every chunk.
+		verdict = promptfilter.Verdict{
+			Enabled:   true,
+			Mode:      cfg.Mode,
+			Threshold: cfg.Threshold,
+		}
+		if engine.ExactPrecheckMayMatch(text) {
+			verdict = engine.InspectTextWithExactPrecheck(
+				text,
+				cfg.Advanced.Guard.Performance,
+			)
+		}
+	} else {
+		verdict = promptfilter.InspectText(text, cfg)
+	}
+	applyRouteVerdict(origin, text, verdict, cfg, result, matchSeen)
+	return verdict
+}
+
+func applyRouteVerdict(
+	origin promptfilter.SegmentOrigin,
+	text string,
+	verdict promptfilter.Verdict,
+	cfg promptfilter.Config,
+	result *Result,
+	matchSeen map[string]struct{},
+) {
+	if result == nil {
+		return
+	}
+	signals := routeSignals(verdict, text, cfg)
+	if len(signals) == 0 {
+		return
+	}
+	if !result.Route || verdict.Score > result.Score {
+		result.PrimaryOrigin = origin
+		result.Score = verdict.Score
+	}
+	result.Route = true
+	for _, signal := range signals {
+		result.Signals = appendUnique(result.Signals, signal)
+	}
+	if matchSeen == nil {
+		matchSeen = routeMatchSeen(result)
+	}
+	for _, match := range verdict.Matched {
+		key := match.Name + "\x00" + match.Category
+		if _, exists := matchSeen[key]; exists {
 			continue
 		}
-		if !result.Route || verdict.Score > result.Score {
-			result.PrimaryOrigin = partition.origin
-			result.Score = verdict.Score
-		}
-		result.Route = true
-		for _, signal := range signals {
-			result.Signals = appendUnique(result.Signals, signal)
-		}
-		for _, match := range verdict.Matched {
-			key := match.Name + "\x00" + match.Category
-			if _, ok := matchSeen[key]; ok {
-				continue
-			}
-			matchSeen[key] = struct{}{}
-			result.Matches = append(result.Matches, match)
-		}
+		matchSeen[key] = struct{}{}
+		result.Matches = append(result.Matches, match)
 	}
-	return result
 }
 
 func partitionEnvelope(envelope promptfilter.RequestEnvelope) []provenancePartition {

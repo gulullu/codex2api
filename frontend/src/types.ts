@@ -1191,9 +1191,11 @@ export interface RelayCYBLearningSummary {
   rule_id: number
   rule_name: string
   updated_at: ISODateString
+  sample_source: string
   account_id: number
   account_name: string
   account_type: string
+  user_text_truncated: boolean
   request_truncated: boolean
 }
 
@@ -1201,11 +1203,13 @@ export interface RelayCYBMissSample {
   request_id: string
   created_at: ISODateString
   updated_at: ISODateString
+  sample_source: string
   account_id: number
   account_name: string
   account_type: string
   redacted_request: string
   user_text: string
+  user_text_truncated: boolean
   request_truncated: boolean
   learning_status: string
   learning_model: string
@@ -1244,6 +1248,8 @@ export interface RelayCYBLearningStats {
   rejected: number
   failed: number
   rules: number
+  oauth_samples: number
+  relay_samples: number
 }
 
 export interface RelayCYBLearningConfig {

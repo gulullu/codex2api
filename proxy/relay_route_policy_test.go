@@ -102,6 +102,108 @@ func TestRelayAuditRequestTextBoundsInputBeforeRetention(t *testing.T) {
 	}
 }
 
+func TestRelayAuditDistinguishesFullRoutingScanFromSavedBodyTruncation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	body := []byte(`{"input":"` + strings.Repeat("ordinary context ", 20000) + `"}`)
+	result := cybroute.Result{
+		Threshold:    100,
+		ScannedBytes: int64(len(body)),
+		FullScan:     true,
+	}
+	plan := &relayRoutePlan{
+		Endpoint:          "/v1/responses",
+		AuditRequestID:    database.NewRelayAuditRequestID(),
+		AuditCreatedAt:    time.Now().UTC(),
+		AuditScannedBytes: result.ScannedBytes,
+		AuditFullScan:     result.FullScan,
+		AuditScanDetails:  relayRouteScanDetailsJSON(result),
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	handler := &Handler{db: db}
+	handler.beginRelayAudit(c, plan, body)
+	if !db.WaitRelayAuditIdle(t.Context()) {
+		t.Fatal("relay audit queue did not become idle")
+	}
+
+	detail, err := db.GetRelayAuditCaseDetail(t.Context(), plan.AuditRequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Case == nil {
+		t.Fatal("relay audit detail did not include a case")
+	}
+	if detail.Case.ScannedBytes != int64(len(body)) {
+		t.Fatalf("scanned_bytes = %d, want %d", detail.Case.ScannedBytes, len(body))
+	}
+	if !detail.Case.ScanTruncated {
+		t.Fatal("fixture should still report the separately bounded saved audit body")
+	}
+	var scanDetails struct {
+		FullScan     bool  `json:"full_scan"`
+		ScannedBytes int64 `json:"scanned_bytes"`
+	}
+	if err := json.Unmarshal([]byte(detail.Case.ScanDetails), &scanDetails); err != nil {
+		t.Fatal(err)
+	}
+	if !scanDetails.FullScan || scanDetails.ScannedBytes != int64(len(body)) {
+		t.Fatalf("scan details = %+v", scanDetails)
+	}
+}
+
+func TestRelayAuditDoesNotReportUnperformedNoAffinityScan(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	body := []byte(`{"model":"gpt-5.4","input":"ordinary no-affinity request"}`)
+	plan := &relayRoutePlan{
+		Endpoint:       "/v1/responses",
+		Source:         relayRouteSourceNoAffinity,
+		AuditRequestID: database.NewRelayAuditRequestID(),
+		AuditCreatedAt: time.Now().UTC(),
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	handler := &Handler{db: db}
+	handler.beginRelayAudit(c, plan, body)
+	if !db.WaitRelayAuditIdle(t.Context()) {
+		t.Fatal("relay audit queue did not become idle")
+	}
+
+	detail, err := db.GetRelayAuditCaseDetail(t.Context(), plan.AuditRequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Case == nil {
+		t.Fatal("relay audit detail did not include a case")
+	}
+	if detail.Case.ScannedBytes != 0 {
+		t.Fatalf("unperformed no-affinity scan reported %d bytes", detail.Case.ScannedBytes)
+	}
+	var scanDetails struct {
+		FullScan     bool  `json:"full_scan"`
+		ScannedBytes int64 `json:"scanned_bytes"`
+	}
+	if err := json.Unmarshal([]byte(detail.Case.ScanDetails), &scanDetails); err != nil {
+		t.Fatal(err)
+	}
+	if scanDetails.FullScan || scanDetails.ScannedBytes != 0 {
+		t.Fatalf("unperformed scan details = %+v", scanDetails)
+	}
+}
+
 func TestRelayAuditRequestTextRedactsSensitiveValueAcrossPrefixBoundary(t *testing.T) {
 	body := []byte(`{"input":"keep visible","encrypted_content":"` +
 		strings.Repeat("opaque-private-fragment-", relayAuditRequestPrefixMaxBytes) +

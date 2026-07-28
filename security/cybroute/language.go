@@ -42,8 +42,10 @@ var nonEnglishLatinMarkerGroups = []latinMarkerGroup{
 	{strong: []string{"pakitingnan", "bakit", "sagot", "kahilingan", "suriin", "ipaliwanag", "nabigo"}, weak: []string{"ito", "hindi", "para", "nang", "na"}},
 }
 
+var nonEnglishASCIIStrongAnchors = buildNonEnglishASCIIStrongAnchors()
+
 func looksLikeNonChineseEnglishNaturalLanguage(text string) bool {
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(text) == "" || !nonChineseEnglishLanguageMayMatch(text) {
 		return false
 	}
 	segments := proseSegments(text)
@@ -79,6 +81,64 @@ func looksLikeNonChineseEnglishNaturalLanguage(text string) bool {
 		}
 		if (len(markers) >= 4 && strong >= 3) ||
 			(len(markers) >= 3 && strong >= 2 && phrases >= 1) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildNonEnglishASCIIStrongAnchors() map[string]struct{} {
+	anchors := make(map[string]struct{})
+	for _, group := range nonEnglishLatinMarkerGroups {
+		for _, marker := range group.strong {
+			if containsNonASCII(marker) {
+				continue
+			}
+			words := strings.Fields(marker)
+			if len(words) == 0 {
+				continue
+			}
+			longest := words[0]
+			for _, word := range words[1:] {
+				if len(word) > len(longest) {
+					longest = word
+				}
+			}
+			anchors[strings.ToLower(longest)] = struct{}{}
+		}
+	}
+	return anchors
+}
+
+func nonChineseEnglishLanguageMayMatch(text string) bool {
+	if containsNonASCII(text) {
+		// Foreign scripts and accented marker variants are handled by the full
+		// prose detector. This conservative branch also preserves all existing
+		// Unicode behavior.
+		return true
+	}
+	lower := strings.ToLower(text)
+	for start := 0; start < len(lower); {
+		for start < len(lower) && (lower[start] < 'a' || lower[start] > 'z') {
+			start++
+		}
+		end := start
+		for end < len(lower) && lower[end] >= 'a' && lower[end] <= 'z' {
+			end++
+		}
+		if end > start {
+			if _, exists := nonEnglishASCIIStrongAnchors[lower[start:end]]; exists {
+				return true
+			}
+		}
+		start = end
+	}
+	return false
+}
+
+func containsNonASCII(text string) bool {
+	for index := 0; index < len(text); index++ {
+		if text[index] >= 0x80 {
 			return true
 		}
 	}

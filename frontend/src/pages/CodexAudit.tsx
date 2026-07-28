@@ -453,10 +453,12 @@ export default function CodexAudit() {
                       ) : null}
                     </div>
                     <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">
-                      OAuth 实际触发 CYB 后异步总结规则；本地机械校验通过即自动启用。关闭开关会同时暂停学习与全部自动规则。学习请求固定使用下方 Relay 分组，并从审计、回放缓存与再次学习中排除。
+                      OAuth 漏放，或 Relay 实际返回 CYB 且本地规则未覆盖时，异步总结规则；本地机械校验通过即自动启用。关闭开关会同时暂停学习与全部自动规则。学习请求固定使用下方 Relay 分组，并从审计、回放缓存与再次学习中排除。
                     </p>
                     {learningConfig ? (
                       <div className="mt-3 flex flex-wrap gap-2 text-[11px]">
+                        <Badge variant="outline">OAuth 样本 {formatNumber(learningConfig.stats?.oauth_samples)}</Badge>
+                        <Badge variant="outline">Relay 样本 {formatNumber(learningConfig.stats?.relay_samples)}</Badge>
                         <Badge variant="outline">等待 {formatNumber(learningConfig.stats?.queued)}</Badge>
                         <Badge variant="outline">处理中 {formatNumber(learningConfig.stats?.processing)}</Badge>
                         <Badge variant="outline">待重试 {formatNumber(learningConfig.stats?.retry)}</Badge>
@@ -691,6 +693,28 @@ function learningStatusTone(status?: string) {
   }
 }
 
+function learningSampleSourceLabel(source?: string) {
+  switch ((source || '').trim()) {
+    case 'oauth_cyb_miss':
+      return 'OAuth 漏放'
+    case 'relay_cyb_miss':
+      return 'Relay 实际 CYB · 本地未覆盖'
+    default:
+      return (source || '').trim() || '来源未记录'
+  }
+}
+
+function learningSampleSourceTone(source?: string) {
+  switch ((source || '').trim()) {
+    case 'oauth_cyb_miss':
+      return 'border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300'
+    case 'relay_cyb_miss':
+      return 'border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300'
+    default:
+      return ''
+  }
+}
+
 function accountLabel(account?: Pick<RelayCYBLearningSummary, 'account_id' | 'account_name'>) {
   if (!account) return ''
   if (account.account_name && account.account_id) return `${account.account_name} · #${account.account_id}`
@@ -720,7 +744,12 @@ function AuditCaseRow({
   const routedAccount = auditCase.final_account_name || (auditCase.final_account_id ? `#${auditCase.final_account_id}` : '未记录')
   const actualCYBAccount = accountLabel(learning) || accountLabel(miss)
   const displayedAccount = actualCYBAccount || routedAccount
-  const requestText = miss?.redacted_request || auditCase.full_text
+  const sampleSource = miss?.sample_source || learning?.sample_source || ''
+  const userText = miss?.user_text || ''
+  const originalRequestText = miss?.redacted_request || auditCase.full_text
+  const displayingUserText = Boolean(userText)
+  const requestText = userText || originalRequestText
+  const userTextTruncated = miss?.user_text_truncated ?? learning?.user_text_truncated ?? false
   const requestTruncated = miss?.request_truncated ?? learning?.request_truncated ?? auditCase.scan_truncated
   const learningStatus = miss?.learning_status || learning?.status || ''
   const learningModel = miss?.learning_model || learning?.model || rule?.model || ''
@@ -733,6 +762,7 @@ function AuditCaseRow({
         <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:inline">{formatBeijingTime(auditCase.created_at)}</span>
         <span className="hidden shrink-0 text-xs font-medium md:inline">{routeSourceLabel(auditCase.route_source)}</span>
         <span className="min-w-0 flex-1 truncate text-xs">{auditCase.text_preview || '未保存请求预览'}</span>
+        {sampleSource ? <Badge variant="outline" className={`hidden shrink-0 xl:inline-flex ${learningSampleSourceTone(sampleSource)}`}>{learningSampleSourceLabel(sampleSource)}</Badge> : null}
         {learningStatus ? <Badge variant="outline" className={`hidden shrink-0 lg:inline-flex ${learningStatusTone(learningStatus)}`}>{learningStatusLabel(learningStatus)}</Badge> : null}
         <span className="hidden max-w-40 truncate text-xs text-muted-foreground xl:inline">{displayedAccount}</span>
         <ChevronDown className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
@@ -753,7 +783,9 @@ function AuditCaseRow({
             <span>尝试 {formatNumber(auditCase.attempt_count)}</span>
             {auditCase.has_previous_response_id ? <span>携带 previous_response_id</span> : null}
             {auditCase.replay_status ? <span>回放 {auditCase.replay_status}{auditCase.replay_source ? ` / ${auditCase.replay_source}` : ''}</span> : null}
-            {requestTruncated ? <span className="text-amber-700 dark:text-amber-300">原始请求已按保存上限截断</span> : null}
+            {sampleSource ? <span className="font-medium text-foreground">样本来源 {learningSampleSourceLabel(sampleSource)}</span> : null}
+            {userTextTruncated ? <span className="text-amber-700 dark:text-amber-300">用户语料已按学习上限截断</span> : null}
+            {requestTruncated ? <span className="text-amber-700 dark:text-amber-300">原始审计正文已按保存上限截断</span> : null}
           </div>
           {signals.length ? (
             <div className="flex flex-wrap gap-1.5">
@@ -764,6 +796,7 @@ function AuditCaseRow({
             <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
               <div className="flex flex-wrap items-center gap-2">
                 <div className="text-[11px] font-medium">自动学习</div>
+                {sampleSource ? <Badge variant="outline" className={learningSampleSourceTone(sampleSource)}>{learningSampleSourceLabel(sampleSource)}</Badge> : null}
                 <Badge variant="outline" className={learningStatusTone(learningStatus)}>{learningStatusLabel(learningStatus)}</Badge>
                 {learningModel ? <Badge variant="outline">模型 {learningModel}</Badge> : null}
                 {learningAttempts !== undefined ? <Badge variant="outline">尝试 {formatNumber(learningAttempts)}</Badge> : null}
@@ -815,17 +848,20 @@ function AuditCaseRow({
           {auditCase.final_error_message ? <div className="rounded-md border border-red-500/20 bg-red-500/[0.06] p-2.5 text-xs text-red-700 dark:text-red-300">{auditCase.final_error_message}</div> : null}
           <div>
             <div className="mb-2 flex flex-wrap items-center gap-2 text-[11px] font-medium">
-              <span>{miss ? '原始请求（已脱敏）' : '扫描到的请求正文（已脱敏）'}</span>
-              {requestTruncated ? <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">已截断</Badge> : null}
+              <span>{displayingUserText ? '供模型总结的用户文本（已脱敏）' : miss ? '原始审计正文（已脱敏）' : '扫描到的请求正文（已脱敏）'}</span>
+              {userTextTruncated ? <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">用户语料已截断</Badge> : null}
+              {requestTruncated ? <Badge variant="outline" className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300">原始审计正文已截断</Badge> : null}
             </div>
             <pre className="max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/45 p-3 text-xs leading-5">
               {detailLoading && !requestText ? '（正在加载）' : requestText || '（没有保存可展示的请求正文）'}
             </pre>
           </div>
-          {miss?.user_text ? (
+          {displayingUserText && originalRequestText ? (
             <details className="rounded-lg border border-border/70 bg-muted/20">
-              <summary className="cursor-pointer px-3 py-2 text-[11px] font-medium">查看供模型总结的用户文本（已脱敏）</summary>
-              <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-words border-t border-border/70 p-3 text-xs leading-5">{miss.user_text}</pre>
+              <summary className="cursor-pointer px-3 py-2 text-[11px] font-medium">
+                查看原始审计正文（已脱敏）{requestTruncated ? ' · 已截断' : ''}
+              </summary>
+              <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-words border-t border-border/70 p-3 text-xs leading-5">{originalRequestText}</pre>
             </details>
           ) : null}
         </div>

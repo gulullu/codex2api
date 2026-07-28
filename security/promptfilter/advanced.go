@@ -1910,10 +1910,87 @@ func (a *decodedSafetyHintAutomaton) match(text string) map[string]struct{} {
 // intermediates; the full normalized string is only built after a hint match
 // (or when an unhinted custom rule requires regex evaluation).
 func (a *decodedSafetyHintAutomaton) matchNormalizedSource(text string) map[string]struct{} {
+	if isASCIISource(text) {
+		return a.matchNormalizedASCIISource(text, false)
+	}
 	return a.matchNormalizedSourceWithTransform(text, nil)
 }
 
+func isASCIISource(text string) bool {
+	for index := 0; index < len(text); index++ {
+		if text[index] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// matchNormalizedASCIISource is the allocation-free ASCII equivalent of
+// normalizeForScan followed by match. Oversized routing chunks are commonly
+// ASCII source/code, so avoiding per-rune Unicode classification keeps the
+// conservative mandatory-hint gate cheap without changing its normalized
+// byte stream.
+func (a *decodedSafetyHintAutomaton) matchNormalizedASCIISource(text string, rot13 bool) map[string]struct{} {
+	if a == nil || len(a.nodes) == 0 || text == "" {
+		return nil
+	}
+	state := 0
+	var matched map[string]struct{}
+	emittedField := false
+	pendingSpace := false
+	emit := func(value byte) {
+		for state != 0 {
+			if nextState, exists := a.nodes[state].next[value]; exists {
+				state = nextState
+				goto collectOutputs
+			}
+			state = a.nodes[state].failure
+		}
+		state = a.root[value]
+	collectOutputs:
+		for _, output := range a.nodes[state].outputs {
+			if matched == nil {
+				matched = make(map[string]struct{})
+			}
+			matched[output] = struct{}{}
+		}
+	}
+	for offset := 0; offset < len(text); {
+		if len(text)-offset >= 3 && text[offset:offset+3] == "```" {
+			if emittedField {
+				pendingSpace = true
+			}
+			offset += 3
+			continue
+		}
+		value := text[offset]
+		offset++
+		if value <= ' ' || value == 0x7f {
+			if emittedField {
+				pendingSpace = true
+			}
+			continue
+		}
+		if value >= 'A' && value <= 'Z' {
+			value += 'a' - 'A'
+		}
+		if rot13 && value >= 'a' && value <= 'z' {
+			value = 'a' + (value-'a'+13)%26
+		}
+		if pendingSpace {
+			emit(' ')
+			pendingSpace = false
+		}
+		emittedField = true
+		emit(value)
+	}
+	return matched
+}
+
 func (a *decodedSafetyHintAutomaton) matchNormalizedROT13Source(text string) map[string]struct{} {
+	if isASCIISource(text) {
+		return a.matchNormalizedASCIISource(text, true)
+	}
 	return a.matchNormalizedSourceWithTransform(text, func(value rune) rune {
 		switch {
 		case value >= 'a' && value <= 'z':

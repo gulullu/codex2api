@@ -20,16 +20,19 @@ import (
 )
 
 const (
-	relayCYBLearningPollInterval = 5 * time.Second
-	relayCYBRuleReloadInterval   = 30 * time.Second
-	relayCYBLearningCallTimeout  = 90 * time.Second
-	relayCYBLearningMaxAttempts  = 5
-	relayCYBCandidateMaxAttempts = 3
-	relayCYBRecentBenignLimit    = 1000
-	relayCYBRuleGuardWindow      = 10 * time.Minute
-	relayCYBRuleGuardMinRequests = 100
-	relayCYBRuleGuardMaxPercent  = 20
-	relayCYBLegacyBackfillLimit  = 100
+	relayCYBLearningPollInterval          = 5 * time.Second
+	relayCYBRuleReloadInterval            = 30 * time.Second
+	relayCYBLearningCallTimeout           = 90 * time.Second
+	relayCYBLearningMaxAttempts           = 5
+	relayCYBCandidateMaxAttempts          = 3
+	relayCYBRecentBenignLimit             = 1000
+	relayCYBRuleGuardWindow               = 10 * time.Minute
+	relayCYBRuleGuardMinRequests          = 100
+	relayCYBRuleGuardMaxPercent           = 20
+	relayCYBLegacyBackfillLimit           = 100
+	relayCYBLegacyBackfillMaxFailures     = 3
+	relayCYBLegacyBackfillRetryBasePeriod = time.Second
+	relayCYBLegacyBackfillSafetyLag       = 10 * time.Minute
 )
 
 var errRelayCYBRecentTrafficUnavailable = errors.New("relay CYB recent traffic unavailable")
@@ -60,20 +63,7 @@ func (h *Handler) StartRelayCYBLearning(ctx context.Context) {
 		if err := h.reloadRelayCYBLearnedRules(ctx); err != nil {
 			log.Printf("Relay CYB 学习规则初始加载失败: %v", err)
 		}
-		result, err := h.imageProxy.BackfillLegacyRelayCYBMissSamples(
-			ctx,
-			relayCYBLegacyBackfillLimit,
-		)
-		if err != nil {
-			log.Printf("Relay CYB 历史漏放回填失败: %v", err)
-		} else if result.Queued+result.Rejected > 0 {
-			log.Printf(
-				"Relay CYB 历史漏放回填完成: scanned=%d queued=%d rejected=%d",
-				result.Scanned,
-				result.Queued,
-				result.Rejected,
-			)
-		}
+		h.startDBBackgroundTaskWithParent(ctx, h.runRelayCYBLegacyBackfill)
 		h.startDBBackgroundTaskWithParent(ctx, h.runRelayCYBLearningWorker)
 	})
 }

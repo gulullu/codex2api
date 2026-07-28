@@ -756,6 +756,132 @@ func TestResponsesWebSocketRetriesFirstTokenTimeoutBeforeRelay(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketRetryableCYBIsAuditedAndLearnedBeforeRetry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "7")
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+	})
+	nextSettings := previousSettings
+	nextSettings.CodexWSSilentRetry = true
+	nextSettings.CodexWSSilentRetries = 1
+	nextSettings.CodexWSHideErrors = false
+	ApplyRuntimeSettings(nextSettings)
+
+	attemptCh := make(chan int64, 4)
+	var upstreamCalls int32
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		attemptCh <- account.ID()
+		if atomic.AddInt32(&upstreamCalls, 1) == 1 {
+			sse := `data: {"type":"response.failed","response":{"error":{"codex_error_info":"cyber_policy","message":"blocked"}}}` + "\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(sse)),
+			}, nil
+		}
+		sse := "" +
+			`data: {"type":"response.output_text.delta","delta":"retried"}` + "\n\n" +
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}
+
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "response-failed-cyb-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:  2,
+		MaxRetries:      1,
+		TestConcurrency: 1,
+		TestModel:       "gpt-5.4",
+	})
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", PlanType: "pro", AccountID: "acct-2"})
+	handler := NewHandler(store, db, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(
+		`{"model":"gpt-5.4","input":"actual OAuth CYB retry learning sentinel"}`,
+	)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	for _, wantType := range []string{"response.output_text.delta", "response.completed"} {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read %s: %v", wantType, err)
+		}
+		if got := gjson.GetBytes(message, "type").String(); got != wantType {
+			t.Fatalf("event type = %q, want %q; body=%s", got, wantType, message)
+		}
+	}
+	seenAccounts := make(map[int64]bool)
+	for attempt := 0; attempt < 2; attempt++ {
+		select {
+		case got := <-attemptCh:
+			seenAccounts[got] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for attempt %d", attempt+1)
+		}
+	}
+	if len(seenAccounts) != 2 {
+		t.Fatalf("transparent retry did not switch accounts: %v", seenAccounts)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !db.WaitRelayAuditIdle(waitCtx) {
+		t.Fatal("CYB retry audit writer did not drain")
+	}
+	sample, err := db.ClaimNextRelayCYBMissSample(context.Background(), "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample == nil ||
+		sample.SampleSource != database.RelayCYBMissSourceOAuth ||
+		!strings.Contains(sample.UserText, "actual OAuth CYB retry learning sentinel") {
+		t.Fatalf("retry learning sample = %+v", sample)
+	}
+	report, err := db.BuildRelayAuditReport(context.Background(), database.RelayAuditQuery{
+		Start: time.Now().Add(-time.Minute),
+		End:   time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.OAuthCyberMisses != 1 ||
+		report.Summary.DetectorMisses != 1 ||
+		report.Summary.RouteAttempts != 2 {
+		t.Fatalf("retry audit summary = %+v", report.Summary)
+	}
+}
+
 func TestEmitResponsesPhaseTimingsSetsHeaderAndSegments(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
@@ -2681,6 +2807,44 @@ func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 	}
 	if generalRetries != 1 || rateLimitRetries != 1 {
 		t.Fatalf("budgets = general %d rate %d, want 1/1", generalRetries, rateLimitRetries)
+	}
+}
+
+func TestUpstreamErrorKindRecognizesCyberPolicyMetadata(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       []byte
+		want       string
+	}{
+		{
+			name:       "nested codex error info without keyword in message",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"codex_error_info":"cyber_policy","message":"blocked"}}`),
+			want:       "cyber_policy",
+		},
+		{
+			name:       "response failed extracted error metadata",
+			statusCode: http.StatusInternalServerError,
+			body: responseFailedErrorBody([]byte(
+				`{"type":"response.failed","response":{"error":{"codex_error_info":"cyber_policy","message":"blocked"}}}`,
+			)),
+			want: "cyber_policy",
+		},
+		{
+			name:       "unrelated client error remains client",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"codex_error_info":"policy_other","message":"blocked"}}`),
+			want:       "client",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := upstreamErrorKind(tt.statusCode, tt.body, codex429Decision{}); got != tt.want {
+				t.Fatalf("upstreamErrorKind = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

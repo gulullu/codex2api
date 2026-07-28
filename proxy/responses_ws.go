@@ -211,6 +211,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			auditEndpoint = configured
 		}
 	}
+	routePlan := h.prepareRelayAuditOnlyDefaultPlan(c, rawBody, auditEndpoint)
+	defer h.finalizeRelayAuditRequest(c, routePlan)
 	if blocked, delegated := h.inspectPromptFilterOpenAIForWebSocket(c, conn, rawBody, auditEndpoint, model, policyEventID); blocked {
 		// A verified NewAPI connection owns warning/ban state. Keep the upstream
 		// WebSocket alive after returning the signed decision so NewAPI can show
@@ -323,6 +325,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			_ = writeResponsesWSError(conn, apiErr)
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
 		}
+		h.recordRelayRouteSelection(c, routePlan, account)
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
@@ -518,7 +521,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			fallbackLog = &wsHTTPFallback
 		}
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, silentRetryEnabled && attempt < maxRetries, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -575,6 +578,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	start time.Time,
 	ttftGuard *firstTokenTimeoutGuard,
 	silentRetryEnabled bool,
+	retryAttemptAvailable bool,
 	hideUpstreamErrors bool,
 	viaWebsocket bool,
 	fallbackLog *websocketHTTPFallbackState,
@@ -764,6 +768,15 @@ func (h *Handler) streamResponsesWSUpstream(
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
 	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+		h.recordRelayCYBStreamAttempt(
+			c,
+			account,
+			outcome,
+			fallbackAttempt,
+			"/v1/responses",
+			viaWebsocket,
+			retryAttemptAvailable,
+		)
 		resp.Body.Close()
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)

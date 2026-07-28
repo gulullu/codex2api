@@ -971,6 +971,39 @@ func (e *Engine) InspectTextWithPerformanceBudget(text string, maxBytes int, per
 	return e.inspectTextWithPerformanceBudget(text, maxBytes, performance, false)
 }
 
+// InspectTextWithExactPrecheck reuses the immutable compiled detector while
+// selecting only rules whose guaranteed literals can occur in the supplied
+// text (plus rules without a provable literal). It preserves the detector's
+// normal normalization, scoring, strictness, and exclusion semantics, but
+// avoids evaluating every compiled regexp over ordinary oversized chunks.
+func (e *Engine) InspectTextWithExactPrecheck(text string, performance GuardPerformanceConfig) Verdict {
+	return e.inspectExactCurrentUserPrecheck(text, performance)
+}
+
+// ExactPrecheckMayMatch reports whether InspectTextWithExactPrecheck can
+// produce Prompt Filter evidence for text. It is a conservative, read-only
+// hint gate: rules without a guaranteed literal and text that may require a
+// derived normalization view always return true, so callers may skip the
+// exact precheck only when doing so cannot hide a configured rule.
+func (e *Engine) ExactPrecheckMayMatch(text string) bool {
+	if e == nil || strings.TrimSpace(text) == "" {
+		return false
+	}
+	scanner := e.exactPrecheckScanner
+	index := scanner.hintIndex
+	if index == nil {
+		index = buildDecodedSafetyHintIndex(scanner)
+	}
+	if index.unhinted {
+		return true
+	}
+	if exactPrecheckNeedsDerivedViews(text, e.cfg.Advanced.Normalization, scanner) {
+		return true
+	}
+	matched, _ := decodedSafetyPriorityMatchedHintsSource(text, scanner)
+	return decodedSafetyPriorityMatchedHintSetCanMatch(scanner, matched)
+}
+
 func (e *Engine) inspectTextWithPerformanceBudget(text string, maxBytes int, performance GuardPerformanceConfig, omitFullEvidence bool) Verdict {
 	if e == nil {
 		return Verdict{}

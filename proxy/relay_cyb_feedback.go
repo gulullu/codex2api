@@ -13,7 +13,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
-	"github.com/codex2api/security/promptfilter"
+	"github.com/codex2api/security/cybroute"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/text/unicode/norm"
 )
@@ -22,6 +22,12 @@ const (
 	relayCybFeedbackTTL        = 24 * time.Hour
 	relayCybFeedbackMaxEntries = 1024
 	relayCybFeedbackMinRunes   = 16
+	// Large requests use bounded raw head/tail digest material. This keeps
+	// one-shot OAuth feedback tail-sensitive without reparsing, normalizing,
+	// or hashing a multi-megabyte user string on the first-token path.
+	relayCybFeedbackNormalizedBodyMaxBytes = 256 * 1024
+	relayCybFeedbackRawHeadBytes           = 32 * 1024
+	relayCybFeedbackRawTailBytes           = 96 * 1024
 )
 
 type relayCybFeedbackDigest [sha256.Size]byte
@@ -60,15 +66,22 @@ func (c *relayCybFeedbackCache) digest(endpoint string, rawBody []byte) (relayCy
 	}
 	mode := "raw_body"
 	material := rawBody
-	if text := normalizeRelayCybFeedbackText(relayCybFeedbackLatestUserText(rawBody, endpoint)); utf8.RuneCountInString(text) >= relayCybFeedbackMinRunes {
-		mode = "current_user"
-		material = []byte(text)
+	if len(rawBody) <= relayCybFeedbackNormalizedBodyMaxBytes {
+		if text := normalizeRelayCybFeedbackText(relayCybFeedbackLatestUserText(rawBody, endpoint)); utf8.RuneCountInString(text) >= relayCybFeedbackMinRunes {
+			mode = "current_user"
+			material = []byte(text)
+		}
 	}
 	mac := hmac.New(sha256.New, c.key[:])
 	writeRelayCybFeedbackFrame(mac, []byte("codex2api-relay-cyb-feedback-v1"))
 	writeRelayCybFeedbackFrame(mac, []byte(strings.ToLower(strings.TrimSpace(endpoint))))
 	writeRelayCybFeedbackFrame(mac, []byte(mode))
-	writeRelayCybFeedbackFrame(mac, material)
+	if mode == "raw_body" && len(material) > relayCybFeedbackNormalizedBodyMaxBytes {
+		writeRelayCybFeedbackFrame(mac, material[:relayCybFeedbackRawHeadBytes])
+		writeRelayCybFeedbackFrame(mac, material[len(material)-relayCybFeedbackRawTailBytes:])
+	} else {
+		writeRelayCybFeedbackFrame(mac, material)
+	}
 	copy(digest[:], mac.Sum(nil))
 	return digest, true
 }
@@ -83,23 +96,8 @@ func relayCybFeedbackTextEndpoint(endpoint string) bool {
 }
 
 func relayCybFeedbackLatestUserText(rawBody []byte, endpoint string) string {
-	envelope := promptfilter.BuildEnvelope(
-		rawBody,
-		endpoint,
-		"",
-		promptfilter.TransportHTTP,
-		max(len(rawBody), promptfilter.DefaultMaxTextLength),
-	)
-	parts := make([]string, 0, 2)
-	for _, segment := range envelope.Segments {
-		if segment.Origin != promptfilter.OriginCurrentUser {
-			continue
-		}
-		if text := strings.TrimSpace(segment.Text); text != "" {
-			parts = append(parts, text)
-		}
-	}
-	return strings.Join(parts, "\n")
+	current, _ := relayCYBExtractUserSegments(rawBody, endpoint)
+	return strings.Join(current, "\n")
 }
 
 func normalizeRelayCybFeedbackText(text string) string {
@@ -192,17 +190,86 @@ func (h *Handler) observeRelayRouteUsage(c *gin.Context, input *database.UsageLo
 	}
 	if plan.Required() {
 		h.logRelayCyberPolicyMetric(c, plan, false)
+		if h.relayCYBLocalRuleMissEligible(plan, account) {
+			h.enqueueRelayCYBMissSample(plan, account, database.RelayCYBMissSourceRelay)
+		}
 		return
 	}
-	if account.IsRelayStyle() || account.IsCodexAgentIdentity() {
+	if plan.Source != relayRouteSourceDefault ||
+		account.IsRelayStyle() || account.IsCodexAgentIdentity() {
 		return
 	}
 	h.logRelayCyberPolicyMetric(c, plan, true)
-	h.enqueueRelayCYBMissSample(plan, account)
-	if !relayCybFeedbackLearnEligible(plan, account) {
+	h.enqueueRelayCYBMissSample(plan, account, database.RelayCYBMissSourceOAuth)
+	if relayCybFeedbackLearnEligible(plan, account) {
+		globalRelayCybFeedback.learn(plan.FeedbackDigest)
+	}
+}
+
+// recordRelayCYBStreamAttempt preserves a real cyber_policy terminal event
+// before a transparent stream retry can skip the normal final usage path. It
+// writes only the independent route audit/learning state; billing usage remains
+// one logical final row.
+func (h *Handler) recordRelayCYBStreamAttempt(
+	c *gin.Context,
+	account *auth.Account,
+	outcome streamOutcome,
+	attemptIndex int,
+	upstreamEndpoint string,
+	viaWebsocket bool,
+	isRetryAttempt bool,
+) {
+	if h == nil || account == nil || outcome.failureKind != "cyber_policy" {
 		return
 	}
-	globalRelayCybFeedback.learn(plan.FeedbackDigest)
+	input := &database.UsageLogInput{
+		AccountID:         account.ID(),
+		Endpoint:          strings.TrimSpace(upstreamEndpoint),
+		UpstreamEndpoint:  strings.TrimSpace(upstreamEndpoint),
+		StatusCode:        outcome.logStatusCode,
+		ViaWebsocket:      viaWebsocket,
+		IsRetryAttempt:    isRetryAttempt,
+		AttemptIndex:      attemptIndex,
+		UpstreamErrorKind: outcome.failureKind,
+		ErrorMessage:      outcome.failureMessage,
+	}
+	h.observeRelayRouteUsage(c, input)
+	h.logRelayAuditUsage(c, input)
+}
+
+func (h *Handler) relayCYBLocalRuleMissEligible(plan *relayRoutePlan, account *auth.Account) bool {
+	inspectionBody := plan.cybInspectionBody()
+	if h == nil || h.store == nil || plan == nil || account == nil ||
+		!plan.Required() || !plan.accountInTargetGroup(account) ||
+		len(plan.AuditRawBody) == 0 || len(inspectionBody) == 0 ||
+		!plan.relayCYBHasCurrentUserText() {
+		return false
+	}
+	switch plan.Source {
+	case relayRouteSourceNoAffinity, relayRouteSourceOverflow:
+	case relayRouteSourceContinuation:
+		// A continuation pin can carry a brand-new user turn. The common
+		// current-user gate above excludes tool-only requests for every Relay
+		// source, so stale history never becomes a learned rule.
+	default:
+		return false
+	}
+	if !plan.LocalRuleInspected {
+		result := cybroute.Inspect(
+			inspectionBody,
+			plan.Endpoint,
+			plan.Model,
+			h.store.GetPromptFilterConfig(),
+		)
+		plan.LocalRuleInspected = true
+		plan.LocalRuleMatched = result.Route
+		plan.AuditScanTruncated = result.Truncated
+		plan.AuditScannedBytes = result.ScannedBytes
+		plan.AuditFullScan = result.FullScan
+		plan.AuditScanDetails = relayRouteScanDetailsJSON(result)
+		h.enrichRelayAuditScan(plan)
+	}
+	return !plan.LocalRuleMatched
 }
 
 func relayCybFeedbackLearnEligible(plan *relayRoutePlan, account *auth.Account) bool {
@@ -211,6 +278,7 @@ func relayCybFeedbackLearnEligible(plan *relayRoutePlan, account *auth.Account) 
 		!plan.Required() &&
 		plan.Source == relayRouteSourceDefault &&
 		plan.FeedbackDigestValid &&
+		plan.relayCYBHasCurrentUserText() &&
 		account != nil &&
 		!account.IsRelayStyle() &&
 		!account.IsCodexAgentIdentity()

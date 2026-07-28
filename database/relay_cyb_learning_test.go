@@ -2,11 +2,448 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSQLiteMigratesRelayCYBLearningSourceAndUserTextTruncation(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "relay-cyb-legacy.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WriteRelayCYBMissSample(context.Background(), &RelayCYBMissSampleInput{
+		RequestID: "legacy-oauth-sample",
+		UserText:  "legacy extracted text",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{"sample_source", "extractor_version", "user_text_truncated"} {
+		if _, err := legacy.Exec(`ALTER TABLE rb_cyb_miss_samples DROP COLUMN ` + column); err != nil {
+			legacy.Close()
+			t.Fatalf("drop legacy column %s: %v", column, err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("migrate legacy CYB table: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.WriteRelayCYBMissSample(context.Background(), &RelayCYBMissSampleInput{
+		RequestID:         "migrated-relay-sample",
+		SampleSource:      RelayCYBMissSourceRelay,
+		UserText:          "migrated user text",
+		UserTextTruncated: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sample, err := db.GetRelayCYBMissSample(context.Background(), "migrated-relay-sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.SampleSource != RelayCYBMissSourceRelay || !sample.UserTextTruncated {
+		t.Fatalf("migrated sample = %+v", sample)
+	}
+	legacySample, err := db.GetRelayCYBMissSample(context.Background(), "legacy-oauth-sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacySample.SampleSource != RelayCYBMissSourceOAuth || !legacySample.UserTextTruncated {
+		t.Fatalf("legacy sample provenance was not conservatively migrated: %+v", legacySample)
+	}
+	if legacySample.LearningStatus != RelayCYBLearningStatusRejected ||
+		!strings.Contains(legacySample.LearningError, "旧版头部提取") {
+		t.Fatalf("legacy sample was not quarantined from automatic learning: %+v", legacySample)
+	}
+	claimed, err := db.ClaimNextRelayCYBMissSample(context.Background(), "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.RequestID != "migrated-relay-sample" {
+		t.Fatalf("new bounded sample should remain eligible after one-shot quarantine: %+v", claimed)
+	}
+}
+
+func TestRelayCYBLegacyUserTextMigrationQuarantinesPendingStatesOnEveryStartup(t *testing.T) {
+	db := newRelayAuditSQLite(t)
+	ctx := context.Background()
+	statuses := []string{
+		RelayCYBLearningStatusQueued,
+		RelayCYBLearningStatusRetry,
+		RelayCYBLearningStatusProcessing,
+	}
+	for index, status := range statuses {
+		requestID := "legacy-pending-" + status
+		if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+			RequestID:         requestID,
+			CreatedAt:         time.Now().UTC().Add(time.Duration(index) * time.Second),
+			UserText:          "legacy head-only user text",
+			UserTextTruncated: true,
+			ContentHash:       "legacy-hash-" + status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.conn.ExecContext(ctx, `
+			UPDATE rb_cyb_miss_samples
+			SET learning_status = $1, extractor_version = 0
+			WHERE request_id = $2
+		`, status, requestID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("run legacy user-text quarantine: %v", err)
+	}
+	for _, status := range statuses {
+		sample, err := db.GetRelayCYBMissSample(ctx, "legacy-pending-"+status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sample.LearningStatus != RelayCYBLearningStatusRejected ||
+			!strings.Contains(sample.LearningError, "旧版头部提取") {
+			t.Fatalf("legacy %s sample was not quarantined: %+v", status, sample)
+		}
+	}
+
+	if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+		RequestID:         "new-bounded-truncated",
+		CreatedAt:         time.Now().UTC().Add(time.Minute),
+		UserText:          "bounded head\n<<<USER_TEXT_MIDDLE_TRUNCATED>>>\nactual tail",
+		UserTextTruncated: true,
+		ContentHash:       "new-bounded-hash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("repeat one-shot migration: %v", err)
+	}
+	claimed, err := db.ClaimNextRelayCYBMissSample(ctx, "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.RequestID != "new-bounded-truncated" {
+		t.Fatalf("new bounded sample was incorrectly rejected on repeat quarantine: %+v", claimed)
+	}
+
+	if _, err := db.conn.ExecContext(ctx, `
+		INSERT INTO rb_cyb_miss_samples (
+			request_id, created_at, updated_at, user_text, content_hash, learning_status
+		) VALUES ($1, $2, $2, $3, $4, $5)
+	`, "rollback-old-writer", time.Now().UTC().Add(2*time.Minute),
+		"head-only text written by a rolled-back binary",
+		"rollback-old-writer-hash", RelayCYBLearningStatusQueued); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("quarantine rollback-created legacy sample: %v", err)
+	}
+	rollbackSample, err := db.GetRelayCYBMissSample(ctx, "rollback-old-writer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rollbackSample.LearningStatus != RelayCYBLearningStatusRejected ||
+		!strings.Contains(rollbackSample.LearningError, "旧版头部提取") {
+		t.Fatalf("rollback-created legacy sample was claimable: %+v", rollbackSample)
+	}
+
+	ruleResult, err := db.conn.ExecContext(ctx, `
+		INSERT INTO rb_cyb_rules (
+			name, pattern, rationale, source_request_id, model, enabled
+		) VALUES ($1, $2, $3, $4, $5, TRUE)
+	`, "rollback_generated_rule", `(?i)rollback.{0,20}head`, "rollback fixture",
+		"rollback-old-worker-applied", "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollbackRuleID, err := ruleResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		INSERT INTO rb_cyb_miss_samples (
+			request_id, created_at, updated_at, user_text, content_hash,
+			learning_status, rule_id
+		) VALUES ($1, $2, $2, $3, $4, $5, $6)
+	`, "rollback-old-worker-applied", time.Now().UTC().Add(3*time.Minute),
+		"head-only text learned by a rolled-back worker",
+		"rollback-old-worker-applied-hash",
+		RelayCYBLearningStatusApplied, rollbackRuleID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("quarantine rule applied by rollback worker: %v", err)
+	}
+	appliedSample, err := db.GetRelayCYBMissSample(ctx, "rollback-old-worker-applied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if appliedSample.LearningStatus != RelayCYBLearningStatusRejected ||
+		!strings.Contains(appliedSample.LearningError, "自动停用") {
+		t.Fatalf("rollback-applied sample was not quarantined: %+v", appliedSample)
+	}
+	rollbackRule, err := db.GetRelayCYBRule(ctx, rollbackRuleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rollbackRule.Enabled || !strings.Contains(rollbackRule.DisabledReason, "旧版头部提取") {
+		t.Fatalf("rollback-generated rule was not disabled: %+v", rollbackRule)
+	}
+}
+
+func TestRelayCYBExtractorBaselinePreservesPreVersionAppliedRule(t *testing.T) {
+	db := newRelayAuditSQLite(t)
+	ctx := context.Background()
+	if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+		RequestID:   "pre-version-applied-sample",
+		CreatedAt:   time.Now().UTC(),
+		UserText:    "pre-version user evidence",
+		ContentHash: "pre-version-applied-hash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ruleResult, err := db.conn.ExecContext(ctx, `
+		INSERT INTO rb_cyb_rules (
+			name, pattern, rationale, source_request_id, model, enabled
+		) VALUES ($1, $2, $3, $4, $5, TRUE)
+	`, "pre_version_rule", `(?i)pre.{0,20}version`, "baseline fixture",
+		"pre-version-applied-sample", "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ruleID, err := ruleResult.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE rb_cyb_miss_samples
+		SET extractor_version = 0, learning_status = $1, rule_id = $2
+		WHERE request_id = $3
+	`, RelayCYBLearningStatusApplied, ruleID, "pre-version-applied-sample"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		DELETE FROM data_migrations
+		WHERE version = $1
+	`, dataMigrationRelayCYBExtractorBaselineV1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("re-run extractor baseline migration: %v", err)
+	}
+
+	sample, err := db.GetRelayCYBMissSample(ctx, "pre-version-applied-sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.LearningStatus != RelayCYBLearningStatusApplied {
+		t.Fatalf("pre-version applied sample was reclassified: %+v", sample)
+	}
+	var extractorVersion int
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT extractor_version
+		FROM rb_cyb_miss_samples
+		WHERE request_id = $1
+	`, "pre-version-applied-sample").Scan(&extractorVersion); err != nil {
+		t.Fatal(err)
+	}
+	if extractorVersion != -1 {
+		t.Fatalf("pre-version extractor version = %d, want -1", extractorVersion)
+	}
+	rule, err := db.GetRelayCYBRule(ctx, ruleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rule.Enabled || rule.DisabledReason != "" {
+		t.Fatalf("pre-version applied rule should remain enabled: %+v", rule)
+	}
+	notifications, err := db.ListRelayCYBLearningNotifications(
+		ctx,
+		time.Now().UTC().Add(-time.Minute),
+		10,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundReview := false
+	for _, notification := range notifications {
+		if notification.EventType == "legacy_rule_review" && notification.Count == 1 {
+			foundReview = true
+			break
+		}
+	}
+	if !foundReview {
+		t.Fatalf("pre-version retained rule review notification missing: %+v", notifications)
+	}
+
+	if _, err := db.conn.ExecContext(ctx, `
+		INSERT INTO rb_cyb_miss_samples (
+			request_id, created_at, updated_at, user_text, content_hash,
+			learning_status, rule_id
+		) VALUES ($1, $2, $2, $3, $4, $5, $6)
+	`, "rollback-merged-existing-rule", time.Now().UTC().Add(time.Minute),
+		"head-only rollback sample merged into an existing pattern",
+		"rollback-merged-existing-rule-hash",
+		RelayCYBLearningStatusMerged, ruleID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("quarantine rollback sample merged into existing rule: %v", err)
+	}
+	mergedSample, err := db.GetRelayCYBMissSample(ctx, "rollback-merged-existing-rule")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mergedSample.LearningStatus != RelayCYBLearningStatusRejected ||
+		!strings.Contains(mergedSample.LearningError, "既有规则保持不变") {
+		t.Fatalf("rollback merged sample was not isolated accurately: %+v", mergedSample)
+	}
+	rule, err = db.GetRelayCYBRule(ctx, ruleID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rule.Enabled || rule.DisabledReason != "" {
+		t.Fatalf("rollback merged sample disabled a pre-version rule: %+v", rule)
+	}
+}
+
+func TestRelayCYBExtractorBaselineRejectsInFlightLegacyClaim(t *testing.T) {
+	db := newRelayAuditSQLite(t)
+	ctx := context.Background()
+	if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+		RequestID:   "legacy-processing-across-baseline",
+		CreatedAt:   time.Now().UTC(),
+		UserText:    "legacy head-only processing evidence",
+		ContentHash: "legacy-processing-across-baseline-hash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE rb_cyb_miss_samples
+		SET extractor_version = 0,
+		    learning_status = $1,
+		    learning_model = $2,
+		    learning_attempts = 1
+		WHERE request_id = $3
+	`, RelayCYBLearningStatusProcessing, "gpt-5.4",
+		"legacy-processing-across-baseline"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		DELETE FROM data_migrations
+		WHERE version = $1
+	`, dataMigrationRelayCYBExtractorBaselineV1); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("migrate with in-flight legacy claim: %v", err)
+	}
+
+	sample, err := db.GetRelayCYBMissSample(ctx, "legacy-processing-across-baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sample.LearningStatus != RelayCYBLearningStatusRejected {
+		t.Fatalf("in-flight legacy sample was not rejected: %+v", sample)
+	}
+	var extractorVersion int
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT extractor_version
+		FROM rb_cyb_miss_samples
+		WHERE request_id = $1
+	`, "legacy-processing-across-baseline").Scan(&extractorVersion); err != nil {
+		t.Fatal(err)
+	}
+	if extractorVersion != 0 {
+		t.Fatalf("in-flight legacy extractor version = %d, want 0", extractorVersion)
+	}
+	if _, err := db.ApplyRelayCYBLearnedRule(
+		ctx,
+		"legacy-processing-across-baseline",
+		1,
+		"legacy_processing_rule",
+		`(?i)legacy.{0,32}processing`,
+		"must remain stale",
+		"gpt-5.4",
+	); !errors.Is(err, ErrRelayCYBLearningClaimStale) {
+		t.Fatalf("legacy worker apply after baseline error = %v, want stale", err)
+	}
+}
+
+func TestRelayCYBLegacyRelaySampleIsQuarantinedFromClaims(t *testing.T) {
+	db := newRelayAuditSQLite(t)
+	ctx := context.Background()
+	if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+		RequestID:         "legacy-relay-truncated",
+		CreatedAt:         time.Now().UTC(),
+		SampleSource:      RelayCYBMissSourceRelay,
+		UserText:          "legacy Relay head-only user text",
+		UserTextTruncated: true,
+		ContentHash:       "legacy-relay-truncated-hash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE rb_cyb_miss_samples
+		SET extractor_version = 0
+		WHERE request_id = $1
+	`, "legacy-relay-truncated"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrateRelayCYBLearning(ctx); err != nil {
+		t.Fatalf("run legacy Relay quarantine: %v", err)
+	}
+
+	legacy, err := db.GetRelayCYBMissSample(ctx, "legacy-relay-truncated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.SampleSource != RelayCYBMissSourceRelay ||
+		legacy.LearningStatus != RelayCYBLearningStatusRejected ||
+		!strings.Contains(legacy.LearningError, "旧版头部提取") {
+		t.Fatalf("legacy Relay sample was not quarantined: %+v", legacy)
+	}
+
+	if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+		RequestID:         "new-relay-bounded",
+		CreatedAt:         time.Now().UTC().Add(time.Minute),
+		SampleSource:      RelayCYBMissSourceRelay,
+		UserText:          "bounded head\n<<<USER_TEXT_MIDDLE_TRUNCATED>>>\nactual tail",
+		UserTextTruncated: true,
+		ContentHash:       "new-relay-bounded-hash",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := db.ClaimNextRelayCYBMissSample(ctx, "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.RequestID != "new-relay-bounded" {
+		t.Fatalf("claim returned quarantined legacy Relay sample: %+v", claimed)
+	}
+	next, err := db.ClaimNextRelayCYBMissSample(ctx, "gpt-5.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != nil {
+		t.Fatalf("quarantined legacy Relay sample remained claimable: %+v", next)
+	}
+}
 
 func TestRelayCYBMissSampleSummaryDetailAndLearningLifecycle(t *testing.T) {
 	db := newRelayAuditSQLite(t)
@@ -111,6 +548,9 @@ func TestRelayCYBMissSampleSummaryDetailAndLearningLifecycle(t *testing.T) {
 	if stats.Applied != 1 || stats.Rules != 1 || stats.Queued != 0 {
 		t.Fatalf("stats=%+v", stats)
 	}
+	if stats.OAuthSamples != 1 || stats.RelaySamples != 0 {
+		t.Fatalf("source stats=%+v", stats)
+	}
 }
 
 func TestRelayCYBLearningSettingsRoundTrip(t *testing.T) {
@@ -155,7 +595,16 @@ func TestRelayCYBClaimMergesDuplicateContentHash(t *testing.T) {
 		t.Fatalf("apply source: %v", err)
 	}
 
-	writeRelayCYBTestSample(t, db, "merge-duplicate", "same content", "same-hash", now.Add(time.Second))
+	if err := db.WriteRelayCYBMissSample(ctx, &RelayCYBMissSampleInput{
+		RequestID:       "merge-duplicate",
+		CreatedAt:       now.Add(time.Second),
+		SampleSource:    RelayCYBMissSourceRelay,
+		RedactedRequest: `{"input":"redacted Relay test sample"}`,
+		UserText:        "same content",
+		ContentHash:     "same-hash",
+	}); err != nil {
+		t.Fatalf("write cross-source duplicate: %v", err)
+	}
 	claimed, err := db.ClaimNextRelayCYBMissSample(ctx, "gpt-5.4")
 	if err != nil {
 		t.Fatalf("claim after duplicate: %v", err)
@@ -169,14 +618,16 @@ func TestRelayCYBClaimMergesDuplicateContentHash(t *testing.T) {
 	}
 	if duplicate.LearningStatus != RelayCYBLearningStatusMerged ||
 		duplicate.RuleID != rule.ID ||
-		duplicate.LearningAttempts != 0 {
+		duplicate.LearningAttempts != 0 ||
+		duplicate.SampleSource != RelayCYBMissSourceRelay {
 		t.Fatalf("merged duplicate = %+v, want rule %d without model attempt", duplicate, rule.ID)
 	}
 	stats, err := db.GetRelayCYBLearningStats(ctx)
 	if err != nil {
 		t.Fatalf("stats: %v", err)
 	}
-	if stats.Applied != 1 || stats.Merged != 1 || stats.Rules != 1 {
+	if stats.Applied != 1 || stats.Merged != 1 || stats.Rules != 1 ||
+		stats.OAuthSamples != 1 || stats.RelaySamples != 1 {
 		t.Fatalf("stats after merge = %+v", stats)
 	}
 }

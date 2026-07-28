@@ -84,6 +84,8 @@ type relayRoutePlan struct {
 	AuditRequestID        string
 	AuditCreatedAt        time.Time
 	AuditScanTruncated    bool
+	AuditScannedBytes     int64
+	AuditFullScan         bool
 	AuditScanDetails      string
 	AuditReplayStatus     string
 	AuditReplaySource     string
@@ -95,11 +97,43 @@ type relayRoutePlan struct {
 	DetectorMiss          bool
 	RouteViolation        bool
 	GroupExhausted        bool
+	LocalRuleInspected    bool
+	LocalRuleMatched      bool
+	CurrentUserChecked    bool
+	HasCurrentUserText    bool
+	CurrentUserBodyBytes  int
 	// AuditRawBody is an immutable request-lifetime reference. It is never
 	// persisted for ordinary traffic and is cleared immediately after a real
-	// OAuth cyber_policy miss is captured.
-	AuditRawBody         []byte
+	// OAuth or eligible Relay cyber_policy miss is captured.
+	AuditRawBody []byte
+	// CYBUpstreamBody is set only when continuation replay reconstructs a
+	// different standalone body for Relay. Local-rule verification and learning
+	// use this actual upstream body, while the current-user gate and retained
+	// audit request remain tied to the original client request.
+	CYBUpstreamBody      []byte
 	LearningCaseCaptured bool
+}
+
+func (plan *relayRoutePlan) setCYBUpstreamBody(body []byte) {
+	if plan == nil || len(body) == 0 {
+		return
+	}
+	plan.CYBUpstreamBody = body
+	// The plan may already contain an inspection result for the original
+	// previous_response_id request. A real Relay cyber_policy must verify the
+	// reconstructed standalone body instead.
+	plan.LocalRuleInspected = false
+	plan.LocalRuleMatched = false
+}
+
+func (plan *relayRoutePlan) cybInspectionBody() []byte {
+	if plan == nil {
+		return nil
+	}
+	if len(plan.CYBUpstreamBody) > 0 {
+		return plan.CYBUpstreamBody
+	}
+	return plan.AuditRawBody
 }
 
 func loadRelayRouteConfig() relayRouteConfig {
@@ -261,8 +295,12 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 			plan.Model,
 			h.store.GetPromptFilterConfig(),
 		)
+		plan.LocalRuleInspected = true
+		plan.LocalRuleMatched = result.Route
 	}
 	plan.AuditScanTruncated = result.Truncated
+	plan.AuditScannedBytes = result.ScannedBytes
+	plan.AuditFullScan = result.FullScan
 	plan.AuditScanDetails = relayRouteScanDetailsJSON(result)
 
 	switch {
@@ -333,6 +371,35 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 	return &plan, nil
 }
 
+// prepareRelayAuditOnlyDefaultPlan attaches the independent audit/learning
+// state to an OAuth-only ingress without changing that ingress's scheduler.
+// Inbound Responses WebSocket currently excludes Relay-style accounts, so
+// applying the normal route plan there would turn a local rule into an empty
+// account pool. Actual routing remains owned by that official WebSocket path.
+func (h *Handler) prepareRelayAuditOnlyDefaultPlan(
+	c *gin.Context,
+	rawBody []byte,
+	endpoint string,
+) *relayRoutePlan {
+	cfg := loadRelayRouteConfig()
+	plan := defaultRelayRoutePlan(cfg)
+	plan.Endpoint = strings.TrimSpace(endpoint)
+	plan.Model = strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	setRelayRoutePlanContext(c, &plan)
+	if !cfg.Enabled || c == nil {
+		return &plan
+	}
+	plan.AuditRequestID = database.NewRelayAuditRequestID()
+	plan.AuditCreatedAt = time.Now()
+	plan.AuditRawBody = rawBody
+	plan.HasPreviousResponseID = strings.TrimSpace(
+		gjson.GetBytes(rawBody, "previous_response_id").String(),
+	) != ""
+	plan.FeedbackDigest, plan.FeedbackDigestValid = globalRelayCybFeedback.digest(endpoint, rawBody)
+	h.beginRelayAudit(c, &plan, rawBody)
+	return &plan
+}
+
 func (h *Handler) relayRoutePlanForRequest(c *gin.Context, rawBody []byte, endpoint string) (*relayRoutePlan, error) {
 	if plan, ok := relayRoutePlanFromContext(c); ok {
 		return plan, nil
@@ -363,7 +430,15 @@ func (h *Handler) upgradeRelayRoutePlanFromPayloadRules(plan *relayRoutePlan, bo
 		return
 	}
 	result := cybroute.Inspect(body, endpoint, model, h.store.GetPromptFilterConfig())
-	plan.AuditScanTruncated = plan.AuditScanTruncated || result.Truncated
+	plan.LocalRuleInspected = true
+	plan.LocalRuleMatched = result.Route
+	if result.FullScan {
+		plan.AuditScannedBytes = result.ScannedBytes
+		plan.AuditFullScan = true
+		plan.AuditScanTruncated = false
+	} else {
+		plan.AuditScanTruncated = plan.AuditScanTruncated || result.Truncated
+	}
 	if details := relayRouteScanDetailsJSON(result); details != "" {
 		plan.AuditScanDetails = details
 	}

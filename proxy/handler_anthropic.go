@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -132,6 +133,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "messages is required")
 		return
 	}
+	routePlan, routeErr := h.prepareRelayRoutePlan(c, rawBody, "/v1/messages")
+	if routeErr != nil {
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "Relay route state is temporarily unavailable")
+		return
+	}
+	defer h.finalizeRelayAuditRequest(c, routePlan)
 	if h.inspectPromptFilterAnthropic(c, rawBody, "/v1/messages", model) {
 		return
 	}
@@ -177,6 +184,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	ruleIdentity := h.payloadRuleIdentity(c)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+	accountFilter = routePlan.composeFilter(accountFilter)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 
@@ -203,6 +211,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if routePlan.Required() {
+				h.logRelayGroupExhausted(c, routePlan)
+			}
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 				return
@@ -213,6 +224,16 @@ func (h *Handler) Messages(c *gin.Context) {
 				return
 			}
 			sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
+			return
+		}
+		accountFilter, ok = h.applyAnthropicRelayRouteSelection(
+			c,
+			routePlan,
+			account,
+			accountFilter,
+			retainedHTTPFallback,
+		)
+		if !ok {
 			return
 		}
 
@@ -605,6 +626,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if responseFailedDecision.Reason != "" {
 				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
+			h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(terminalFailurePayload))
 		}
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
@@ -618,6 +640,15 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			h.recordRelayCYBStreamAttempt(
+				c,
+				account,
+				outcome,
+				attempt+1,
+				upstreamEndpoint,
+				useWebsocket,
+				true,
+			)
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -720,4 +751,27 @@ func (h *Handler) Messages(c *gin.Context) {
 		h.store.Release(account)
 		return
 	}
+}
+
+func (h *Handler) applyAnthropicRelayRouteSelection(
+	c *gin.Context,
+	plan *relayRoutePlan,
+	account *auth.Account,
+	filter auth.AccountFilter,
+	retainedHTTPFallback bool,
+) (auth.AccountFilter, bool) {
+	if retainedHTTPFallback {
+		h.recordRelayRouteSelection(c, plan, account)
+		return filter, true
+	}
+	becameOverflow, err := h.observeRelayRouteSelection(c, plan, account)
+	if err != nil {
+		h.store.Release(account)
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "Relay route state is temporarily unavailable")
+		return filter, false
+	}
+	if becameOverflow {
+		filter = plan.composeFilter(filter)
+	}
+	return filter, true
 }

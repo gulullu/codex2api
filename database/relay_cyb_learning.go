@@ -24,47 +24,58 @@ const (
 	RelayCYBLearningStatusRejected   = "rejected"
 	RelayCYBLearningStatusFailed     = "failed"
 
+	RelayCYBMissSourceOAuth = "oauth_cyb_miss"
+	RelayCYBMissSourceRelay = "relay_cyb_miss"
+
 	DefaultRelayCYBLearningModel = "gpt-5.4"
 
-	relayCYBMissRequestMaxRunes   = 512 * 1024
-	relayCYBMissUserTextMaxRunes  = 128 * 1024
-	relayCYBRulePatternMaxRunes   = 2048
-	relayCYBRuleRationaleMaxRunes = 4000
+	relayCYBMissRequestMaxRunes     = 512 * 1024
+	relayCYBMissUserTextMaxRunes    = 128 * 1024
+	relayCYBRulePatternMaxRunes     = 2048
+	relayCYBRuleRationaleMaxRunes   = 4000
+	relayCYBCurrentExtractorVersion = 1
+
+	dataMigrationRelayCYBExtractorBaselineV1 = "20260728_relay_cyb_extractor_baseline_v1"
 )
 
-// RelayCYBMissSampleInput is written only after an OAuth account actually
-// returns cyber_policy. It is deliberately separate from Prompt Filter logs:
+// RelayCYBMissSampleInput is written only after an upstream account actually
+// returns cyber_policy and the local routing rules did not already cover that
+// user-authored sample. It is deliberately separate from Prompt Filter logs:
 // the sample exists to explain and learn Relay routing, never to block traffic.
 type RelayCYBMissSampleInput struct {
-	RequestID        string
-	CreatedAt        time.Time
-	AccountID        int64
-	AccountName      string
-	AccountType      string
-	RedactedRequest  string
-	UserText         string
-	RequestTruncated bool
-	ContentHash      string
+	RequestID         string
+	CreatedAt         time.Time
+	SampleSource      string
+	AccountID         int64
+	AccountName       string
+	AccountType       string
+	RedactedRequest   string
+	UserText          string
+	UserTextTruncated bool
+	RequestTruncated  bool
+	ContentHash       string
 }
 
 type RelayCYBMissSample struct {
-	RequestID        string     `json:"request_id"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	AccountID        int64      `json:"account_id"`
-	AccountName      string     `json:"account_name"`
-	AccountType      string     `json:"account_type"`
-	RedactedRequest  string     `json:"redacted_request"`
-	UserText         string     `json:"user_text"`
-	RequestTruncated bool       `json:"request_truncated"`
-	ContentHash      string     `json:"-"`
-	LearningStatus   string     `json:"learning_status"`
-	LearningModel    string     `json:"learning_model"`
-	LearningAttempts int        `json:"learning_attempts"`
-	NextAttemptAt    *time.Time `json:"next_attempt_at,omitempty"`
-	LearningError    string     `json:"learning_error"`
-	RuleID           int64      `json:"rule_id"`
-	LearnedAt        *time.Time `json:"learned_at,omitempty"`
+	RequestID         string     `json:"request_id"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	SampleSource      string     `json:"sample_source"`
+	AccountID         int64      `json:"account_id"`
+	AccountName       string     `json:"account_name"`
+	AccountType       string     `json:"account_type"`
+	RedactedRequest   string     `json:"redacted_request"`
+	UserText          string     `json:"user_text"`
+	UserTextTruncated bool       `json:"user_text_truncated"`
+	RequestTruncated  bool       `json:"request_truncated"`
+	ContentHash       string     `json:"-"`
+	LearningStatus    string     `json:"learning_status"`
+	LearningModel     string     `json:"learning_model"`
+	LearningAttempts  int        `json:"learning_attempts"`
+	NextAttemptAt     *time.Time `json:"next_attempt_at,omitempty"`
+	LearningError     string     `json:"learning_error"`
+	RuleID            int64      `json:"rule_id"`
+	LearnedAt         *time.Time `json:"learned_at,omitempty"`
 }
 
 // RelayCYBMissBackfillCandidate is a bounded, already-redacted audit record
@@ -73,6 +84,7 @@ type RelayCYBMissSample struct {
 type RelayCYBMissBackfillCandidate struct {
 	RequestID        string
 	CreatedAt        time.Time
+	SampleSource     string
 	Endpoint         string
 	RedactedRequest  string
 	RequestTruncated bool
@@ -82,23 +94,27 @@ type RelayCYBMissBackfillCandidate struct {
 }
 
 type RelayCYBMissBackfillResult struct {
-	Scanned  int
-	Queued   int
-	Rejected int
+	Scanned       int
+	Queued        int
+	Rejected      int
+	NextCreatedAt time.Time
+	NextRequestID string
 }
 
 type RelayCYBLearningSummary struct {
-	Status           string    `json:"status"`
-	Model            string    `json:"model"`
-	Attempts         int       `json:"attempts"`
-	Message          string    `json:"message"`
-	RuleID           int64     `json:"rule_id"`
-	RuleName         string    `json:"rule_name"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	AccountID        int64     `json:"account_id"`
-	AccountName      string    `json:"account_name"`
-	AccountType      string    `json:"account_type"`
-	RequestTruncated bool      `json:"request_truncated"`
+	Status            string    `json:"status"`
+	Model             string    `json:"model"`
+	Attempts          int       `json:"attempts"`
+	Message           string    `json:"message"`
+	RuleID            int64     `json:"rule_id"`
+	RuleName          string    `json:"rule_name"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	SampleSource      string    `json:"sample_source"`
+	AccountID         int64     `json:"account_id"`
+	AccountName       string    `json:"account_name"`
+	AccountType       string    `json:"account_type"`
+	UserTextTruncated bool      `json:"user_text_truncated"`
+	RequestTruncated  bool      `json:"request_truncated"`
 }
 
 type RelayCYBLearningSettings struct {
@@ -128,14 +144,16 @@ type RelayCYBRulePage struct {
 }
 
 type RelayCYBLearningStats struct {
-	Queued     int64 `json:"queued"`
-	Processing int64 `json:"processing"`
-	Retry      int64 `json:"retry"`
-	Applied    int64 `json:"applied"`
-	Merged     int64 `json:"merged"`
-	Rejected   int64 `json:"rejected"`
-	Failed     int64 `json:"failed"`
-	Rules      int64 `json:"rules"`
+	Queued       int64 `json:"queued"`
+	Processing   int64 `json:"processing"`
+	Retry        int64 `json:"retry"`
+	Applied      int64 `json:"applied"`
+	Merged       int64 `json:"merged"`
+	Rejected     int64 `json:"rejected"`
+	Failed       int64 `json:"failed"`
+	Rules        int64 `json:"rules"`
+	OAuthSamples int64 `json:"oauth_samples"`
+	RelaySamples int64 `json:"relay_samples"`
 }
 
 type RelayCYBLearningNotification struct {
@@ -178,8 +196,11 @@ func (db *DB) migrateRelayCYBLearning(ctx context.Context) error {
 			oauth_account_id BIGINT NOT NULL DEFAULT 0,
 			oauth_account_name TEXT NOT NULL DEFAULT '',
 			oauth_account_type TEXT NOT NULL DEFAULT '',
+			sample_source TEXT NOT NULL DEFAULT 'oauth_cyb_miss',
 			redacted_request TEXT NOT NULL DEFAULT '',
 			user_text TEXT NOT NULL DEFAULT '',
+			extractor_version INTEGER NOT NULL DEFAULT 0,
+			user_text_truncated BOOLEAN NOT NULL DEFAULT FALSE,
 			request_truncated BOOLEAN NOT NULL DEFAULT FALSE,
 			content_hash TEXT NOT NULL DEFAULT '',
 			learning_status TEXT NOT NULL DEFAULT 'queued',
@@ -229,11 +250,181 @@ func (db *DB) migrateRelayCYBLearning(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	if db.isSQLite() {
+		if err := db.ensureSQLiteColumn(
+			ctx,
+			"rb_cyb_miss_samples",
+			"sample_source",
+			"TEXT NOT NULL DEFAULT 'oauth_cyb_miss'",
+		); err != nil {
+			return err
+		}
+		if err := db.ensureSQLiteColumn(
+			ctx,
+			"rb_cyb_miss_samples",
+			"extractor_version",
+			"INTEGER NOT NULL DEFAULT 0",
+		); err != nil {
+			return err
+		}
+		if err := db.ensureSQLiteColumn(
+			ctx,
+			"rb_cyb_miss_samples",
+			"user_text_truncated",
+			// Existing rows were extracted by the legacy head-heavy path and
+			// cannot prove that a long latest-user tail was retained. Mark
+			// them conservatively; all new writers provide an explicit value.
+			"BOOLEAN NOT NULL DEFAULT TRUE",
+		); err != nil {
+			return err
+		}
+	} else {
+		if _, err := db.conn.ExecContext(ctx, `
+			ALTER TABLE rb_cyb_miss_samples
+				ADD COLUMN IF NOT EXISTS sample_source TEXT NOT NULL DEFAULT 'oauth_cyb_miss';
+			ALTER TABLE rb_cyb_miss_samples
+				ADD COLUMN IF NOT EXISTS extractor_version INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE rb_cyb_miss_samples
+				ADD COLUMN IF NOT EXISTS user_text_truncated BOOLEAN NOT NULL DEFAULT TRUE;
+			ALTER TABLE rb_cyb_miss_samples
+				ALTER COLUMN user_text_truncated SET DEFAULT FALSE;
+		`); err != nil {
+			return err
+		}
+	}
+	if err := db.ensureDataMigrationsTable(ctx); err != nil {
+		return err
+	}
+	if err := db.runDataMigrationOnce(
+		ctx,
+		dataMigrationRelayCYBExtractorBaselineV1,
+		db.markRelayCYBExtractorBaseline,
+	); err != nil {
+		return err
+	}
+	return db.rejectLegacyRelayCYBUserText(ctx)
+}
+
+// markRelayCYBExtractorBaseline distinguishes rows that existed before
+// extractor versioning from rows written by an older binary after a rollback.
+// Existing applied rules are preserved at version -1; only a later version-0
+// writer is evidence that the obsolete head-only extractor ran again.
+func (db *DB) markRelayCYBExtractorBaseline(ctx context.Context, tx *sql.Tx) error {
+	var retainedRules int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(DISTINCT rule.id)
+		FROM rb_cyb_miss_samples sample
+		JOIN rb_cyb_rules rule ON rule.id = sample.rule_id
+		WHERE COALESCE(sample.extractor_version, 0) = 0
+		  AND COALESCE(sample.rule_id, 0) > 0
+		  AND sample.learning_status IN ($1, $2)
+		  AND rule.enabled = TRUE
+	`, RelayCYBLearningStatusApplied, RelayCYBLearningStatusMerged).Scan(&retainedRules); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE rb_cyb_miss_samples
+		SET extractor_version = -1
+		WHERE COALESCE(extractor_version, 0) = 0
+		  AND COALESCE(rule_id, 0) > 0
+		  AND learning_status IN ($1, $2)
+	`, RelayCYBLearningStatusApplied, RelayCYBLearningStatusMerged); err != nil {
+		return err
+	}
+	if retainedRules == 0 {
+		return nil
+	}
+	return insertRelayCYBLearningEventWith(
+		ctx,
+		tx,
+		"legacy_rule_review",
+		0,
+		"升级前 CYB 规则已保留并标记复核",
+		fmt.Sprintf(
+			"%d 条升级前规则继续启用；旧审计正文无法可靠重建真实用户尾部，不能伪装成已完成尾部回测。新样本将使用新版尾部校验，请在审计列表按截断标记抽查旧规则。",
+			retainedRules,
+		),
+		time.Now().UTC(),
+	)
+}
+
+// rejectLegacyRelayCYBUserText is deliberately idempotent. If production rolls
+// back after the baseline marker exists, the older binary writes version 0.
+// Pending rows are quarantined before claim; any rule it created is disabled
+// on the next upgrade. A version-0 sample merely merged into an existing rule
+// cannot disable that rule. Pre-versioning applied rules marked -1 also remain
+// enabled because their historical extraction quality cannot be reclassified.
+func (db *DB) rejectLegacyRelayCYBUserText(ctx context.Context) error {
+	const pendingReason = "历史样本使用旧版头部提取，无法确认最新用户语料，禁止自动学习"
+	const rollbackReason = "规则由回滚期间的旧版头部提取样本生成，已自动停用"
+	const mergedReason = "回滚期间的旧版头部提取样本已隔离；其引用的既有规则保持不变"
+	return db.withRelayAuditTransaction(ctx, func(tx *sql.Tx) error {
+		// Reject/lock samples before looking for rollback-created rules. On
+		// PostgreSQL an old worker may still hold the sample row lock while its
+		// new rule is uncommitted. Updating the sample first either wins the
+		// claim race or waits for that worker to commit, so the rule update below
+		// cannot miss a just-created bad rule.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE rb_cyb_miss_samples
+			SET learning_status = $1,
+			    learning_error = $2,
+			    user_text_truncated = TRUE,
+			    next_attempt_at = NULL,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE COALESCE(extractor_version, 0) = 0
+			   OR (
+			     COALESCE(extractor_version, 0) < $3
+			     AND COALESCE(rule_id, 0) = 0
+			     AND learning_status IN ($4, $5, $6)
+			   )
+		`, RelayCYBLearningStatusRejected,
+			pendingReason,
+			relayCYBCurrentExtractorVersion,
+			RelayCYBLearningStatusQueued,
+			RelayCYBLearningStatusRetry,
+			RelayCYBLearningStatusProcessing,
+		); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE rb_cyb_rules
+			SET enabled = FALSE,
+			    disabled_reason = $1,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE id IN (
+				SELECT sample.rule_id
+				FROM rb_cyb_miss_samples sample
+				JOIN rb_cyb_rules source_rule ON source_rule.id = sample.rule_id
+				WHERE COALESCE(sample.extractor_version, 0) = 0
+				  AND COALESCE(sample.rule_id, 0) > 0
+				  AND source_rule.source_request_id = sample.request_id
+			)
+		`, rollbackReason); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `
+			UPDATE rb_cyb_miss_samples
+			SET learning_error = CASE
+			      WHEN EXISTS (
+			        SELECT 1
+			        FROM rb_cyb_rules source_rule
+			        WHERE source_rule.id = rb_cyb_miss_samples.rule_id
+			          AND source_rule.source_request_id = rb_cyb_miss_samples.request_id
+			      )
+			      THEN $1
+			      ELSE $2
+			    END,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE COALESCE(extractor_version, 0) = 0
+			  AND COALESCE(rule_id, 0) > 0
+		`, rollbackReason, mergedReason)
+		return err
+	})
 }
 
 func normalizeRelayCYBMissSampleInput(input RelayCYBMissSampleInput) RelayCYBMissSampleInput {
 	input.RequestID = strings.TrimSpace(input.RequestID)
+	input.SampleSource = normalizeRelayCYBMissSource(input.SampleSource)
 	input.AccountName = strings.TrimSpace(input.AccountName)
 	input.AccountType = strings.TrimSpace(input.AccountType)
 	input.ContentHash = strings.TrimSpace(input.ContentHash)
@@ -246,11 +437,26 @@ func normalizeRelayCYBMissSampleInput(input RelayCYBMissSampleInput) RelayCYBMis
 	// becomes a NUL byte, which PostgreSQL text columns reject. Preserve the
 	// surrounding learning evidence while making every writer backend-safe.
 	input.UserText = strings.ReplaceAll(input.UserText, "\x00", "\uFFFD")
-	input.UserText, _ = boundRelayCYBText(input.UserText, relayCYBMissUserTextMaxRunes, false)
+	var userTextTruncated bool
+	input.UserText, userTextTruncated = boundRelayCYBText(
+		input.UserText,
+		relayCYBMissUserTextMaxRunes,
+		input.UserTextTruncated,
+	)
+	input.UserTextTruncated = userTextTruncated
 	if !input.CreatedAt.IsZero() {
 		input.CreatedAt = input.CreatedAt.UTC()
 	}
 	return input
+}
+
+func normalizeRelayCYBMissSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case RelayCYBMissSourceRelay:
+		return RelayCYBMissSourceRelay
+	default:
+		return RelayCYBMissSourceOAuth
+	}
 }
 
 func cloneRelayCYBMissSampleInput(input *RelayCYBMissSampleInput) {
@@ -258,6 +464,7 @@ func cloneRelayCYBMissSampleInput(input *RelayCYBMissSampleInput) {
 		return
 	}
 	input.RequestID = strings.Clone(input.RequestID)
+	input.SampleSource = strings.Clone(input.SampleSource)
 	input.AccountName = strings.Clone(input.AccountName)
 	input.AccountType = strings.Clone(input.AccountType)
 	input.RedactedRequest = strings.Clone(input.RedactedRequest)
@@ -266,7 +473,7 @@ func cloneRelayCYBMissSampleInput(input *RelayCYBMissSampleInput) {
 }
 
 func relayCYBMissSampleBytes(input RelayCYBMissSampleInput) int64 {
-	return int64(len(input.RequestID) + len(input.AccountName) + len(input.AccountType) +
+	return int64(len(input.RequestID) + len(input.SampleSource) + len(input.AccountName) + len(input.AccountType) +
 		len(input.RedactedRequest) + len(input.UserText) + len(input.ContentHash))
 }
 
@@ -296,29 +503,66 @@ func (db *DB) WriteRelayCYBMissSample(ctx context.Context, input *RelayCYBMissSa
 			INSERT INTO rb_cyb_miss_samples (
 				request_id, created_at, updated_at,
 				oauth_account_id, oauth_account_name, oauth_account_type,
-				redacted_request, user_text, request_truncated, content_hash
-			) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9)
+				sample_source, redacted_request, user_text, extractor_version, user_text_truncated,
+				request_truncated, content_hash
+			) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT(request_id) DO UPDATE SET
 				updated_at = excluded.updated_at,
 				oauth_account_id = CASE WHEN excluded.oauth_account_id > 0 THEN excluded.oauth_account_id ELSE rb_cyb_miss_samples.oauth_account_id END,
 				oauth_account_name = CASE WHEN excluded.oauth_account_name <> '' THEN excluded.oauth_account_name ELSE rb_cyb_miss_samples.oauth_account_name END,
 				oauth_account_type = CASE WHEN excluded.oauth_account_type <> '' THEN excluded.oauth_account_type ELSE rb_cyb_miss_samples.oauth_account_type END,
+				sample_source = CASE WHEN rb_cyb_miss_samples.sample_source = '' THEN excluded.sample_source ELSE rb_cyb_miss_samples.sample_source END,
 				redacted_request = CASE WHEN excluded.redacted_request <> '' THEN excluded.redacted_request ELSE rb_cyb_miss_samples.redacted_request END,
 				user_text = CASE WHEN excluded.user_text <> '' THEN excluded.user_text ELSE rb_cyb_miss_samples.user_text END,
+				extractor_version = CASE
+					WHEN excluded.user_text <> '' AND excluded.extractor_version > rb_cyb_miss_samples.extractor_version
+					THEN excluded.extractor_version
+					ELSE rb_cyb_miss_samples.extractor_version
+				END,
+				user_text_truncated = rb_cyb_miss_samples.user_text_truncated OR excluded.user_text_truncated,
 				request_truncated = rb_cyb_miss_samples.request_truncated OR excluded.request_truncated,
 				content_hash = CASE WHEN excluded.content_hash <> '' THEN excluded.content_hash ELSE rb_cyb_miss_samples.content_hash END
 		`, normalized.RequestID, db.timeArg(normalized.CreatedAt), normalized.AccountID,
-			normalized.AccountName, normalized.AccountType, normalized.RedactedRequest,
-			normalized.UserText, normalized.RequestTruncated, normalized.ContentHash)
+			normalized.AccountName, normalized.AccountType, normalized.SampleSource,
+			normalized.RedactedRequest, normalized.UserText, relayCYBCurrentExtractorVersion,
+			normalized.UserTextTruncated,
+			normalized.RequestTruncated, normalized.ContentHash)
 		return err
 	})
 }
 
-// ListRelayCYBMissBackfillCandidates returns at most one OAuth cyber_policy
-// attempt per logical request and excludes every request already represented in
-// the learning table. This keeps startup backfill bounded and restart-safe.
+// ListRelayCYBMissBackfillCandidates returns at most one eligible cyber_policy
+// attempt per logical request. Ordinary OAuth misses, the two approved Relay
+// entry routes, and Relay continuations share one queue; rule, feedback and
+// probe routes remain excluded. Backfill extraction still requires a confirmed
+// current-user turn, so tool-only continuations are recorded but never learned.
 func (db *DB) ListRelayCYBMissBackfillCandidates(
 	ctx context.Context,
+	relayGroupID int64,
+	cutoff time.Time,
+	limit int,
+) ([]RelayCYBMissBackfillCandidate, error) {
+	return db.ListRelayCYBMissBackfillCandidatesAfter(
+		ctx,
+		relayGroupID,
+		cutoff,
+		time.Time{},
+		"",
+		limit,
+	)
+}
+
+// ListRelayCYBMissBackfillCandidatesAfter uses a stable (created_at,
+// request_id) keyset. Historical audit tables can be large; restarting every
+// bounded batch at the oldest row would repeatedly evaluate the same complex
+// attempt/account predicates even though earlier candidates were already
+// processed.
+func (db *DB) ListRelayCYBMissBackfillCandidatesAfter(
+	ctx context.Context,
+	relayGroupID int64,
+	cutoff time.Time,
+	afterCreatedAt time.Time,
+	afterRequestID string,
 	limit int,
 ) ([]RelayCYBMissBackfillCandidate, error) {
 	if db == nil || db.conn == nil {
@@ -330,8 +574,30 @@ func (db *DB) ListRelayCYBMissBackfillCandidates(
 	if limit > 200 {
 		limit = 200
 	}
+	if cutoff.IsZero() {
+		cutoff = time.Now().UTC()
+	} else {
+		cutoff = cutoff.UTC()
+	}
+	var afterCreatedAtArg any
+	if !afterCreatedAt.IsZero() {
+		afterCreatedAtArg = db.timeArg(afterCreatedAt.UTC())
+	}
+	afterRequestID = strings.TrimSpace(afterRequestID)
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT request.request_id, request.created_at,
+		       CASE
+		         WHEN LOWER(TRIM(COALESCE(request.route_source, ''))) IN
+		              ('no_affinity_split', 'oauth_overflow', 'relay_continuation')
+		              AND EXISTS (
+		                SELECT 1
+		                FROM account_group_members selected_membership
+		                WHERE selected_membership.account_id = attempt.account_id
+		                  AND selected_membership.group_id = $1
+		              )
+		         THEN 'relay_cyb_miss'
+		         ELSE 'oauth_cyb_miss'
+		       END,
 		       COALESCE(request.endpoint, ''), COALESCE(request.full_text, ''),
 		       COALESCE(request.scan_truncated, FALSE),
 		       COALESCE(attempt.account_id, 0), COALESCE(attempt.account_name, ''),
@@ -343,17 +609,65 @@ func (db *DB) ListRelayCYBMissBackfillCandidates(
 			FROM rb_route_attempts candidate
 			WHERE candidate.request_id = request.request_id
 			  AND LOWER(TRIM(COALESCE(candidate.error_kind, ''))) = 'cyber_policy'
-			  AND LOWER(TRIM(COALESCE(candidate.account_type, ''))) NOT IN
-			      ('responses_api', 'openai_responses', 'relay', 'relay_style')
-			ORDER BY candidate.attempt_index, candidate.id
+			  AND (
+			    (
+			      LOWER(TRIM(COALESCE(request.route_source, ''))) IN ('', 'official_default')
+			      AND LOWER(TRIM(COALESCE(candidate.account_type, ''))) NOT IN
+			          ('responses_api', 'openai_responses', 'relay', 'relay_style')
+			    )
+			    OR (
+			      LOWER(TRIM(COALESCE(request.route_source, ''))) = 'oauth_overflow'
+			      AND LOWER(TRIM(COALESCE(candidate.account_type, ''))) NOT IN
+			          ('responses_api', 'openai_responses', 'relay', 'relay_style')
+			      AND NOT EXISTS (
+			        SELECT 1
+			        FROM account_group_members oauth_membership
+			        WHERE oauth_membership.account_id = candidate.account_id
+			          AND oauth_membership.group_id = $1
+			      )
+			    )
+			    OR (
+			      LOWER(TRIM(COALESCE(request.route_source, ''))) IN
+			          ('no_affinity_split', 'oauth_overflow', 'relay_continuation')
+			      AND $1 > 0
+			      AND COALESCE(request.route_group_id, 0) IN (0, $1)
+			      AND EXISTS (
+			        SELECT 1
+			        FROM account_group_members membership
+			        WHERE membership.account_id = candidate.account_id
+			          AND membership.group_id = $1
+			      )
+			    )
+			  )
+			ORDER BY
+			  CASE
+			    WHEN LOWER(TRIM(COALESCE(candidate.account_type, ''))) NOT IN
+			             ('responses_api', 'openai_responses', 'relay', 'relay_style')
+			         AND NOT EXISTS (
+			           SELECT 1
+			           FROM account_group_members priority_membership
+			           WHERE priority_membership.account_id = candidate.account_id
+			             AND priority_membership.group_id = $1
+			         )
+			    THEN 0
+			    ELSE 1
+			  END,
+			  candidate.attempt_index,
+			  candidate.id
 			LIMIT 1
 		  )
 		LEFT JOIN rb_cyb_miss_samples sample
 		  ON sample.request_id = request.request_id
 		WHERE sample.request_id IS NULL
+		  AND request.created_at < $2
+		  AND (
+		    CAST($3 AS TIMESTAMP) IS NULL
+		    OR request.created_at > $3
+		    OR (request.created_at = $3 AND request.request_id > $4)
+		  )
 		ORDER BY request.created_at, request.request_id
-		LIMIT $1
-	`, limit)
+		LIMIT $5
+	`, relayGroupID, db.timeArg(cutoff), afterCreatedAtArg, afterRequestID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -365,6 +679,7 @@ func (db *DB) ListRelayCYBMissBackfillCandidates(
 		if err := rows.Scan(
 			&item.RequestID,
 			&createdRaw,
+			&item.SampleSource,
 			&item.Endpoint,
 			&item.RedactedRequest,
 			&item.RequestTruncated,
@@ -413,13 +728,16 @@ func (db *DB) InsertRelayCYBMissBackfillSample(
 			INSERT INTO rb_cyb_miss_samples (
 				request_id, created_at, updated_at,
 				oauth_account_id, oauth_account_name, oauth_account_type,
-				redacted_request, user_text, request_truncated, content_hash,
+				sample_source, redacted_request, user_text, extractor_version, user_text_truncated,
+				request_truncated, content_hash,
 				learning_status, learning_error
-			) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			) VALUES ($1, $2, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT(request_id) DO NOTHING
 		`, normalized.RequestID, db.timeArg(normalized.CreatedAt), normalized.AccountID,
-			normalized.AccountName, normalized.AccountType, normalized.RedactedRequest,
-			normalized.UserText, normalized.RequestTruncated, normalized.ContentHash,
+			normalized.AccountName, normalized.AccountType, normalized.SampleSource,
+			normalized.RedactedRequest, normalized.UserText, relayCYBCurrentExtractorVersion,
+			normalized.UserTextTruncated,
+			normalized.RequestTruncated, normalized.ContentHash,
 			status, rejectionReason)
 		if err != nil {
 			return err
@@ -442,7 +760,7 @@ func (db *DB) RecordRelayCYBMissBackfillEvent(
 		return nil
 	}
 	message := fmt.Sprintf(
-		"历史 OAuth CYB 漏放回填完成：%d 条进入学习队列，%d 条因历史正文不完整而记录为不可学习。",
+		"历史 CYB 本地未覆盖样本回填完成：%d 条进入学习队列，%d 条因历史正文不完整而记录为不可学习。",
 		result.Queued,
 		result.Rejected,
 	)
@@ -452,7 +770,7 @@ func (db *DB) RecordRelayCYBMissBackfillEvent(
 			tx,
 			"legacy_backfill",
 			0,
-			"历史 OAuth CYB 漏放已回填",
+			"历史 CYB 本地未覆盖样本已回填",
 			message,
 			time.Now().UTC(),
 		)
@@ -469,8 +787,10 @@ func (db *DB) GetRelayCYBMissSample(ctx context.Context, requestID string) (*Rel
 	}
 	return scanRelayCYBMissSample(db.conn.QueryRowContext(ctx, `
 		SELECT request_id, created_at, updated_at,
+		       COALESCE(sample_source, 'oauth_cyb_miss'),
 		       COALESCE(oauth_account_id, 0), COALESCE(oauth_account_name, ''), COALESCE(oauth_account_type, ''),
-		       COALESCE(redacted_request, ''), COALESCE(user_text, ''), COALESCE(request_truncated, FALSE),
+		       COALESCE(redacted_request, ''), COALESCE(user_text, ''),
+		       COALESCE(user_text_truncated, FALSE), COALESCE(request_truncated, FALSE),
 		       COALESCE(content_hash, ''), COALESCE(learning_status, 'queued'), COALESCE(learning_model, ''),
 		       COALESCE(learning_attempts, 0), next_attempt_at, COALESCE(learning_error, ''),
 		       COALESCE(rule_id, 0), learned_at
@@ -502,8 +822,11 @@ func (db *DB) attachRelayCYBLearningSummaries(ctx context.Context, items []*Rela
 		       COALESCE(sample.learning_model, ''), COALESCE(sample.learning_attempts, 0),
 		       COALESCE(sample.learning_error, ''), COALESCE(sample.rule_id, 0),
 		       COALESCE(rule.name, ''), sample.updated_at,
+		       COALESCE(sample.sample_source, 'oauth_cyb_miss'),
 		       COALESCE(sample.oauth_account_id, 0), COALESCE(sample.oauth_account_name, ''),
-		       COALESCE(sample.oauth_account_type, ''), COALESCE(sample.request_truncated, FALSE)
+		       COALESCE(sample.oauth_account_type, ''),
+		       COALESCE(sample.user_text_truncated, FALSE),
+		       COALESCE(sample.request_truncated, FALSE)
 		FROM rb_cyb_miss_samples sample
 		LEFT JOIN rb_cyb_rules rule ON rule.id = sample.rule_id
 		WHERE sample.request_id IN (`+strings.Join(placeholders, ",")+`)
@@ -519,7 +842,8 @@ func (db *DB) attachRelayCYBLearningSummaries(ctx context.Context, items []*Rela
 		if err := rows.Scan(
 			&requestID, &summary.Status, &summary.Model, &summary.Attempts,
 			&summary.Message, &summary.RuleID, &summary.RuleName, &updatedRaw,
-			&summary.AccountID, &summary.AccountName, &summary.AccountType,
+			&summary.SampleSource, &summary.AccountID, &summary.AccountName, &summary.AccountType,
+			&summary.UserTextTruncated,
 			&summary.RequestTruncated,
 		); err != nil {
 			return err
@@ -544,8 +868,10 @@ func scanRelayCYBMissSample(row relayCYBRowScanner) (*RelayCYBMissSample, error)
 	var createdRaw, updatedRaw, nextRaw, learnedRaw any
 	if err := row.Scan(
 		&sample.RequestID, &createdRaw, &updatedRaw,
+		&sample.SampleSource,
 		&sample.AccountID, &sample.AccountName, &sample.AccountType,
-		&sample.RedactedRequest, &sample.UserText, &sample.RequestTruncated,
+		&sample.RedactedRequest, &sample.UserText, &sample.UserTextTruncated,
+		&sample.RequestTruncated,
 		&sample.ContentHash, &sample.LearningStatus, &sample.LearningModel,
 		&sample.LearningAttempts, &nextRaw, &sample.LearningError,
 		&sample.RuleID, &learnedRaw,
@@ -593,9 +919,12 @@ func (db *DB) ClaimNextRelayCYBMissSample(ctx context.Context, model string) (*R
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE rb_cyb_miss_samples
 			SET learning_status = $1, next_attempt_at = $2, updated_at = $2
-			WHERE learning_status = $3 AND updated_at < $4
+			WHERE learning_status = $3
+			  AND COALESCE(extractor_version, 0) >= $4
+			  AND updated_at < $5
 		`, RelayCYBLearningStatusRetry, db.timeArg(now),
-			RelayCYBLearningStatusProcessing, db.timeArg(now.Add(-10*time.Minute))); err != nil {
+			RelayCYBLearningStatusProcessing, relayCYBCurrentExtractorVersion,
+			db.timeArg(now.Add(-10*time.Minute))); err != nil {
 			return err
 		}
 		duplicateRows, err := tx.QueryContext(ctx, `
@@ -609,9 +938,11 @@ func (db *DB) ClaimNextRelayCYBMissSample(ctx context.Context, model string) (*R
 			  ON rule.id = applied.rule_id
 			 AND rule.enabled = TRUE
 			WHERE pending.learning_status IN ($2, $3)
+			  AND COALESCE(pending.extractor_version, 0) >= $4
 			  AND COALESCE(pending.content_hash, '') <> ''
 			LIMIT 100
-		`, RelayCYBLearningStatusApplied, RelayCYBLearningStatusQueued, RelayCYBLearningStatusRetry)
+		`, RelayCYBLearningStatusApplied, RelayCYBLearningStatusQueued,
+			RelayCYBLearningStatusRetry, relayCYBCurrentExtractorVersion)
 		if err != nil {
 			return err
 		}
@@ -646,17 +977,21 @@ func (db *DB) ClaimNextRelayCYBMissSample(ctx context.Context, model string) (*R
 		}
 		row := tx.QueryRowContext(ctx, `
 			SELECT request_id, created_at, updated_at,
+			       COALESCE(sample_source, 'oauth_cyb_miss'),
 			       COALESCE(oauth_account_id, 0), COALESCE(oauth_account_name, ''), COALESCE(oauth_account_type, ''),
-			       COALESCE(redacted_request, ''), COALESCE(user_text, ''), COALESCE(request_truncated, FALSE),
+			       COALESCE(redacted_request, ''), COALESCE(user_text, ''),
+			       COALESCE(user_text_truncated, FALSE), COALESCE(request_truncated, FALSE),
 			       COALESCE(content_hash, ''), COALESCE(learning_status, 'queued'), COALESCE(learning_model, ''),
 			       COALESCE(learning_attempts, 0), next_attempt_at, COALESCE(learning_error, ''),
 			       COALESCE(rule_id, 0), learned_at
 			FROM rb_cyb_miss_samples
 			WHERE learning_status IN ($1, $2)
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= $3)
+			  AND COALESCE(extractor_version, 0) >= $3
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= $4)
 			ORDER BY created_at, request_id
 			LIMIT 1
-		`, RelayCYBLearningStatusQueued, RelayCYBLearningStatusRetry, db.timeArg(now))
+		`, RelayCYBLearningStatusQueued, RelayCYBLearningStatusRetry,
+			relayCYBCurrentExtractorVersion, db.timeArg(now))
 		sample, err := scanRelayCYBMissSample(row)
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -674,8 +1009,10 @@ func (db *DB) ClaimNextRelayCYBMissSample(ctx context.Context, model string) (*R
 			    learning_attempts = learning_attempts + 1,
 			    learning_error = '', next_attempt_at = NULL, updated_at = $3
 			WHERE request_id = $4 AND learning_status IN ($5, $6)
+			  AND COALESCE(extractor_version, 0) >= $7
 		`, RelayCYBLearningStatusProcessing, model, db.timeArg(now), sample.RequestID,
-			RelayCYBLearningStatusQueued, RelayCYBLearningStatusRetry)
+			RelayCYBLearningStatusQueued, RelayCYBLearningStatusRetry,
+			relayCYBCurrentExtractorVersion)
 		if err != nil {
 			return err
 		}
@@ -1197,6 +1534,34 @@ func (db *DB) GetRelayCYBLearningStats(ctx context.Context) (RelayCYBLearningSta
 		return stats, err
 	}
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM rb_cyb_rules WHERE enabled = TRUE`).Scan(&stats.Rules); err != nil {
+		return stats, err
+	}
+	sourceRows, err := db.conn.QueryContext(ctx, `
+		SELECT COALESCE(sample_source, 'oauth_cyb_miss'), COUNT(*)
+		FROM rb_cyb_miss_samples
+		GROUP BY COALESCE(sample_source, 'oauth_cyb_miss')
+	`)
+	if err != nil {
+		return stats, err
+	}
+	for sourceRows.Next() {
+		var source string
+		var count int64
+		if err := sourceRows.Scan(&source, &count); err != nil {
+			sourceRows.Close()
+			return stats, err
+		}
+		switch normalizeRelayCYBMissSource(source) {
+		case RelayCYBMissSourceRelay:
+			stats.RelaySamples += count
+		default:
+			stats.OAuthSamples += count
+		}
+	}
+	if err := sourceRows.Close(); err != nil {
+		return stats, err
+	}
+	if err := sourceRows.Err(); err != nil {
 		return stats, err
 	}
 	return stats, nil
