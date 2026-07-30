@@ -15,7 +15,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const relayAuditRequestPrefixMaxBytes = database.RelayAuditFullTextMaxRunes * 4
+const (
+	relayAuditRequestPrefixMaxBytes = database.RelayAuditFullTextMaxRunes * 4
+	relayReplaySourceNative         = "relay_native"
+)
 
 var relayAuditSensitiveJSONFieldPattern = regexp.MustCompile(
 	`(?i)("(?:previous_response_id|prompt_cache_key|encrypted_content|authorization|api_key|access_token|refresh_token|password|secret|credential|credentials|private_key)"\s*:\s*)"(?:\\.|[^"\\])*(?:"|$)`,
@@ -184,6 +187,32 @@ func (h *Handler) recordRelayContinuationReplayAudit(
 	}
 	plan.AuditReplayStatus = status
 	plan.AuditReplaySource = strings.TrimSpace(source)
+	h.enqueueRelayAuditState(plan, database.RelayAuditStateInput{
+		ReplayStatus: plan.AuditReplayStatus,
+		ReplaySource: plan.AuditReplaySource,
+	})
+}
+
+func (h *Handler) recordRelayContinuationNativeFallback(
+	plan *relayRoutePlan,
+	replayErr error,
+) {
+	if plan == nil || !plan.HasPreviousResponseID || replayErr == nil {
+		return
+	}
+	status := plan.AuditReplayStatus
+	if status == "" {
+		status = "unavailable"
+		var typed *RelayContinuationReplayError
+		if errors.As(replayErr, &typed) && typed.Reason != "" {
+			status = string(typed.Reason)
+		}
+	}
+	plan.AuditReplayStatus = status
+	plan.AuditReplaySource = relayReplaySourceNative
+	if h == nil || h.db == nil || plan.AuditRequestID == "" {
+		return
+	}
 	h.enqueueRelayAuditState(plan, database.RelayAuditStateInput{
 		ReplayStatus: plan.AuditReplayStatus,
 		ReplaySource: plan.AuditReplaySource,

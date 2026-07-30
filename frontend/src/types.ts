@@ -1105,6 +1105,9 @@ export interface RelayAuditSummary {
   replay_hits: number
   replay_misses: number
   replay_unavailable: number
+  relay_native_fallbacks: number
+  relay_native_successes: number
+  relay_native_failures: number
   retries: number
   same_group_switches: number
   group_exhausted: number

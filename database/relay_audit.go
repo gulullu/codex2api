@@ -1292,6 +1292,9 @@ type RelayAuditSummary struct {
 	ReplayHits           int64 `json:"replay_hits"`
 	ReplayMisses         int64 `json:"replay_misses"`
 	ReplayUnavailable    int64 `json:"replay_unavailable"`
+	RelayNativeFallbacks int64 `json:"relay_native_fallbacks"`
+	RelayNativeSuccesses int64 `json:"relay_native_successes"`
+	RelayNativeFailures  int64 `json:"relay_native_failures"`
 	Retries              int64 `json:"retries"`
 	SameGroupSwitches    int64 `json:"same_group_switches"`
 	GroupExhausted       int64 `json:"group_exhausted"`
@@ -1456,6 +1459,7 @@ const relayAuditClassifiedRequestsCTE = `
 		       r.route_group_id,
 		       r.has_previous_response_id,
 		       r.replay_status,
+		       r.replay_source,
 		       r.state_fallback_reason,
 		       r.detector_miss,
 		       r.route_violation,
@@ -1534,6 +1538,21 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 		         WHEN COALESCE(final_error_kind, '') = 'continuation_replay_unavailable'
 		         THEN 1 ELSE 0
 		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(replay_source, '') = 'relay_native'
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(replay_source, '') = 'relay_native'
+		          AND COALESCE(final_status_code, 0) >= 200
+		          AND COALESCE(final_status_code, 0) < 300
+		         THEN 1 ELSE 0
+		       END), 0),
+		       COALESCE(SUM(CASE
+		         WHEN COALESCE(replay_source, '') = 'relay_native'
+		          AND COALESCE(final_status_code, 0) >= 400
+		         THEN 1 ELSE 0
+		       END), 0),
 		       COALESCE(SUM(CASE WHEN COALESCE(group_exhausted, FALSE) THEN 1 ELSE 0 END), 0),
 		       COALESCE(SUM(CASE
 		         WHEN COALESCE(detector_miss, FALSE) OR oauth_cyber > 0 THEN 1 ELSE 0
@@ -1574,6 +1593,9 @@ func (db *DB) BuildRelayAuditReport(ctx context.Context, query RelayAuditQuery) 
 		&report.Summary.ReplayHits,
 		&report.Summary.ReplayMisses,
 		&report.Summary.ReplayUnavailable,
+		&report.Summary.RelayNativeFallbacks,
+		&report.Summary.RelayNativeSuccesses,
+		&report.Summary.RelayNativeFailures,
 		&report.Summary.GroupExhausted,
 		&report.Summary.DetectorMisses,
 		&report.Summary.RelayCyberPolicies,

@@ -458,45 +458,202 @@ func TestPrepareRelayContinuationHTTPFallbackRejectsPartialProvider(t *testing.T
 	}
 }
 
-func TestResponsesRelayContinuationReplayMissReturns409WithoutUpstream(t *testing.T) {
+func TestResponsesRelayContinuationReplayUnavailableUsesNativeFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("CODEX_CYB_RELAY_ENABLED", "false")
+
+	tests := []struct {
+		name            string
+		setReplay       func(*testing.T)
+		assertChildMiss bool
+	}{
+		{
+			name:            "cache miss",
+			assertChildMiss: true,
+			setReplay: func(t *testing.T) {
+				setRelayReplayStoreForTest(t, testRelayReplayStore())
+			},
+		},
+		{
+			name: "incomplete replay",
+			setReplay: func(t *testing.T) {
+				setRelayReplayProviderForTest(t, relayReplayProviderFunc(func(
+					context.Context,
+					RelayContinuationReplayQuery,
+				) (RelayContinuationReplaySnapshot, error) {
+					return RelayContinuationReplaySnapshot{
+						StandaloneRequestBody: []byte(`{"model":"gpt-4.1-direct","input":"partial"}`),
+						Source:                "partial",
+					}, nil
+				}))
+			},
+		},
+		{
+			name: "invalid replay",
+			setReplay: func(t *testing.T) {
+				setRelayReplayProviderForTest(t, relayReplayProviderFunc(func(
+					context.Context,
+					RelayContinuationReplayQuery,
+				) (RelayContinuationReplaySnapshot, error) {
+					return RelayContinuationReplaySnapshot{
+						StandaloneRequestBody: []byte(`{`),
+						Completeness:          RelayContinuationReplayComplete,
+						Source:                "invalid",
+					}, nil
+				}))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetResponseCacheStateForTest(testResponseCacheConfig())
+			t.Cleanup(func() { resetResponseCacheStateForTest(defaultResponseCacheConfig()) })
+			tt.setReplay(t)
+
+			var upstreamCalls atomic.Int32
+			var seenBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamCalls.Add(1)
+				seenBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{
+					"id":"resp_native_child",
+					"status":"completed",
+					"model":"gpt-4.1-direct",
+					"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"child"}]}],
+					"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}
+				}`)
+			}))
+			defer upstream.Close()
+
+			handler := NewHandler(newOpenAIResponsesRelayStore(upstream.URL), nil, &config.Config{
+				AllowAnonymousV1:       true,
+				CodexUpstreamTransport: "http",
+			}, nil)
+			body := []byte(`{
+				"model":"gpt-4.1-direct",
+				"previous_response_id":"resp_missing",
+				"input":"continue"
+			}`)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = req
+
+			handler.Responses(ctx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status=%d want=200 body=%s", recorder.Code, recorder.Body.String())
+			}
+			if upstreamCalls.Load() != 1 {
+				t.Fatalf("Relay upstream calls=%d want=1", upstreamCalls.Load())
+			}
+			if previous := gjson.GetBytes(seenBody, "previous_response_id").String(); previous != "resp_missing" {
+				t.Fatalf("native fallback previous_response_id=%q want=resp_missing body=%s", previous, seenBody)
+			}
+			if tt.assertChildMiss {
+				_, _, _, _, err := PrepareRelayContinuationHTTPFallback(
+					context.Background(),
+					"anon",
+					[]byte(`{"model":"gpt-4.1-direct","previous_response_id":"resp_native_child","input":"again"}`),
+				)
+				var replayErr *RelayContinuationReplayError
+				if !errors.As(err, &replayErr) || replayErr.Reason != RelayReplayCacheMiss {
+					t.Fatalf("native fallback child was promoted to complete replay: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestResponsesRelayNativeFallbackKeepsRequiredGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "7")
+	resetResponseCacheStateForTest(testResponseCacheConfig())
+	t.Cleanup(func() { resetResponseCacheStateForTest(defaultResponseCacheConfig()) })
 	setRelayReplayStoreForTest(t, testRelayReplayStore())
 
-	var upstreamCalls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upstreamCalls.Add(1)
+	var group7Calls atomic.Int32
+	group7 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		group7Calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"resp_group_7",
+			"status":"completed",
+			"model":"gpt-4.1-direct",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],
+			"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+		}`)
+	}))
+	defer group7.Close()
+	var group8Calls atomic.Int32
+	group8 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		group8Calls.Add(1)
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
-	defer upstream.Close()
+	defer group8.Close()
 
-	handler := NewHandler(newOpenAIResponsesRelayStore(upstream.URL), nil, &config.Config{
-		AllowAnonymousV1:       true,
-		CodexUpstreamTransport: "http",
-	}, nil)
-	body := []byte(`{
-		"model":"gpt-4.1-direct",
-		"previous_response_id":"resp_missing",
-		"input":"continue"
-	}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(recorder)
-	ctx.Request = req
+	newStore := func(includeRequiredGroup bool) *auth.Store {
+		store := newOpenAIResponsesRelayStore(group8.URL)
+		outOfGroup := store.FindByID(1)
+		outOfGroup.Mu().Lock()
+		outOfGroup.GroupIDs = []int64{8}
+		outOfGroup.Mu().Unlock()
+		if includeRequiredGroup {
+			store.AddAccount(&auth.Account{
+				DBID:         2,
+				UpstreamType: auth.UpstreamOpenAIResponses,
+				BaseURL:      group7.URL,
+				APIKey:       "group-7",
+				Models:       []string{"gpt-4.1-direct"},
+				PlanType:     "api",
+				GroupIDs:     []int64{7},
+			})
+		}
+		return store
+	}
+	invoke := func(store *auth.Store) *httptest.ResponseRecorder {
+		handler := NewHandler(store, nil, &config.Config{
+			AllowAnonymousV1:       true,
+			CodexUpstreamTransport: "http",
+		}, nil)
+		body := []byte(`{
+			"model":"gpt-4.1-direct",
+			"previous_response_id":"resp_missing_group",
+			"input":"ping"
+		}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = req
+		handler.Responses(ctx)
+		return recorder
+	}
 
-	handler.Responses(ctx)
+	t.Run("selects only the required group", func(t *testing.T) {
+		recorder := invoke(newStore(true))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d want=200 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if group7Calls.Load() != 1 || group8Calls.Load() != 0 {
+			t.Fatalf("group calls: required=%d outside=%d", group7Calls.Load(), group8Calls.Load())
+		}
+	})
 
-	if recorder.Code != http.StatusConflict {
-		t.Fatalf("status=%d want=409 body=%s", recorder.Code, recorder.Body.String())
-	}
-	if upstreamCalls.Load() != 0 {
-		t.Fatalf("Relay upstream calls=%d want=0", upstreamCalls.Load())
-	}
-	message := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String()
-	if !strings.Contains(message, "No Relay HTTP request was sent") {
-		t.Fatalf("409 message did not state zero Relay HTTP attempts: %q", message)
-	}
+	t.Run("does not escape when the required group is exhausted", func(t *testing.T) {
+		beforeRequired := group7Calls.Load()
+		beforeOutside := group8Calls.Load()
+		recorder := invoke(newStore(false))
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want=503 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if group7Calls.Load() != beforeRequired || group8Calls.Load() != beforeOutside {
+			t.Fatalf("group-exhausted request reached upstream: required=%d outside=%d", group7Calls.Load(), group8Calls.Load())
+		}
+	})
 }
 
 func TestResponsesRelayContinuationReplayHitSendsStandaloneHistory(t *testing.T) {

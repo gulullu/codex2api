@@ -229,17 +229,17 @@ func TestResponseCacheKnownUnavailableCountsOnlyFinal409(t *testing.T) {
 		}
 	})
 
-	t.Run("relay replay safety rejection is tracked separately", func(t *testing.T) {
+	t.Run("successful relay fallback does not count", func(t *testing.T) {
 		resetResponseCacheStateForTest(testResponseCacheConfig())
 		t.Cleanup(func() { resetResponseCacheStateForTest(defaultResponseCacheConfig()) })
 		upstream := newContinuationRelayUpstream(t, false, new([]byte))
 		handler := NewHandler(newContinuationRelayStore(upstream.URL), nil, nil, nil)
 		recorder := invokeResponsesHandler(t, handler.Responses, raw)
-		if recorder.Code != http.StatusConflict {
-			t.Fatalf("status = %d, want relay replay 409; body=%s", recorder.Code, recorder.Body.String())
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 		}
 		if got := GetResponseCacheStats().KnownUnavailableErrors; got != 0 {
-			t.Fatalf("relay replay rejection counted as response-cache unavailable = %d, want 0", got)
+			t.Fatalf("relay success known unavailable errors = %d, want 0", got)
 		}
 	})
 
