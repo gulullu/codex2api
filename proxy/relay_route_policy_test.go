@@ -1114,21 +1114,6 @@ func TestUnknownContinuationReplayDoesNotForceRelayGroup(t *testing.T) {
 	}
 }
 
-func TestRelayNativeFallbackPreservesReplayMissReason(t *testing.T) {
-	plan := defaultRelayRoutePlan(relayRouteConfig{})
-	plan.HasPreviousResponseID = true
-	handler := &Handler{}
-
-	handler.recordRelayContinuationNativeFallback(
-		&plan,
-		&RelayContinuationReplayError{Reason: RelayReplayIncomplete},
-	)
-	if plan.AuditReplayStatus != string(RelayReplayIncomplete) ||
-		plan.AuditReplaySource != relayReplaySourceNative {
-		t.Fatalf("native fallback audit state = %+v", plan)
-	}
-}
-
 func TestRelayRoutePinReadFailureKeepsOrdinaryRequestOnOfficialRoute(t *testing.T) {
 	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "3")
 	gin.SetMode(gin.TestMode)

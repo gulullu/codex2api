@@ -38,22 +38,25 @@ func TestResponsesContinuationUnavailableWaitsForRelayRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("relay only preserves previous response id", func(t *testing.T) {
+	t.Run("relay only rejects a missing complete replay", func(t *testing.T) {
 		resetResponseCacheStateForTest(testResponseCacheConfig())
 		var seenBody []byte
 		upstream := newContinuationRelayUpstream(t, false, &seenBody)
 		store := newContinuationRelayStore(upstream.URL)
 		handler := NewHandler(store, nil, nil, nil)
 		recorder := invokeResponsesHandler(t, handler.Responses, raw)
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+		if recorder.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", recorder.Code, recorder.Body.String())
 		}
-		if prev := gjson.GetBytes(seenBody, "previous_response_id").String(); prev != "resp_missing" {
-			t.Fatalf("relay previous_response_id = %q, want preserved; body=%s", prev, seenBody)
+		if code := gjson.Get(recorder.Body.String(), "error.code").String(); code != "relay_continuation_replay_unavailable" {
+			t.Fatalf("error code = %q, want relay replay safety rejection; body=%s", code, recorder.Body.String())
+		}
+		if len(seenBody) != 0 {
+			t.Fatalf("unsafe previous_response_id was sent upstream: %s", seenBody)
 		}
 	})
 
-	t.Run("mixed pool chooses relay", func(t *testing.T) {
+	t.Run("mixed pool keeps the relay replay safety gate", func(t *testing.T) {
 		resetResponseCacheStateForTest(testResponseCacheConfig())
 		var seenBody []byte
 		upstream := newContinuationRelayUpstream(t, false, &seenBody)
@@ -61,12 +64,12 @@ func TestResponsesContinuationUnavailableWaitsForRelayRouting(t *testing.T) {
 		store.AddAccount(&auth.Account{DBID: 2, AccessToken: "codex-token", PlanType: "plus", AccountID: "codex"})
 		handler := NewHandler(store, nil, nil, nil)
 		recorder := invokeResponsesHandler(t, handler.Responses, raw)
-		if recorder.Code != http.StatusOK || gjson.GetBytes(seenBody, "previous_response_id").String() != "resp_missing" {
+		if recorder.Code != http.StatusConflict || len(seenBody) != 0 {
 			t.Fatalf("mixed result status=%d upstream=%s response=%s", recorder.Code, seenBody, recorder.Body.String())
 		}
 	})
 
-	t.Run("compaction pin yields to relay fallback", func(t *testing.T) {
+	t.Run("compaction pin yields to relay replay safety", func(t *testing.T) {
 		resetResponseCacheStateForTest(testResponseCacheConfig())
 		var seenBody []byte
 		upstream := newContinuationRelayUpstream(t, false, &seenBody)
@@ -75,7 +78,7 @@ func TestResponsesContinuationUnavailableWaitsForRelayRouting(t *testing.T) {
 		handler := NewHandler(store, nil, nil, nil)
 		compactionRaw := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_missing","input":[{"type":"compaction_trigger"},{"type":"function_call_output","call_id":"call_1","output":"ok"}],"stream":true}`)
 		recorder := invokeResponsesHandler(t, handler.Responses, compactionRaw)
-		if recorder.Code != http.StatusOK || gjson.GetBytes(seenBody, "previous_response_id").String() != "resp_missing" {
+		if recorder.Code != http.StatusConflict || len(seenBody) != 0 {
 			t.Fatalf("compaction fallback status=%d upstream=%s response=%s", recorder.Code, seenBody, recorder.Body.String())
 		}
 	})
@@ -100,7 +103,7 @@ func TestResponsesContinuationBackendErrorReturns503AfterRouting(t *testing.T) {
 	}
 }
 
-func TestResponsesContinuationBackendErrorUsesRelayWhenAvailable(t *testing.T) {
+func TestResponsesContinuationBackendErrorDoesNotBypassRelayReplaySafety(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	resetResponseCacheStateForTest(testResponseCacheConfig())
 	backend := newRecordingResponseContextBackend(true)
@@ -116,11 +119,11 @@ func TestResponsesContinuationBackendErrorUsesRelayWhenAvailable(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_missing","input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}],"stream":true}`)
 
 	recorder := invokeResponsesHandler(t, handler.Responses, raw)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want relay success; body=%s", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want relay replay 409; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if prev := gjson.GetBytes(seenBody, "previous_response_id").String(); prev != "resp_missing" {
-		t.Fatalf("relay previous_response_id = %q, want preserved; body=%s", prev, seenBody)
+	if len(seenBody) != 0 {
+		t.Fatalf("unsafe previous_response_id was sent upstream: %s", seenBody)
 	}
 }
 

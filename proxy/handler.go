@@ -2353,12 +2353,14 @@ func (h *Handler) Responses(c *gin.Context) {
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
+		if account.IsRelayStyle() && relayReplayErr != nil {
+			h.store.Release(account)
+			replyRelayContinuationReplayUnavailable(c, relayReplayErr)
+			return
+		}
 		accountFilter, ok = h.applyRelayRouteSelection(c, routePlan, account, accountFilter, retainedHTTPFallback)
 		if !ok {
 			return
-		}
-		if account.IsRelayStyle() && relayReplayErr != nil {
-			h.recordRelayContinuationNativeFallback(routePlan, relayReplayErr)
 		}
 		relayReplayResponseGroupID := relayContinuationReplayResponseGroup(routePlan, account)
 

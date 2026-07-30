@@ -347,8 +347,7 @@ export default function CodexAudit() {
               <MetricCard icon={<Shuffle />} label="OAuth 溢出" value={summary?.oauth_overflow} detail="无更高优先级候选" />
               <MetricCard icon={<CheckCircle2 />} label="Relay 成功" value={summary?.relay_successes} detail={`最终失败 ${formatNumber(summary?.relay_final_failures)}`} bad={Boolean(summary?.relay_final_failures)} />
               <MetricCard icon={<AlertTriangle />} label="OAuth CYB 漏放" value={summary?.oauth_cyber_misses} detail={`Relay CYB ${formatNumber(summary?.relay_cyber_policies)}`} bad={Boolean(summary?.oauth_cyber_misses)} />
-              <MetricCard icon={<RefreshCw />} label="续接回放命中" value={summary?.replay_hits} detail={`本地未命中 ${formatNumber(summary?.replay_misses)} · 最终不可用 ${formatNumber(summary?.replay_unavailable)}`} bad={Boolean(summary?.replay_unavailable)} />
-              <MetricCard icon={<Route />} label="Relay 原生续接" value={summary?.relay_native_fallbacks} detail={`成功 ${formatNumber(summary?.relay_native_successes)} · 失败 ${formatNumber(summary?.relay_native_failures)}`} bad={Boolean(summary?.relay_native_failures)} />
+              <MetricCard icon={<RefreshCw />} label="续接回放命中" value={summary?.replay_hits} detail={`未命中 ${formatNumber(summary?.replay_misses)} · 409 ${formatNumber(summary?.replay_unavailable)}`} bad={Boolean(summary?.replay_unavailable)} />
               <MetricCard icon={<ShieldAlert />} label="会话隔离异常" value={summary?.session_bleed} detail="跨请求内容违规计数" bad={Boolean(summary?.session_bleed)} />
             </div>
 

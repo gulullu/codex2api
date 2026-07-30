@@ -14,12 +14,13 @@ import (
 	"time"
 
 	"github.com/codex2api/cache"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
-// ErrRelayContinuationReplayUnavailable means the local replay layer cannot
-// build a complete, account-independent request body. The caller may still
-// use the official Relay-native previous_response_id fallback.
+// ErrRelayContinuationReplayUnavailable means a request containing
+// previous_response_id cannot safely move to a Relay account because its
+// complete, account-independent history is unavailable.
 var ErrRelayContinuationReplayUnavailable = errors.New("complete relay continuation replay unavailable")
 
 type RelayContinuationReplayFailureReason string
@@ -732,4 +733,23 @@ func (s *relayContinuationReplayStore) evictOldestLocked() bool {
 	}
 	s.removeLocked(oldestKey)
 	return true
+}
+
+func replyRelayContinuationReplayUnavailable(c *gin.Context, err error) {
+	if c == nil {
+		return
+	}
+	reason := RelayReplayCacheMiss
+	var replayErr *RelayContinuationReplayError
+	if errors.As(err, &replayErr) && replayErr.Reason != "" {
+		reason = replayErr.Reason
+	}
+	c.JSON(http.StatusConflict, gin.H{
+		"error": gin.H{
+			"type":    "relay_continuation_replay_unavailable",
+			"code":    "relay_continuation_replay_unavailable",
+			"reason":  reason,
+			"message": "Complete local conversation history is unavailable. No Relay HTTP request was sent, and the raw previous_response_id was not forwarded to another account.",
+		},
+	})
 }
