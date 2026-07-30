@@ -831,6 +831,116 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "compact",
+			query:     "compact=maybe",
+			wantError: "compact 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "compaction history",
+			query:     "has_compaction_history=1",
+			wantError: "has_compaction_history 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "trigger-only", StatusCode: http.StatusOK, Compact: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "history-only", StatusCode: http.StatusOK, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "both", StatusCode: http.StatusOK, Compact: true, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "neither", StatusCode: http.StatusOK},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		name       string
+		query      string
+		wantModels map[string]bool
+	}{
+		{
+			name:       "trigger",
+			query:      "compact=true",
+			wantModels: map[string]bool{"trigger-only": true, "both": true},
+		},
+		{
+			name:       "history",
+			query:      "has_compaction_history=true",
+			wantModels: map[string]bool{"history-only": true, "both": true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ginCtx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var page database.UsageLogPage
+			if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if page.Total != int64(len(test.wantModels)) || len(page.Logs) != len(test.wantModels) {
+				t.Fatalf("total/logs = %d/%d, want %d; body=%s", page.Total, len(page.Logs), len(test.wantModels), recorder.Body.String())
+			}
+			for _, logRow := range page.Logs {
+				if !test.wantModels[logRow.Model] {
+					t.Fatalf("unexpected model %q for %s filter", logRow.Model, test.name)
+				}
+			}
+		})
+	}
+}
+
 func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1095,6 +1205,45 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 	if response.TransportRetryPolicy != "sticky" {
 		t.Fatalf("transport_retry_policy = %q, want sticky", response.TransportRetryPolicy)
+	}
+}
+
+func TestUpdateSettingsAllowsGlobalConcurrencyAboveLegacyCaps(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"max_concurrency":1001}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := store.GetMaxConcurrency(); got != 1001 {
+		t.Fatalf("runtime max_concurrency = %d, want 1001", got)
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || persisted.MaxConcurrency != 1001 {
+		t.Fatalf("persisted max_concurrency = %v, want 1001", persisted)
 	}
 }
 
@@ -1564,12 +1713,7 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 		{
 			name:    "base concurrency out of range",
 			body:    `{"base_concurrency_override":0}`,
-			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
-		},
-		{
-			name:    "OAuth base concurrency above range",
-			body:    `{"base_concurrency_override":51}`,
-			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
+			message: "base_concurrency_override 超出范围，必须 >= 1",
 		},
 		{
 			name:    "5h auto pause threshold out of range",
@@ -1601,11 +1745,13 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 	}
 }
 
-func TestUpdateAccountSchedulerAllowsExtendedResponsesConcurrency(t *testing.T) {
+func TestUpdateAccountSchedulerAllowsBaseConcurrencyAboveLegacyCaps(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	db := newTestAdminDB(t)
-	accountID, err := db.InsertOpenAIResponsesAccount(context.Background(), "responses", map[string]interface{}{
+	ctx := context.Background()
+	oauthID := insertTestAccount(t, db)
+	responsesID, err := db.InsertOpenAIResponsesAccount(ctx, "responses", map[string]interface{}{
 		"upstream_type": auth.UpstreamOpenAIResponses,
 		"base_url":      "https://api.openai.com",
 		"api_key":       "test-only-key",
@@ -1616,7 +1762,7 @@ func TestUpdateAccountSchedulerAllowsExtendedResponsesConcurrency(t *testing.T) 
 	}
 	handler := &Handler{db: db}
 
-	patch := func(body string) *httptest.ResponseRecorder {
+	patch := func(accountID int64, body string) *httptest.ResponseRecorder {
 		t.Helper()
 		recorder := httptest.NewRecorder()
 		ginCtx, _ := gin.CreateTestContext(recorder)
@@ -1627,22 +1773,24 @@ func TestUpdateAccountSchedulerAllowsExtendedResponsesConcurrency(t *testing.T) 
 		return recorder
 	}
 
-	if recorder := patch(`{"base_concurrency_override":1000}`); recorder.Code != http.StatusOK {
-		t.Fatalf("1000 status = %d, body=%s", recorder.Code, recorder.Body.String())
+	for name, accountID := range map[string]int64{
+		"OAuth":     oauthID,
+		"Responses": responsesID,
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := patch(accountID, `{"base_concurrency_override":1001}`)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+			}
+			row, err := db.GetAccountByID(ctx, accountID)
+			if err != nil {
+				t.Fatalf("GetAccountByID: %v", err)
+			}
+			if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 1001 {
+				t.Fatalf("base_concurrency_override = %+v, want 1001", row.BaseConcurrencyOverride)
+			}
+		})
 	}
-	row, err := db.GetAccountByID(context.Background(), accountID)
-	if err != nil {
-		t.Fatalf("GetAccountByID: %v", err)
-	}
-	if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 1000 {
-		t.Fatalf("base_concurrency_override = %+v, want 1000", row.BaseConcurrencyOverride)
-	}
-
-	recorder := patch(`{"base_concurrency_override":1001}`)
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("1001 status = %d, want %d", recorder.Code, http.StatusBadRequest)
-	}
-	assertErrorMessage(t, recorder, "base_concurrency_override 超出范围，必须在 1..1000 之间")
 }
 
 func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
@@ -2261,7 +2409,7 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	}
 }
 
-func TestBatchUpdateAccountsExtendedConcurrencyRequiresAllResponsesAccounts(t *testing.T) {
+func TestBatchUpdateAccountsAllowsExtendedConcurrencyForMixedAccountTypes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	db := newTestAdminDB(t)
@@ -2301,30 +2449,18 @@ func TestBatchUpdateAccountsExtendedConcurrencyRequiresAllResponsesAccounts(t *t
 		return recorder
 	}
 
-	if recorder := invoke([]int64{responsesID1, responsesID2}, 1000); recorder.Code != http.StatusOK {
-		t.Fatalf("all Responses status = %d, body=%s", recorder.Code, recorder.Body.String())
+	ids := []int64{responsesID1, responsesID2, oauthID}
+	if recorder := invoke(ids, 1001); recorder.Code != http.StatusOK {
+		t.Fatalf("mixed account status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
-	for _, id := range []int64{responsesID1, responsesID2} {
+	for _, id := range ids {
 		row, err := db.GetAccountByID(ctx, id)
 		if err != nil {
 			t.Fatalf("GetAccountByID(%d): %v", id, err)
 		}
-		if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 1000 {
-			t.Fatalf("account %d concurrency = %+v, want 1000", id, row.BaseConcurrencyOverride)
+		if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 1001 {
+			t.Fatalf("account %d concurrency = %+v, want 1001", id, row.BaseConcurrencyOverride)
 		}
-	}
-
-	recorder := invoke([]int64{responsesID1, oauthID}, 51)
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("mixed batch status = %d, want %d, body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
-	}
-	assertErrorMessage(t, recorder, "base_concurrency_override 超出范围，必须在 1..50 之间")
-	oauthRow, err := db.GetAccountByID(ctx, oauthID)
-	if err != nil {
-		t.Fatalf("GetAccountByID OAuth: %v", err)
-	}
-	if oauthRow.BaseConcurrencyOverride.Valid {
-		t.Fatalf("OAuth concurrency changed on rejected batch: %+v", oauthRow.BaseConcurrencyOverride)
 	}
 }
 

@@ -133,6 +133,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			upstream_endpoint TEXT DEFAULT '',
 				stream INTEGER DEFAULT 0,
 				compact INTEGER DEFAULT 0,
+				has_compaction_history INTEGER DEFAULT 0,
 				via_websocket INTEGER DEFAULT 0,
 				cached_tokens INTEGER DEFAULT 0,
 				service_tier TEXT DEFAULT '',
@@ -273,7 +274,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					ignore_usage_limit_status INTEGER DEFAULT 0,
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60,
-					utls_shutdown_timeout_minutes INTEGER DEFAULT 30
+					utls_shutdown_timeout_minutes INTEGER DEFAULT 30,
+					response_cache_local_max_bytes INTEGER NOT NULL DEFAULT 67108864,
+					response_cache_local_max_entry_bytes INTEGER NOT NULL DEFAULT 8388608,
+					response_cache_reconstruct_max_bytes INTEGER NOT NULL DEFAULT 67108864,
+					response_cache_config_generation INTEGER NOT NULL DEFAULT 1
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -298,7 +303,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			test_ip TEXT DEFAULT '',
 			test_location TEXT DEFAULT '',
-			test_latency_ms INTEGER DEFAULT 0
+			test_latency_ms INTEGER DEFAULT 0,
+			test_status TEXT NOT NULL DEFAULT 'untested'
 		);`,
 		`CREATE TABLE IF NOT EXISTS account_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -423,6 +429,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "stream", "INTEGER DEFAULT 0"},
 		{"usage_logs", "via_websocket", "INTEGER DEFAULT 0"},
 		{"usage_logs", "compact", "INTEGER DEFAULT 0"},
+		{"usage_logs", "has_compaction_history", "INTEGER DEFAULT 0"},
 		{"usage_logs", "cached_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "service_tier", "TEXT DEFAULT ''"},
 		{"usage_logs", "requested_service_tier", "TEXT DEFAULT ''"},
@@ -509,6 +516,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
 		{"system_settings", "utls_shutdown_timeout_minutes", "INTEGER DEFAULT 30"},
+		{"system_settings", "response_cache_local_max_bytes", "INTEGER NOT NULL DEFAULT 67108864"},
+		{"system_settings", "response_cache_local_max_entry_bytes", "INTEGER NOT NULL DEFAULT 8388608"},
+		{"system_settings", "response_cache_reconstruct_max_bytes", "INTEGER NOT NULL DEFAULT 67108864"},
+		{"system_settings", "response_cache_config_generation", "INTEGER NOT NULL DEFAULT 1"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
@@ -586,11 +597,20 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},
+		{"proxies", "test_status", "TEXT NOT NULL DEFAULT 'untested'"},
 	}
 	for _, column := range columns {
 		if err := db.ensureSQLiteColumn(ctx, column.table, column.name, column.def); err != nil {
 			return err
 		}
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE proxies
+		SET test_status = 'success'
+		WHERE COALESCE(test_status, 'untested') = 'untested'
+		  AND (COALESCE(test_ip, '') <> '' OR COALESCE(test_location, '') <> '' OR COALESCE(test_latency_ms, 0) > 0)
+	`); err != nil {
+		return err
 	}
 
 	indexStatements := []string{

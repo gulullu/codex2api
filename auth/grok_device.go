@@ -121,11 +121,11 @@ func StartGrokDeviceFlow(ctx context.Context, proxyURL string) (*GrokDeviceCodeR
 
 // GrokDevicePollResult 是一次 device token 轮询结果。
 type GrokDevicePollResult struct {
-	Pending      bool // authorization_pending / slow_down
-	SlowDown     bool
-	Token        *GrokTokenData
-	Email        string
-	Subject      string
+	Pending       bool // authorization_pending / slow_down
+	SlowDown      bool
+	Token         *GrokTokenData
+	Email         string
+	Subject       string
 	TokenEndpoint string
 }
 
@@ -221,6 +221,7 @@ func PollGrokDeviceToken(ctx context.Context, deviceCode, tokenEndpoint, proxyUR
 			AccessToken:  payload.AccessToken,
 			RefreshToken: payload.RefreshToken,
 			IDToken:      payload.IDToken,
+			PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 			ExpiresAt:    expiresAt,
 		},
 		Email:         email,

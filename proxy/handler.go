@@ -879,19 +879,45 @@ func populateClientIPFromRequest(c *gin.Context, input *database.UsageLogInput) 
 }
 
 func populateCompactUsageMetaFromRequest(c *gin.Context, input *database.UsageLogInput) {
-	if input == nil || input.Compact {
+	if input == nil {
 		return
 	}
-	if isCompactUsageEndpoint(input.Endpoint) || isCompactUsageEndpoint(input.InboundEndpoint) || isCompactUsageEndpoint(input.UpstreamEndpoint) {
+
+	meta, ok := cachedRequestCompactionMeta(c)
+	if !ok {
+		if body, bodyOK := rawRequestBodyFromContext(c); bodyOK {
+			meta = requestBodyCompactionMeta(body)
+		}
+		// HTTP requests may carry the same per-turn metadata as a request header.
+		// Client WebSocket turns always cache frame-local metadata before logging,
+		// so the Upgrade request header cannot leak into individual frames here.
+		if c != nil && c.Request != nil && turnMetadataIndicatesCompaction(c.GetHeader("X-Codex-Turn-Metadata")) {
+			meta.UsageTriggered = true
+		}
+	}
+
+	// Only the original inbound path can mark an explicit Compact request.
+	// UpstreamEndpoint may be rewritten internally and must not affect this signal.
+	if isExplicitCompactUsageRequest(c, input) {
+		meta.UsageTriggered = true
+	}
+
+	if meta.UsageTriggered {
 		input.Compact = true
-		return
 	}
-	if c == nil {
-		return
+	if meta.HasHistory {
+		input.HasCompactionHistory = true
 	}
-	if body, ok := rawRequestBodyFromContext(c); ok && requestBodyHasCompactionTrigger(body) {
-		input.Compact = true
+}
+
+func isExplicitCompactUsageRequest(c *gin.Context, input *database.UsageLogInput) bool {
+	if c != nil && c.Request != nil && c.Request.URL != nil {
+		return isCompactUsageEndpoint(c.Request.URL.Path)
 	}
+	if input == nil {
+		return false
+	}
+	return isCompactUsageEndpoint(input.InboundEndpoint) || isCompactUsageEndpoint(input.Endpoint)
 }
 
 func isCompactUsageEndpoint(endpoint string) bool {
@@ -970,27 +996,103 @@ func setRawRequestBody(c *gin.Context, body []byte) {
 	}
 }
 
-// requestBodyHasCompactionTrigger reports whether input itself, or one of the direct input array
-// items, is the Codex compaction request control. Durable compaction history items and nested tool
-// output data are conversation content, not new compaction requests.
-func requestBodyHasCompactionTrigger(body []byte) bool {
-	input := gjson.GetBytes(body, "input")
-	if !input.Exists() {
-		return false
+const requestCompactionMetaContextKey = "request_compaction_meta"
+
+type requestCompactionMeta struct {
+	// ProtocolTriggered is the wire-level compaction_trigger control. Only this
+	// value may affect routing, account pinning, or protocol-specific timeouts.
+	ProtocolTriggered bool
+	// UsageTriggered is the observability signal persisted in usage_logs.compact.
+	UsageTriggered bool
+	// HasHistory marks direct durable compaction/context_compaction input items.
+	HasHistory bool
+}
+
+func cacheRequestCompactionMeta(c *gin.Context, meta requestCompactionMeta) {
+	if c != nil {
+		c.Set(requestCompactionMetaContextKey, meta)
 	}
-	if !input.IsArray() {
-		return gjsonResultIsCompactionTrigger(input)
+}
+
+func cachedRequestCompactionMeta(c *gin.Context) (requestCompactionMeta, bool) {
+	if c == nil {
+		return requestCompactionMeta{}, false
+	}
+	value, exists := c.Get(requestCompactionMetaContextKey)
+	if !exists {
+		return requestCompactionMeta{}, false
+	}
+	meta, ok := value.(requestCompactionMeta)
+	return meta, ok
+}
+
+func requestCompactionMetaForHTTP(c *gin.Context, body []byte) requestCompactionMeta {
+	meta := requestBodyCompactionMeta(body)
+	if c != nil && c.Request != nil {
+		if turnMetadataIndicatesCompaction(c.GetHeader("X-Codex-Turn-Metadata")) {
+			meta.UsageTriggered = true
+		}
+		if c.Request.URL != nil && isCompactUsageEndpoint(c.Request.URL.Path) {
+			meta.UsageTriggered = true
+		}
+	}
+	return meta
+}
+
+// requestBodyCompactionMeta inspects only direct input items plus the canonical
+// per-turn metadata field. It deliberately does not recurse into messages,
+// content, tool output, or arbitrary stringified JSON.
+func requestBodyCompactionMeta(body []byte) requestCompactionMeta {
+	meta := requestCompactionMeta{}
+	input := gjson.GetBytes(body, "input")
+	inspect := func(item gjson.Result) {
+		switch {
+		case gjsonResultIsCompactionTrigger(item):
+			meta.ProtocolTriggered = true
+		case gjsonResultIsCompactionHistory(item):
+			meta.HasHistory = true
+		}
+	}
+	if input.Exists() {
+		if input.IsArray() {
+			input.ForEach(func(_, item gjson.Result) bool {
+				inspect(item)
+				return true
+			})
+		} else {
+			inspect(input)
+		}
 	}
 
-	found := false
-	input.ForEach(func(_, item gjson.Result) bool {
-		if gjsonResultIsCompactionTrigger(item) {
-			found = true
-			return false
+	meta.UsageTriggered = meta.ProtocolTriggered
+	clientMetadata := gjson.GetBytes(body, "client_metadata")
+	if clientMetadata.IsObject() {
+		turnMetadata := clientMetadata.Get("x-codex-turn-metadata")
+		if turnMetadata.Type == gjson.String && turnMetadataIndicatesCompaction(turnMetadata.String()) {
+			meta.UsageTriggered = true
 		}
-		return true
-	})
-	return found
+	}
+	return meta
+}
+
+func turnMetadataIndicatesCompaction(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !gjson.Valid(raw) {
+		return false
+	}
+	root := gjson.Parse(raw)
+	if !root.IsObject() {
+		return false
+	}
+	requestKind := root.Get("request_kind")
+	return requestKind.Type == gjson.String &&
+		strings.EqualFold(strings.TrimSpace(requestKind.String()), "compaction")
+}
+
+// requestBodyHasCompactionTrigger reports only the protocol-level control used
+// for routing. Metadata-only local compaction turns must remain on /responses.
+func requestBodyHasCompactionTrigger(body []byte) bool {
+	return requestBodyCompactionMeta(body).ProtocolTriggered
 }
 
 // storeHasAvailableCodexAccount 判断账号池中是否还有可调度的官方（非中转）账号。
@@ -1022,8 +1124,70 @@ func excludeRelayAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
+func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsRelayStyle() {
+			return false
+		}
+		return inner == nil || inner(account)
+	}
+}
+
+func responseCachePreparationFailure(prepared responsesBodyPreparation) (status int, reason string, unavailable bool) {
+	if prepared.PreviousResponseID == "" || prepared.Bypassed || prepared.CacheLookup.Kind == responseCacheLookupHit {
+		return 0, "", false
+	}
+	switch prepared.CacheLookup.Kind {
+	case responseCacheLookupKnownEvicted:
+		return http.StatusConflict, "local_context_evicted", true
+	case responseCacheLookupKnownOversize:
+		return http.StatusConflict, "local_context_oversize", true
+	case responseCacheLookupReconstructionTooLarge:
+		return http.StatusConflict, "reconstruction_too_large", true
+	case responseCacheLookupBackendCorrupt:
+		return http.StatusConflict, "backend_value_corrupt", true
+	case responseCacheLookupBackendError:
+		if prepared.RequiresLocalContext {
+			return http.StatusServiceUnavailable, "backend_unavailable", true
+		}
+	case responseCacheLookupMiss, responseCacheLookupExpired:
+		if prepared.RequiresLocalContext {
+			return http.StatusConflict, "missing_required_call_context", true
+		}
+	}
+	return 0, "", false
+}
+
+func sendResponseContextUnavailable(c *gin.Context, status int, reason string) {
+	code := api.ErrCodeResponseContextUnavailable
+	errType := api.ErrorTypeInvalidRequest
+	message := "Previous response context is unavailable"
+	if status == http.StatusServiceUnavailable {
+		code = api.ErrCodeServiceUnavailable
+		errType = api.ErrorTypeServer
+		message = "Previous response context backend is temporarily unavailable"
+	}
+	if status == http.StatusConflict {
+		recordResponseCacheKnownUnavailableError()
+	}
+	api.SendErrorWithStatus(c, api.NewAPIErrorWithDetails(
+		code,
+		message,
+		errType,
+		api.ErrorDetail{Field: "previous_response_id", Message: reason},
+	), status)
+}
+
 func gjsonResultIsCompactionTrigger(result gjson.Result) bool {
 	return result.IsObject() && strings.EqualFold(strings.TrimSpace(result.Get("type").String()), "compaction_trigger")
+}
+
+func gjsonResultIsCompactionHistory(result gjson.Result) bool {
+	if !result.IsObject() {
+		return false
+	}
+	itemType := strings.TrimSpace(result.Get("type").String())
+	return strings.EqualFold(itemType, "compaction") || strings.EqualFold(itemType, "context_compaction")
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -1968,6 +2132,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	defer h.finalizeRelayAuditRequest(c, routePlan)
 	bodyReadDone := time.Now()
+	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
+	cacheRequestCompactionMeta(c, compactionMeta)
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
 	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
@@ -1980,7 +2146,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// 一次性 JSON 会让客户端在收到 response.completed 前遇到 EOF（issue #361）。
 	// 非流式请求仍可提升到 compact 专用链路，保留只实现 /responses/compact 的
 	// 中转兼容性。
-	bodySignalCompact := requestBodyHasCompactionTrigger(rawBody)
+	bodySignalCompact := compactionMeta.ProtocolTriggered
 	pinBodySignalToCodexAccounts := bodySignalCompact && !routePlan.Required() && h.storeHasAvailableCodexAccount()
 	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
 	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
@@ -2078,7 +2244,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		return rawBody
 	}
-	codexBody, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, respCacheOwner)
+	bodyPreparation := prepareResponsesBodyForOwnerDetailed(rawBody, respCacheOwner)
+	codexBody, expandedInputRaw := bodyPreparation.Body, bodyPreparation.ExpandedInputRaw
+	continuationStatus, continuationReason, continuationUnavailable := responseCachePreparationFailure(bodyPreparation)
+	replayCoversRequiredRelay := relayReplayReplayed && routePlan.Required()
+	effectiveContinuationUnavailable := continuationUnavailable && !replayCoversRequiredRelay
 	// strip 策略：剥离网关注入及客户端携带的图片工具能力声明，作为普通文本请求继续（issue #411）。
 	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	oauthRulePreview := ApplyPayloadRulesToBody(codexBody, gjson.GetBytes(codexBody, "model").String(), c.Request.Header, ruleIdentity)
@@ -2118,8 +2288,11 @@ func (h *Handler) Responses(c *gin.Context) {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	if pinBodySignalToCodexAccounts {
+	if pinBodySignalToCodexAccounts && !effectiveContinuationUnavailable {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
+	}
+	if effectiveContinuationUnavailable {
+		accountFilter = relayOnlyAccountFilter(accountFilter)
 	}
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
@@ -2138,6 +2311,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
 	invalidEncryptedContentRetried := false
+	relayContinuationAttempted := false
 	overflowCompactRetried := false
 	overflowCompactEnabled := autoCompactOverflowEnabled(c)
 
@@ -2153,7 +2327,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			if effectiveContinuationUnavailable && !relayContinuationAttempted {
+				account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter)
+			} else {
+				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			}
 		}
 		if account == nil {
 			if routePlan.Required() {
@@ -2166,6 +2344,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
+			if effectiveContinuationUnavailable && !relayContinuationAttempted {
+				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
@@ -2228,6 +2410,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		downstreamHeaders := c.Request.Header.Clone()
 
 		if account.IsRelayStyle() {
+			relayContinuationAttempted = true
 			if lastUpstreamCancel != nil {
 				lastUpstreamCancel()
 			}
@@ -3256,6 +3439,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	cacheRequestCompactionMeta(c, requestCompactionMetaForHTTP(c, rawBody))
 	routePlan, ok := h.relayRoutePlanForRequestAndReply(c, rawBody, "/v1/responses/compact")
 	if !ok {
 		return
@@ -3336,7 +3520,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	rawBody, _ = sjson.SetBytes(rawBody, "stream", false)
 
 	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
-	codexBody, _ := PrepareCompactResponsesBodyForOwner(rawBody, responseCacheOwner(apiKeyID))
+	bodyPreparation := prepareCompactResponsesBodyForOwnerDetailed(rawBody, responseCacheOwner(apiKeyID))
+	codexBody := bodyPreparation.Body
+	continuationStatus, continuationReason, continuationUnavailable := responseCachePreparationFailure(bodyPreparation)
 	// strip 策略：剥离图片工具能力声明后作为普通文本请求继续（issue #411）。
 	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
@@ -3359,6 +3545,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	if continuationUnavailable {
+		accountFilter = relayOnlyAccountFilter(accountFilter)
+	}
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	accountFilter = routePlan.composeFilter(accountFilter)
@@ -3377,10 +3566,19 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 	invalidEncryptedContentRetried := false
+	relayContinuationAttempted := false
 
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
+			if continuationUnavailable && !relayContinuationAttempted {
+				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
+				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
+				return
+			}
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if routePlan.Required() {
@@ -3419,6 +3617,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		downstreamHeaders := c.Request.Header.Clone()
 
 		if account.IsOpenAIResponsesAPI() {
+			relayContinuationAttempted = true
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
 			upstreamBody := openAIResponsesBody

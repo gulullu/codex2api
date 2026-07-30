@@ -183,7 +183,8 @@ func (a *Account) GrokCredentials() (baseURL, bearer string) {
 }
 
 // GrokRateLimitSnapshot 是 Grok 上游逐请求返回的配额余量（x-ratelimit-* 响应头）。
-// 仅运行时保存，重启后由下一次请求恢复。
+// 内存实时更新;由 store 后台循环按分钟批量落库(grok_rate_limit 凭据),重启后恢复,
+// 账号列表的用量进度条不再因容器重启清零。
 type GrokRateLimitSnapshot struct {
 	LimitTokens       int64     `json:"limit_tokens,omitempty"`
 	RemainingTokens   int64     `json:"remaining_tokens,omitempty"`
@@ -194,6 +195,12 @@ type GrokRateLimitSnapshot struct {
 
 // SetGrokRateLimitSnapshot 更新配额余量快照（时间倒流的旧观测被忽略）。
 func (a *Account) SetGrokRateLimitSnapshot(snap GrokRateLimitSnapshot) {
+	a.setGrokRateLimitSnapshot(snap, true)
+}
+
+// setGrokRateLimitSnapshot 的 markDirty=false 供启动恢复用:恢复的值本来就来自
+// 库里,不需要再触发一轮落库。
+func (a *Account) setGrokRateLimitSnapshot(snap GrokRateLimitSnapshot, markDirty bool) {
 	if a == nil {
 		return
 	}
@@ -204,6 +211,24 @@ func (a *Account) SetGrokRateLimitSnapshot(snap GrokRateLimitSnapshot) {
 	}
 	copied := snap
 	a.grokRateLimit = &copied
+	if markDirty {
+		a.grokRateLimitDirty = true
+	}
+}
+
+// TakeGrokRateLimitSnapshotIfDirty 返回自上次持久化后有更新的快照并清除脏位;
+// 无更新时 ok=false。供 store 的分钟级批量落库循环调用。
+func (a *Account) TakeGrokRateLimitSnapshotIfDirty() (GrokRateLimitSnapshot, bool) {
+	if a == nil {
+		return GrokRateLimitSnapshot{}, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.grokRateLimitDirty || a.grokRateLimit == nil {
+		return GrokRateLimitSnapshot{}, false
+	}
+	a.grokRateLimitDirty = false
+	return *a.grokRateLimit, true
 }
 
 // GetGrokRateLimitSnapshot 返回配额余量快照；无观测时 ok=false。
@@ -332,6 +357,7 @@ type GrokImportedCredential struct {
 	AccessToken   string
 	RefreshToken  string
 	APIKey        string
+	PlanType      string
 	ClientID      string
 	TokenEndpoint string
 	OIDCIssuer    string
@@ -420,6 +446,7 @@ func parseGrokCredentialNode(scope string, node map[string]any) (*GrokImportedCr
 	cred := &GrokImportedCredential{
 		AccessToken:   access,
 		RefreshToken:  refresh,
+		PlanType:      GrokPlanTypeFromAccessToken(access),
 		ClientID:      grokFirstString(node, "client_id", "clientId", "oidc_client_id", "oidcClientId"),
 		TokenEndpoint: grokFirstString(node, "token_endpoint", "tokenEndpoint"),
 		OIDCIssuer:    strings.TrimRight(grokFirstString(node, "oidc_issuer", "oidcIssuer", "issuer"), "/"),
@@ -541,6 +568,7 @@ type GrokTokenData struct {
 	AccessToken  string
 	RefreshToken string // 上游轮换时非空
 	IDToken      string
+	PlanType     string
 	ExpiresAt    time.Time
 }
 
@@ -746,6 +774,7 @@ func ExchangeGrokAuthorizationCode(ctx context.Context, params GrokExchangeCodeP
 		AccessToken:  payload.AccessToken,
 		RefreshToken: payload.RefreshToken,
 		IDToken:      payload.IDToken,
+		PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 		ExpiresAt:    expiresAt,
 	}, nil
 }
@@ -957,6 +986,7 @@ func RefreshGrokAccessToken(ctx context.Context, params GrokRefreshParams) (*Gro
 		AccessToken:  payload.AccessToken,
 		RefreshToken: payload.RefreshToken,
 		IDToken:      payload.IDToken,
+		PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 		ExpiresAt:    expiresAt,
 	}, nil
 }
@@ -997,6 +1027,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 			if !forceRefresh && waitErr == nil && token != "" {
 				acc.mu.Lock()
 				acc.AccessToken = token
+				if planType := GrokPlanTypeFromAccessToken(token); planType != "" {
+					acc.PlanType = planType
+				}
 				if expiresAt := grokAccessTokenExpiry(token); !expiresAt.IsZero() {
 					acc.ExpiresAt = expiresAt
 				} else {
@@ -1044,6 +1077,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 
 	acc.mu.Lock()
 	acc.AccessToken = td.AccessToken
+	if td.PlanType != "" {
+		acc.PlanType = td.PlanType
+	}
 	if td.RefreshToken != "" {
 		acc.RefreshToken = td.RefreshToken
 	}
@@ -1075,6 +1111,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 		credentials := map[string]interface{}{
 			"access_token": td.AccessToken,
 			"expires_at":   td.ExpiresAt.Format(time.RFC3339),
+		}
+		if td.PlanType != "" {
+			credentials["plan_type"] = td.PlanType
 		}
 		if td.RefreshToken != "" {
 			credentials["refresh_token"] = td.RefreshToken

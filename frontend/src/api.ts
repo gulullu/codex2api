@@ -411,9 +411,11 @@ export const api = {
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
   // channel: 'codex' | 'grok' — server-side filter; omit for all accounts.
-  getAccounts: (params: { channel?: 'codex' | 'grok' } = {}) => {
+  // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。
+  getAccounts: (params: { channel?: 'codex' | 'grok'; view?: 'lite' } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.channel) searchParams.set('channel', params.channel)
+    if (params.view) searchParams.set('view', params.view)
     const qs = searchParams.toString()
     return request<AccountsResponse>(`/accounts${qs ? `?${qs}` : ''}`)
   },
@@ -635,7 +637,7 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; channel?: string }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; compact?: string; hasCompactionHistory?: string; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
@@ -648,6 +650,8 @@ export const api = {
     if (params.accountId) searchParams.set('account_id', params.accountId)
     if (params.fast) searchParams.set('fast', params.fast)
     if (params.stream) searchParams.set('stream', params.stream)
+    if (params.compact) searchParams.set('compact', params.compact)
+    if (params.hasCompactionHistory) searchParams.set('has_compaction_history', params.hasCompactionHistory)
     if (params.channel) searchParams.set('channel', params.channel)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
@@ -676,6 +680,10 @@ export const api = {
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  resetAPIKeyQuota: (id: number) =>
+    request<MessageResponse>(`/keys/${id}/reset-quota`, { method: 'POST' }),
+  resetAllAPIKeyQuotas: () =>
+    request<MessageResponse & { reset_count: number }>('/keys/reset-all-quotas', { method: 'POST' }),
   // 分组 / 账号维度限额的当前用量（issue #439）。
   getAPIKeyScopeUsage: (id: number) =>
     request<{ items: APIKeyScopeUsageItem[] }>(`/keys/${id}/scope-usage`),
@@ -904,6 +912,10 @@ export const api = {
     request<MessageResponse>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   batchDeleteProxies: (ids: number[]) =>
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  cleanErrorProxies: () =>
+    request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
+  autoBalanceProxies: (data: { channel?: 'codex' | 'grok'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
+    request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth
@@ -924,10 +936,23 @@ export interface ProxyRow {
   test_ip: string
   test_location: string
   test_latency_ms: number
+  test_status: 'untested' | 'success' | 'error'
+  /** 绑定到该代理的账号数(服务端聚合,前端免拉全量账号)。 */
+  bound_count: number
+}
+
+export interface AutoBalanceProxiesResult {
+  message: string
+  assigned: number
+  kept: number
+  skipped: number
+  proxies_used?: number
+  distribution?: Array<{ proxy_id: number; label?: string; bound_count: number }>
 }
 
 export interface ProxyTestResult {
   success: boolean
+  conclusive?: boolean
   ip?: string
   country?: string
   region?: string

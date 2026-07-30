@@ -72,6 +72,13 @@ export interface GrokFreeQuotaSnapshot {
   exhausted_at: string
 }
 
+export interface GrokPlanInfo {
+  key: string
+  display: string
+  paid: boolean
+  billing: boolean
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -89,6 +96,7 @@ export interface AccountRow {
   grok_api?: boolean
   agent_identity?: boolean
   grok_auth_kind?: string
+  grok_plan?: GrokPlanInfo
   grok_billing?: GrokBillingDetail
   // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
   grok_rate_limit?: GrokRateLimitSnapshot
@@ -652,6 +660,42 @@ export interface OpsOverviewResponse {
     used_bytes: number
     total_bytes: number
     process_bytes: number
+    heap_alloc_bytes?: number
+    heap_inuse_bytes?: number
+    heap_released_bytes?: number
+    num_gc?: number
+  }
+  response_cache?: {
+    effective_config: {
+      generation: number
+      local_max_bytes: number
+      local_max_entry_bytes: number
+      reconstruct_max_bytes: number
+    }
+    applied_config: {
+      generation: number
+      local_max_bytes: number
+      local_max_entry_bytes: number
+      reconstruct_max_bytes: number
+    }
+    entries: number
+    max_entries: number
+    current_bytes: number
+    max_bytes: number
+    high_water_bytes: number
+    largest_entry_bytes: number
+    local_hits: number
+    local_misses: number
+    remote_hits: number
+    remote_misses: number
+    expirations: number
+    count_evictions: number
+    byte_evictions: number
+    oversize_bypasses: number
+    oversize_rejections: number
+    known_unavailable_errors: number
+    last_config_sync_at: ISODateString | ''
+    last_config_sync_error: string
   }
   runtime: {
     goroutines: number
@@ -862,6 +906,10 @@ export interface SystemSettings {
   database_label: string
   cache_driver: string
   cache_label: string
+  response_cache_local_max_bytes: number
+  response_cache_local_max_entry_bytes: number
+  response_cache_reconstruct_max_bytes: number
+  readonly response_cache_config_generation: number
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
@@ -1665,6 +1713,7 @@ export interface UsageLog {
   upstream_endpoint: string
   stream: boolean
   compact: boolean
+  has_compaction_history: boolean
   via_websocket?: boolean
   cached_tokens: number
   service_tier: string
@@ -1848,9 +1897,12 @@ export interface APIKeyLimits {
   cost_limit_5h?: number
   cost_limit_7d?: number
   cost_limit_30d?: number
+  /** 自然日(服务器本地时区)金额上限,零点清零;与滑动窗口语义不同(issue #460)。 */
+  cost_limit_daily?: number
   token_limit_5h?: number
   token_limit_7d?: number
   token_limit_30d?: number
+  token_limit_daily?: number
   disable_image_generation?: boolean
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
@@ -1866,6 +1918,7 @@ export interface APIKeyWindowUsage {
   cost_5h: number
   cost_7d: number
   cost_30d: number
+  cost_today?: number
 }
 
 export interface APIKeyRow {
@@ -1935,9 +1988,16 @@ export interface PublicAPIKeyWindowUsage {
   requests: number
   tokens: number
   user_billed: number
+  /** 窗口内最早一笔用量时间(无用量时缺省)。 */
+  oldest_at?: ISODateString
+  /** fixed=自然日固定窗口(reset_at 清零);sliding=滑动窗口(decay_at 开始回落)。 */
+  window_kind: 'fixed' | 'sliding'
+  reset_at?: ISODateString
+  decay_at?: ISODateString
 }
 
 export interface PublicAPIKeyUsageWindows {
+  today: PublicAPIKeyWindowUsage
   last_5h: PublicAPIKeyWindowUsage
   last_7d: PublicAPIKeyWindowUsage
   last_30d: PublicAPIKeyWindowUsage
@@ -1993,6 +2053,7 @@ export interface PublicAPIKeyUsageLog {
   service_tier: string
   stream: boolean
   compact: boolean
+  has_compaction_history: boolean
   via_websocket: boolean
   upstream_error_kind: string
   created_at: ISODateString

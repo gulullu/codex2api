@@ -4,9 +4,6 @@ import type {
   UpdateAccountSchedulerRequest,
 } from "../types";
 
-export const DEFAULT_ACCOUNT_BASE_CONCURRENCY_MAX = 50;
-export const RESPONSES_ACCOUNT_BASE_CONCURRENCY_MAX = 1000;
-
 const SENSITIVE_HEADER_NAMES = new Set([
   "api-key",
   "authorization",
@@ -29,13 +26,6 @@ const SENSITIVE_HEADER_FRAGMENTS = [
 export interface OpenAIResponsesAccountDraft {
   account: AddOpenAIResponsesAccountRequest;
   scheduler: UpdateAccountSchedulerRequest;
-}
-
-export function accountBaseConcurrencyMax(accounts: AccountRow[]): number {
-  return accounts.length > 0 &&
-    accounts.every((account) => account.openai_responses_api === true)
-    ? RESPONSES_ACCOUNT_BASE_CONCURRENCY_MAX
-    : DEFAULT_ACCOUNT_BASE_CONCURRENCY_MAX;
 }
 
 export function copySafeCustomHeaders(

@@ -44,9 +44,8 @@ func grokCredentialsFromRequest(req *addGrokAccountReq) (map[string]interface{},
 	}
 	credentials := map[string]interface{}{
 		"upstream_type": auth.UpstreamGrok,
-		// 默认按 OAuth 订阅账号的免费档展示；API Key 账号无订阅档位，下方分支改回 "api"。
-		// billing 探针成功后 OAuth 账号会被纠正为真实套餐（free/SuperGrok/Heavy）。
-		"plan_type": "free",
+		// OAuth 凭据若带 access_token，会在下方从 JWT tier claim 识别真实套餐；
+		// 缺失/无效 tier 保持空值。API Key 账号无订阅档位，单独标记为 "api"。
 	}
 	if baseURL != "" {
 		credentials["base_url"] = baseURL
@@ -86,6 +85,9 @@ func grokCredentialsFromRequest(req *addGrokAccountReq) (map[string]interface{},
 		credentials["grok_client_id"] = cred.ClientID
 		if cred.AccessToken != "" {
 			credentials["access_token"] = cred.AccessToken
+		}
+		if cred.PlanType != "" {
+			credentials["plan_type"] = cred.PlanType
 		}
 		if !cred.ExpiresAt.IsZero() {
 			credentials["expires_at"] = cred.ExpiresAt.Format(time.RFC3339)
@@ -339,7 +341,7 @@ func (h *Handler) FetchGrokModels(c *gin.Context) {
 		probe.AccessToken = td.AccessToken
 	}
 
-	models, err := proxy.FetchGrokModelIDs(ctx, probe)
+	models, err := proxy.FetchGrokModelIDs(ctx, probe, h.store.ResolveProxyForAccount(probe))
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -357,13 +359,19 @@ func credentialStringValue(credentials map[string]interface{}, key string) strin
 	return ""
 }
 
-// grokPlanTypeOrDefault 取 credentials 里的 plan_type，缺失时回落到免费档
-// （现有写入路径都会显式设置，这里仅作防御性兜底）。
-func grokPlanTypeOrDefault(credentials map[string]interface{}) string {
-	if plan := strings.TrimSpace(credentialStringValue(credentials, "plan_type")); plan != "" {
+// grokPlanTypeFromCredentials 优先读取 access_token 的 tier claim，再兼容已有
+// plan_type 展示值；API Key 账号没有订阅 tier，其余缺失/无效值保持空白。
+func grokPlanTypeFromCredentials(credentials map[string]interface{}) string {
+	if plan := auth.GrokPlanTypeFromAccessToken(credentialStringValue(credentials, "access_token")); plan != "" {
 		return plan
 	}
-	return "free"
+	if plan, ok := auth.ResolveGrokPlan(credentialStringValue(credentials, "plan_type")); ok {
+		return plan.Key
+	}
+	if strings.TrimSpace(credentialStringValue(credentials, "api_key")) != "" {
+		return "api"
+	}
+	return ""
 }
 
 // grokAccountFromCredentials 从入库用的 credentials map 构造内存态 Account，
@@ -377,8 +385,8 @@ func grokAccountFromCredentials(id int64, credentials map[string]interface{}, pr
 		BaseURL:      strings.TrimRight(credentialStringValue(credentials, "base_url"), "/"),
 		ModelMapping: credentialStringValue(credentials, "model_mapping"),
 		Email:        credentialStringValue(credentials, "email"),
-		// 与 credentials 保持一致（OAuth 默认 free、API Key 为 api）；不再写死 "api"。
-		PlanType:          grokPlanTypeOrDefault(credentials),
+		// 与 credentials 保持一致：OAuth 使用 tier 映射，API Key 为 api。
+		PlanType:          grokPlanTypeFromCredentials(credentials),
 		GrokClientID:      credentialStringValue(credentials, "grok_client_id"),
 		GrokTokenEndpoint: credentialStringValue(credentials, "grok_token_endpoint"),
 		GrokOIDCIssuer:    credentialStringValue(credentials, "grok_oidc_issuer"),

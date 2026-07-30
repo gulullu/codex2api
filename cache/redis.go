@@ -425,7 +425,11 @@ func (tc *redisTokenCache) SetResponseContext(ctx context.Context, responseID st
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	record := redisResponseContextRecord{Items: items}
+	normalizedItems, err := NormalizeResponseContextItems(items)
+	if err != nil {
+		return err
+	}
+	record := redisResponseContextRecord{Items: normalizedItems}
 	payload, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -453,7 +457,48 @@ func (tc *redisTokenCache) GetResponseContext(ctx context.Context, responseID st
 	for i, item := range record.Items {
 		items[i] = append(json.RawMessage(nil), item...)
 	}
-	return items, nil
+	normalizedItems, err := NormalizeResponseContextItems(items)
+	if err != nil {
+		return nil, err
+	}
+	return normalizedItems, nil
+}
+
+// GetResponseContextBounded reads at most maxWireBytes+1 bytes so an oversized
+// Redis value can be rejected before the complete value is fetched or decoded.
+func (tc *redisTokenCache) GetResponseContextBounded(ctx context.Context, responseID string, maxWireBytes int64) (ResponseContextReadResult, error) {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	if maxWireBytes < 0 {
+		maxWireBytes = 0
+	}
+	val, err := tc.client.GetRange(ctx, responseContextKey(responseID), 0, maxWireBytes).Bytes()
+	if err == redis.Nil {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	if err != nil {
+		return ResponseContextReadResult{}, err
+	}
+	if len(val) == 0 {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	if int64(len(val)) > maxWireBytes {
+		return ResponseContextReadResult{Status: ResponseContextReadTooLarge}, nil
+	}
+	var record redisResponseContextRecord
+	if err := json.Unmarshal(val, &record); err != nil {
+		return ResponseContextReadResult{Status: ResponseContextReadCorrupt}, nil
+	}
+	if len(record.Items) == 0 {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	normalizedItems, err := NormalizeResponseContextItems(record.Items)
+	if err != nil {
+		return ResponseContextReadResult{Status: ResponseContextReadCorrupt}, nil
+	}
+	return ResponseContextReadResult{Status: ResponseContextReadFound, Items: normalizedItems}, nil
 }
 
 func (tc *redisTokenCache) SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error {

@@ -800,7 +800,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "has_compaction_history", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
@@ -2802,7 +2802,7 @@ func TestGetAccountUsageStatsAggregatesRecentAccountSummary(t *testing.T) {
 	insertUsage(7, "old-model", 200, 9000, 9000, 0, 0, 0, 5000, 9.99, 9.99, todayStart.AddDate(0, 0, -40))
 	insertUsage(7, "cancelled", 499, 8000, 8000, 0, 0, 0, 5000, 8.88, 8.88, todayStart.Add(2*time.Hour))
 	insertUsage(8, "other-account", 200, 7000, 7000, 0, 0, 0, 5000, 7.77, 7.77, todayStart.Add(2*time.Hour))
-	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 500, stream = 1 WHERE account_id = 7 AND total_tokens = 1000`); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 500, stream = 1, has_compaction_history = 1 WHERE account_id = 7 AND total_tokens = 1000`); err != nil {
 		t.Fatalf("update first usage quality fields: %v", err)
 	}
 	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 1500, compact = 1 WHERE account_id = 7 AND total_tokens = 2000`); err != nil {

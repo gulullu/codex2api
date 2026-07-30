@@ -333,7 +333,9 @@ func relayUpstreamEndpointForAccount(account *auth.Account) string {
 // FetchGrokModelIDs 用凭据探测 Grok 上游模型目录（GET /models），返回可用模型 ID
 // 列表（过滤 hidden；API Key 凭据只保留 supported_in_api 的模型）。
 // 条目兼容字符串与对象两种形态、data/models 两种容器（与 Grok CLI 目录响应一致）。
-func FetchGrokModelIDs(ctx context.Context, account *auth.Account) ([]string, error) {
+// proxyURL 由调用方解析(建议 store.ResolveProxyForAccount,与主请求路径同一套
+// 三级回退),避免未绑定代理的账号在探测时直连同一出口 IP。
+func FetchGrokModelIDs(ctx context.Context, account *auth.Account, proxyURL string) ([]string, error) {
 	baseURL, bearer := account.GrokCredentials()
 	if baseURL == "" || bearer == "" {
 		return nil, fmt.Errorf("grok 账号缺少可用凭据")
@@ -348,7 +350,7 @@ func FetchGrokModelIDs(ctx context.Context, account *auth.Account) ([]string, er
 	applyGrokRequestHeaders(req, account, bearer, nil)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := getPooledClient(account, account.GetProxyURL()).Do(req)
+	resp, err := getPooledClient(account, proxyURL).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求 Grok 模型列表失败: %w", err)
 	}

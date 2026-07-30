@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -119,8 +120,10 @@ type Account struct {
 	GrokOIDCIssuer    string
 	GrokPrincipalType string
 	GrokPrincipalID   string
-	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头），仅运行时。
-	grokRateLimit *GrokRateLimitSnapshot
+	// grokRateLimit 是上游逐请求返回的配额余量快照（x-ratelimit-* 头）。
+	// 内存实时更新;dirty 位驱动 store 后台循环按分钟批量落库(grok_rate_limit 凭据)。
+	grokRateLimit      *GrokRateLimitSnapshot
+	grokRateLimitDirty bool
 	// grokFreeQuota 是免费额度耗尽 429 解析出的权威用量快照，随 credentials 落库。
 	grokFreeQuota  *GrokFreeQuotaSnapshot
 	Status         AccountStatus
@@ -2494,9 +2497,12 @@ type Store struct {
 	wg                  sync.WaitGroup
 
 	// 代理池
-	proxyPool        []string // 已启用的代理 URL 列表
-	proxyPoolEnabled bool     // 代理池是否开启
-	proxyRoundRobin  uint64   // 轮询计数器
+	proxyPoolReloadMu sync.Mutex
+	proxyPoolLoader   func(context.Context) ([]*database.ProxyRow, error)
+	proxyPool         []string // 已启用的代理 URL 列表
+	proxyPoolSet      map[string]struct{}
+	proxyPoolEnabled  bool   // 代理池是否开启
+	proxyRoundRobin   uint64 // 轮询计数器
 
 	// Fast scheduler POC（默认关闭，通过环境变量启用）
 	fastScheduler        atomic.Pointer[FastScheduler]
@@ -2975,6 +2981,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		proxyPoolEnabled:        settings.ProxyPoolEnabled,
 		sessionBindings:         make(map[string]sessionAffinity),
 	}
+	if db != nil {
+		s.proxyPoolLoader = db.ListEnabledProxies
+	}
 	s.testModel.Store(settings.TestModel)
 	s.testContent.Store(NormalizeTestContent(settings.TestContent))
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
@@ -3079,6 +3088,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 				urls = append(urls, p.URL)
 			}
 			s.proxyPool = urls
+			s.proxyPoolSet = buildProxyPoolSet(urls)
 			log.Printf("代理池已加载: %d 个活跃代理", len(urls))
 		}
 	}
@@ -3557,9 +3567,16 @@ func (s *Store) SetProxyPoolEnabled(enabled bool) {
 
 // ReloadProxyPool 从数据库重新加载代理池
 func (s *Store) ReloadProxyPool() error {
+	s.proxyPoolReloadMu.Lock()
+	defer s.proxyPoolReloadMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	proxies, err := s.db.ListEnabledProxies(ctx)
+	loader := s.proxyPoolLoader
+	if loader == nil {
+		return errors.New("proxy pool loader is not configured")
+	}
+	proxies, err := loader(ctx)
 	if err != nil {
 		return err
 	}
@@ -3569,9 +3586,44 @@ func (s *Store) ReloadProxyPool() error {
 	}
 	s.mu.Lock()
 	s.proxyPool = urls
+	s.proxyPoolSet = buildProxyPoolSet(urls)
 	s.mu.Unlock()
 	log.Printf("代理池已重新加载: %d 个活跃代理", len(urls))
 	return nil
+}
+
+// RemoveProxyURLs immediately removes proxies from the in-memory pool. It uses
+// the same serialization lock as ReloadProxyPool so an older reload snapshot
+// cannot publish the removed URLs afterward.
+func (s *Store) RemoveProxyURLs(proxyURLs []string) {
+	if s == nil {
+		return
+	}
+	removeSet := buildProxyPoolSet(proxyURLs)
+	if len(removeSet) == 0 {
+		return
+	}
+
+	s.proxyPoolReloadMu.Lock()
+	s.mu.Lock()
+	filtered := make([]string, 0, len(s.proxyPool))
+	for _, proxyURL := range s.proxyPool {
+		if _, remove := removeSet[strings.TrimSpace(proxyURL)]; !remove {
+			filtered = append(filtered, proxyURL)
+		}
+	}
+	s.proxyPool = filtered
+	s.proxyPoolSet = buildProxyPoolSet(filtered)
+	s.mu.Unlock()
+	s.proxyPoolReloadMu.Unlock()
+
+	s.sessionMu.Lock()
+	for key, binding := range s.sessionBindings {
+		if _, remove := removeSet[strings.TrimSpace(binding.proxyURL)]; remove {
+			delete(s.sessionBindings, key)
+		}
+	}
+	s.sessionMu.Unlock()
 }
 
 // GetAutoCleanUnauthorized 获取是否自动清理 401 账号
@@ -3879,12 +3931,18 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		// API Key 凭据没有 AT，下方 at!="" 的恢复分支不会执行，这里补齐身份信息
 		account.AccountID = row.GetCredential("account_id")
 		account.Email = row.GetCredential("email")
-		account.PlanType = row.GetCredential("plan_type")
+		if strings.TrimSpace(apiKey) != "" {
+			account.PlanType = "api"
+		} else {
+			account.PlanType = GrokPlanTypeFromAccessToken(at)
+			if account.PlanType == "" {
+				if storedPlan, ok := ResolveGrokPlan(row.GetCredential("plan_type")); ok {
+					account.PlanType = storedPlan.Key
+				}
+			}
+		}
 		if strings.TrimSpace(apiKey) != "" || at != "" {
 			account.HealthTier = HealthTierHealthy
-		}
-		if account.PlanType == "" {
-			account.PlanType = "api"
 		}
 		// billing 探针的周/月用量随 credentials 落库，重启后在此恢复运行时快照
 		// （周额度占用 5h 槽位、月额度占用 7d 槽位，与探针写入端一致）
@@ -3908,6 +3966,14 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 			var snap GrokFreeQuotaSnapshot
 			if err := json.Unmarshal([]byte(raw), &snap); err == nil && snap.LimitTokens > 0 {
 				account.SetGrokFreeQuotaSnapshot(snap)
+			}
+		}
+		// 配额余量快照（x-ratelimit-* 头）重启后恢复,用量进度条不清零。
+		// markDirty=false:恢复值本来自库里,不需要再触发落库。
+		if raw := strings.TrimSpace(row.GetCredential("grok_rate_limit")); raw != "" {
+			var snap GrokRateLimitSnapshot
+			if err := json.Unmarshal([]byte(raw), &snap); err == nil && !snap.UpdatedAt.IsZero() {
+				account.setGrokRateLimitSnapshot(snap, false)
 			}
 		}
 	}
@@ -3954,7 +4020,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.AccessToken = at
 		account.AccountID = row.GetCredential("account_id")
 		account.Email = row.GetCredential("email")
-		account.PlanType = row.GetCredential("plan_type")
+		if !isGrokAccount {
+			account.PlanType = row.GetCredential("plan_type")
+		}
 		if account.Status != StatusError {
 			account.HealthTier = HealthTierHealthy
 		}
@@ -4091,6 +4159,8 @@ func (s *Store) StartBackgroundRefresh() {
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
+		// Grok 配额余量快照按分钟批量落库(逐请求都在变,不逐请求写库)。
+		grokRateLimitPersistTicker := time.NewTicker(time.Minute)
 		// 到点即探定时器：始终武装到「最近的限流冷却/窗口重置边界」，倒计时归零即探针刷新。
 		boundaryProbeTimer := time.NewTimer(time.Hour)
 		if !boundaryProbeTimer.Stop() {
@@ -4101,6 +4171,7 @@ func (s *Store) StartBackgroundRefresh() {
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
+		defer grokRateLimitPersistTicker.Stop()
 		defer boundaryProbeTimer.Stop()
 
 		resetRefreshTimer := func() {
@@ -4159,13 +4230,50 @@ func (s *Store) StartBackgroundRefresh() {
 				if s.FastSchedulerEnabled() {
 					s.rebuildFastScheduler()
 				}
+			case <-grokRateLimitPersistTicker.C:
+				s.flushGrokRateLimitSnapshots()
 			case <-s.stopCh:
+				// 退出前把未落库的余量快照写掉,容器重启后进度条不清零。
+				s.flushGrokRateLimitSnapshots()
 				return
 			case <-backgroundCtx.Done():
+				s.flushGrokRateLimitSnapshots()
 				return
 			}
 		}
 	}()
+}
+
+// flushGrokRateLimitSnapshots 把自上次落库后有更新的 Grok 配额余量快照批量写进
+// credentials(grok_rate_limit)。逐请求的 x-ratelimit 观测只更新内存并置脏位,
+// 由该函数按分钟节流落库;重启时在账号加载处恢复。
+func (s *Store) flushGrokRateLimitSnapshots() {
+	if s == nil || s.db == nil {
+		return
+	}
+	s.mu.RLock()
+	accounts := make([]*Account, len(s.accounts))
+	copy(accounts, s.accounts)
+	s.mu.RUnlock()
+
+	for _, acc := range accounts {
+		if !acc.IsGrokAPI() {
+			continue
+		}
+		snap, dirty := acc.TakeGrokRateLimitSnapshotIfDirty()
+		if !dirty {
+			continue
+		}
+		raw, err := json.Marshal(snap)
+		if err != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"grok_rate_limit": string(raw)}); err != nil {
+			log.Printf("[账号 %d] 持久化 grok_rate_limit 失败: %v", acc.DBID, err)
+		}
+		cancel()
+	}
 }
 
 // Stop 停止后台刷新
@@ -4597,11 +4705,15 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	if key == "" {
 		return
 	}
+	proxyURL = strings.TrimSpace(proxyURL)
+	if !s.affinityProxyStillValid(account.DBID, proxyURL) {
+		return
+	}
 	ttl := sessionAffinityTTL()
 	now := time.Now()
 	binding := sessionAffinity{
 		accountID:    account.DBID,
-		proxyURL:     strings.TrimSpace(proxyURL),
+		proxyURL:     proxyURL,
 		boundAt:      now,
 		requestCount: 0,
 		expiresAt:    now.Add(ttl),
@@ -4710,6 +4822,12 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	}
 
 	if ok {
+		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
+			s.UnbindSessionAffinity(key, binding.accountID)
+			ok = false
+		}
+	}
+	if ok {
 		expired := !binding.expiresAt.After(now)
 		// bounded 模式下追加逃逸条件检查
 		escape := false
@@ -4724,11 +4842,7 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 
 		if expired || escape {
-			s.sessionMu.Lock()
-			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
-				delete(s.sessionBindings, key)
-			}
-			s.sessionMu.Unlock()
+			s.UnbindSessionAffinity(key, binding.accountID)
 		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
 			// 命中粘性,记一次复用
 			s.sessionMu.Lock()
@@ -4741,6 +4855,10 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 	}
 	if binding, ok := s.getCachedSessionAffinity(key); ok {
+		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
+			s.UnbindSessionAffinity(key, binding.accountID)
+			return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+		}
 		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
 		cacheMode := mode
 		if override := s.resolveGrokAffinityOverride(binding.accountID); override != "" {
@@ -4760,6 +4878,59 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	}
 
 	return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+}
+
+// affinityProxyStillValid verifies that a sticky proxy still matches the
+// account's current explicit proxy or the current fallback proxy configuration.
+// This check applies to strict affinity too: affinity may keep an account sticky,
+// but it must never resurrect a proxy that has been removed or disabled.
+func (s *Store) affinityProxyStillValid(accountID int64, proxyURL string) bool {
+	if s == nil || accountID == 0 {
+		return false
+	}
+	proxyURL = strings.TrimSpace(proxyURL)
+
+	s.mu.RLock()
+	account := s.lookupByIDLocked(accountID)
+	poolEnabled := s.proxyPoolEnabled
+	poolHasEntries := len(s.proxyPool) > 0
+	poolContainsProxy := false
+	if poolHasEntries {
+		if s.proxyPoolSet != nil {
+			_, poolContainsProxy = s.proxyPoolSet[proxyURL]
+		} else {
+			// Backward-compatible fallback for tests or manually assembled stores.
+			for _, candidate := range s.proxyPool {
+				if proxyURL == strings.TrimSpace(candidate) {
+					poolContainsProxy = true
+					break
+				}
+			}
+		}
+	}
+	globalProxy := strings.TrimSpace(s.globalProxy)
+	s.mu.RUnlock()
+	if account == nil {
+		return false
+	}
+
+	if accountProxy := account.GetProxyURL(); accountProxy != "" {
+		return proxyURL == accountProxy
+	}
+	if poolEnabled && poolHasEntries {
+		return poolContainsProxy
+	}
+	return proxyURL == globalProxy
+}
+
+func buildProxyPoolSet(urls []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(urls))
+	for _, proxyURL := range urls {
+		if proxyURL = strings.TrimSpace(proxyURL); proxyURL != "" {
+			set[proxyURL] = struct{}{}
+		}
+	}
+	return set
 }
 
 // affinityAccountStillHealthy 检查一个粘性绑定的账号是否仍处于 healthy 桶。
@@ -6333,6 +6504,26 @@ func (s *Store) ApplyAccountProxyURL(dbID int64, proxyURL string) bool {
 	acc.mu.Lock()
 	acc.ProxyURL = strings.TrimSpace(proxyURL)
 	acc.mu.Unlock()
+	return true
+}
+
+// ClearAccountProxyURLIfMatches clears an account proxy only when its current
+// runtime value still points to one of the removed URLs.
+func (s *Store) ClearAccountProxyURLIfMatches(dbID int64, proxyURLs []string) bool {
+	expected := buildProxyPoolSet(proxyURLs)
+	if len(expected) == 0 {
+		return false
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if _, ok := expected[strings.TrimSpace(acc.ProxyURL)]; !ok {
+		return false
+	}
+	acc.ProxyURL = ""
 	return true
 }
 

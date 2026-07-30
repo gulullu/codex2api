@@ -19,6 +19,32 @@ type SessionAffinityBinding struct {
 	ProxyURL  string `json:"proxy_url,omitempty"`
 }
 
+// ResponseContextReadStatus classifies a bounded shared-backend lookup without
+// changing the TokenCache compatibility interface.
+type ResponseContextReadStatus uint8
+
+const (
+	ResponseContextReadMiss ResponseContextReadStatus = iota
+	ResponseContextReadFound
+	ResponseContextReadTooLarge
+	ResponseContextReadCorrupt
+)
+
+// ResponseContextReadResult is returned by optional bounded response-context
+// readers. Transport failures remain ordinary errors.
+type ResponseContextReadResult struct {
+	Status ResponseContextReadStatus
+	Items  []json.RawMessage
+}
+
+// BoundedResponseContextReader is an additive capability for shared backends.
+// Implementations may reject oversized wire values before deserialization.
+// TokenCache implementations that do not provide it remain supported through
+// GetResponseContext followed by a logical-size check in the proxy.
+type BoundedResponseContextReader interface {
+	GetResponseContextBounded(ctx context.Context, responseID string, maxWireBytes int64) (ResponseContextReadResult, error)
+}
+
 // TokenCache 统一的 token 缓存、刷新锁与短期运行态缓存接口。
 type TokenCache interface {
 	Driver() string

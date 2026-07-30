@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  accountBaseConcurrencyMax,
   buildOpenAIResponsesAccountDraft,
   copySafeCustomHeaders,
   copySafeProxyURL,
@@ -95,29 +94,4 @@ test("copySafeProxyURL never carries embedded proxy credentials", () => {
   assert.equal(copySafeProxyURL("http://proxy.example:8080"), "http://proxy.example:8080");
   assert.equal(copySafeProxyURL("http://user:password@proxy.example:8080"), "");
   assert.equal(copySafeProxyURL("not a URL"), "");
-});
-
-test("base concurrency maximum is 1000 only when every selected account uses Responses API", () => {
-  const responses = {
-    id: 1,
-    name: "relay",
-    email: "relay",
-    plan_type: "api",
-    status: "ready",
-    openai_responses_api: true,
-    proxy_url: "",
-    created_at: "",
-    updated_at: "",
-  };
-  const oauth = {
-    ...responses,
-    id: 2,
-    openai_responses_api: false,
-  };
-
-  assert.equal(accountBaseConcurrencyMax([responses]), 1000);
-  assert.equal(accountBaseConcurrencyMax([responses, { ...responses, id: 3 }]), 1000);
-  assert.equal(accountBaseConcurrencyMax([responses, oauth]), 50);
-  assert.equal(accountBaseConcurrencyMax([oauth]), 50);
-  assert.equal(accountBaseConcurrencyMax([]), 50);
 });

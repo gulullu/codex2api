@@ -12,7 +12,11 @@ import {
 
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 
-export type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
+export type BatchOperationAction =
+  | "batch_test"
+  | "batch_delete"
+  | "batch_refresh"
+  | "grok_import";
 
 export interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
@@ -115,6 +119,9 @@ export interface UseOperationProgressResult {
     body: unknown,
     title: string,
   ) => Promise<BatchOperationEvent | null>;
+  // 直接向浮层喂一个合成进度事件。供非 SSE 的分片式操作(如文件导入按片
+  // 汇报)复用同一个右上角进度条,与流式批量操作视觉一致。
+  reportOperationEvent: (title: string, event: BatchOperationEvent) => void;
   closeOperationProgress: () => void;
   closeOperationResults: () => void;
 }
@@ -305,6 +312,7 @@ export function useOperationProgress(
     operationProgress,
     operationResults,
     runStreamingOperation,
+    reportOperationEvent: applyOperationProgressEvent,
     closeOperationProgress,
     closeOperationResults,
   };

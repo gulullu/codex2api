@@ -111,12 +111,16 @@ interface LimitsFormState {
   costLimit5h: string;
   costLimit7d: string;
   costLimit30d: string;
+  // 自然日(服务器时区,零点清零)限额,与上面的滑动窗口语义不同(issue #460)。
+  costLimitDaily: string;
   tokenLimit5h: string;
   tokenLimit5hUnit: TokenLimitUnit;
   tokenLimit7d: string;
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
+  tokenLimitDaily: string;
+  tokenLimitDailyUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
   upstreamChannel: UpstreamChannel;
   scopeLimits: ScopeLimitFormState[];
@@ -194,8 +198,11 @@ const emptyLimitsForm: LimitsFormState = {
   costLimit5h: "",
   costLimit7d: "",
   costLimit30d: "",
+  costLimitDaily: "",
   tokenLimit5h: "",
   tokenLimit5hUnit: "token",
+  tokenLimitDaily: "",
+  tokenLimitDailyUnit: "token",
   tokenLimit7d: "",
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
@@ -256,6 +263,7 @@ export default function APIKeys() {
   const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
   const [editDirty, setEditDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resettingAll, setResettingAll] = useState(false);
   const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
   const [savingPublicImageStudioPage, setSavingPublicImageStudioPage] =
     useState(false);
@@ -710,7 +718,7 @@ export default function APIKeys() {
       ),
     }));
     try {
-      await api.updateAPIKey(keyRow.id, { reset_quota: true });
+      await api.resetAPIKeyQuota(keyRow.id);
       showToast(t("apiKeys.resetQuotaSuccess"));
       void reloadSilently();
     } catch (error) {
@@ -732,6 +740,41 @@ export default function APIKeys() {
         next.delete(keyRow.id);
         return next;
       });
+    }
+  };
+
+  const handleResetAllQuotas = async () => {
+    const quotaKeyCount = keys.filter((keyRow) => keyRow.quota_limit > 0).length;
+    if (quotaKeyCount === 0) return;
+    const confirmed = await confirm({
+      title: t("apiKeys.resetAllQuotasTitle"),
+      description: t("apiKeys.resetAllQuotasDesc", { count: quotaKeyCount }),
+      confirmText: t("apiKeys.resetAllQuotasConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+
+    setResettingAll(true);
+    try {
+      const result = await api.resetAllAPIKeyQuotas();
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map((item) =>
+          item.quota_limit > 0 ? { ...item, quota_used: 0 } : item,
+        ),
+      }));
+      showToast(
+        t("apiKeys.resetAllQuotasSuccess", { count: result.reset_count }),
+      );
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        `${t("apiKeys.resetAllQuotasFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setResettingAll(false);
     }
   };
 
@@ -983,13 +1026,32 @@ export default function APIKeys() {
             </span>
           }
           actions={
-            <Button
-              onClick={() => setCreateDialogOpen(true)}
-              className="max-sm:w-full"
-            >
-              <Plus className="size-3.5" />
-              {t("apiKeys.createKey")}
-            </Button>
+            <>
+              <Button
+                variant="outline"
+                disabled={
+                  resettingAll ||
+                  !keys.some((keyRow) => keyRow.quota_limit > 0)
+                }
+                onClick={() => void handleResetAllQuotas()}
+                className="max-sm:flex-1"
+              >
+                {resettingAll ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RotateCcw className="size-3.5" />
+                )}
+                {t("apiKeys.resetAllQuotas")}
+              </Button>
+              <Button
+                disabled={resettingAll}
+                onClick={() => setCreateDialogOpen(true)}
+                className="max-sm:flex-1"
+              >
+                <Plus className="size-3.5" />
+                {t("apiKeys.createKey")}
+              </Button>
+            </>
           }
         />
 
@@ -1235,6 +1297,7 @@ export default function APIKeys() {
                         const isVisible = visibleKeys.has(keyRow.id);
                         const isNew = createdKeyId === keyRow.id;
                         const isBusy =
+                          resettingAll ||
                           deletingIds.has(keyRow.id) ||
                           resettingIds.has(keyRow.id);
                         const displayKey = isVisible
@@ -1359,7 +1422,9 @@ export default function APIKeys() {
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  disabled={resettingIds.has(keyRow.id)}
+                                  disabled={
+                                    resettingAll || resettingIds.has(keyRow.id)
+                                  }
                                   onClick={() => void handleResetQuota(keyRow)}
                                   className="min-w-[7rem] flex-1"
                                 >
@@ -1422,6 +1487,7 @@ export default function APIKeys() {
                             const isVisible = visibleKeys.has(keyRow.id);
                             const isNew = createdKeyId === keyRow.id;
                             const isBusy =
+                              resettingAll ||
                               deletingIds.has(keyRow.id) ||
                               resettingIds.has(keyRow.id);
                             const displayKey = isVisible
@@ -1568,7 +1634,10 @@ export default function APIKeys() {
                                       <Button
                                         variant="outline"
                                         size="sm"
-                                        disabled={resettingIds.has(keyRow.id)}
+                                        disabled={
+                                          resettingAll ||
+                                          resettingIds.has(keyRow.id)
+                                        }
                                         onClick={() =>
                                           void handleResetQuota(keyRow)
                                         }
@@ -2354,6 +2423,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
   const token5h = formatTokenLimitForForm(limits.token_limit_5h);
   const token7d = formatTokenLimitForForm(limits.token_limit_7d);
   const token30d = formatTokenLimitForForm(limits.token_limit_30d);
+  const tokenDaily = formatTokenLimitForForm(limits.token_limit_daily);
   return {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
@@ -2379,12 +2449,18 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.cost_limit_30d && limits.cost_limit_30d > 0
         ? String(limits.cost_limit_30d)
         : "",
+    costLimitDaily:
+      limits.cost_limit_daily && limits.cost_limit_daily > 0
+        ? String(limits.cost_limit_daily)
+        : "",
     tokenLimit5h: token5h.value,
     tokenLimit5hUnit: token5h.unit,
     tokenLimit7d: token7d.value,
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
+    tokenLimitDaily: tokenDaily.value,
+    tokenLimitDailyUnit: tokenDaily.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     upstreamChannel:
       limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
@@ -2567,9 +2643,11 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
     cost_limit_30d: num(form.costLimit30d),
+    cost_limit_daily: num(form.costLimitDaily),
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
+    token_limit_daily: parseTokenLimit(form.tokenLimitDaily, form.tokenLimitDailyUnit),
     image_generation_policy:
       form.imageGenerationPolicy === "allow"
         ? undefined
@@ -2825,6 +2903,13 @@ function WindowCostBars({
   usage: APIKeyWindowUsage;
 }) {
   const bars: { label: string; used: number; limit: number }[] = [];
+  if (limits.cost_limit_daily && limits.cost_limit_daily > 0) {
+    bars.push({
+      label: "1D",
+      used: usage.cost_today ?? 0,
+      limit: limits.cost_limit_daily,
+    });
+  }
   if (limits.cost_limit_5h && limits.cost_limit_5h > 0) {
     bars.push({ label: "5h", used: usage.cost_5h, limit: limits.cost_limit_5h });
   }
@@ -3018,9 +3103,11 @@ function LimitsEditor({
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.costLimit30d !== "" ||
+    value.costLimitDaily !== "" ||
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "" ||
     value.tokenLimit30d !== "" ||
+    value.tokenLimitDaily !== "" ||
     value.scopeLimits.length > 0 ||
     value.imageGenerationPolicy !== "allow";
   const [open, setOpen] = useState(hasAny || !!expanded);
@@ -3162,7 +3249,7 @@ function LimitsEditor({
         title={t("apiKeys.limits.sectionCost")}
         description={t("apiKeys.limits.sectionCostDesc")}
       >
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <LimitNumberField
             label={t("apiKeys.limits.cost5h")}
             value={value.costLimit5h}
@@ -3184,7 +3271,17 @@ function LimitsEditor({
             suffix="$"
             step="0.01"
           />
+          <LimitNumberField
+            label={t("apiKeys.limits.costDaily")}
+            value={value.costLimitDaily}
+            onChange={(costLimitDaily) => patch({ costLimitDaily })}
+            suffix="$"
+            step="0.01"
+          />
         </div>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          {t("apiKeys.limits.dailyHint")}
+        </p>
       </LimitSection>
 
       <LimitSection
@@ -3216,6 +3313,14 @@ function LimitsEditor({
             unitOptions={tokenUnitOptions}
             onValueChange={(tokenLimit30d) => patch({ tokenLimit30d })}
             onUnitChange={(tokenLimit30dUnit) => patch({ tokenLimit30dUnit })}
+          />
+          <TokenLimitField
+            label={t("apiKeys.limits.tokensDaily")}
+            value={value.tokenLimitDaily}
+            unit={value.tokenLimitDailyUnit}
+            unitOptions={tokenUnitOptions}
+            onValueChange={(tokenLimitDaily) => patch({ tokenLimitDaily })}
+            onUnitChange={(tokenLimitDailyUnit) => patch({ tokenLimitDailyUnit })}
           />
         </div>
       </LimitSection>
@@ -3934,5 +4039,4 @@ function FormField({
     </Component>
   );
 }
-
 

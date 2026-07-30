@@ -11,6 +11,17 @@ import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '..
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import { buildWritableSettingsPayload } from '../lib/settingsPayload'
+import {
+  MIB,
+  buildResponseCacheBudgetPatch,
+  bytesToMiB,
+  mergeResponseCacheGeneration,
+  mibToBytes,
+  validateResponseCacheBudget,
+  type ResponseCacheBudgetMiB,
+  type ResponseCacheBudgetValidationError,
+} from '../lib/responseCacheMetrics'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -94,6 +105,14 @@ const REASONING_EFFORT_OPTIONS = ['none', 'minimal', 'low', 'medium', 'high', 'x
 }))
 const AUTO_SAVE_STATUS_RESET_MS = 1800
 const AUTO_SAVE_TOAST_MS = 2000
+const DEFAULT_RESPONSE_CACHE_TOTAL_BYTES = 64 * MIB
+const DEFAULT_RESPONSE_CACHE_ENTRY_BYTES = 8 * MIB
+const DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES = 64 * MIB
+const RESPONSE_CACHE_BUDGET_KEYS = [
+  'response_cache_local_max_bytes',
+  'response_cache_local_max_entry_bytes',
+  'response_cache_reconstruct_max_bytes',
+] as const satisfies ReadonlyArray<keyof SystemSettings>
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
   client_name: 'codex-tui',
@@ -154,6 +173,45 @@ const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof Syst
     patch[key] = settings[key]
   }
   return patch as Partial<SystemSettings>
+}
+
+const normalizeResponseCacheSettings = (settings: SystemSettings): SystemSettings => ({
+  ...settings,
+  response_cache_local_max_bytes: Number.isFinite(settings.response_cache_local_max_bytes)
+    ? settings.response_cache_local_max_bytes
+    : DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
+  response_cache_local_max_entry_bytes: Number.isFinite(settings.response_cache_local_max_entry_bytes)
+    ? settings.response_cache_local_max_entry_bytes
+    : DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
+  response_cache_reconstruct_max_bytes: Number.isFinite(settings.response_cache_reconstruct_max_bytes)
+    ? settings.response_cache_reconstruct_max_bytes
+    : DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+  response_cache_config_generation: Number.isFinite(settings.response_cache_config_generation)
+    ? settings.response_cache_config_generation
+    : 0,
+})
+
+const responseCacheBudgetFromSettings = (settings: SystemSettings): ResponseCacheBudgetMiB => ({
+  totalMiB: bytesToMiB(settings.response_cache_local_max_bytes),
+  entryMiB: bytesToMiB(settings.response_cache_local_max_entry_bytes),
+  reconstructMiB: bytesToMiB(settings.response_cache_reconstruct_max_bytes),
+})
+
+const isResponseCacheBudgetKey = (key: keyof SystemSettings) =>
+  RESPONSE_CACHE_BUDGET_KEYS.some((candidate) => candidate === key)
+
+const responseCacheBudgetFieldPatch = (
+  field: keyof ResponseCacheBudgetMiB,
+  value: number,
+): Partial<SystemSettings> => {
+  switch (field) {
+    case 'totalMiB':
+      return { response_cache_local_max_bytes: mibToBytes(value) }
+    case 'entryMiB':
+      return { response_cache_local_max_entry_bytes: mibToBytes(value) }
+    case 'reconstructMiB':
+      return { response_cache_reconstruct_max_bytes: mibToBytes(value) }
+  }
 }
 
 const parseReasoningEffortModelEntries = (value: string): ReasoningEffortModelEntry[] => {
@@ -1101,10 +1159,11 @@ export default function Settings() {
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
   const normalizeLazySettingsForm = useCallback((settings: SystemSettings): SystemSettings => {
+    const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
-      ...settings,
-      billing_tier_policy: normalizeBillingTierPolicyValue(settings.billing_tier_policy),
-      first_token_mode: normalizeFirstTokenModeValue(settings.first_token_mode),
+      ...cacheNormalized,
+      billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
+      first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
     }
     if (!normalized.lazy_mode) {
       return normalized
@@ -1178,6 +1237,10 @@ export default function Settings() {
     database_label: 'PostgreSQL',
     cache_driver: 'redis',
     cache_label: 'Redis',
+    response_cache_local_max_bytes: DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
+    response_cache_local_max_entry_bytes: DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
+    response_cache_reconstruct_max_bytes: DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+    response_cache_config_generation: 0,
     model_mapping: '{}',
     codex_model_mapping: '{}',
     payload_rules: '{}',
@@ -1238,8 +1301,13 @@ export default function Settings() {
     ignore_usage_limit_status: false,
   })
   const lazyModeActive = settingsForm.lazy_mode
+  const responseCacheBudget = responseCacheBudgetFromSettings(settingsForm)
   const [savingSettings, setSavingSettings] = useState(false)
   const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
+  const [responseCacheValidationError, setResponseCacheValidationError] = useState<ResponseCacheBudgetValidationError | null>(null)
+  const responseCacheValidationMessage = responseCacheValidationError
+    ? t(`settings.responseCache.validation.${responseCacheValidationError}`)
+    : ''
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
@@ -1255,7 +1323,7 @@ export default function Settings() {
   const settingsFormRef = useRef(settingsForm)
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
-  const autoSaveStatusTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
+  const autoSaveStatusTimerRef = useRef<number | null>(null)
   const { toast, showToast } = useToast()
 
   useEffect(() => {
@@ -1334,10 +1402,24 @@ export default function Settings() {
         const fieldKey = String(key)
         return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
       })
-      if (mergeKeys.length > 0) {
+      const currentSettings = settingsFormRef.current
+      const responseCacheRequest = patchKeys.some(isResponseCacheBudgetKey)
+      const mergedResponseCacheGeneration = responseCacheRequest
+        ? mergeResponseCacheGeneration(
+            currentSettings.response_cache_config_generation,
+            updated.response_cache_config_generation,
+          )
+        : currentSettings.response_cache_config_generation
+      if (
+        mergeKeys.length > 0
+        || mergedResponseCacheGeneration !== currentSettings.response_cache_config_generation
+      ) {
         commitSettingsForm({
-          ...settingsFormRef.current,
+          ...currentSettings,
           ...getSettingsPatchValues(updated, mergeKeys),
+          ...(responseCacheRequest
+            ? { response_cache_config_generation: mergedResponseCacheGeneration }
+            : {}),
         })
       }
       const autoSaveSuccessMessage = updated.expired_cleaned && updated.expired_cleaned > 0
@@ -1376,6 +1458,38 @@ export default function Settings() {
     } as Partial<SystemSettings>)
   }, [autoSaveSettingsPatch])
 
+  const updateResponseCacheBudget = (
+    field: keyof ResponseCacheBudgetMiB,
+    value: number,
+  ) => {
+    const next = {
+      ...responseCacheBudgetFromSettings(settingsFormRef.current),
+      [field]: value,
+    }
+    setResponseCacheValidationError(validateResponseCacheBudget(next))
+    commitSettingsForm({
+      ...settingsFormRef.current,
+      ...responseCacheBudgetFieldPatch(field, value),
+    })
+  }
+
+  const commitResponseCacheBudget = (
+    field: keyof ResponseCacheBudgetMiB,
+    value: number,
+  ) => {
+    const next = {
+      ...responseCacheBudgetFromSettings(settingsFormRef.current),
+      [field]: value,
+    }
+    const validationError = validateResponseCacheBudget(next)
+    setResponseCacheValidationError(validationError)
+    if (validationError) {
+      showToast(t(`settings.responseCache.validation.${validationError}`), 'error')
+      return
+    }
+    void autoSaveSettingsPatch(buildResponseCacheBudgetPatch(next))
+  }
+
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
     commitSettingsForm(settings)
@@ -1411,10 +1525,19 @@ export default function Settings() {
   })
 
   const handleSaveSettings = async () => {
+    const normalized = normalizeLazySettingsForm(settingsForm)
+    const validationError = validateResponseCacheBudget(responseCacheBudgetFromSettings(normalized))
+    setResponseCacheValidationError(validationError)
+    if (validationError) {
+      showToast(t(`settings.responseCache.validation.${validationError}`), 'error')
+      return
+    }
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
+      const updated = await api.updateSettings(
+        buildWritableSettingsPayload(normalized),
+      )
       commitSettingsForm(updated)
       const branding = {
         site_name: updated.site_name,
@@ -1876,7 +1999,6 @@ export default function Settings() {
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')} suffix={t('settings.unit.concurrency')}>
                   <DraftNumberInput
                     min={1}
-                    max={50}
                     value={settingsForm.max_concurrency}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, max_concurrency: value }))}
                   />
@@ -2328,6 +2450,75 @@ export default function Settings() {
           </SettingsSection>
 
           <SettingsSection id="settings-runtime" title={t('settings.nav.runtime')} description={t('settings.nav.runtimeDesc')}>
+          <SettingsCard
+            title={t('settings.responseCache.title')}
+            description={t('settings.responseCache.description')}
+            icon={<Database className="size-4" />}
+            badge={
+              <Badge variant="outline" className="text-[11px] tabular-nums">
+                {settingsForm.response_cache_config_generation > 0
+                  ? t('settings.responseCache.generation', { value: settingsForm.response_cache_config_generation })
+                  : t('settings.responseCache.generationPending')}
+              </Badge>
+            }
+          >
+            <div className="space-y-4">
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField
+                  label={t('settings.responseCache.total')}
+                  description={t('settings.responseCache.totalDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.totalMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('totalMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('totalMiB', value)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.responseCache.entry')}
+                  description={t('settings.responseCache.entryDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.entryMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('entryMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('entryMiB', value)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.responseCache.reconstruct')}
+                  description={t('settings.responseCache.reconstructDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.reconstructMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('reconstructMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('reconstructMiB', value)}
+                  />
+                </SettingField>
+              </div>
+              {responseCacheValidationMessage ? (
+                <p role="alert" className="text-xs font-medium text-destructive">
+                  {responseCacheValidationMessage}
+                </p>
+              ) : null}
+              <div className="rounded-lg border border-primary/15 bg-primary/5 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
+                <p>{t('settings.responseCache.l1Note')}</p>
+                <p className="mt-1.5">{t('settings.responseCache.memoryNote')}</p>
+              </div>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')} icon={<Wifi className="size-4" />}>
             <div className="space-y-4">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">

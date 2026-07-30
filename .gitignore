@@ -44,4 +44,5 @@ CPA-Manager-Plus/
 grok2api/
 grokcli2api-go/
 .gstack/
+.superpowers/
 CLAUDE.md

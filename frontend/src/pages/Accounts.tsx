@@ -44,11 +44,7 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
-import {
-  DEFAULT_ACCOUNT_BASE_CONCURRENCY_MAX,
-  accountBaseConcurrencyMax,
-  buildOpenAIResponsesAccountDraft,
-} from "../lib/openAIResponsesAccountDraft";
+import { buildOpenAIResponsesAccountDraft } from "../lib/openAIResponsesAccountDraft";
 import {
   collectAccountOperationResult,
   resolveChannelBatchTestAccountIDs,
@@ -3660,19 +3656,10 @@ export default function Accounts() {
   const batchBaseConcurrencyValue = batchBaseConcurrencyTrimmed
     ? parseIntegerInput(batchBaseConcurrencyTrimmed)
     : null;
-  const selectedAccountRows = accounts.filter((account) =>
-    selected.has(account.id),
-  );
-  const batchBaseConcurrencyMax =
-    selectedAccountRows.length === selected.size
-      ? accountBaseConcurrencyMax(selectedAccountRows)
-      : DEFAULT_ACCOUNT_BASE_CONCURRENCY_MAX;
   const batchBaseConcurrencyInvalid =
     batchUpdateBaseConcurrency &&
     batchBaseConcurrencyTrimmed !== "" &&
-    (batchBaseConcurrencyValue === null ||
-      batchBaseConcurrencyValue < 1 ||
-      batchBaseConcurrencyValue > batchBaseConcurrencyMax);
+    (batchBaseConcurrencyValue === null || batchBaseConcurrencyValue < 1);
   const batchSchedulerPriorityInvalid =
     batchUpdateSchedulerPriority &&
     isSchedulerPriorityInputInvalid(batchSchedulerPriorityInput);
@@ -4034,9 +4021,6 @@ export default function Accounts() {
     scoreMode === "custom" ? parseIntegerInput(scoreInput) : null;
   const parsedBaseConcurrency =
     concurrencyMode === "custom" ? parseIntegerInput(concurrencyInput) : null;
-  const editBaseConcurrencyMax = accountBaseConcurrencyMax(
-    editingAccount ? [editingAccount] : [],
-  );
   const scoreInputInvalid =
     scoreMode === "custom" &&
     (parsedScoreBias === null ||
@@ -4044,9 +4028,7 @@ export default function Accounts() {
       parsedScoreBias > 200);
   const concurrencyInputInvalid =
     concurrencyMode === "custom" &&
-    (parsedBaseConcurrency === null ||
-      parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > editBaseConcurrencyMax);
+    (parsedBaseConcurrency === null || parsedBaseConcurrency < 1);
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
@@ -4227,9 +4209,7 @@ export default function Accounts() {
   );
   const groupBaseConcurrencyInvalid =
     groupDraft.baseConcurrencyInput.trim() !== "" &&
-    (parsedGroupBaseConcurrency === null ||
-      parsedGroupBaseConcurrency < 1 ||
-      parsedGroupBaseConcurrency > 50);
+    (parsedGroupBaseConcurrency === null || parsedGroupBaseConcurrency < 1);
 
   const resetGroupDraft = () => {
     setGroupDraft({
@@ -7804,23 +7784,19 @@ export default function Accounts() {
                           <div className="mt-3 space-y-2">
                             <Input
                               inputMode="numeric"
-                              max={editBaseConcurrencyMax}
                               value={concurrencyInput}
                               onChange={(
                                 event: ChangeEvent<HTMLInputElement>,
                               ) => setConcurrencyInput(event.target.value)}
                               placeholder={t(
                                 "accounts.schedulerConcurrencyPlaceholder",
-                                { max: editBaseConcurrencyMax },
                               )}
                             />
                             <div
                               className={`text-xs ${concurrencyInputInvalid ? "text-red-500" : "text-muted-foreground"}`}
                             >
                               {concurrencyInputInvalid
-                                ? t("accounts.schedulerConcurrencyRange", {
-                                    max: editBaseConcurrencyMax,
-                                  })
+                                ? t("accounts.schedulerConcurrencyRange")
                                 : t("accounts.schedulerCustomValuePreview", {
                                     value:
                                       parsedBaseConcurrency ??
@@ -8512,14 +8488,12 @@ export default function Accounts() {
                     <Input
                       className="mt-3"
                       inputMode="numeric"
-                      max={batchBaseConcurrencyMax}
                       value={batchBaseConcurrencyInput}
                       onChange={(event: ChangeEvent<HTMLInputElement>) =>
                         setBatchBaseConcurrencyInput(event.target.value)
                       }
                       placeholder={t(
                         "accounts.schedulerConcurrencyPlaceholder",
-                        { max: batchBaseConcurrencyMax },
                       )}
                       disabled={!batchUpdateBaseConcurrency}
                     />
@@ -8527,9 +8501,7 @@ export default function Accounts() {
                       className={`mt-1.5 text-xs ${batchBaseConcurrencyInvalid ? "text-red-500" : "text-muted-foreground"}`}
                     >
                       {batchBaseConcurrencyInvalid
-                        ? t("accounts.schedulerConcurrencyRange", {
-                            max: batchBaseConcurrencyMax,
-                          })
+                        ? t("accounts.schedulerConcurrencyRange")
                         : t("accounts.batchMetaResetHint")}
                     </div>
                   </div>
@@ -8962,7 +8934,6 @@ export default function Accounts() {
                     <Input
                       type="number"
                       min={1}
-                      max={50}
                       step={1}
                       inputMode="numeric"
                       value={groupDraft.baseConcurrencyInput}

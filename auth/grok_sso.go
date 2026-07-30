@@ -292,6 +292,7 @@ func (f *grokSSOFlow) pollToken(ctx context.Context, deviceCode string, interval
 				AccessToken:  payload.AccessToken,
 				RefreshToken: payload.RefreshToken,
 				IDToken:      payload.IDToken,
+				PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 				ExpiresAt:    expiresAt,
 			}, nil
 		}

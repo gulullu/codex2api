@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -46,6 +47,7 @@ type Handler struct {
 	store                     *auth.Store
 	cache                     cache.TokenCache
 	db                        *database.DB
+	cacheCfgStore             responseCacheSettingsStore
 	rateLimiter               *proxy.RateLimiter
 	systemUpdate              *systemUpdater
 	systemUpdateOnce          sync.Once
@@ -55,7 +57,12 @@ type Handler struct {
 	queryResetCredits         func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit        func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
 	recordAccountEvent        func(int64, string, string)
+	proxyProbe                func(context.Context, string, string) proxyProbeResult
+	reloadProxyPoolFn         func() error
+	proxyBatchEventSender     func(*gin.Context, proxyBatchTestEvent) bool
+	proxyBatchTestMu          sync.Mutex
 	cpuSampler                *cpuSampler
+	memReader                 memStatsReader
 	startedAt                 time.Time
 	pgMaxConns                int
 	redisPoolSize             int
@@ -98,6 +105,61 @@ type Handler struct {
 	// Agent Identity 导入互斥锁：串行化 runtime_id 的数据库查重与插入，
 	// 防止并发请求在“检查不存在”后同时建号。
 	agentIdentityImportMu sync.Mutex
+}
+
+type responseCacheSettingsStore interface {
+	GetResponseCacheSettings(context.Context) (database.ResponseCacheSettings, error)
+	UpdateResponseCacheSettings(
+		context.Context,
+		database.ResponseCacheSettingsUpdate,
+	) (database.ResponseCacheSettings, error)
+}
+
+func validateResponseCacheSettingsUpdateRanges(update database.ResponseCacheSettingsUpdate) error {
+	switch {
+	case update.LocalMaxBytes != nil &&
+		(*update.LocalMaxBytes < database.MinResponseCacheLocalMaxBytes ||
+			*update.LocalMaxBytes > database.MaxResponseCacheLocalMaxBytes):
+		return fmt.Errorf(
+			"%w: response_cache_local_max_bytes must be between %d and %d",
+			database.ErrInvalidResponseCacheSettings,
+			database.MinResponseCacheLocalMaxBytes,
+			database.MaxResponseCacheLocalMaxBytes,
+		)
+	case update.LocalMaxEntryBytes != nil &&
+		(*update.LocalMaxEntryBytes < database.MinResponseCacheLocalMaxEntryBytes ||
+			*update.LocalMaxEntryBytes > database.MaxResponseCacheLocalMaxEntryBytes):
+		return fmt.Errorf(
+			"%w: response_cache_local_max_entry_bytes must be between %d and %d",
+			database.ErrInvalidResponseCacheSettings,
+			database.MinResponseCacheLocalMaxEntryBytes,
+			database.MaxResponseCacheLocalMaxEntryBytes,
+		)
+	case update.ReconstructMaxBytes != nil &&
+		(*update.ReconstructMaxBytes < database.MinResponseCacheReconstructMaxBytes ||
+			*update.ReconstructMaxBytes > database.MaxResponseCacheReconstructMaxBytes):
+		return fmt.Errorf(
+			"%w: response_cache_reconstruct_max_bytes must be between %d and %d",
+			database.ErrInvalidResponseCacheSettings,
+			database.MinResponseCacheReconstructMaxBytes,
+			database.MaxResponseCacheReconstructMaxBytes,
+		)
+	default:
+		return nil
+	}
+}
+
+func (h *Handler) cacheSettingsStore() responseCacheSettingsStore {
+	if h == nil {
+		return nil
+	}
+	if h.cacheCfgStore != nil {
+		return h.cacheCfgStore
+	}
+	if h.db == nil {
+		return nil
+	}
+	return h.db
 }
 
 type chartCacheEntry struct {
@@ -399,6 +461,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		store:          store,
 		cache:          tc,
 		db:             db,
+		cacheCfgStore:  db,
 		rateLimiter:    rl,
 		cpuSampler:     newCPUSampler(),
 		startedAt:      time.Now(),
@@ -539,7 +602,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
+	api.POST("/keys/reset-all-quotas", h.ResetAllAPIKeyQuotas)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
+	api.POST("/keys/:id/reset-quota", h.ResetAPIKeyQuota)
 	api.GET("/keys/:id/scope-usage", h.GetAPIKeyScopeUsage)
 	api.GET("/keys-scope-summary", h.GetAPIKeysScopeSummary)
 	api.POST("/keys/:id/scope-quota/reset", h.ResetAPIKeyScopeQuota)
@@ -604,7 +669,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/proxies/:id", h.DeleteProxy)
 	api.PATCH("/proxies/:id", h.UpdateProxy)
 	api.POST("/proxies/batch-delete", h.BatchDeleteProxies)
+	api.POST("/proxies/clean-error", h.CleanErrorProxies)
 	api.POST("/proxies/test", h.TestProxy)
+	api.POST("/proxies/test-all", h.TestAllProxies)
+	api.POST("/proxies/auto-balance", h.AutoBalanceProxies)
 
 	// OAuth 授权流程
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
@@ -831,6 +899,7 @@ type accountResponse struct {
 	GrokAPI                    bool                        `json:"grok_api,omitempty"`
 	AgentIdentity              bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind               string                      `json:"grok_auth_kind,omitempty"`
+	GrokPlan                   *auth.GrokPlan              `json:"grok_plan,omitempty"`
 	GrokBilling                json.RawMessage             `json:"grok_billing,omitempty"`
 	GrokRateLimit              *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
 	GrokFreeQuota              *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
@@ -967,6 +1036,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	// ?view=lite — 轻量视图:只返回身份/绑定字段,跳过用量富化与探测触发。
+	// 供代理绑定弹窗等只需要"账号是谁、绑了哪条代理"的场景,大号池下不再传输
+	// 全量调度指标(代理页卡死问题)。
+	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+		h.listAccountsLite(c, ctx)
+		return
+	}
+
 	h.store.TriggerUsageProbeAsync()
 	h.store.TriggerRecoveryProbeAsync()
 
@@ -1012,8 +1089,24 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			email = baseURL
 		}
 		planType := row.GetCredential("plan_type")
-		if (isOpenAIResponsesAccount || isGrokAccount) && planType == "" {
+		if isOpenAIResponsesAccount && planType == "" {
 			planType = "api"
+		}
+		if isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey {
+			planType = "api"
+		}
+		if isGrokAccount {
+			if runtimeAccount, ok := accountMap[row.ID]; ok {
+				if runtimePlan := runtimeAccount.GetPlanType(); runtimePlan != "" {
+					planType = runtimePlan
+				}
+			}
+		}
+		var grokPlan *auth.GrokPlan
+		if isGrokAccount {
+			if resolved, ok := auth.ResolveGrokPlan(planType); ok {
+				grokPlan = &resolved
+			}
 		}
 		codexClientMetadataMode := ""
 		if isOpenAIResponsesAccount {
@@ -1044,6 +1137,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			GrokAPI:                  isGrokAccount,
 			AgentIdentity:            isAgentIdentityCredentialRow(row),
 			GrokAuthKind:             grokAuthKind,
+			GrokPlan:                 grokPlan,
 			GrokBilling:              grokBilling,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
@@ -1260,6 +1354,80 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
 }
 
+// accountLiteResponse 是 ?view=lite 的账号条目:身份 + 绑定字段,无调度/用量指标。
+// 字段名与完整版 accountResponse 对齐,前端可直接当 AccountRow 子集消费。
+type accountLiteResponse struct {
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Email              string `json:"email"`
+	PlanType           string `json:"plan_type"`
+	Status             string `json:"status"`
+	Enabled            bool   `json:"enabled"`
+	ProxyURL           string `json:"proxy_url"`
+	ATOnly             bool   `json:"at_only"`
+	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
+	GrokAPI            bool   `json:"grok_api"`
+	AgentIdentity      bool   `json:"agent_identity"`
+	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
+}
+
+func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
+	channel := parseUsageChannel(c)
+	rows, err := h.db.ListActiveByChannel(ctx, channel)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	// 运行时状态覆盖 DB 状态(与完整视图一致),其余富化一律跳过。
+	runtimeStatus := make(map[int64]string)
+	for _, acc := range h.store.Accounts() {
+		runtimeStatus[acc.DBID] = acc.RuntimeStatus()
+	}
+
+	accounts := make([]accountLiteResponse, 0, len(rows))
+	for _, row := range rows {
+		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
+		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+		grokAuthKind := ""
+		if isGrokAccount {
+			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
+				grokAuthKind = auth.GrokAuthKindAPIKey
+			} else {
+				grokAuthKind = auth.GrokAuthKindOAuth
+			}
+		}
+		email := row.GetCredential("email")
+		if isOpenAIResponsesAccount && email == "" {
+			email = row.GetCredential("base_url")
+		}
+		planType := row.GetCredential("plan_type")
+		if (isOpenAIResponsesAccount || (isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey)) && planType == "" {
+			planType = "api"
+		}
+		status := row.Status
+		if rt, ok := runtimeStatus[row.ID]; ok && rt != "" {
+			status = rt
+		}
+		accounts = append(accounts, accountLiteResponse{
+			ID:                 row.ID,
+			Name:               row.Name,
+			Email:              email,
+			PlanType:           planType,
+			Status:             status,
+			Enabled:            row.Enabled,
+			ProxyURL:           row.ProxyURL,
+			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			GrokAPI:            isGrokAccount,
+			AgentIdentity:      isAgentIdentityCredentialRow(row),
+			GrokAuthKind:       grokAuthKind,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"accounts": accounts})
+}
+
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
@@ -1297,17 +1465,13 @@ type accountSchedulerUpdate struct {
 	CredentialUpdates       map[string]interface{}
 }
 
-const (
-	defaultAccountBaseConcurrencyMax         int64 = 50
-	openAIResponsesAccountBaseConcurrencyMax int64 = 1000
-)
-
-func parseAccountSchedulerUpdate(req updateAccountSchedulerReq, baseConcurrencyMax int64) (accountSchedulerUpdate, error) {
+func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
 	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, baseConcurrencyMax)
+	// 基础并发覆盖：最小 1，无上限（与全局 max_concurrency 一致）
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, math.MaxInt64)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1425,48 +1589,6 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq, baseConcurrencyM
 	}, nil
 }
 
-func requestsExtendedBaseConcurrency(raw json.RawMessage) bool {
-	var value int64
-	return json.Unmarshal(raw, &value) == nil && value > defaultAccountBaseConcurrencyMax
-}
-
-func isOpenAIResponsesAccountRow(row *database.AccountRow) bool {
-	return row != nil && strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
-}
-
-func (h *Handler) accountBaseConcurrencyMax(ctx context.Context, id int64, raw json.RawMessage) (int64, error) {
-	if !requestsExtendedBaseConcurrency(raw) {
-		return defaultAccountBaseConcurrencyMax, nil
-	}
-	row, err := h.db.GetAccountByID(ctx, id)
-	if err != nil {
-		return 0, err
-	}
-	if isOpenAIResponsesAccountRow(row) {
-		return openAIResponsesAccountBaseConcurrencyMax, nil
-	}
-	return defaultAccountBaseConcurrencyMax, nil
-}
-
-func (h *Handler) batchBaseConcurrencyMax(ctx context.Context, ids []int64, raw json.RawMessage) (int64, error) {
-	if !requestsExtendedBaseConcurrency(raw) {
-		return defaultAccountBaseConcurrencyMax, nil
-	}
-	for _, id := range ids {
-		row, err := h.db.GetAccountByID(ctx, id)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return defaultAccountBaseConcurrencyMax, nil
-			}
-			return 0, err
-		}
-		if !isOpenAIResponsesAccountRow(row) {
-			return defaultAccountBaseConcurrencyMax, nil
-		}
-	}
-	return openAIResponsesAccountBaseConcurrencyMax, nil
-}
-
 func (u accountSchedulerUpdate) hasChanges() bool {
 	return u.ScoreBiasOverride.Set ||
 		u.BaseConcurrencyOverride.Set ||
@@ -1546,23 +1668,14 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
-	defer cancel()
-
-	baseConcurrencyMax, err := h.accountBaseConcurrencyMax(ctx, id, req.BaseConcurrencyOverride)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(c, http.StatusNotFound, "账号不存在")
-			return
-		}
-		writeInternalError(c, err)
-		return
-	}
-	update, err := parseAccountSchedulerUpdate(req, baseConcurrencyMax)
+	update, err := parseAccountSchedulerUpdate(req)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
 
 	if update.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
@@ -1917,6 +2030,9 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
 	}
 	if value < minValue || value > maxValue {
+		if maxValue == math.MaxInt64 {
+			return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须 >= %d", field, minValue)
+		}
 		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
@@ -3266,7 +3382,7 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		// Grok 账号：用自身凭据拉取 Grok 上游模型目录
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 		defer cancel()
-		models, err := proxy.FetchGrokModelIDs(ctx, account)
+		models, err := proxy.FetchGrokModelIDs(ctx, account, h.store.ResolveProxyForAccount(account))
 		if err != nil {
 			writeError(c, http.StatusBadGateway, fmt.Sprintf("拉取 Grok 上游模型目录失败: %s", err.Error()))
 			return
@@ -4023,17 +4139,18 @@ func setupSSE(c *gin.Context) {
 	c.Writer.Flush()
 }
 
-func sendSSEJSON(c *gin.Context, event any) {
+func sendSSEJSON(c *gin.Context, event any) bool {
 	data, err := json.Marshal(event)
 	if err != nil {
 		log.Printf("序列化 SSE 事件失败: %v", err)
-		return
+		return false
 	}
 	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
 		log.Printf("写入 SSE 事件失败: %v", err)
-		return
+		return false
 	}
 	c.Writer.Flush()
+	return true
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
@@ -4952,15 +5069,7 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
-
-	baseConcurrencyMax, err := h.batchBaseConcurrencyMax(ctx, ids, req.BaseConcurrencyOverride)
-	if err != nil {
-		writeError(c, http.StatusInternalServerError, "校验账号类型失败: "+err.Error())
-		return
-	}
-	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq, baseConcurrencyMax)
+	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -4971,6 +5080,9 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请提供要更新的字段")
 		return
 	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
 
 	if schedulerUpdate.AllowedAPIKeyIDs.Set {
 		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, schedulerUpdate.AllowedAPIKeyIDs.Values)
@@ -6020,6 +6132,24 @@ func appendUniqueInt64(values []int64, value int64, limit int) []int64 {
 	return append(values, value)
 }
 
+func parseUsageLogBoolFilter(c *gin.Context, name string) (*bool, bool) {
+	raw, exists := c.GetQuery(name)
+	if !exists {
+		return nil, true
+	}
+	switch strings.TrimSpace(raw) {
+	case "true":
+		value := true
+		return &value, true
+	case "false":
+		value := false
+		return &value, true
+	default:
+		writeError(c, http.StatusBadRequest, name+" 参数无效，需要 true 或 false")
+		return nil, false
+	}
+}
+
 // GetOpsErrorSummary 获取运维错误日志概览
 func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -6101,6 +6231,15 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				v := streamStr == "true"
 				filter.StreamOnly = &v
 			}
+			var ok bool
+			filter.CompactOnly, ok = parseUsageLogBoolFilter(c, "compact")
+			if !ok {
+				return
+			}
+			filter.CompactionHistoryOnly, ok = parseUsageLogBoolFilter(c, "has_compaction_history")
+			if !ok {
+				return
+			}
 
 			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
 			if err != nil {
@@ -6172,7 +6311,7 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	}
 
 	// 检查是否有任何 key 配置了窗口 cost limit
-	var need5h, need7d, need30d bool
+	var need5h, need7d, need30d, needDaily bool
 	for _, k := range keys {
 		if k.Limits.CostLimit5h > 0 {
 			need5h = true
@@ -6183,10 +6322,13 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		if k.Limits.CostLimit30d > 0 {
 			need30d = true
 		}
+		if k.Limits.CostLimitDaily > 0 {
+			needDaily = true
+		}
 	}
 
 	// 按需批量查询窗口用量
-	var cost5h, cost7d, cost30d map[int64]float64
+	var cost5h, cost7d, cost30d, costToday map[int64]float64
 	if need5h {
 		cost5h, _ = h.db.GetAllAPIKeysWindowCost(ctx, 5*time.Hour)
 	}
@@ -6196,6 +6338,9 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	if need30d {
 		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
 	}
+	if needDaily {
+		costToday, _ = h.db.GetAllAPIKeysCostSince(ctx, database.StartOfDay(time.Now()))
+	}
 
 	// 最近使用时间：一次聚合，失败不阻断列表
 	lastUsedByID, _ := h.db.ListAPIKeyLastUsedAt(ctx)
@@ -6204,7 +6349,7 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
 	for _, k := range keys {
 		mk := NewMaskedAPIKeyRow(k)
-		if k.Limits.CostLimit5h > 0 || k.Limits.CostLimit7d > 0 || k.Limits.CostLimit30d > 0 {
+		if k.Limits.CostLimit5h > 0 || k.Limits.CostLimit7d > 0 || k.Limits.CostLimit30d > 0 || k.Limits.CostLimitDaily > 0 {
 			detail := &APIKeyWindowUsageDetail{}
 			if cost5h != nil {
 				detail.Cost5h = cost5h[k.ID]
@@ -6214,6 +6359,9 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 			}
 			if cost30d != nil {
 				detail.Cost30d = cost30d[k.ID]
+			}
+			if costToday != nil {
+				detail.CostToday = costToday[k.ID]
 			}
 			mk.WindowUsage = detail
 		}
@@ -6553,9 +6701,11 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		CostLimit5h:            maxFloat(in.CostLimit5h, 0),
 		CostLimit7d:            maxFloat(in.CostLimit7d, 0),
 		CostLimit30d:           maxFloat(in.CostLimit30d, 0),
+		CostLimitDaily:         maxFloat(in.CostLimitDaily, 0),
 		TokenLimit5h:           maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:           maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
+		TokenLimitDaily:        maxInt64(in.TokenLimitDaily, 0),
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
@@ -6938,7 +7088,13 @@ type settingsResponse struct {
 	SmartPacingMinConcurrency          int     `json:"smart_pacing_min_concurrency"`
 	SmartPacingWindows                 string  `json:"smart_pacing_windows"`
 	IgnoreUsageLimitStatus             bool    `json:"ignore_usage_limit_status"`
+	ResponseCacheLocalMaxBytes         int64   `json:"response_cache_local_max_bytes"`
+	ResponseCacheLocalMaxEntryBytes    int64   `json:"response_cache_local_max_entry_bytes"`
+	ResponseCacheReconstructMaxBytes   int64   `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheConfigGeneration      int64   `json:"response_cache_config_generation"`
 }
+
+type rawJSON = json.RawMessage
 
 type updateSettingsReq struct {
 	SiteName                            *string  `json:"site_name"`
@@ -7057,6 +7213,10 @@ type updateSettingsReq struct {
 	SmartPacingMinConcurrency           *int     `json:"smart_pacing_min_concurrency"`
 	SmartPacingWindows                  *string  `json:"smart_pacing_windows"`
 	IgnoreUsageLimitStatus              *bool    `json:"ignore_usage_limit_status"`
+	ResponseCacheLocalMaxBytes          *int64   `json:"response_cache_local_max_bytes"`
+	ResponseCacheLocalMaxEntryBytes     *int64   `json:"response_cache_local_max_entry_bytes"`
+	ResponseCacheReconstructMaxBytes    *int64   `json:"response_cache_reconstruct_max_bytes"`
+	ResponseCacheConfigGeneration       rawJSON  `json:"response_cache_config_generation"`
 }
 
 type brandingResponse struct {
@@ -7569,6 +7729,16 @@ func (h *Handler) GetObservedInstructions(c *gin.Context) {
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
+	cacheSettingsStore := h.cacheSettingsStore()
+	if cacheSettingsStore == nil {
+		writeError(c, http.StatusInternalServerError, "响应缓存设置存储不可用")
+		return
+	}
+	responseCacheSettings, err := cacheSettingsStore.GetResponseCacheSettings(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "读取响应缓存设置失败："+err.Error())
+		return
+	}
 	dbSettings, _ := h.db.GetSystemSettings(ctx)
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
@@ -7625,6 +7795,10 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		TestModel:                           h.store.GetTestModel(),
 		TestContent:                         h.store.GetTestContent(),
 		TestConcurrency:                     h.store.GetTestConcurrency(),
+		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
+		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
+		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -7750,6 +7924,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	h.settingsUpdateMu.Lock()
 	defer h.settingsUpdateMu.Unlock()
+	if req.ResponseCacheConfigGeneration != nil {
+		writeError(c, http.StatusBadRequest, "response_cache_config_generation 为只读字段")
+		return
+	}
 	if req.AutoPause5hThreshold != nil {
 		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
@@ -7794,6 +7972,42 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "auto_reset_credits_before_expiry_min 需在 10 到 10080 分钟之间")
 			return
 		}
+	}
+
+	responseCacheUpdate := database.ResponseCacheSettingsUpdate{
+		LocalMaxBytes:       req.ResponseCacheLocalMaxBytes,
+		LocalMaxEntryBytes:  req.ResponseCacheLocalMaxEntryBytes,
+		ReconstructMaxBytes: req.ResponseCacheReconstructMaxBytes,
+	}
+	responseCacheUpdateRequested := responseCacheUpdate.LocalMaxBytes != nil ||
+		responseCacheUpdate.LocalMaxEntryBytes != nil ||
+		responseCacheUpdate.ReconstructMaxBytes != nil
+	if err := validateResponseCacheSettingsUpdateRanges(responseCacheUpdate); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	cacheSettingsStore := h.cacheSettingsStore()
+	if cacheSettingsStore == nil {
+		writeError(c, http.StatusInternalServerError, "响应缓存设置存储不可用")
+		return
+	}
+	responseCacheSettings, err := cacheSettingsStore.GetResponseCacheSettings(c.Request.Context())
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "读取响应缓存设置失败："+err.Error())
+		return
+	}
+	if responseCacheUpdate.LocalMaxBytes != nil {
+		responseCacheSettings.LocalMaxBytes = *responseCacheUpdate.LocalMaxBytes
+	}
+	if responseCacheUpdate.LocalMaxEntryBytes != nil {
+		responseCacheSettings.LocalMaxEntryBytes = *responseCacheUpdate.LocalMaxEntryBytes
+	}
+	if responseCacheUpdate.ReconstructMaxBytes != nil {
+		responseCacheSettings.ReconstructMaxBytes = *responseCacheUpdate.ReconstructMaxBytes
+	}
+	if err := database.ValidateResponseCacheSettings(responseCacheSettings); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	currentAdminSecret := ""
@@ -7896,9 +8110,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 1 {
 			v = 1
 		}
-		if v > 50 {
-			v = 50
-		}
+		// 不再设上限：由运营按机器与上游承载自行决定
 		h.store.SetMaxConcurrency(v)
 		log.Printf("设置已更新: max_concurrency = %d", v)
 	}
@@ -8665,7 +8877,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	// 持久化保存到数据库
-	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
+	err = h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		SiteName:                            siteName,
 		SiteLogo:                            siteLogo,
 		MaxConcurrency:                      h.store.GetMaxConcurrency(),
@@ -8773,6 +8985,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if responseCacheUpdateRequested {
+			writeError(c, http.StatusInternalServerError, "保存响应缓存设置前无法持久化系统设置")
+			return
+		}
 		if promptFilterChanged {
 			writeError(c, http.StatusInternalServerError, "保存 Prompt 检查设置失败，设置未生效")
 			return
@@ -8803,6 +9019,30 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
+	if responseCacheUpdateRequested {
+		committed, updateErr := cacheSettingsStore.UpdateResponseCacheSettings(
+			c.Request.Context(),
+			responseCacheUpdate,
+		)
+		if updateErr != nil {
+			if errors.Is(updateErr, database.ErrInvalidResponseCacheSettings) {
+				writeError(c, http.StatusBadRequest, updateErr.Error())
+			} else {
+				writeError(c, http.StatusInternalServerError, "保存响应缓存设置失败："+updateErr.Error())
+			}
+			return
+		}
+		responseCacheSettings = committed
+		proxy.ApplyResponseCacheSettings(committed)
+	} else {
+		latest, readErr := cacheSettingsStore.GetResponseCacheSettings(c.Request.Context())
+		if readErr != nil {
+			writeError(c, http.StatusInternalServerError, "读取响应缓存设置失败："+readErr.Error())
+			return
+		}
+		responseCacheSettings = latest
+	}
+
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
 		h.store.TriggerAutoCleanupAsync()
 	}
@@ -8829,6 +9069,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TestModel:                           h.store.GetTestModel(),
 		TestContent:                         h.store.GetTestContent(),
 		TestConcurrency:                     h.store.GetTestConcurrency(),
+		ResponseCacheLocalMaxBytes:          responseCacheSettings.LocalMaxBytes,
+		ResponseCacheLocalMaxEntryBytes:     responseCacheSettings.LocalMaxEntryBytes,
+		ResponseCacheReconstructMaxBytes:    responseCacheSettings.ReconstructMaxBytes,
+		ResponseCacheConfigGeneration:       responseCacheSettings.Generation,
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -9488,6 +9732,17 @@ func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
 
 // ==================== Proxies ====================
 
+func normalizeManagedProxyURL(raw string) (string, error) {
+	normalized := strings.TrimSpace(raw)
+	if err := security.ValidateProxyURL(normalized); err != nil {
+		return "", err
+	}
+	if _, err := security.ParseProxyURL(normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
 // ListProxies 获取代理列表
 func (h *Handler) ListProxies(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -9500,6 +9755,12 @@ func (h *Handler) ListProxies(c *gin.Context) {
 	}
 	if proxies == nil {
 		proxies = []*database.ProxyRow{}
+	}
+	// 绑定数服务端聚合;失败不阻断列表(前端把 0 当"无绑定"展示)。
+	if boundCounts, err := h.db.CountAccountsByProxyURL(ctx); err == nil {
+		for _, p := range proxies {
+			p.BoundCount = boundCounts[strings.TrimSpace(p.URL)]
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"proxies": proxies})
 }
@@ -9529,10 +9790,18 @@ func (h *Handler) AddProxies(c *gin.Context) {
 	// 过滤空行
 	cleaned := make([]string, 0, len(urls))
 	for _, u := range urls {
-		u = strings.TrimSpace(u)
-		if u != "" {
-			cleaned = append(cleaned, u)
+		if strings.TrimSpace(u) != "" {
+			normalizedURL, err := normalizeManagedProxyURL(u)
+			if err != nil {
+				writeError(c, http.StatusBadRequest, "无效的代理 URL: "+err.Error())
+				return
+			}
+			cleaned = append(cleaned, normalizedURL)
 		}
+	}
+	if len(cleaned) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供至少一个有效的代理 URL")
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -9598,6 +9867,14 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	if req.URL != nil {
+		normalizedURL, err := normalizeManagedProxyURL(*req.URL)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "无效的代理 URL: "+err.Error())
+			return
+		}
+		req.URL = &normalizedURL
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -9640,6 +9917,73 @@ func (h *Handler) BatchDeleteProxies(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已删除 %d 个代理", deleted), "deleted": deleted})
 }
 
+// CleanErrorProxies 一键清理测试错误的代理，并解绑引用这些代理的账号。
+func (h *Handler) CleanErrorProxies(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	result, err := h.db.CleanErrorProxies(ctx)
+	if err != nil {
+		log.Printf("清理错误代理失败: %v", err)
+		writeError(c, http.StatusInternalServerError, "清理错误代理失败")
+		return
+	}
+
+	if h.store != nil {
+		for _, accountID := range result.UnboundAccountIDs {
+			h.store.ClearAccountProxyURLIfMatches(accountID, result.DeletedProxyURLs)
+		}
+		h.removeProxyURLsFromRuntime(result.DeletedProxyURLs)
+	}
+	if err := h.reloadProxyPool(); err != nil {
+		log.Printf("错误代理已清理，但代理池刷新失败: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "错误代理已清理，但代理池刷新失败",
+			"cleaned": result.Deleted,
+			"unbound": result.Unbound,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已清理 %d 个错误代理并解绑 %d 个账号", result.Deleted, result.Unbound),
+		"cleaned": result.Deleted,
+		"unbound": result.Unbound,
+	})
+}
+
+func (h *Handler) persistProxyTestResult(ctx context.Context, id int64, expectedURL, status, ip, location string, latencyMs int) error {
+	if id <= 0 {
+		return nil
+	}
+	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if err := h.db.UpdateProxyTestResult(saveCtx, id, expectedURL, status, ip, location, latencyMs); err != nil {
+		return err
+	}
+	if status == database.ProxyTestStatusError {
+		h.removeProxyURLsFromRuntime([]string{expectedURL})
+	}
+	if err := h.reloadProxyPool(); err != nil {
+		return fmt.Errorf("代理测试状态已保存，但代理池刷新失败: %w", err)
+	}
+	return nil
+}
+
+func respondProxyTestSaveError(c *gin.Context, err error, probeMessage string) {
+	if errors.Is(err, database.ErrProxyTestTargetChanged) {
+		c.JSON(http.StatusConflict, gin.H{"error": "代理在测试期间已被修改，请重新测试"})
+		return
+	}
+	if strings.TrimSpace(probeMessage) == "" {
+		probeMessage = "代理测试已完成"
+	}
+	log.Printf("同步代理测试结果失败: probe_error=%q err=%v", probeMessage, err)
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error": fmt.Sprintf("%s；保存测试结果或刷新代理池失败: %v", probeMessage, err),
+	})
+}
+
 // TestProxy 测试代理连通性与出口 IP 位置
 func (h *Handler) TestProxy(c *gin.Context) {
 	var req struct {
@@ -9656,64 +10000,44 @@ func (h *Handler) TestProxy(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请提供代理 URL")
 		return
 	}
-
-	// 创建使用指定代理的 HTTP client
-	transport := &http.Transport{}
-	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	transport.DialContext = baseDialer.DialContext
-	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("代理 URL 格式错误: %v", err)})
-		return
-	}
-	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
-
-	apiLang := req.Lang
-	if apiLang == "" {
-		apiLang = "en"
-	}
-	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/?lang=%s&fields=status,message,country,regionName,city,isp,query", apiLang))
-	latencyMs := int(time.Since(start).Milliseconds())
-
-	if err != nil {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("连接失败: %v", err), "latency_ms": latencyMs})
-		return
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	result := gjson.ParseBytes(body)
-
-	if result.Get("status").String() != "success" {
-		c.JSON(http.StatusOK, gin.H{"success": false, "error": result.Get("message").String(), "latency_ms": latencyMs})
-		return
-	}
-
-	ip := result.Get("query").String()
-	country := result.Get("country").String()
-	region := result.Get("regionName").String()
-	city := result.Get("city").String()
-	isp := result.Get("isp").String()
-	location := country + "·" + region + "·" + city
-
-	// 持久化测试结果
+	expectedURL := proxyURL
 	if req.ID > 0 {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-		defer cancel()
-		if err := h.db.UpdateProxyTestResult(ctx, req.ID, ip, location, latencyMs); err != nil {
-			c.JSON(http.StatusOK, gin.H{"success": false, "error": "代理测试结果保存失败: " + err.Error(), "latency_ms": latencyMs})
+		row, err := h.db.GetProxy(c.Request.Context(), req.ID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "代理不存在")
+				return
+			}
+			writeError(c, http.StatusInternalServerError, "获取代理信息失败")
+			return
+		}
+		storedURL := row.URL
+		if strings.TrimSpace(storedURL) != proxyURL {
+			c.JSON(http.StatusConflict, gin.H{"error": "代理已被修改，请刷新后重新测试"})
+			return
+		}
+		expectedURL = storedURL
+		proxyURL = strings.TrimSpace(storedURL)
+	}
+
+	result := h.runProxyProbe(c.Request.Context(), proxyURL, req.Lang)
+	if result.Conclusive {
+		status := database.ProxyTestStatusError
+		if result.Success {
+			status = database.ProxyTestStatusSuccess
+		}
+		if err := h.persistProxyTestResult(
+			c.Request.Context(),
+			req.ID,
+			expectedURL,
+			status,
+			result.IP,
+			result.Location,
+			result.LatencyMs,
+		); err != nil {
+			respondProxyTestSaveError(c, err, result.Error)
 			return
 		}
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":    true,
-		"ip":         ip,
-		"country":    country,
-		"region":     region,
-		"city":       city,
-		"isp":        isp,
-		"latency_ms": latencyMs,
-		"location":   location,
-	})
+	c.JSON(http.StatusOK, result)
 }

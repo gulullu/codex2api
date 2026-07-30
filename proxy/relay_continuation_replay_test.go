@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
@@ -527,6 +528,102 @@ func TestResponsesRelayContinuationReplayHitSendsStandaloneHistory(t *testing.T)
 		t.Fatalf("status=%d want=200 body=%s", recorder.Code, recorder.Body.String())
 	}
 	assertStandaloneReplayUpstreamBody(t, seenBody)
+}
+
+func TestResponsesRelayReplayHitWinsOverOfficialCacheMissForRequiredGroup(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "7")
+	resetResponseCacheStateForTest(testResponseCacheConfig())
+	t.Cleanup(func() { resetResponseCacheStateForTest(defaultResponseCacheConfig()) })
+	setRelayReplayStoreForTest(t, testRelayReplayStore())
+	cacheRelayContinuationReplay(
+		"anon",
+		[]byte(`{"model":"gpt-4.1-direct","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"look this up"}]}]}`),
+		true,
+		7,
+		[]byte(`{
+			"id":"resp_replay_tool",
+			"output":[{"type":"function_call","id":"fc_1","status":"completed","call_id":"call_1","name":"lookup","arguments":"{}"}]
+		}`),
+		nil,
+	)
+
+	var upstreamCalls atomic.Int32
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"id":"resp_relay_child",
+			"status":"completed",
+			"model":"gpt-4.1-direct",
+			"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],
+			"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}
+		}`)
+	}))
+	defer upstream.Close()
+
+	invoke := func(accountGroupID int64) *httptest.ResponseRecorder {
+		t.Helper()
+		store := newOpenAIResponsesRelayStore(upstream.URL)
+		account := store.FindByID(1)
+		if account == nil {
+			t.Fatal("relay account missing from test store")
+		}
+		account.Mu().Lock()
+		account.GroupIDs = []int64{accountGroupID}
+		account.Mu().Unlock()
+		handler := NewHandler(store, nil, &config.Config{
+			AllowAnonymousV1:       true,
+			CodexUpstreamTransport: "http",
+		}, nil)
+		body := []byte(`{
+			"model":"gpt-4.1-direct",
+			"stream":false,
+			"previous_response_id":"resp_replay_tool",
+			"input":[{"type":"function_call_output","call_id":"call_1","output":"ok"}]
+		}`)
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = req
+		handler.Responses(ctx)
+		return recorder
+	}
+
+	t.Run("complete replay reaches another account in the same group", func(t *testing.T) {
+		recorder := invoke(7)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d want=200 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if upstreamCalls.Load() != 1 {
+			t.Fatalf("Relay upstream calls=%d want=1", upstreamCalls.Load())
+		}
+		if gjson.GetBytes(seenBody, "previous_response_id").Exists() {
+			t.Fatalf("upstream received raw previous_response_id: %s", seenBody)
+		}
+		if !strings.Contains(string(seenBody), `"type":"function_call"`) ||
+			!strings.Contains(string(seenBody), `"type":"function_call_output"`) {
+			t.Fatalf("standalone replay did not contain the complete tool chain: %s", seenBody)
+		}
+	})
+
+	t.Run("group exhaustion remains a 503 instead of a cache 409", func(t *testing.T) {
+		before := upstreamCalls.Load()
+		recorder := invoke(8)
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d want=503 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if upstreamCalls.Load() != before {
+			t.Fatalf("out-of-group Relay received the continuation, calls=%d want=%d", upstreamCalls.Load(), before)
+		}
+		if code := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); code == string(api.ErrCodeResponseContextUnavailable) {
+			t.Fatalf("group exhaustion was masked as response-cache unavailability: %s", recorder.Body.String())
+		}
+	})
 }
 
 func TestResponsesOAuthContinuationReplayHitKeepsOfficialRequestBody(t *testing.T) {
