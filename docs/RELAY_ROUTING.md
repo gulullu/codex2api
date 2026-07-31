@@ -49,11 +49,17 @@ shapes; ordinary HTTP Responses remains the supported Relay path.
 ```env
 CODEX_CYB_RELAY_GROUP_ID=3
 CODEX_CYB_RELAY_ENABLED=true
+CODEX_CYB_RELAY_PIN_ENABLED=true
 CODEX_CYB_RELAY_PIN_TTL_SECONDS=86400
 ```
 
 `CODEX_CYB_RELAY_GROUP_ID` is required. Routing is enabled by default when the
-group ID is positive. The group pin TTL defaults to 24 hours.
+group ID is positive. Relay conversation pins remain enabled by default for
+backward compatibility, and their TTL defaults to 24 hours. Set
+`CODEX_CYB_RELAY_PIN_ENABLED=false` to stop reading and writing conversation
+pins without disabling CYB request-local routing or complete
+`previous_response_id` Replay group restoration. Existing Redis pin keys are
+left untouched to expire naturally.
 
 For the API key used by the caller, configure:
 

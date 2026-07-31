@@ -159,6 +159,21 @@ func loadRelayRouteConfig() relayRouteConfig {
 	return cfg
 }
 
+func relayRoutePinsEnabled() bool {
+	// Keep the historical behavior unless an operator explicitly disables
+	// conversation pinning. Request-local CYB and Replay routing do not depend
+	// on this switch.
+	raw := strings.TrimSpace(os.Getenv("CODEX_CYB_RELAY_PIN_ENABLED"))
+	if raw == "" {
+		return true
+	}
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		return true
+	}
+	return enabled
+}
+
 // ConfiguredCYBRelayGroupID exposes only the resolved numeric group target for
 // administrative learning status and model validation. No credential or
 // upstream endpoint is returned.
@@ -361,7 +376,10 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 			plan.Pinned = true
 		}
 	}
-	if plan.Required() && len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
+	if relayRoutePinsEnabled() &&
+		plan.Required() &&
+		len(plan.PinCandidates) == 0 &&
+		!plan.SkipPinPersistence {
 		plan.SkipPinPersistence = true
 		h.recordRelayRouteStateFallback(c, &plan, "missing_scope")
 	}
@@ -556,6 +574,9 @@ func relayRoutePinAppliesToRequest(source string) bool {
 }
 
 func (h *Handler) readRelayRoutePin(ctx context.Context, candidates []relayRoutePinCandidate) (relayRoutePinValue, bool, error) {
+	if !relayRoutePinsEnabled() {
+		return relayRoutePinValue{}, false, nil
+	}
 	if len(candidates) == 0 {
 		return relayRoutePinValue{}, false, nil
 	}
@@ -582,7 +603,7 @@ func (h *Handler) readRelayRoutePin(ctx context.Context, candidates []relayRoute
 }
 
 func (h *Handler) writeRelayRoutePins(ctx context.Context, plan *relayRoutePlan) error {
-	if plan == nil || !plan.Required() || plan.SkipPinPersistence {
+	if !relayRoutePinsEnabled() || plan == nil || !plan.Required() || plan.SkipPinPersistence {
 		return nil
 	}
 	if len(plan.PinCandidates) == 0 {
@@ -630,7 +651,9 @@ func (h *Handler) observeRelayRouteSelection(c *gin.Context, plan *relayRoutePla
 		becameOverflow = true
 	}
 	if plan.Required() {
-		if len(plan.PinCandidates) == 0 && !plan.SkipPinPersistence {
+		if relayRoutePinsEnabled() &&
+			len(plan.PinCandidates) == 0 &&
+			!plan.SkipPinPersistence {
 			plan.SkipPinPersistence = true
 			h.recordRelayRouteStateFallback(c, plan, "missing_scope")
 		} else if err := h.writeRelayRoutePins(c.Request.Context(), plan); err != nil {
