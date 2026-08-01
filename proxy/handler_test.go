@@ -3123,6 +3123,66 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesAPI403DoesNotCooldownAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.invalid",
+		APIKey:       "test-api-key",
+		Status:       auth.StatusReady,
+	}
+	handler := &Handler{store: store}
+	body := []byte(`{"error":{"code":"forbidden","message":"request rejected"}}`)
+
+	handler.applyCooldownForModel(account, http.StatusForbidden, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active", got)
+	}
+	if reason, until := account.GetCooldownSnapshot(); reason != "" || !until.IsZero() {
+		t.Fatalf("cooldown = (%q, %s), want no cooldown", reason, until)
+	}
+}
+
+func TestOpenAIResponsesAPI402StillMarksPaymentRequired(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.invalid",
+		APIKey:       "test-api-key",
+		Status:       auth.StatusReady,
+	}
+	handler := &Handler{store: store}
+	body := []byte(`{"error":{"code":"payment_required"}}`)
+
+	handler.applyCooldownForModel(account, http.StatusPaymentRequired, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if got := account.RuntimeStatus(); got != "payment_required" {
+		t.Fatalf("RuntimeStatus() = %q, want payment_required", got)
+	}
+}
+
+func TestOpenAIResponsesAPIDeactivatedWorkspace403StillMarksAccountError(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.invalid",
+		APIKey:       "test-api-key",
+		Status:       auth.StatusReady,
+	}
+	handler := &Handler{store: store}
+	body := []byte(`{"detail":{"code":"deactivated_workspace"}}`)
+
+	handler.applyCooldownForModel(account, http.StatusForbidden, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
+	}
+}
+
 // TestAgentRuntimeDeleted403MarksAccountBanned 验证代理请求会将 runtime 已删除的账号标记为封禁。
 func TestAgentRuntimeDeleted403MarksAccountBanned(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})

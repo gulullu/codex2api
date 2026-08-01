@@ -5188,6 +5188,11 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			}
 			return codex429Decision{}
 		}
+		// Responses API 上游的普通 403 可能是请求级拒绝，不应污染后续请求的账号状态。
+		// 当前请求的换号重试由上层逻辑继续处理；402 及上述明确致命 403 仍保持原行为。
+		if statusCode == http.StatusForbidden && account.IsOpenAIResponsesAPI() {
+			return codex429Decision{}
+		}
 		h.store.MarkCooldown(account, 30*time.Minute, "payment_required")
 	}
 	return codex429Decision{}
