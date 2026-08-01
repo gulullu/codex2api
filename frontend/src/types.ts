@@ -1695,6 +1695,8 @@ export interface UsageLog {
   client_user_agent: string
   upstream_user_agent: string
   user_agent_overridden: boolean
+  internal_reason: string
+  parent_request_id: string
   endpoint: string
   model: string
   effective_model: string

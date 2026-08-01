@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -22,10 +24,12 @@ func TestResetAPIKeyQuotaHandler(t *testing.T) {
 	defer db.Close()
 
 	id, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
-		Name:       "client",
-		Key:        "sk-handler-reset-single-1234567890",
-		QuotaLimit: 5,
-		QuotaUsed:  4,
+		Name: "client",
+		Key:  "sk-handler-reset-single-1234567890",
+		Limits: database.APIKeyLimits{
+			CostLimit5h: 1,
+			CostLimit7d: 2,
+		},
 	})
 	if err != nil {
 		t.Fatalf("InsertAPIKeyWithOptions: %v", err)
@@ -35,7 +39,23 @@ func TestResetAPIKeyQuotaHandler(t *testing.T) {
 	c, _ := gin.CreateTestContext(recorder)
 	c.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/admin/keys/1/reset-quota", nil)
-	(&Handler{db: db}).ResetAPIKeyQuota(c)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	cacheCtx := context.Background()
+	for _, key := range []string{
+		fmt.Sprintf("%d:usage:5h", id),
+		fmt.Sprintf("%d:usage:7d", id),
+		fmt.Sprintf("%d:usage:30d", id),
+	} {
+		if err := tc.SetRuntime(cacheCtx, adminAPIKeyLimitsCacheNamespace, key, json.RawMessage(`{"user_billed":4}`), time.Minute); err != nil {
+			t.Fatalf("seed limit cache %s: %v", key, err)
+		}
+	}
+	if err := tc.SetRuntime(cacheCtx, adminAPIKeyCacheNamespace, "sk-handler-reset-single-1234567890", json.RawMessage(`{"id":1}`), time.Minute); err != nil {
+		t.Fatalf("seed API key cache: %v", err)
+	}
+
+	(&Handler{db: db, cache: tc}).ResetAPIKeyQuota(c)
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200, body=%s", recorder.Code, recorder.Body.String())
@@ -46,6 +66,17 @@ func TestResetAPIKeyQuotaHandler(t *testing.T) {
 	}
 	if row.QuotaUsed != 0 || row.ResetCount != 1 || !row.LastResetAt.Valid {
 		t.Fatalf("row after reset = %#v", row)
+	}
+	for _, key := range []string{fmt.Sprintf("%d:usage:5h", id), fmt.Sprintf("%d:usage:7d", id)} {
+		if _, ok, err := tc.GetRuntime(cacheCtx, adminAPIKeyLimitsCacheNamespace, key); err != nil || ok {
+			t.Fatalf("reset cache %s still present: ok=%v err=%v", key, ok, err)
+		}
+	}
+	if _, ok, err := tc.GetRuntime(cacheCtx, adminAPIKeyLimitsCacheNamespace, fmt.Sprintf("%d:usage:30d", id)); err != nil || !ok {
+		t.Fatalf("30d cache should remain: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := tc.GetRuntime(cacheCtx, adminAPIKeyCacheNamespace, "sk-handler-reset-single-1234567890"); err != nil || ok {
+		t.Fatalf("API key auth cache still present: ok=%v err=%v", ok, err)
 	}
 }
 

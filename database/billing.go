@@ -81,30 +81,31 @@ var (
 			LongOutputPricePerMToken:    45.0,
 			LongCacheReadPricePerMToken: 1.0,
 		}},
-		// gpt-5.6-terra: 官方 standard 同 gpt-5.4（$2.5/$15），priority 2×；
+		// gpt-5.6-terra: 2026-07-30 官方降价 20%（$2/$12，原 $2.5/$15），priority 2×；
 		// 独立规范键，便于定价页单独覆盖，不与 gpt-5.4 互相污染。
 		{model: "gpt-5.6-terra", pricing: ModelPricing{
-			InputPricePerMToken:                 2.5,
-			InputPricePerMTokenPriority:         5.0,
-			OutputPricePerMToken:                15.0,
-			OutputPricePerMTokenPriority:        30.0,
-			CacheReadPricePerMToken:             0.25,
-			CacheReadPricePerMTokenPriority:     0.5,
-			LongInputPricePerMToken:             5.0,
-			LongInputPricePerMTokenPriority:     10.0,
-			LongOutputPricePerMToken:            22.5,
-			LongOutputPricePerMTokenPriority:    45.0,
-			LongCacheReadPricePerMToken:         0.5,
-			LongCacheReadPricePerMTokenPriority: 1.0,
+			InputPricePerMToken:                 2.0,
+			InputPricePerMTokenPriority:         4.0,
+			OutputPricePerMToken:                12.0,
+			OutputPricePerMTokenPriority:        24.0,
+			CacheReadPricePerMToken:             0.2,
+			CacheReadPricePerMTokenPriority:     0.4,
+			LongInputPricePerMToken:             4.0,
+			LongInputPricePerMTokenPriority:     8.0,
+			LongOutputPricePerMToken:            18.0,
+			LongOutputPricePerMTokenPriority:    36.0,
+			LongCacheReadPricePerMToken:         0.4,
+			LongCacheReadPricePerMTokenPriority: 0.8,
 		}},
-		// gpt-5.6-luna: 全新最低档。priority 均为 2× standard，由 fast 档兜底自动得出。
+		// gpt-5.6-luna: 2026-07-30 官方降价 80%（$0.20/$1.20，原 $1/$6）。
+		// priority 均为 2× standard，由 fast 档兜底自动得出。
 		{model: "gpt-5.6-luna", pricing: ModelPricing{
-			InputPricePerMToken:         1.0,
-			OutputPricePerMToken:        6.0,
-			CacheReadPricePerMToken:     0.1,
-			LongInputPricePerMToken:     2.0,
-			LongOutputPricePerMToken:    9.0,
-			LongCacheReadPricePerMToken: 0.2,
+			InputPricePerMToken:         0.2,
+			OutputPricePerMToken:        1.2,
+			CacheReadPricePerMToken:     0.02,
+			LongInputPricePerMToken:     0.4,
+			LongOutputPricePerMToken:    1.8,
+			LongCacheReadPricePerMToken: 0.04,
 		}},
 		{model: "gpt-5.4-mini", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 4.5, CacheReadPricePerMToken: 0.075}},
 		{model: "gpt-5.4-nano", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 1.25, CacheReadPricePerMToken: 0.02}},
@@ -368,8 +369,8 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 		return "gpt-5.5", true
 	// GPT-5.6 三个变体官方定价各不相同（developers.openai.com/api/docs/pricing）：
 	//   sol   $5/$30（standard，priority 2× = $10/$60）——同 gpt-5.5 standard 但 priority 更低
-	//   terra $2.5/$15 —— 与 gpt-5.4 同价，但独立规范键，定价页可单独配置
-	//   luna  $1/$6 —— 全新档位
+	//   terra $2/$12（2026-07-30 降 20%，原 $2.5/$15）——独立规范键，定价页可单独配置
+	//   luna  $0.20/$1.20（2026-07-30 降 80%，原 $1/$6）
 	// priority 均为 standard 的 2×，由 serviceTierCostMultiplier 兜底自动得出，无需显式配置。
 	case strings.Contains(compact, "gpt-5.6-sol") || strings.Contains(compact, "gpt5-6-sol") || strings.Contains(compact, "gpt5.6-sol"):
 		return "gpt-5.6-sol", true

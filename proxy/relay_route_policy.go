@@ -272,6 +272,12 @@ func (h *Handler) prepareRelayRoutePlan(c *gin.Context, rawBody []byte, endpoint
 				return &plan, nil
 			}
 		}
+		// Synthetic internal requests without an explicit learning group still
+		// follow the official account filter, including inherited no-affinity
+		// groups, but must not enter the custom Relay audit/learning/replay path.
+		plan.Config = relayRouteConfig{}
+		setRelayRoutePlanContext(c, &plan)
+		return &plan, nil
 	}
 	if !cfg.Enabled || c == nil {
 		setRelayRoutePlanContext(c, &plan)

@@ -244,6 +244,26 @@ func (a *Account) GetGrokRateLimitSnapshot() (GrokRateLimitSnapshot, bool) {
 	return *a.grokRateLimit, true
 }
 
+// SetGrokContextWindow 记录上游 x-grok-context-window 的观测值（非正数忽略）。
+func (a *Account) SetGrokContextWindow(window int64) {
+	if a == nil || window <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.grokContextWindow = window
+}
+
+// GetGrokContextWindow 返回上下文窗口观测值；未观测到时返回 0。
+func (a *Account) GetGrokContextWindow() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.grokContextWindow
+}
+
 // GrokFreeQuotaSnapshot 是免费额度耗尽时从上游 429 错误体解析出的权威用量
 // （tokens (actual/limit)，滚动 24h 窗口）。随 credentials 落库，重启后恢复。
 type GrokFreeQuotaSnapshot struct {

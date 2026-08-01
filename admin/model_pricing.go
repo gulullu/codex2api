@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
@@ -130,9 +131,24 @@ func (h *Handler) grokBillingModelIDs() []string {
 		return nil
 	}
 	ids := h.grokChannelModels()
+	// 默认集按凭据类型不同（OAuth 走 CLI 通道、API Key 走公开 API），
+	// 两种通道各取一次，不能见到第一个未声明账号就收工。
+	oauthCovered, apiKeyCovered := false, false
 	for _, account := range h.store.Accounts() {
-		if account.IsGrokAPI() && len(account.GrokModels()) == 0 {
-			ids = append(ids, proxy.DefaultGrokModelIDs()...)
+		if !account.IsGrokAPI() || len(account.GrokModels()) > 0 {
+			continue
+		}
+		isAPIKey := account.GrokAuthKind() == auth.GrokAuthKindAPIKey
+		if (isAPIKey && apiKeyCovered) || (!isAPIKey && oauthCovered) {
+			continue
+		}
+		if isAPIKey {
+			apiKeyCovered = true
+		} else {
+			oauthCovered = true
+		}
+		ids = append(ids, proxy.DefaultGrokModelIDsForAccount(account)...)
+		if oauthCovered && apiKeyCovered {
 			break
 		}
 	}

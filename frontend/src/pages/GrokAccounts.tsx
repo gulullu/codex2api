@@ -23,6 +23,7 @@ import {
   Rows3,
   LayoutGrid,
   Upload,
+  Download,
   FileText,
   RotateCcw,
   Pencil,
@@ -450,6 +451,7 @@ export default function GrokAccounts({
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
   const [batchTesting, setBatchTesting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [exporting, setExporting] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
   const selectAllRef = useRef<HTMLInputElement>(null);
 
@@ -1348,6 +1350,32 @@ export default function GrokAccounts({
     }
   };
 
+  // 导出 Grok 账号凭据：有勾选则导出选中，否则导出全部。
+  // 单账号后端给裸 JSON，多账号给 ZIP（内部每账号一个 <邮箱>.json）。
+  // 文件名取服务端 Content-Disposition，命名规则只在后端一处维护。
+  const handleExport = async () => {
+    if (accounts.length === 0) return;
+    const ids = selected.size > 0 ? Array.from(selected) : undefined;
+    setExporting(true);
+    try {
+      const { blob, filename } = await api.exportGrokAccounts(ids);
+      const count = ids ? ids.length : accounts.length;
+      const fallback = `codex2api-grok-${new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .slice(0, 19)}-${count}.${blob.type.includes("zip") ? "zip" : "json"}`;
+      downloadBlob(blob, filename || fallback);
+      showToast(t("grok.exportSuccess", { count }));
+    } catch (err) {
+      showToast(
+        t("grok.exportFailed", { error: getErrorMessage(err) }),
+        "error",
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const handleBatchTest = async (testIds?: number[]) => {
     if (accounts.length === 0) return;
 
@@ -1616,6 +1644,24 @@ export default function GrokAccounts({
                   {batchTesting
                     ? t("accounts.batchTesting")
                     : t("accounts.testConnection")}
+                </span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={exporting || accounts.length === 0}
+                onClick={() => void handleExport()}
+                title={t("grok.exportHint")}
+              >
+                {exporting ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Download className="size-3.5" />
+                )}
+                <span className="hidden sm:inline">
+                  {selected.size > 0
+                    ? t("grok.exportSelectedBtn", { count: selected.size })
+                    : t("grok.exportBtn")}
                 </span>
               </Button>
               <label
@@ -4456,4 +4502,16 @@ function CompactStat({
       </div>
     </button>
   );
+}
+
+// downloadBlob 触发浏览器下载（与 Codex 账号页同款实现）。
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }

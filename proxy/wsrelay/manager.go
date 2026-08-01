@@ -333,7 +333,7 @@ func (m *Manager) cleanupLoop() {
 // evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）。
 // 有在途请求的连接/会话一律跳过：IsExpired 只看 lastUsed/LastActiveAt，上游长思考
 // 或 pong 丢失时会把活跃对象误判为空闲，直接 Close 会把在途流同秒批量截断
-// （issue #436）；等在途收尾（PendingRequestTimeout 兜底）后下一轮再清。
+// （issue #436）；等在途收尾（读路径业务帧静默上限 ActiveReadMaxTurnSilence 兜底）后下一轮再清。
 func (m *Manager) evictExpired() {
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)

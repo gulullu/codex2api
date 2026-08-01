@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestResetAPIKeyQuotaPreservesHistoricalUsage(t *testing.T) {
@@ -28,8 +29,12 @@ func TestResetAPIKeyQuotaPreservesHistoricalUsage(t *testing.T) {
 		t.Fatalf("seed total_used: %v", err)
 	}
 
-	if err := db.ResetAPIKeyQuota(ctx, id); err != nil {
+	target, err := db.ResetAPIKeyQuota(ctx, id)
+	if err != nil {
 		t.Fatalf("ResetAPIKeyQuota: %v", err)
+	}
+	if target.ID != id || target.Key != "sk-reset-single-1234567890" {
+		t.Fatalf("reset target = %#v", target)
 	}
 	row, err := db.GetAPIKeyByID(ctx, id)
 	if err != nil {
@@ -43,7 +48,7 @@ func TestResetAPIKeyQuotaPreservesHistoricalUsage(t *testing.T) {
 	}
 }
 
-func TestResetAllAPIKeyQuotasOnlyResetsConfiguredQuotas(t *testing.T) {
+func TestResetAllAPIKeyQuotasResetsEveryKey(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "quota-all.db"))
 	if err != nil {
 		t.Fatalf("New(sqlite): %v", err)
@@ -73,12 +78,12 @@ func TestResetAllAPIKeyQuotasOnlyResetsConfiguredQuotas(t *testing.T) {
 		t.Fatalf("InsertAPIKeyWithOptions unlimited: %v", err)
 	}
 
-	count, err := db.ResetAllAPIKeyQuotas(ctx)
+	targets, err := db.ResetAllAPIKeyQuotas(ctx)
 	if err != nil {
 		t.Fatalf("ResetAllAPIKeyQuotas: %v", err)
 	}
-	if count != 2 {
-		t.Fatalf("reset count = %d, want 2", count)
+	if len(targets) != 3 {
+		t.Fatalf("reset targets = %d, want 3", len(targets))
 	}
 	for _, id := range limitedIDs {
 		row, err := db.GetAPIKeyByID(ctx, id)
@@ -93,7 +98,85 @@ func TestResetAllAPIKeyQuotasOnlyResetsConfiguredQuotas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAPIKeyByID(unlimited): %v", err)
 	}
-	if unlimited.QuotaUsed != 4 || unlimited.ResetCount != 0 || unlimited.LastResetAt.Valid {
-		t.Fatalf("unlimited row was unexpectedly reset: %#v", unlimited)
+	if unlimited.QuotaUsed != 0 || unlimited.ResetCount != 1 || !unlimited.LastResetAt.Valid {
+		t.Fatalf("unlimited row was not reset: %#v", unlimited)
+	}
+}
+
+func TestResetAPIKeyQuotaRestartsOnlyFiveHourAndSevenDayWindows(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "quota-windows.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{
+		Name: "window-only",
+		Key:  "sk-reset-window-only-1234567890",
+		Limits: APIKeyLimits{
+			CostLimit5h: 1,
+			CostLimit7d: 2,
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions: %v", err)
+	}
+	oldAt := time.Now().Add(-time.Hour).Truncate(time.Second)
+	insertAPIKeyQuotaWindowUsage(t, db, id, oldAt, 100, 0.75)
+
+	before, err := db.GetAPIKeyWindowUsage(ctx, id, 5*time.Hour)
+	if err != nil || before.UserBilled != 0.75 || before.Tokens != 100 {
+		t.Fatalf("5h usage before reset = %#v, err=%v", before, err)
+	}
+	if _, err := db.ResetAPIKeyQuota(ctx, id); err != nil {
+		t.Fatalf("ResetAPIKeyQuota: %v", err)
+	}
+
+	for _, window := range []time.Duration{5 * time.Hour, 7 * 24 * time.Hour} {
+		usage, err := db.GetAPIKeyWindowUsage(ctx, id, window)
+		if err != nil {
+			t.Fatalf("GetAPIKeyWindowUsage(%v): %v", window, err)
+		}
+		if usage.UserBilled != 0 || usage.Tokens != 0 || usage.Requests != 0 {
+			t.Fatalf("usage after reset for %v = %#v, want zero", window, usage)
+		}
+		costs, err := db.GetAllAPIKeysWindowCost(ctx, window)
+		if err != nil {
+			t.Fatalf("GetAllAPIKeysWindowCost(%v): %v", window, err)
+		}
+		if costs[id] != 0 {
+			t.Fatalf("batch cost after reset for %v = %v, want zero", window, costs[id])
+		}
+	}
+
+	usage30d, err := db.GetAPIKeyWindowUsage(ctx, id, 30*24*time.Hour)
+	if err != nil || usage30d.UserBilled != 0.75 || usage30d.Tokens != 100 {
+		t.Fatalf("30d usage should retain history: %#v, err=%v", usage30d, err)
+	}
+	daily, err := db.GetAPIKeyUsageSince(ctx, id, time.Now().Add(-24*time.Hour))
+	if err != nil || daily.UserBilled != 0.75 || daily.Tokens != 100 {
+		t.Fatalf("daily usage should retain history: %#v, err=%v", daily, err)
+	}
+
+	row, err := db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID: %v", err)
+	}
+	insertAPIKeyQuotaWindowUsage(t, db, id, row.LastResetAt.Time.Add(time.Second), 25, 0.2)
+	usage5h, err := db.GetAPIKeyWindowUsage(ctx, id, 5*time.Hour)
+	if err != nil || usage5h.UserBilled != 0.2 || usage5h.Tokens != 25 || usage5h.Requests != 1 {
+		t.Fatalf("5h usage after new request = %#v, err=%v", usage5h, err)
+	}
+}
+
+func insertAPIKeyQuotaWindowUsage(t *testing.T, db *DB, apiKeyID int64, at time.Time, tokens int64, billed float64) {
+	t.Helper()
+	_, err := db.conn.Exec(`
+		INSERT INTO usage_logs (api_key_id, status_code, total_tokens, user_billed, created_at)
+		VALUES ($1, 200, $2, $3, $4)
+	`, apiKeyID, tokens, billed, sqliteTimeParam(at))
+	if err != nil {
+		t.Fatalf("insert usage log: %v", err)
 	}
 }

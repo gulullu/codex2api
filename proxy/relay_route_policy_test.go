@@ -370,6 +370,74 @@ func TestInternalRelayRoutePlanSkipsCYBPipelineAndForcesGroup(t *testing.T) {
 	}
 }
 
+func TestAttributedInternalRoutePlanSkipsCustomRelayPipeline(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("CODEX_CYB_RELAY_ENABLED", "true")
+	t.Setenv("CODEX_CYB_RELAY_GROUP_ID", "9")
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	row := &database.APIKeyRow{
+		ID: 42,
+		Limits: database.APIKeyLimits{
+			NoAffinityGroupIDs: []int64{9},
+		},
+	}
+	applyInternalResponseAttribution(c, c.Request, &internalResponseAttribution{
+		APIKeyID:  row.ID,
+		APIKeyRow: row,
+		Reason:    internalReasonOverflowCompact,
+	})
+
+	body := []byte(`{"model":"gpt-5.4","input":"synthetic overflow summary"}`)
+	plan, err := handler.prepareRelayRoutePlan(c, body, "/v1/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Required() || plan.Source != relayRouteSourceDefault {
+		t.Fatalf("internal attributed plan entered custom Relay routing: %+v", plan)
+	}
+	if plan.Config.Enabled || plan.Config.GroupID != 0 {
+		t.Fatalf("internal attributed plan retained custom Relay configuration: %+v", plan.Config)
+	}
+	if plan.AuditRequestID != "" || len(plan.AuditRawBody) != 0 || plan.LocalRuleInspected {
+		t.Fatalf("internal attributed plan entered Relay audit/inspection: %+v", plan)
+	}
+	if len(plan.PinCandidates) != 0 || len(plan.Signals) != 0 || plan.FeedbackDigestValid {
+		t.Fatalf("internal attributed plan retained Relay learning state: %+v", plan)
+	}
+	cachedPlan, ok := relayRoutePlanFromContext(c)
+	if !ok || cachedPlan != plan {
+		t.Fatal("internal attributed plan was not preserved in request context")
+	}
+	learned, err := cyblearn.CompileRule("cyb_auto_internal_overflow_test", `(?i)synthetic overflow summary`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cybroute.PublishLearnedRules([]cyblearn.Rule{learned})
+	t.Cleanup(func() { cybroute.PublishLearnedRules(nil) })
+	handler.upgradeRelayRoutePlanFromPayloadRules(plan, body, "/v1/responses", "gpt-5.4")
+	if plan.Required() || plan.LocalRuleInspected || len(plan.Signals) != 0 {
+		t.Fatalf("internal attributed plan was re-enabled by payload rules: %+v", plan)
+	}
+	becameOverflow, err := handler.observeRelayRouteSelection(c, plan, &auth.Account{DBID: 7, GroupIDs: []int64{9}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if becameOverflow || plan.Required() || plan.Source != relayRouteSourceDefault || plan.SelectionCount != 0 {
+		t.Fatalf("internal attributed plan was re-enabled during account selection: %+v", plan)
+	}
+
+	filter := applyAffinityGroupRouting(c, resolveRequestSessionIdentity(c.Request.Header, body), nil)
+	if filter == nil || !filter(&auth.Account{GroupIDs: []int64{9}}) || filter(&auth.Account{GroupIDs: []int64{8}}) {
+		t.Fatal("official inherited no-affinity account routing was not preserved")
+	}
+}
+
 func TestRequestUsesOfficialNoAffinityRelaySplit(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	newContext := func(groups []int64, headers map[string]string) *gin.Context {

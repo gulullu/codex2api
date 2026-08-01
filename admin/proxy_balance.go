@@ -8,13 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
 // autoBalanceProxiesReq 是代理均衡绑定的请求体。
-//   - Channel: grok/codex/空(全部)。Grok 单 IP 号多会被上游 402,均衡绑定把号摊开。
+//   - Channel: grok/codex/空(全部 OAuth)。Grok 单 IP 号多会被上游 402,均衡绑定把号摊开。
 //   - Mode: unbound(默认,只分配未绑定账号) / all(全量重排,但尽量保留现有绑定以减少换 IP)。
 //   - MaxPerProxy: 每条代理的账号数上限,0 表示不限。
 //   - ProxyIDs: 限定参与分配的代理,空表示所有启用且未测出错误的代理。
@@ -35,6 +36,43 @@ type autoBalanceDistribution struct {
 type balanceAccount struct {
 	id      int64
 	current string
+}
+
+// isOAuthProxyBalanceTarget 只允许真正可刷新的 OAuth 账号参与自动均衡。
+// API Key、中转 API、AT-only、Session Token 与 Agent Identity 账号都不应被
+// 自动改变出口；它们已有的手工绑定仍会作为 baseline 负载参与容量计算。
+func isOAuthProxyBalanceTarget(row *database.AccountRow) bool {
+	if row == nil || strings.TrimSpace(row.GetCredential("refresh_token")) == "" {
+		return false
+	}
+	if strings.TrimSpace(row.GetCredential("api_key")) != "" {
+		return false
+	}
+
+	upstreamType := strings.ToLower(strings.TrimSpace(row.GetCredential("upstream_type")))
+	switch upstreamType {
+	case "":
+		return strings.EqualFold(strings.TrimSpace(row.Type), "oauth")
+	case auth.UpstreamGrok:
+		return true
+	default:
+		return false
+	}
+}
+
+func selectOAuthProxyBalanceTargets(rows []*database.AccountRow, mode string) []balanceAccount {
+	targets := make([]balanceAccount, 0, len(rows))
+	for _, row := range rows {
+		if !isOAuthProxyBalanceTarget(row) {
+			continue
+		}
+		bound := strings.TrimSpace(row.ProxyURL)
+		if mode == "unbound" && bound != "" {
+			continue
+		}
+		targets = append(targets, balanceAccount{id: row.ID, current: bound})
+	}
+	return targets
 }
 
 // balanceResult 是纯分配算法的产出。
@@ -122,7 +160,7 @@ func computeProxyAssignments(targets []balanceAccount, candidates []string, base
 	return result
 }
 
-// AutoBalanceProxies 把指定渠道的账号按"最少绑定优先"均匀分配到候选代理上。
+// AutoBalanceProxies 把指定渠道的 OAuth 账号按"最少绑定优先"均匀分配到候选代理上。
 // POST /api/admin/proxies/auto-balance
 func (h *Handler) AutoBalanceProxies(c *gin.Context) {
 	var req autoBalanceProxiesReq
@@ -167,17 +205,11 @@ func (h *Handler) AutoBalanceProxies(c *gin.Context) {
 		return
 	}
 
-	// 待分配账号集合。unbound 模式只挑未绑定的;all 模式全量参与。
-	targets := make([]balanceAccount, 0, len(rows))
-	for _, row := range rows {
-		bound := strings.TrimSpace(row.ProxyURL)
-		if mode == "unbound" && bound != "" {
-			continue
-		}
-		targets = append(targets, balanceAccount{id: row.ID, current: bound})
-	}
+	// 待分配账号集合只包含可刷新的 OAuth 账号。unbound 模式只挑未绑定的;
+	// all 模式重排全部 OAuth，非 OAuth 账号不参与但其已有绑定仍计入 baseline。
+	targets := selectOAuthProxyBalanceTargets(rows, mode)
 	if len(targets) == 0 {
-		c.JSON(http.StatusOK, gin.H{"message": "没有需要分配的账号", "assigned": 0, "kept": 0, "skipped": 0})
+		c.JSON(http.StatusOK, gin.H{"message": "没有需要分配的 OAuth 账号", "assigned": 0, "kept": 0, "skipped": 0})
 		return
 	}
 
@@ -227,11 +259,11 @@ func (h *Handler) AutoBalanceProxies(c *gin.Context) {
 	sort.Slice(distribution, func(i, j int) bool { return distribution[i].ProxyID < distribution[j].ProxyID })
 
 	security.SecurityAuditLog("PROXY_AUTO_BALANCE", fmt.Sprintf(
-		"channel=%s mode=%s assigned=%d kept=%d skipped=%d proxies=%d cap=%d ip=%s",
+		"channel=%s auth=oauth mode=%s assigned=%d kept=%d skipped=%d proxies=%d cap=%d ip=%s",
 		channel, mode, len(result.assignments), result.kept, result.skipped, len(proxies), req.MaxPerProxy, c.ClientIP()))
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":      "均衡绑定完成",
+		"message":      "OAuth 账号均衡绑定完成",
 		"assigned":     len(result.assignments),
 		"kept":         result.kept,
 		"skipped":      result.skipped,

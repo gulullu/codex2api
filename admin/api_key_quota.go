@@ -9,12 +9,25 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
-// ResetAPIKeyQuota manually renews one API key's configured quota while
-// preserving its cumulative historical usage.
+const (
+	adminAPIKeyLimitsCacheNamespace = "api-key-limits"
+	apiKeyResetWindow5h             = "5h"
+	apiKeyResetWindow7d             = "7d"
+)
+
+// ResetAPIKeyQuota manually renews one API key's cumulative and 5h/7d quota
+// periods while preserving historical usage logs and total usage.
+//
+// POST /api/admin/keys/:id/reset-quota
+//
+// The reset timestamp is used as an aggregation cutoff for 5h/7d cost and
+// token limits, so neither the admin UI nor the gateway counts older events.
+// Runtime caches are evicted before success is returned.
 func (h *Handler) ResetAPIKeyQuota(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -22,10 +35,10 @@ func (h *Handler) ResetAPIKeyQuota(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	row, err := h.db.GetAPIKeyByID(ctx, id)
+	target, err := h.db.ResetAPIKeyQuota(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(c, http.StatusNotFound, "API Key 不存在")
 		return
@@ -34,48 +47,40 @@ func (h *Handler) ResetAPIKeyQuota(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	if row.QuotaLimit <= 0 {
-		writeError(c, http.StatusBadRequest, "该 API Key 未配置额度限制")
-		return
-	}
 
-	if err := h.db.ResetAPIKeyQuota(ctx, id); err != nil {
-		writeInternalError(c, err)
-		return
-	}
-	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
+	h.invalidateResetAPIKeyCaches(ctx, *target)
 	security.SecurityAuditLog("API_KEY_QUOTA_RESET", fmt.Sprintf("id=%d ip=%s", id, c.ClientIP()))
-	c.JSON(http.StatusOK, gin.H{"message": "API Key 额度已重置"})
+	c.JSON(http.StatusOK, gin.H{"message": "API Key 累计额度及 5h/7d 用量已重置"})
 }
 
-// ResetAllAPIKeyQuotas renews every configured API key quota in one database
-// statement so the operation cannot be left half-complete.
+// ResetAllAPIKeyQuotas renews cumulative and 5h/7d quota periods for all API
+// keys in one statement, preserving historical usage logs.
+//
+// POST /api/admin/keys/reset-all-quotas
 func (h *Handler) ResetAllAPIKeyQuotas(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
-	keys, err := h.db.ListAPIKeys(ctx)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-	resetCount, err := h.db.ResetAllAPIKeyQuotas(ctx)
+	targets, err := h.db.ResetAllAPIKeyQuotas(ctx)
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
 
-	// The proxy caches quota_used by raw API key. Evict every affected entry so
-	// exhausted keys become usable immediately instead of waiting for the TTL.
 	h.deleteRuntimeCache(ctx, adminAPIKeyCountNamespace, "all")
-	for _, key := range keys {
-		if key.QuotaLimit > 0 {
-			h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, key.Key)
-		}
+	for _, target := range targets {
+		h.invalidateResetAPIKeyCaches(ctx, target)
 	}
-	security.SecurityAuditLog("API_KEY_QUOTA_RESET_ALL", fmt.Sprintf("count=%d ip=%s", resetCount, c.ClientIP()))
+	security.SecurityAuditLog("API_KEY_QUOTA_RESET_ALL", fmt.Sprintf("count=%d ip=%s", len(targets), c.ClientIP()))
 	c.JSON(http.StatusOK, gin.H{
-		"message":     "所有 API Key 额度已重置",
-		"reset_count": resetCount,
+		"message":     "所有 API Key 累计额度及 5h/7d 用量已重置",
+		"reset_count": len(targets),
 	})
+}
+
+func (h *Handler) invalidateResetAPIKeyCaches(ctx context.Context, target database.APIKeyQuotaResetTarget) {
+	h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, target.Key)
+	for _, label := range []string{apiKeyResetWindow5h, apiKeyResetWindow7d} {
+		h.deleteRuntimeCache(ctx, adminAPIKeyLimitsCacheNamespace, fmt.Sprintf("%d:usage:%s", target.ID, label))
+	}
 }

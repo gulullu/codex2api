@@ -27,17 +27,26 @@ func StartOfDay(t time.Time) time.Time {
 
 // GetAPIKeyWindowUsage 聚合指定 API Key 在 [now-window, now] 时间窗口内的使用情况。
 // 用于 API Key 级别的滑动窗口限额校验(rpm/rpd/cost_5h/cost_7d/token_5h/token_7d)。
+// 手动额度重置只截断 5h/7d 窗口，RPM/RPD/30d 与自然日窗口保持原有口径。
 func (db *DB) GetAPIKeyWindowUsage(ctx context.Context, apiKeyID int64, window time.Duration) (*APIKeyWindowUsage, error) {
 	if window <= 0 {
 		return &APIKeyWindowUsage{}, nil
 	}
-	return db.GetAPIKeyUsageSince(ctx, apiKeyID, time.Now().Add(-window))
+	return db.getAPIKeyUsageSince(ctx, apiKeyID, time.Now().Add(-window), isResettableAPIKeyWindow(window))
+}
+
+func isResettableAPIKeyWindow(window time.Duration) bool {
+	return window == 5*time.Hour || window == 7*24*time.Hour
 }
 
 // GetAPIKeyUsageSince 聚合指定 API Key 自 since 起的使用情况。自然日限额
 // (issue #460)以当天零点为 since 复用同一条查询。
 // 索引 idx_usage_logs_api_key_created_at 让该查询在数据量大时仍 O(log n)。
 func (db *DB) GetAPIKeyUsageSince(ctx context.Context, apiKeyID int64, since time.Time) (*APIKeyWindowUsage, error) {
+	return db.getAPIKeyUsageSince(ctx, apiKeyID, since, false)
+}
+
+func (db *DB) getAPIKeyUsageSince(ctx context.Context, apiKeyID int64, since time.Time, honorReset bool) (*APIKeyWindowUsage, error) {
 	if apiKeyID <= 0 || since.IsZero() {
 		return &APIKeyWindowUsage{}, nil
 	}
@@ -53,6 +62,21 @@ func (db *DB) GetAPIKeyUsageSince(ctx context.Context, apiKeyID int64, since tim
 		  AND created_at >= $2
 		  AND status_code <> 499
 	`
+	if honorReset {
+		query = `
+			SELECT
+				COUNT(*),
+				COALESCE(SUM(u.total_tokens), 0),
+				COALESCE(SUM(u.user_billed), 0),
+				MIN(u.created_at)
+			FROM usage_logs u
+			JOIN api_keys k ON k.id = u.api_key_id
+			WHERE u.api_key_id = $1
+			  AND u.created_at >= $2
+			  AND (k.last_reset_at IS NULL OR u.created_at >= k.last_reset_at)
+			  AND u.status_code <> 499
+		`
+	}
 	var oldestRaw interface{}
 	err := db.conn.QueryRowContext(ctx, query, apiKeyID, db.timeArg(since)).Scan(
 		&usage.Requests, &usage.Tokens, &usage.UserBilled, &oldestRaw,
@@ -485,12 +509,16 @@ func (db *DB) GetAllAPIKeysWindowCost(ctx context.Context, window time.Duration)
 	if window <= 0 {
 		return make(map[int64]float64), nil
 	}
-	return db.GetAllAPIKeysCostSince(ctx, time.Now().Add(-window))
+	return db.getAllAPIKeysCostSince(ctx, time.Now().Add(-window), isResettableAPIKeyWindow(window))
 }
 
 // GetAllAPIKeysCostSince 批量聚合所有 API Key 自 since 起的 user_billed。
 // 自然日限额(issue #460)以当天零点为 since 复用该查询。
 func (db *DB) GetAllAPIKeysCostSince(ctx context.Context, since time.Time) (map[int64]float64, error) {
+	return db.getAllAPIKeysCostSince(ctx, since, false)
+}
+
+func (db *DB) getAllAPIKeysCostSince(ctx context.Context, since time.Time, honorReset bool) (map[int64]float64, error) {
 	if since.IsZero() {
 		return make(map[int64]float64), nil
 	}
@@ -502,6 +530,18 @@ func (db *DB) GetAllAPIKeysCostSince(ctx context.Context, since time.Time) (map[
 		  AND status_code <> 499
 		GROUP BY api_key_id
 	`
+	if honorReset {
+		query = `
+			SELECT u.api_key_id, COALESCE(SUM(u.user_billed), 0)
+			FROM usage_logs u
+			JOIN api_keys k ON k.id = u.api_key_id
+			WHERE u.api_key_id > 0
+			  AND u.created_at >= $1
+			  AND (k.last_reset_at IS NULL OR u.created_at >= k.last_reset_at)
+			  AND u.status_code <> 499
+			GROUP BY u.api_key_id
+		`
+	}
 	rows, err := db.conn.QueryContext(ctx, query, db.timeArg(since))
 	if err != nil {
 		return nil, err

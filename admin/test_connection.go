@@ -508,8 +508,9 @@ func (h *Handler) connectionTestModel(ctx context.Context) string {
 
 // defaultGrokConnectionTestModels：账号未声明 models 时的 Grok 连通性测试回落列表
 // （与 /v1/models 的默认 Grok 模型集共用同一真相，仅文本模型）。
-func defaultGrokConnectionTestModels() []string {
-	return proxy.DefaultGrokModelIDs()
+// 默认集按凭据类型区分（OAuth 走 CLI 通道、API Key 走公开 API），故需要账号上下文。
+func defaultGrokConnectionTestModels(account *auth.Account) []string {
+	return proxy.DefaultGrokModelIDsForAccount(account)
 }
 
 func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *auth.Account, requested string) (string, error) {
@@ -533,7 +534,7 @@ func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *au
 	}
 	// Grok 账号常不预声明 models（依赖上游 /v1/models），回落到常见文本模型。
 	if len(textModels) == 0 && account.IsGrokAPI() {
-		textModels = append(textModels, defaultGrokConnectionTestModels()...)
+		textModels = append(textModels, defaultGrokConnectionTestModels(account)...)
 	}
 	if len(textModels) == 0 {
 		return "", fmt.Errorf("该 Responses API 账号没有可用于测试的文本模型")

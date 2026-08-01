@@ -177,7 +177,7 @@ func TestGPT55PricingDoesNotMatchGPT54(t *testing.T) {
 }
 
 // gpt-5.6 三个变体官方定价各不相同（developers.openai.com/api/docs/pricing）：
-// sol $5/$30、terra $2.5/$15、luna $1/$6（standard）；priority 均为 2× standard。
+// sol $5/$30、terra $2/$12、luna $0.20/$1.20（standard）；priority 均为 2× standard。
 func TestGPT56VariantPricing(t *testing.T) {
 	cases := []struct {
 		model                   string
@@ -185,8 +185,8 @@ func TestGPT56VariantPricing(t *testing.T) {
 		priorityIn, priorityOut float64
 	}{
 		{"gpt-5.6-sol", 5.0, 30.0, 0.5, 10.0, 60.0},
-		{"gpt-5.6-terra", 2.5, 15.0, 0.25, 5.0, 30.0},
-		{"gpt-5.6-luna", 1.0, 6.0, 0.1, 2.0, 12.0},
+		{"gpt-5.6-terra", 2.0, 12.0, 0.2, 4.0, 24.0},
+		{"gpt-5.6-luna", 0.2, 1.2, 0.02, 0.4, 2.4},
 		{"gpt-5.6-sol-high", 5.0, 30.0, 0.5, 10.0, 60.0},
 	}
 	for _, c := range cases {

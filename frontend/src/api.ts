@@ -302,6 +302,53 @@ async function requestImageStudioPortalBlob(path: string, apiKey: string, option
   return res.blob()
 }
 
+/** 下载物：blob + 服务端在 Content-Disposition 里给出的文件名（可能为空）。 */
+export type NamedBlob = { blob: Blob; filename: string }
+
+/** parseContentDispositionFilename 取 Content-Disposition 里的 filename，取不到返回空串。 */
+function parseContentDispositionFilename(header: string | null): string {
+  if (!header) return ''
+  // RFC 5987 的 filename*=UTF-8''… 优先，其次普通 filename="…"。
+  const encoded = /filename\*=(?:UTF-8|utf-8)''([^;]+)/i.exec(header)
+  if (encoded?.[1]) {
+    try {
+      return decodeURIComponent(encoded[1].trim())
+    } catch {
+      // 编码不合法时退回普通 filename
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(header)
+  return plain?.[1]?.trim() ?? ''
+}
+
+async function requestNamedBlob(path: string, options: RequestInit = {}): Promise<NamedBlob> {
+  const headers = new Headers(options.headers)
+
+  const adminKey = getAdminKey()
+  if (adminKey) {
+    headers.set('X-Admin-Key', adminKey)
+  }
+
+  const res = await fetch(BASE + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    if (res.status === 401) {
+      resetAdminAuthState()
+    }
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return {
+    blob: await res.blob(),
+    filename: parseContentDispositionFilename(res.headers.get('Content-Disposition')),
+  }
+}
+
 async function requestBlob(path: string, options: RequestInit = {}): Promise<Blob> {
   const headers = new Headers(options.headers)
 
@@ -898,6 +945,16 @@ export const api = {
   },
   downloadAccountAuthJSON: (id: number) =>
     requestBlob(`/accounts/${id}/auth-json`),
+  /**
+   * 导出 Grok 账号凭据。ids 为空则导出全部 Grok 账号。
+   * 单个账号返回裸 JSON，多个账号返回 ZIP（内部每账号一个 <邮箱>.json）。
+   * 文件名由服务端在 Content-Disposition 里给出，前端不再自行拼接。
+   */
+  exportGrokAccounts: (ids?: number[]) => {
+    const sp = new URLSearchParams({ filter: 'all' })
+    if (ids && ids.length > 0) sp.set('ids', ids.join(','))
+    return requestNamedBlob(`/accounts/grok/export?${sp.toString()}`)
+  },
   migrateAccounts: (data: { url: string; admin_key: string }) =>
     request<{ message: string; total: number; imported: number; duplicate: number; failed: number }>(
       '/accounts/migrate', { method: 'POST', body: JSON.stringify(data) }),

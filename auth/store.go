@@ -124,6 +124,9 @@ type Account struct {
 	// 内存实时更新;dirty 位驱动 store 后台循环按分钟批量落库(grok_rate_limit 凭据)。
 	grokRateLimit      *GrokRateLimitSnapshot
 	grokRateLimitDirty bool
+	// grokContextWindow 是上游 x-grok-context-window 响应头的观测值，用于推导
+	// 客户端压缩阈值。仅内存保留：值只能在收到响应后才知道，落库也救不了首个请求。
+	grokContextWindow int64
 	// grokFreeQuota 是免费额度耗尽 429 解析出的权威用量快照，随 credentials 落库。
 	grokFreeQuota  *GrokFreeQuotaSnapshot
 	Status         AccountStatus

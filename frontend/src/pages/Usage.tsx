@@ -76,6 +76,30 @@ function ReasoningEffortBadge({ effort }: { effort: string }) {
   )
 }
 
+function InternalRequestBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const reason = log.internal_reason?.trim()
+  if (!reason) return null
+
+  const label = reason === 'overflow_compact_summary'
+    ? t('usage.internalOverflowSummary')
+    : t('usage.internalRequest')
+  const title = log.parent_request_id?.trim()
+    ? t('usage.internalRequestParentTooltip', { parentRequestId: log.parent_request_id.trim() })
+    : t('usage.internalRequestTooltip')
+
+  return (
+    <Badge
+      variant="outline"
+      className="gap-0.5 whitespace-nowrap border-transparent bg-fuchsia-500/12 text-[11px] font-semibold text-fuchsia-700 dark:bg-fuchsia-500/20 dark:text-fuchsia-300"
+      title={title}
+    >
+      <Brain className="size-3" />
+      {label}
+    </Badge>
+  )
+}
+
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
     return 'border-transparent bg-emerald-500/14 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300'
@@ -2163,6 +2187,7 @@ export default function Usage() {
                             compact={log.compact}
                             hasCompactionHistory={log.has_compaction_history}
                           />
+                          <InternalRequestBadge log={log} />
                         </div>
                         <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
                           {formatBeijingTime(log.created_at)}
@@ -2379,6 +2404,7 @@ export default function Usage() {
                               compact={log.compact}
                               hasCompactionHistory={log.has_compaction_history}
                             />
+                            <InternalRequestBadge log={log} />
                           </div>
                         </TableCell>}
                         {visibleColumns.token && <TableCell>
